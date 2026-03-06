@@ -45,7 +45,7 @@ This has a direct implication for serving efficiency: by completing KV retrieval
 
 ## Energy Efficiency: Tokens
 
-| Context Length | Recompute | Maru | LMCache P2P | Maru / P2P |
+| Context Length | Recompute | Maru | LMCache P2P | Maru / LMCache P2P |
 |---|---|---|---|---|
 | 16K | 19.7 | 59.8 | 50.7 | 1.18× |
 | 32K | 22.0 | 101.2 | 73.2 | 1.38× |
