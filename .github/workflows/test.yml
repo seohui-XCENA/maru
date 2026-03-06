@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  pull_request:
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install -e .
+      - name: Run unit tests with coverage
+        run: |
+          pytest -m "not integration" \
+            --cov=maru_handler \
+            --cov=maru_server \
+            --cov=maru_common \
+            --cov=maru_shm \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --junitxml=pytest.xml \
+            -v
+      - name: Coverage comment on PR
+        if: github.event_name == 'pull_request'
+        uses: MishaKav/pytest-coverage-comment@main
+        with:
+          pytest-xml-coverage-path: coverage.xml
+          junitxml-path: pytest.xml
+          unique-id-for-comment: coverage-report

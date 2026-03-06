@@ -1,0 +1,28 @@
+#!/bin/bash
+
+export VLLM_LOG_LEVEL=${VLLM_LOG_LEVEL:-DEBUG}
+export LMCACHE_LOG_LEVEL=${LMCACHE_LOG_LEVEL:-ERROR}
+export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.1}
+
+# Port base configuration
+export LMCACHE_PORT_BASE=${LMCACHE_PORT_BASE:-$((10000 + $(id -u)))}
+
+# Derived ports (can be overridden by setting before sourcing)
+export LMCACHE_PROXY_EXTERNAL_PORT=${LMCACHE_PROXY_EXTERNAL_PORT:-$((LMCACHE_PORT_BASE + 2100))}
+export LMCACHE_PREFILLER_PORT=${LMCACHE_PREFILLER_PORT:-$((LMCACHE_PORT_BASE + 100))}
+export LMCACHE_DECODER_PORT=${LMCACHE_DECODER_PORT:-$((LMCACHE_PORT_BASE + 200))}
+export LMCACHE_DECODER_INIT_PORT=${LMCACHE_DECODER_INIT_PORT:-$((LMCACHE_PORT_BASE + 300))}
+export LMCACHE_DECODER_ALLOC_PORT=${LMCACHE_DECODER_ALLOC_PORT:-$((LMCACHE_PORT_BASE + 400))}
+export LMCACHE_PROXY_PORT=${LMCACHE_PROXY_PORT:-$((LMCACHE_PORT_BASE + 500))}
+
+# Maru Server port (required for maru remote connector)
+export MARU_SERVER_PORT=${MARU_SERVER_PORT:-$((10000 + $(id -u)))}
+
+echo "Using LMCACHE_PORT_BASE: $LMCACHE_PORT_BASE"
+echo "  Proxy External: $LMCACHE_PROXY_EXTERNAL_PORT"
+echo "  Prefiller:      $LMCACHE_PREFILLER_PORT"
+echo "  Decoder:        $LMCACHE_DECODER_PORT"
+echo "  Decoder Init:   $LMCACHE_DECODER_INIT_PORT"
+echo "  Decoder Alloc:  $LMCACHE_DECODER_ALLOC_PORT"
+echo "  Proxy Internal: $LMCACHE_PROXY_PORT"
+echo "  Maru Server: $MARU_SERVER_PORT"

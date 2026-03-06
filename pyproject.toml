@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maru"
+version = "0.1.0"
+description = "Maru - A high-performance KV cache manager for CXL shared memory"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    {name = "XCENA"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pyzmq>=25.0.0",
+    "msgpack>=1.0.0",
+    "dacite>=1.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.1.29",
+    "myst-parser>=2.0",
+    "sphinxcontrib-mermaid",
+    "sphinx-autobuild",
+]
+
+[project.scripts]
+maru-server = "maru_server.server:main"
+install-maru-resource-manager = "maru_common.resource_manager_installer:main"
+
+[project.urls]
+Homepage = "https://xcena-dev.github.io/maru/"
+Repository = "https://github.com/xcena-dev/maru"
+Documentation = "https://xcena-dev.github.io/maru/"
+Organization = "https://xcena.com"
+
+[tool.setuptools.packages.find]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+python_files = "test_*.py"
+python_functions = "test_*"
+markers = [
+    "integration: tests requiring real ZMQ connectivity (deselect with '-m \"not integration\"')",
+    "slow: slow-running tests",
+]

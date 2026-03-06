@@ -1,0 +1,14 @@
+enable_pd: False
+chunk_size: 256
+# Maru remote backend
+remote_url: "maru://localhost:${MARU_SERVER_PORT}"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 100
+save_unfull_chunk: True
+
+extra_config:
+  maru_pool_size: "4G"
+  save_chunk_meta: False
+  lookup_backoff_time: 0.001
+
