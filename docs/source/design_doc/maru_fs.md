@@ -94,8 +94,8 @@ The data plane (zero-copy mmap access to CXL memory) is shared across both modes
 ```mermaid
 sequenceDiagram
     participant C as LMCache
-    participant H as MaruHandlerV3
-    participant ORM as OwnedRegionManagerV3
+    participant H as MaruHandlerFs
+    participant ORM as OwnedRegionManagerFs
     participant XM as MarufsMapper
     participant XC as MarufsClient
     participant K as marufs (kernel)
@@ -123,7 +123,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as LMCache (Instance B)
-    participant H as MaruHandlerV3 (B)
+    participant H as MaruHandlerFs (B)
     participant XC as MarufsClient
     participant XM as MarufsMapper
     participant K as marufs (kernel)
@@ -161,9 +161,9 @@ Subsequent accesses to the same region reuse the cached mmap (0 open/mmap).
 ```mermaid
 sequenceDiagram
     participant C as LMCache
-    participant H as MaruHandlerV3
+    participant H as MaruHandlerFs
     participant XC as MarufsClient
-    participant ORM as OwnedRegionManagerV3
+    participant ORM as OwnedRegionManagerFs
     participant K as marufs (kernel)
 
     C->>H: delete(key)
@@ -181,10 +181,10 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant H as MaruHandlerV3
+    participant H as MaruHandlerFs
     participant XC as MarufsClient
     participant XM as MarufsMapper
-    participant ORM as OwnedRegionManagerV3
+    participant ORM as OwnedRegionManagerFs
     participant K as marufs (kernel)
 
     Note over H: Step 1 — Clear own name-refs from global index
@@ -220,7 +220,7 @@ Filesystem mode introduces three components that replace their Remote mode count
 |-----------|----------|------|
 | **MarufsClient** | RpcClient + MaruShmClient | Wraps kernel filesystem interface — region CRUD via VFS, global index operations via ioctl, permission management. Caches file descriptors internally and validates region names against path traversal. |
 | **MarufsMapper** | DaxMapper | Memory-mapping lifecycle manager. All regions are mapped with CUDA pinning for owned regions; shared region size is auto-detected via fstat. Performs bulk unmap on close. |
-| **OwnedRegionManagerV3** | OwnedRegionManager | Page-level allocator for multiple owned regions, using the same O(1) free-list strategy as Remote mode. Allocation follows the same fast-path: active region → scan others → create new. |
+| **OwnedRegionManagerFs** | OwnedRegionManager | Page-level allocator for multiple owned regions, using the same O(1) free-list strategy as Remote mode. Allocation follows the same fast-path: active region → scan others → create new. |
 
 ---
 
