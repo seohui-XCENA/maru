@@ -10,11 +10,13 @@ from maru_common.logging_setup import setup_package_logging
 setup_package_logging("maru_handler")
 
 from .handler import MaruHandler  # noqa: E402
+from .handler_fs import MaruHandlerFs  # noqa: E402
 from .memory import OwnedRegionManager  # noqa: E402
 from .rpc_client import RpcClient  # noqa: E402
 
 __all__ = [
     "MaruHandler",
+    "MaruHandlerFs",
     "OwnedRegionManager",
     "RpcClient",
 ]

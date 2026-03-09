@@ -88,6 +88,20 @@ class MaruHandler:
             └── _key_to_location (key -> (region_id, page_index))
     """
 
+    def __new__(cls, config: MaruConfig | None = None):
+        """Route to MaruHandlerFs if marufs mode is configured."""
+        if cls is MaruHandler:
+            cfg = config or MaruConfig()
+            if cfg.is_marufs_mode:
+                from .handler_fs import MaruHandlerFs
+
+                logger.info(
+                    "marufs mode enabled (mount_path=%s), using MaruHandlerFs",
+                    cfg.mount_path,
+                )
+                return MaruHandlerFs(cfg)
+        return super().__new__(cls)
+
     def __init__(self, config: MaruConfig | None = None):
         """Initialize MaruHandler.
 

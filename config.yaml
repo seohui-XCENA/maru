@@ -1,0 +1,6 @@
+# Maru Configuration
+# Fields here are maru-internal defaults. LMCache-provided values
+# (server_url, pool_size, etc.) take precedence when set.
+
+# Handler mode: set mount_path to enable marufs (fs mode), omit for RPC mode
+# mount_path: /mnt/marufs
