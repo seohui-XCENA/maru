@@ -393,20 +393,22 @@ class MarufsClient:
 
         return results
 
-    def clear_name(self, fd: int, name: str | bytes) -> None:
+    def clear_name(self, fd: int, name: str | bytes, name_hash: int = 0) -> None:
         """Remove a name-ref from the global index.
 
         Issues ``ioctl(MARUFS_IOC_CLEAR_NAME)``.
 
         Args:
-            fd:   Open file descriptor for the region (permission check).
-            name: Key string or bytes to remove.
+            fd:        Open file descriptor for the region (permission check).
+            name:      Key string or bytes to remove.
+            name_hash: Pre-computed hash (0 = kernel uses djb2 fallback).
         """
         req = MarufsNameOffsetReq()
         req.name = (name if isinstance(name, bytes) else name.encode("utf-8"))[
             :MARUFS_NAME_MAX
         ]
         req.offset = 0
+        req.name_hash = name_hash
         logger.debug("clear_name: fd=%d name=%s", fd, name)
         fcntl.ioctl(fd, MARUFS_IOC_CLEAR_NAME, req)
 

@@ -247,13 +247,13 @@ class MaruHandlerFs(MaruHandler):
         try:
             with self._write_lock:
                 # 1. Clear own KV entries from the global index
-                for key, (region_name, _page_idx, _kh) in self._key_to_location.items():
+                for key, (region_name, _page_idx, key_hash) in self._key_to_location.items():
                     if self._owned is not None and self._owned.is_owned(region_name):
                         key_name = self._get_name(key)
                         fd = self._mapper.get_fd(region_name)
                         if fd is not None:
                             try:
-                                self._marufs.clear_name(fd, key_name)
+                                self._marufs.clear_name(fd, key_name, key_hash)
                             except OSError:
                                 pass
 
@@ -1085,12 +1085,13 @@ class MaruHandlerFs(MaruHandler):
             key: Key string to remove.
         """
         key_name = self._get_name(key)
+        key_hash = self._get_hash(key)
 
         # Clear from global index
         region = self._mapper.get_region(region_name)
         if region is not None:
             try:
-                self._marufs.clear_name(region.fd, key_name)
+                self._marufs.clear_name(region.fd, key_name, key_hash)
             except OSError as e:
                 logger.warning(
                     "_clear_key: clear_name failed for key=%s region=%s: %s",
