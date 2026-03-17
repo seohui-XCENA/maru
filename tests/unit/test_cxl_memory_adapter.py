@@ -4,12 +4,21 @@
 import mmap
 from unittest.mock import MagicMock
 
-import torch
-from lmcache.v1.memory_management import MemoryFormat
+# TODO: temporary fix — skip when torch/lmcache are not installed (CI)
+import pytest
 
-from maru_handler.memory import AllocHandle
-from maru_handler.memory.types import MappedRegion
-from maru_lmcache.adapter import CxlMemoryAdapter
+torch = pytest.importorskip(
+    "torch", reason="torch not installed — skipping CxlMemoryAdapter tests"
+)
+lmcache = pytest.importorskip(
+    "lmcache.v1.memory_management",
+    reason="lmcache not installed — skipping CxlMemoryAdapter tests",
+)
+from lmcache.v1.memory_management import MemoryFormat  # noqa: E402
+
+from maru_handler.memory import AllocHandle  # noqa: E402
+from maru_handler.memory.types import MappedRegion  # noqa: E402
+from maru_lmcache.adapter import CxlMemoryAdapter  # noqa: E402
 
 # =========================================================================
 # Fixtures
@@ -34,13 +43,11 @@ def _make_mock_handler(pool_size=4096, chunk_size=1024):
     )
 
     # Facade methods
-    handler.get_buffer_view.side_effect = (
-        lambda rid, offset, size: mapped_region.get_buffer_view(offset, size)
-        if rid == region_id
-        else None
+    handler.get_buffer_view.side_effect = lambda rid, offset, size: (
+        mapped_region.get_buffer_view(offset, size) if rid == region_id else None
     )
-    handler.get_region_page_count.side_effect = (
-        lambda rid: page_count if rid == region_id else None
+    handler.get_region_page_count.side_effect = lambda rid: (
+        page_count if rid == region_id else None
     )
     handler.get_owned_region_ids.return_value = [region_id]
     handler.get_chunk_size.return_value = chunk_size

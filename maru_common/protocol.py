@@ -548,7 +548,10 @@ MESSAGE_CLASSES = {
     MessageType.BATCH_REGISTER_KV: (BatchRegisterKVRequest, BatchRegisterKVResponse),
     MessageType.BATCH_LOOKUP_KV: (BatchLookupKVRequest, BatchLookupKVResponse),
     MessageType.BATCH_EXISTS_KV: (BatchExistsKVRequest, BatchExistsKVResponse),
-    MessageType.BATCH_EXISTS_AND_PIN_KV: (BatchExistsAndPinKVRequest, BatchExistsAndPinKVResponse),
+    MessageType.BATCH_EXISTS_AND_PIN_KV: (
+        BatchExistsAndPinKVRequest,
+        BatchExistsAndPinKVResponse,
+    ),
     MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
     MessageType.BATCH_PIN_KV: (BatchPinKVRequest, BatchPinKVResponse),
     # Admin
