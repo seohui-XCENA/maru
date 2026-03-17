@@ -113,6 +113,10 @@ class MaruServer:
         """Check if a KV entry exists and pin it atomically."""
         return self._kv_manager.exists_and_pin(key)
 
+    def pin_kv(self, key: str) -> bool:
+        """Pin a KV entry to protect from eviction."""
+        return self._kv_manager.pin(key)
+
     def unpin_kv(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
         return self._kv_manager.unpin(key)
@@ -183,6 +187,18 @@ class MaruServer:
                         )
 
             return results
+
+    def batch_exists_and_pin_kv(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin multiple KV entries atomically."""
+        return self._kv_manager.batch_exists_and_pin(keys)
+
+    def batch_pin_kv(self, keys: list[str]) -> list[bool]:
+        """Pin multiple KV entries."""
+        return self._kv_manager.batch_pin(keys)
+
+    def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple KV entries."""
+        return self._kv_manager.batch_unpin(keys)
 
     def batch_exists_kv(self, keys: list[str]) -> list[bool]:
         """

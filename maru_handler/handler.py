@@ -566,6 +566,18 @@ class MaruHandler:
         self._ensure_connected()
         return self._rpc.exists_and_pin_kv(key)
 
+    def pin_kv(self, key: str) -> bool:
+        """Pin a KV entry to protect from eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if pinned successfully
+        """
+        self._ensure_connected()
+        return self._rpc.pin_kv(key)
+
     def unpin_kv(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction.
 
@@ -866,6 +878,54 @@ class MaruHandler:
             logger.error("batch_exists RPC failed", exc_info=True)
             return [False] * len(keys)
         return batch_resp.results
+
+    def batch_exists_and_pin(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if key exists (and was pinned).
+        """
+        self._ensure_connected()
+        try:
+            return self._rpc.batch_exists_and_pin_kv(keys)
+        except Exception:
+            logger.error("batch_exists_and_pin RPC failed", exc_info=True)
+            return [False] * len(keys)
+
+    def batch_pin_kv(self, keys: list[str]) -> list[bool]:
+        """Pin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if pinned successfully.
+        """
+        self._ensure_connected()
+        try:
+            return self._rpc.batch_pin_kv(keys)
+        except Exception:
+            logger.error("batch_pin_kv RPC failed", exc_info=True)
+            return [False] * len(keys)
+
+    def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if successfully unpinned.
+        """
+        self._ensure_connected()
+        try:
+            return self._rpc.batch_unpin_kv(keys)
+        except Exception:
+            logger.error("batch_unpin_kv RPC failed", exc_info=True)
+            return [False] * len(keys)
 
     # =========================================================================
     # Properties

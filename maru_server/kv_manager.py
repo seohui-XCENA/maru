@@ -95,6 +95,21 @@ class KVManager:
             logger.debug("Pinned KV: key=%s, pin_count=%d", key, entry.pin_count)
             return True
 
+    def pin(self, key: str) -> bool:
+        """Pin a KV entry to protect from eviction.
+
+        Returns:
+            True if key exists and was pinned, False otherwise.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                logger.warning("Pin failed: key=%s not found", key)
+                return False
+            entry.pin_count += 1
+            logger.debug("Pinned KV: key=%s, pin_count=%d", key, entry.pin_count)
+            return True
+
     def unpin(self, key: str) -> bool:
         """Decrement pin_count for a KV entry.
 
@@ -192,3 +207,54 @@ class KVManager:
         """
         with self._lock:
             return [key in self._store for key in keys]
+
+    def batch_exists_and_pin(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin multiple KV entries atomically.
+
+        Returns:
+            List of booleans — True if key exists (and was pinned).
+        """
+        with self._lock:
+            results = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None:
+                    results.append(False)
+                else:
+                    entry.pin_count += 1
+                    results.append(True)
+            return results
+
+    def batch_pin(self, keys: list[str]) -> list[bool]:
+        """Pin multiple KV entries.
+
+        Returns:
+            List of booleans — True if key exists and was pinned.
+        """
+        with self._lock:
+            results = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None:
+                    results.append(False)
+                else:
+                    entry.pin_count += 1
+                    results.append(True)
+            return results
+
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple KV entries.
+
+        Returns:
+            List of booleans — True if successfully unpinned.
+        """
+        with self._lock:
+            results = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None or entry.pin_count <= 0:
+                    results.append(False)
+                else:
+                    entry.pin_count -= 1
+                    results.append(True)
+            return results
