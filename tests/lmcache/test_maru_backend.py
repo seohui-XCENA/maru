@@ -254,7 +254,10 @@ class TestMaruBackendPut:
         future = backend.submit_put_task(key, obj)
         future.result(timeout=5)
 
-        assert obj.get_ref_count() == initial_ref
+        # submit_put_task: ref_count_up x2 (pool ref + async guard)
+        # _async_store: ref_count_down x1 (async guard release)
+        # SM ref_count_down is not called here (only via StorageManager.batched_put)
+        assert obj.get_ref_count() == initial_ref + 1
 
 
 class TestMaruBackendGet:
@@ -313,7 +316,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_all_hit(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.return_value = True
+        backend._handler.batch_exists.return_value = [True, True, True]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-1", keys)
@@ -322,7 +325,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_partial_prefix(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.side_effect = [True, True, False]
+        backend._handler.batch_exists.return_value = [True, True, False]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-2", keys)
@@ -331,7 +334,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_first_miss(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.return_value = False
+        backend._handler.batch_exists.return_value = [False, False, False]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-3", keys)
@@ -339,6 +342,7 @@ class TestMaruBackendAsyncLookup:
         assert result == 0
 
     def test_batched_async_contains_empty_keys(self, backend, async_loop):
+        backend._handler.batch_exists.return_value = []
         result = _run_async(async_loop, backend.batched_async_contains("lookup-4", []))
         assert result == 0
 
