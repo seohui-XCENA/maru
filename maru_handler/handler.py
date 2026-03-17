@@ -552,6 +552,32 @@ class MaruHandler:
         self._ensure_connected()
         return self._rpc.exists_kv(key)
 
+    def exists_and_pin(self, key: str) -> bool:
+        """Check if a key exists and pin it atomically.
+
+        If the key exists, increments pin_count to protect from eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if exists (and was pinned)
+        """
+        self._ensure_connected()
+        return self._rpc.exists_and_pin_kv(key)
+
+    def unpin_kv(self, key: str) -> bool:
+        """Unpin a KV entry, making it eligible for eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if unpinned successfully
+        """
+        self._ensure_connected()
+        return self._rpc.unpin_kv(key)
+
     def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
 

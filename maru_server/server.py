@@ -109,6 +109,14 @@ class MaruServer:
         """Check if a KV entry exists."""
         return self._kv_manager.exists(key)
 
+    def exists_and_pin_kv(self, key: str) -> bool:
+        """Check if a KV entry exists and pin it atomically."""
+        return self._kv_manager.exists_and_pin(key)
+
+    def unpin_kv(self, key: str) -> bool:
+        """Unpin a KV entry, making it eligible for eviction."""
+        return self._kv_manager.unpin(key)
+
     def delete_kv(self, key: str) -> bool:
         """Delete a KV entry."""
         with self._lock:

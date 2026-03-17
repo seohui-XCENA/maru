@@ -33,6 +33,8 @@ class RpcHandlerMixin:
                 MessageType.LOOKUP_KV.value: self._handle_lookup_kv,
                 MessageType.EXISTS_KV.value: self._handle_exists_kv,
                 MessageType.DELETE_KV.value: self._handle_delete_kv,
+                MessageType.EXISTS_AND_PIN_KV.value: self._handle_exists_and_pin_kv,
+                MessageType.UNPIN_KV.value: self._handle_unpin_kv,
                 # Batch operations
                 MessageType.BATCH_REGISTER_KV.value: self._handle_batch_register_kv,
                 MessageType.BATCH_LOOKUP_KV.value: self._handle_batch_lookup_kv,
@@ -144,6 +146,16 @@ class RpcHandlerMixin:
 
     def _handle_delete_kv(self, req: Any) -> dict:
         success = self._server.delete_kv(key=req.key)
+        return {"success": success}
+
+    def _handle_exists_and_pin_kv(self, req: Any) -> dict:
+        exists = self._server.exists_and_pin_kv(key=req.key)
+        logger.debug("[EXISTS_AND_PIN] key=%s -> %s", req.key, exists)
+        return {"exists": exists}
+
+    def _handle_unpin_kv(self, req: Any) -> dict:
+        success = self._server.unpin_kv(key=req.key)
+        logger.debug("[UNPIN] key=%s -> %s", req.key, success)
         return {"success": success}
 
     # =========================================================================

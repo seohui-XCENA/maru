@@ -16,6 +16,7 @@ class KVEntry:
     region_id: int  # Region ID (allocation identifier)
     kv_offset: int  # Offset within allocation (relative to handle.offset)
     kv_length: int  # Size of KV data
+    pin_count: int = 0  # Pin count for eviction protection
 
 
 class KVManager:
@@ -77,6 +78,40 @@ class KVManager:
         """Check if a KV entry exists."""
         with self._lock:
             return key in self._store
+
+    def exists_and_pin(self, key: str) -> bool:
+        """Check if a KV entry exists and pin it atomically.
+
+        If the key exists, increments pin_count to protect from eviction.
+
+        Returns:
+            True if key exists (and was pinned), False otherwise.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return False
+            entry.pin_count += 1
+            logger.debug("Pinned KV: key=%s, pin_count=%d", key, entry.pin_count)
+            return True
+
+    def unpin(self, key: str) -> bool:
+        """Decrement pin_count for a KV entry.
+
+        Returns:
+            True if successfully unpinned, False if key not found or not pinned.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                logger.warning("Unpin failed: key=%s not found", key)
+                return False
+            if entry.pin_count <= 0:
+                logger.warning("Unpin failed: key=%s pin_count already 0", key)
+                return False
+            entry.pin_count -= 1
+            logger.debug("Unpinned KV: key=%s, pin_count=%d", key, entry.pin_count)
+            return True
 
     def delete(self, key: str) -> tuple[bool, int | None]:
         """

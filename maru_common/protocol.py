@@ -48,6 +48,8 @@ class MessageType(IntEnum):
     LOOKUP_KV = 0x11
     EXISTS_KV = 0x12
     DELETE_KV = 0x13
+    EXISTS_AND_PIN_KV = 0x14
+    UNPIN_KV = 0x15
 
     # Batch Operations (0x20 - 0x2F)
     BATCH_REGISTER_KV = 0x20
@@ -271,6 +273,43 @@ class DeleteKVResponse:
     success: bool
 
 
+@dataclass
+class ExistsAndPinKVRequest:
+    """EXISTS_AND_PIN_KV (0x14) - Check if KV entry exists and pin it atomically.
+
+    If the key exists, increments the entry's pin_count to protect it from
+    eviction. This is an atomic operation to avoid race conditions between
+    existence check and pinning.
+    """
+
+    key: str
+
+
+@dataclass
+class ExistsAndPinKVResponse:
+    """Response for EXISTS_AND_PIN_KV."""
+
+    exists: bool
+
+
+@dataclass
+class UnpinKVRequest:
+    """UNPIN_KV (0x15) - Unpin a KV entry.
+
+    Decrements the entry's pin_count. When pin_count reaches 0, the entry
+    becomes eligible for eviction again.
+    """
+
+    key: str
+
+
+@dataclass
+class UnpinKVResponse:
+    """Response for UNPIN_KV."""
+
+    success: bool
+
+
 # =============================================================================
 # Batch Operations Messages (0x20 - 0x2F)
 # =============================================================================
@@ -438,6 +477,8 @@ MESSAGE_CLASSES = {
     MessageType.LOOKUP_KV: (LookupKVRequest, LookupKVResponse),
     MessageType.EXISTS_KV: (ExistsKVRequest, ExistsKVResponse),
     MessageType.DELETE_KV: (DeleteKVRequest, DeleteKVResponse),
+    MessageType.EXISTS_AND_PIN_KV: (ExistsAndPinKVRequest, ExistsAndPinKVResponse),
+    MessageType.UNPIN_KV: (UnpinKVRequest, UnpinKVResponse),
     # Batch Operations
     MessageType.BATCH_REGISTER_KV: (BatchRegisterKVRequest, BatchRegisterKVResponse),
     MessageType.BATCH_LOOKUP_KV: (BatchLookupKVRequest, BatchLookupKVResponse),
