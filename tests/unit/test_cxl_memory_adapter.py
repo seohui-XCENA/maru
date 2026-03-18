@@ -4,17 +4,11 @@
 import mmap
 from unittest.mock import MagicMock
 
-# TODO: temporary fix — skip when torch/lmcache are not installed (CI)
 import pytest
 
-torch = pytest.importorskip(
-    "torch", reason="torch not installed — skipping CxlMemoryAdapter tests"
-)
-lmcache = pytest.importorskip(
-    "lmcache.v1.memory_management",
-    reason="lmcache not installed — skipping CxlMemoryAdapter tests",
-)
-from lmcache.v1.memory_management import MemoryFormat  # noqa: E402
+torch = pytest.importorskip("torch")
+lmcache_mm = pytest.importorskip("lmcache.v1.memory_management")
+MemoryFormat = lmcache_mm.MemoryFormat
 
 from maru_handler.memory import AllocHandle  # noqa: E402
 from maru_handler.memory.types import MappedRegion  # noqa: E402
