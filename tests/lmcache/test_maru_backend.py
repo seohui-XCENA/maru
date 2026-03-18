@@ -251,9 +251,7 @@ class TestMaruBackendPut:
         future = backend.submit_put_task(key, obj)
         future.result(timeout=5)
 
-        # submit_put_task: ref_count_up x2 (pool ref + async guard)
-        # _async_store: ref_count_down x1 (async guard release)
-        # SM ref_count_down is not called here (only via StorageManager.batched_put)
+        # ref_count_up x1 in submit_put_task, SM ref_count_down not called here
         assert obj.get_ref_count() == initial_ref + 1
 
 
