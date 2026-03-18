@@ -5,6 +5,7 @@
 import argparse
 import logging
 import signal
+import threading
 from threading import RLock
 
 from maru_common.protocol import ANY_POOL_ID
@@ -25,10 +26,28 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    def __init__(self):
+    PIN_TIMEOUT_SEC = 60.0
+    PIN_CHECK_INTERVAL_SEC = 30.0
+
+    def __init__(
+        self,
+        pin_timeout_sec: float = PIN_TIMEOUT_SEC,
+        pin_check_interval_sec: float = PIN_CHECK_INTERVAL_SEC,
+    ):
         self._allocation_manager = AllocationManager()
-        self._kv_manager = KVManager()
+        self._kv_manager = KVManager(pin_timeout_sec=pin_timeout_sec)
         self._lock = RLock()  # Coordinates cross-manager operations
+
+        # Pin timeout monitor
+        self._pin_check_interval = pin_check_interval_sec
+        self._pin_monitor_stop = threading.Event()
+        self._pin_monitor_thread = threading.Thread(
+            target=self._pin_monitor_loop,
+            name="PinMonitor",
+            daemon=True,
+        )
+        self._pin_monitor_thread.start()
+
         logger.info("MaruServer initialized")
 
     # =========================================================================
@@ -109,14 +128,6 @@ class MaruServer:
         """Check if a KV entry exists."""
         return self._kv_manager.exists(key)
 
-    def exists_and_pin_kv(self, key: str) -> bool:
-        """Check if a KV entry exists and pin it atomically."""
-        return self._kv_manager.exists_and_pin(key)
-
-    def pin_kv(self, key: str) -> bool:
-        """Pin a KV entry to protect from eviction."""
-        return self._kv_manager.pin(key)
-
     def unpin_kv(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
         return self._kv_manager.unpin(key)
@@ -192,10 +203,6 @@ class MaruServer:
         """Check existence and pin multiple KV entries atomically."""
         return self._kv_manager.batch_exists_and_pin(keys)
 
-    def batch_pin_kv(self, keys: list[str]) -> list[bool]:
-        """Pin multiple KV entries."""
-        return self._kv_manager.batch_pin(keys)
-
     def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
         """Unpin multiple KV entries."""
         return self._kv_manager.batch_unpin(keys)
@@ -218,6 +225,23 @@ class MaruServer:
             "kv_manager": self._kv_manager.get_stats(),
             "allocation_manager": self._allocation_manager.get_stats(),
         }
+
+    # =========================================================================
+    # Pin Timeout Monitor
+    # =========================================================================
+
+    def _pin_monitor_loop(self) -> None:
+        """Background thread: periodically force-unpin timed-out entries."""
+        while not self._pin_monitor_stop.wait(self._pin_check_interval):
+            try:
+                self._kv_manager.check_pin_timeouts()
+            except Exception:
+                logger.error("PinMonitor error", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Stop background threads."""
+        self._pin_monitor_stop.set()
+        self._pin_monitor_thread.join(timeout=5.0)
 
 
 # =============================================================================

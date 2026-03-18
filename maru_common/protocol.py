@@ -48,9 +48,7 @@ class MessageType(IntEnum):
     LOOKUP_KV = 0x11
     EXISTS_KV = 0x12
     DELETE_KV = 0x13
-    EXISTS_AND_PIN_KV = 0x14
-    UNPIN_KV = 0x15
-    PIN_KV = 0x16
+    UNPIN_KV = 0x14
 
     # Batch Operations (0x20 - 0x2F)
     BATCH_REGISTER_KV = 0x20
@@ -58,7 +56,6 @@ class MessageType(IntEnum):
     BATCH_EXISTS_KV = 0x22
     BATCH_EXISTS_AND_PIN_KV = 0x23
     BATCH_UNPIN_KV = 0x24
-    BATCH_PIN_KV = 0x25
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -278,43 +275,6 @@ class DeleteKVResponse:
 
 
 @dataclass
-class ExistsAndPinKVRequest:
-    """EXISTS_AND_PIN_KV (0x14) - Check if KV entry exists and pin it atomically.
-
-    If the key exists, increments the entry's pin_count to protect it from
-    eviction. This is an atomic operation to avoid race conditions between
-    existence check and pinning.
-    """
-
-    key: str
-
-
-@dataclass
-class ExistsAndPinKVResponse:
-    """Response for EXISTS_AND_PIN_KV."""
-
-    exists: bool
-
-
-@dataclass
-class PinKVRequest:
-    """PIN_KV (0x16) - Pin a KV entry.
-
-    Increments the entry's pin_count to protect it from eviction.
-    Returns failure if the key does not exist.
-    """
-
-    key: str
-
-
-@dataclass
-class PinKVResponse:
-    """Response for PIN_KV."""
-
-    success: bool
-
-
-@dataclass
 class UnpinKVRequest:
     """UNPIN_KV (0x15) - Unpin a KV entry.
 
@@ -410,20 +370,6 @@ class BatchExistsAndPinKVRequest:
 @dataclass
 class BatchExistsAndPinKVResponse:
     """Response for BATCH_EXISTS_AND_PIN_KV."""
-
-    results: list[bool] = field(default_factory=list)
-
-
-@dataclass
-class BatchPinKVRequest:
-    """BATCH_PIN_KV (0x25) - Batch pin KV entries."""
-
-    keys: list[str] = field(default_factory=list)
-
-
-@dataclass
-class BatchPinKVResponse:
-    """Response for BATCH_PIN_KV."""
 
     results: list[bool] = field(default_factory=list)
 
@@ -541,9 +487,7 @@ MESSAGE_CLASSES = {
     MessageType.LOOKUP_KV: (LookupKVRequest, LookupKVResponse),
     MessageType.EXISTS_KV: (ExistsKVRequest, ExistsKVResponse),
     MessageType.DELETE_KV: (DeleteKVRequest, DeleteKVResponse),
-    MessageType.EXISTS_AND_PIN_KV: (ExistsAndPinKVRequest, ExistsAndPinKVResponse),
     MessageType.UNPIN_KV: (UnpinKVRequest, UnpinKVResponse),
-    MessageType.PIN_KV: (PinKVRequest, PinKVResponse),
     # Batch Operations
     MessageType.BATCH_REGISTER_KV: (BatchRegisterKVRequest, BatchRegisterKVResponse),
     MessageType.BATCH_LOOKUP_KV: (BatchLookupKVRequest, BatchLookupKVResponse),
@@ -553,7 +497,6 @@ MESSAGE_CLASSES = {
         BatchExistsAndPinKVResponse,
     ),
     MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
-    MessageType.BATCH_PIN_KV: (BatchPinKVRequest, BatchPinKVResponse),
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
     MessageType.HEARTBEAT: (HeartbeatRequest, HeartbeatResponse),

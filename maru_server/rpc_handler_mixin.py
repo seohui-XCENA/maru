@@ -33,16 +33,13 @@ class RpcHandlerMixin:
                 MessageType.LOOKUP_KV.value: self._handle_lookup_kv,
                 MessageType.EXISTS_KV.value: self._handle_exists_kv,
                 MessageType.DELETE_KV.value: self._handle_delete_kv,
-                MessageType.EXISTS_AND_PIN_KV.value: self._handle_exists_and_pin_kv,
                 MessageType.UNPIN_KV.value: self._handle_unpin_kv,
-                MessageType.PIN_KV.value: self._handle_pin_kv,
                 # Batch operations
                 MessageType.BATCH_REGISTER_KV.value: self._handle_batch_register_kv,
                 MessageType.BATCH_LOOKUP_KV.value: self._handle_batch_lookup_kv,
                 MessageType.BATCH_EXISTS_KV.value: self._handle_batch_exists_kv,
                 MessageType.BATCH_EXISTS_AND_PIN_KV.value: self._handle_batch_exists_and_pin_kv,
                 MessageType.BATCH_UNPIN_KV.value: self._handle_batch_unpin_kv,
-                MessageType.BATCH_PIN_KV.value: self._handle_batch_pin_kv,
                 # Admin
                 MessageType.GET_STATS.value: self._handle_get_stats,
                 MessageType.HEARTBEAT.value: self._handle_heartbeat,
@@ -152,16 +149,6 @@ class RpcHandlerMixin:
         success = self._server.delete_kv(key=req.key)
         return {"success": success}
 
-    def _handle_exists_and_pin_kv(self, req: Any) -> dict:
-        exists = self._server.exists_and_pin_kv(key=req.key)
-        logger.debug("[EXISTS_AND_PIN] key=%s -> %s", req.key, exists)
-        return {"exists": exists}
-
-    def _handle_pin_kv(self, req: Any) -> dict:
-        success = self._server.pin_kv(key=req.key)
-        logger.debug("[PIN] key=%s -> %s", req.key, success)
-        return {"success": success}
-
     def _handle_unpin_kv(self, req: Any) -> dict:
         success = self._server.unpin_kv(key=req.key)
         logger.debug("[UNPIN] key=%s -> %s", req.key, success)
@@ -216,29 +203,25 @@ class RpcHandlerMixin:
     def _handle_batch_exists_kv(self, req: Any) -> dict:
         """Handle batch exists KV request."""
         keys = req.keys
-        logger.debug("[BATCH_EXISTS] %d keys", len(keys))
         results = self._server.batch_exists_kv(keys)
+        hits = sum(results)
+        logger.debug("[BATCH_EXISTS] %d keys, %d hits", len(keys), hits)
         return {"results": results}
 
     def _handle_batch_exists_and_pin_kv(self, req: Any) -> dict:
         """Handle batch exists and pin KV request."""
         keys = req.keys
-        logger.debug("[BATCH_EXISTS_AND_PIN] %d keys", len(keys))
         results = self._server.batch_exists_and_pin_kv(keys)
-        return {"results": results}
-
-    def _handle_batch_pin_kv(self, req: Any) -> dict:
-        """Handle batch pin KV request."""
-        keys = req.keys
-        logger.debug("[BATCH_PIN] %d keys", len(keys))
-        results = self._server.batch_pin_kv(keys)
+        hits = sum(results)
+        logger.debug("[BATCH_EXISTS_AND_PIN] %d keys, %d hits", len(keys), hits)
         return {"results": results}
 
     def _handle_batch_unpin_kv(self, req: Any) -> dict:
         """Handle batch unpin KV request."""
         keys = req.keys
-        logger.debug("[BATCH_UNPIN] %d keys", len(keys))
         results = self._server.batch_unpin_kv(keys)
+        ok = sum(results)
+        logger.debug("[BATCH_UNPIN] %d keys, %d ok", len(keys), ok)
         return {"results": results}
 
     # =========================================================================

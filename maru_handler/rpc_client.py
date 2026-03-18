@@ -279,34 +279,6 @@ class RpcClient:
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
-    def exists_and_pin_kv(self, key: str) -> bool:
-        """
-        Check if a KV entry exists and pin it atomically.
-
-        If the key exists, increments pin_count to protect from eviction.
-
-        Args:
-            key: Chunk key string
-
-        Returns:
-            True if exists (and was pinned)
-        """
-        response = self._send_request(MessageType.EXISTS_AND_PIN_KV, {"key": key})
-        return response.get("exists", False)
-
-    def pin_kv(self, key: str) -> bool:
-        """
-        Pin a KV entry to protect from eviction.
-
-        Args:
-            key: Chunk key string
-
-        Returns:
-            True if pinned successfully
-        """
-        response = self._send_request(MessageType.PIN_KV, {"key": key})
-        return response.get("success", False)
-
     def unpin_kv(self, key: str) -> bool:
         """
         Unpin a KV entry, making it eligible for eviction.
@@ -414,11 +386,6 @@ class RpcClient:
         response = self._send_request(
             MessageType.BATCH_EXISTS_AND_PIN_KV, {"keys": keys}
         )
-        return response.get("results", [])
-
-    def batch_pin_kv(self, keys: list[str]) -> list[bool]:
-        """Pin multiple KV entries in a single RPC call."""
-        response = self._send_request(MessageType.BATCH_PIN_KV, {"keys": keys})
         return response.get("results", [])
 
     def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
