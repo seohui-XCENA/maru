@@ -589,6 +589,32 @@ class MaruHandler:
         self._ensure_connected()
         return self._rpc.exists_kv(key)
 
+    def pin(self, key: str) -> bool:
+        """Check if a key exists and pin it atomically.
+
+        If the key exists, increments pin_count to protect from eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if exists (and was pinned)
+        """
+        self._ensure_connected()
+        return self._rpc.pin_kv(key)
+
+    def unpin(self, key: str) -> bool:
+        """Unpin a KV entry, making it eligible for eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if unpinned successfully
+        """
+        self._ensure_connected()
+        return self._rpc.unpin(key)
+
     def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
 
@@ -877,6 +903,30 @@ class MaruHandler:
             logger.error("batch_exists RPC failed", exc_info=True)
             return [False] * len(keys)
         return batch_resp.results
+
+    def batch_pin(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if key exists (and was pinned).
+        """
+        self._ensure_connected()
+        return self._rpc.batch_pin_kv(keys).results
+
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if successfully unpinned.
+        """
+        self._ensure_connected()
+        return self._rpc.batch_unpin(keys).results
 
     # =========================================================================
     # Properties

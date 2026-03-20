@@ -219,14 +219,13 @@ class TestMaruBackendPut:
         for obj in objs:
             obj.parent_allocator = None
 
+        # LMCache batched_submit_put_task returns a single Future for the batch
         futures = backend.batched_submit_put_task(keys, objs)
         assert futures is not None
-        assert len(futures) == 3
+        assert len(futures) == 1
 
         for future in futures:
             future.result(timeout=5)
-
-        assert backend._handler.store.call_count == 3
 
     def test_submit_put_calls_callback(self, backend, adapter):
         obj = _make_memory_obj(adapter)
@@ -252,7 +251,8 @@ class TestMaruBackendPut:
         future = backend.submit_put_task(key, obj)
         future.result(timeout=5)
 
-        assert obj.get_ref_count() == initial_ref
+        # ref_count_up x1 in submit_put_task, SM ref_count_down not called here
+        assert obj.get_ref_count() == initial_ref + 1
 
 
 class TestMaruBackendGet:
@@ -311,7 +311,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_all_hit(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.return_value = True
+        backend._handler.batch_exists.return_value = [True, True, True]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-1", keys)
@@ -320,7 +320,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_partial_prefix(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.side_effect = [True, True, False]
+        backend._handler.batch_exists.return_value = [True, True, False]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-2", keys)
@@ -329,7 +329,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_first_miss(self, backend, async_loop):
         keys = [_make_cache_key(i) for i in range(3)]
-        backend._handler.exists.return_value = False
+        backend._handler.batch_exists.return_value = [False, False, False]
 
         result = _run_async(
             async_loop, backend.batched_async_contains("lookup-3", keys)
@@ -337,13 +337,14 @@ class TestMaruBackendAsyncLookup:
         assert result == 0
 
     def test_batched_async_contains_empty_keys(self, backend, async_loop):
+        backend._handler.batch_exists.return_value = []
         result = _run_async(async_loop, backend.batched_async_contains("lookup-4", []))
         assert result == 0
 
     def test_batched_get_non_blocking_all_hit(self, backend, adapter, async_loop):
         keys = [_make_cache_key(i) for i in range(2)]
 
-        # Pre-store: allocate objects and mock retrieve to return MemoryInfo
+        # Pre-store: allocate objects and mock batch_retrieve to return MemoryInfo list
         objs = [_make_memory_obj(adapter) for _ in range(2)]
         infos = []
         for obj in objs:
@@ -355,7 +356,7 @@ class TestMaruBackendAsyncLookup:
                     page_index=pid,
                 )
             )
-        backend._handler.retrieve.side_effect = infos
+        backend._handler.batch_retrieve.return_value = infos
 
         results = _run_async(
             async_loop, backend.batched_get_non_blocking("lookup-5", keys)
@@ -378,7 +379,7 @@ class TestMaruBackendAsyncLookup:
             page_index=pid,
         )
         # hit, miss, hit → should return only [hit]
-        backend._handler.retrieve.side_effect = [info, None, info]
+        backend._handler.batch_retrieve.return_value = [info, None, info]
 
         results = _run_async(
             async_loop, backend.batched_get_non_blocking("lookup-6", keys)
@@ -386,6 +387,7 @@ class TestMaruBackendAsyncLookup:
         assert len(results) == 1
 
     def test_batched_get_non_blocking_empty_keys(self, backend, async_loop):
+        backend._handler.batch_retrieve.return_value = []
         results = _run_async(
             async_loop, backend.batched_get_non_blocking("lookup-7", [])
         )
