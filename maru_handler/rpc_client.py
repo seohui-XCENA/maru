@@ -398,9 +398,7 @@ class RpcClient:
 
     def batch_pin_kv(self, keys: list[str]) -> BatchPinKVResponse:
         """Check existence and pin multiple KV entries in a single RPC call."""
-        response = self._send_request(
-            MessageType.BATCH_PIN_KV, {"keys": keys}
-        )
+        response = self._send_request(MessageType.BATCH_PIN_KV, {"keys": keys})
         return BatchPinKVResponse(results=response.get("results", []))
 
     def batch_unpin(self, keys: list[str]) -> BatchUnpinKVResponse:
