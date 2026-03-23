@@ -115,9 +115,7 @@ class AllocReq:
     client_id: str = ""
 
     def pack(self) -> bytes:
-        fixed = struct.pack(
-            _ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved
-        )
+        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
         if self.client_id:
             id_bytes = self.client_id.encode("utf-8")
             return fixed + struct.pack("=H", len(id_bytes)) + id_bytes
@@ -296,9 +294,7 @@ class GetAccessResp:
         length = 0
         if off + 16 <= len(data):
             offset, length = struct.unpack("=QQ", data[off : off + 16])
-        return cls(
-            status=status, device_path=device_path, offset=offset, length=length
-        )
+        return cls(status=status, device_path=device_path, offset=offset, length=length)
 
 
 # StatsReq: empty payload (0 bytes)
