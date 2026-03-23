@@ -54,15 +54,21 @@ flowchart TB
 
 ## 2. Lifecycle
 
-The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager is designed to require no manual management — it starts and stops automatically based on demand.
+The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager must be started explicitly by the user before launching any Maru services.
 
-**Auto-start:** When `AllocationManager` initializes (as part of `MaruServer` startup), it calls `MaruShmClient._ensure_resource_manager()`. This method checks if the resource manager is already running; if not, it reads `rm.conf` from the socket directory to recover the previous instance's settings (state-dir, log-level, idle-timeout), starts the binary with those arguments, and waits for the socket to become available. If `rm.conf` does not exist, defaults are used. A file lock prevents multiple processes from starting it simultaneously.
+**Manual start:** The user starts the resource manager on the node before running `MaruServer` or any client. Currently all components (Resource Manager, MaruServer, clients) run on the same node:
 
-**Crash recovery:** Every `MaruShmClient._connect()` call that fails triggers `_ensure_resource_manager()`, which restarts the binary. The resource manager recovers its previous state from the WAL on startup.
+```bash
+maru-resource-manager --socket-path /tmp/maru-resourced/maru-resourced.sock
+```
 
-**Server registration:** After auto-start, the `MaruServer` registers itself via `REGISTER_SERVER_REQ`. This adds its PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
+If a client attempts to connect when the resource manager is not running, `MaruShmClient` raises a `ConnectionError` with actionable instructions. The `MaruShmClient.is_running()` method can be used to check availability before attempting operations.
 
-**Idle shutdown:** The main loop checks both registered server count and active allocation count. When both are zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The next `MaruServer` startup will auto-start it again.
+**Crash recovery:** If the resource manager crashes, the user must restart it manually. On startup, the resource manager recovers its previous state from the WAL.
+
+**Server registration:** After startup, the `MaruServer` registers itself via `REGISTER_SERVER_REQ`. This adds its PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
+
+**Idle shutdown:** The main loop checks both registered server count and active allocation count. When both are zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The user must restart it manually when needed again.
 
 ---
 
@@ -138,7 +144,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 ## 8. Server Configuration
 
-The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the socket directory (atomic tmp+rename). When `_ensure_resource_manager()` auto-restarts the server, it reads this file and passes the saved settings, ensuring custom configuration survives crashes and idle shutdowns.
+The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the socket directory (atomic tmp+rename) for reference.
 
 | Option | Default | Description |
 |--------|---------|-------------|
