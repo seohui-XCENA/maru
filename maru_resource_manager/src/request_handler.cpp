@@ -92,20 +92,4 @@ StatsResult RequestHandler::handleStats() {
     return result;
 }
 
-RegisterServerResult RequestHandler::handleRegisterServer(
-    const RequestContext &ctx) {
-    RegisterServerResult result;
-    pm_.registerServer(ctx.client_id);
-    result.resp.status = 0;
-    return result;
-}
-
-UnregisterServerResult RequestHandler::handleUnregisterServer(
-    const RequestContext &ctx) {
-    UnregisterServerResult result;
-    pm_.unregisterServer(ctx.client_id);
-    result.resp.status = 0;
-    return result;
-}
-
 }  // namespace maru

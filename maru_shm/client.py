@@ -24,12 +24,8 @@ from .ipc import (
     GetAccessResp,
     MsgHeader,
     MsgType,
-    RegisterServerReq,
-    RegisterServerResp,
     StatsReq,
     StatsResp,
-    UnregisterServerReq,
-    UnregisterServerResp,
 )
 from .types import MaruHandle, MaruPoolInfo
 from .uds_helpers import read_full, write_full
@@ -173,36 +169,6 @@ class MaruShmClient:
         self._check_error(hdr, payload, "Stats failed")
         resp = StatsResp.unpack(payload)
         return resp.pools or []
-
-    def register_server(self) -> None:
-        """Register this process as an active MaruServer with the resource manager.
-
-        Prevents idle shutdown while the server is running.
-        """
-        hdr, payload = self._rpc(
-            MsgType.REGISTER_SERVER_REQ,
-            RegisterServerReq(client_id=self._client_id).pack(),
-        )
-        self._check_error(hdr, payload, "Register server failed")
-        resp = RegisterServerResp.unpack(payload)
-        if resp.status != 0:
-            raise RuntimeError(f"Register server failed with status {resp.status}")
-        logger.info("Registered as active server with resource manager")
-
-    def unregister_server(self) -> None:
-        """Unregister this process as an active MaruServer.
-
-        Allows idle shutdown to proceed if no allocations remain.
-        """
-        hdr, payload = self._rpc(
-            MsgType.UNREGISTER_SERVER_REQ,
-            UnregisterServerReq(client_id=self._client_id).pack(),
-        )
-        self._check_error(hdr, payload, "Unregister server failed")
-        resp = UnregisterServerResp.unpack(payload)
-        if resp.status != 0:
-            raise RuntimeError(f"Unregister server failed with status {resp.status}")
-        logger.info("Unregistered from resource manager")
 
     def alloc(self, size: int, pool_id: int = ANY_POOL_ID) -> MaruHandle:
         """Allocate shared memory from the resource manager.

@@ -25,7 +25,6 @@ struct ServerConfig {
     uint16_t port = 9850;
     std::string stateDir = "/var/lib/maru-resourced";
     maru::LogLevel logLevel = maru::LogLevel::Info;
-    int idleTimeout = 60;  // seconds, 0=disable
     int numWorkers = 32;
 };
 
@@ -43,7 +42,6 @@ static void writeConfigFile(const ServerConfig &cfg) {
     std::fprintf(fp, "host=%s\n", cfg.host.c_str());
     std::fprintf(fp, "port=%u\n", cfg.port);
     std::fprintf(fp, "log_level=%s\n", maru::logLevelStr(cfg.logLevel));
-    std::fprintf(fp, "idle_timeout=%d\n", cfg.idleTimeout);
     bool writeOk = (std::ferror(fp) == 0);
     std::fclose(fp);
 
@@ -71,7 +69,6 @@ static void printUsage(const char *prog) {
         "  -p, --port PORT           TCP port (default: 9850)\n"
         "  -d, --state-dir PATH      State directory for WAL/metadata (default: /var/lib/maru-resourced)\n"
         "  -l, --log-level LEVEL     Log level: debug, info, warn, error (default: info)\n"
-        "  -t, --idle-timeout SECS   Auto-shutdown after N seconds idle (default: 60, 0=disable)\n"
         "  -w, --num-workers N       Worker thread pool size (default: 32)\n"
         "  -h, --help                Show this help\n",
         prog);
@@ -84,20 +81,18 @@ static ServerConfig parseArgs(int argc, char **argv) {
         {"port",         required_argument, nullptr, 'p'},
         {"state-dir",    required_argument, nullptr, 'd'},
         {"log-level",    required_argument, nullptr, 'l'},
-        {"idle-timeout", required_argument, nullptr, 't'},
         {"num-workers",  required_argument, nullptr, 'w'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:t:w:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': cfg.port = static_cast<uint16_t>(std::atoi(optarg)); break;
         case 'd': cfg.stateDir = optarg; break;
         case 'l': cfg.logLevel = maru::parseLogLevel(optarg); break;
-        case 't': cfg.idleTimeout = std::atoi(optarg); break;
         case 'w': cfg.numWorkers = std::atoi(optarg); break;
         case 'h': printUsage(argv[0]); std::exit(0);
         default:  printUsage(argv[0]); std::exit(1);
@@ -121,8 +116,6 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "  listen     : %s:%u", cfg.host.c_str(), cfg.port);
     maru::logf(maru::LogLevel::Info, "  state dir  : %s", cfg.stateDir.c_str());
     maru::logf(maru::LogLevel::Info, "  log level  : %s", maru::logLevelStr(cfg.logLevel));
-    maru::logf(maru::LogLevel::Info, "  idle timeout: %ds%s", cfg.idleTimeout,
-               cfg.idleTimeout == 0 ? " (disabled)" : "");
     maru::logf(maru::LogLevel::Info, "  workers    : %d", cfg.numWorkers);
 
     // Signal handlers
@@ -152,27 +145,11 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "ready — listening on %s:%u",
                cfg.host.c_str(), cfg.port);
 
-    // Main loop with idle timeout
-    int idleSeconds = 0;
+    // Main loop — runs until SIGINT/SIGTERM
     while (!gStop) {
         if (gRescan) {
             gRescan = 0;
             pm.rescanDevices();
-        }
-
-        // Idle timeout check
-        if (cfg.idleTimeout > 0) {
-            if (pm.allocationCount() == 0 && pm.registeredServerCount() == 0) {
-                ++idleSeconds;
-            } else {
-                idleSeconds = 0;
-            }
-            if (idleSeconds >= cfg.idleTimeout) {
-                maru::logf(maru::LogLevel::Info,
-                           "no active allocations for %ds, shutting down",
-                           cfg.idleTimeout);
-                break;
-            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));

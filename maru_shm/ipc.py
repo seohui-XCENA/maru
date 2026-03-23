@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Binary IPC protocol for resource manager <-> client communication.
 
-This protocol is used over UDS (Unix Domain Sockets) between the Maru Resource Manager
+This protocol is used over TCP between the Maru Resource Manager
 and MaruShmClient. It is separate from the maru RPC protocol in
 maru_common/protocol.py which uses MessagePack over ZMQ.
 
@@ -35,12 +35,8 @@ class MsgType(IntEnum):
     FREE_RESP = 4
     STATS_REQ = 5
     STATS_RESP = 6
-    REGISTER_SERVER_REQ = 7
-    REGISTER_SERVER_RESP = 8
     GET_ACCESS_REQ = 9
     GET_ACCESS_RESP = 10
-    UNREGISTER_SERVER_REQ = 11
-    UNREGISTER_SERVER_RESP = 12
     ERROR_RESP = 255
 
 
@@ -379,104 +375,6 @@ class StatsResp:
             )
             offset += _STATS_POOL_SIZE
         return cls(pools=pools)
-
-
-# RegisterServerReq: optional client_id for TCP (PID no longer from SO_PEERCRED)
-@dataclass
-class RegisterServerReq:
-    """Register server request payload."""
-
-    client_id: str = ""
-
-    def pack(self) -> bytes:
-        if self.client_id:
-            id_bytes = self.client_id.encode("utf-8")
-            return struct.pack("=H", len(id_bytes)) + id_bytes
-        return b""
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "RegisterServerReq":
-        client_id = ""
-        if len(data) >= 2:
-            (id_len,) = struct.unpack("=H", data[:2])
-            if id_len > 0 and 2 + id_len <= len(data):
-                client_id = data[2 : 2 + id_len].decode("utf-8")
-        return cls(client_id=client_id)
-
-
-# RegisterServerResp: status(i32) = 4 bytes
-_REGISTER_SERVER_RESP_FORMAT = "=i"
-_REGISTER_SERVER_RESP_SIZE = struct.calcsize(_REGISTER_SERVER_RESP_FORMAT)
-
-
-@dataclass
-class RegisterServerResp:
-    """Register server response payload."""
-
-    status: int = 0
-
-    def pack(self) -> bytes:
-        return struct.pack(_REGISTER_SERVER_RESP_FORMAT, self.status)
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "RegisterServerResp":
-        if len(data) < _REGISTER_SERVER_RESP_SIZE:
-            raise ValueError(
-                f"RegisterServerResp too short: {len(data)} < {_REGISTER_SERVER_RESP_SIZE}"
-            )
-        (status,) = struct.unpack(
-            _REGISTER_SERVER_RESP_FORMAT, data[:_REGISTER_SERVER_RESP_SIZE]
-        )
-        return cls(status=status)
-
-
-# UnregisterServerReq: optional client_id for TCP
-@dataclass
-class UnregisterServerReq:
-    """Unregister server request payload."""
-
-    client_id: str = ""
-
-    def pack(self) -> bytes:
-        if self.client_id:
-            id_bytes = self.client_id.encode("utf-8")
-            return struct.pack("=H", len(id_bytes)) + id_bytes
-        return b""
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "UnregisterServerReq":
-        client_id = ""
-        if len(data) >= 2:
-            (id_len,) = struct.unpack("=H", data[:2])
-            if id_len > 0 and 2 + id_len <= len(data):
-                client_id = data[2 : 2 + id_len].decode("utf-8")
-        return cls(client_id=client_id)
-
-
-# UnregisterServerResp: status(i32) = 4 bytes
-_UNREGISTER_SERVER_RESP_FORMAT = "=i"
-_UNREGISTER_SERVER_RESP_SIZE = struct.calcsize(_UNREGISTER_SERVER_RESP_FORMAT)
-
-
-@dataclass
-class UnregisterServerResp:
-    """Unregister server response payload."""
-
-    status: int = 0
-
-    def pack(self) -> bytes:
-        return struct.pack(_UNREGISTER_SERVER_RESP_FORMAT, self.status)
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "UnregisterServerResp":
-        if len(data) < _UNREGISTER_SERVER_RESP_SIZE:
-            raise ValueError(
-                f"UnregisterServerResp too short: {len(data)} < {_UNREGISTER_SERVER_RESP_SIZE}"
-            )
-        (status,) = struct.unpack(
-            _UNREGISTER_SERVER_RESP_FORMAT, data[:_UNREGISTER_SERVER_RESP_SIZE]
-        )
-        return cls(status=status)
 
 
 # ErrorResp: status(i32) + msg_len(u32) + message(variable)

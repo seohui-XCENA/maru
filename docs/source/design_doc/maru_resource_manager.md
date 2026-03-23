@@ -7,7 +7,7 @@ The `MaruResourceManager` is a server that manages physical CXL DAX device pools
 ```mermaid
 flowchart TB
     subgraph RM["Maru Resource Manager"]
-        Main["Main<br/>CLI parsing<br/>Signal handling<br/>Idle timeout"]
+        Main["Main<br/>CLI parsing<br/>Signal handling"]
         TCP["TcpServer<br/>TCP :9850<br/>Binary IPC protocol"]
         RH["RequestHandler<br/>Business logic<br/>Alloc / Free / Stats"]
         PM["PoolManager<br/>Pool management<br/>Free list tracking"]
@@ -66,9 +66,7 @@ If a client attempts to connect when the resource manager is not running, `MaruS
 
 **Crash recovery:** If the resource manager crashes, the user must restart it manually. On startup, the resource manager recovers its previous state from the WAL.
 
-**Server registration:** After startup, the `MaruServer` registers itself via `REGISTER_SERVER_REQ` with a `client_id` (`hostname:pid`). This adds the PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
-
-**Idle shutdown:** The main loop checks both registered server count and active allocation count. When both are zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The user must restart it manually when needed again.
+**Shutdown:** The resource manager runs until explicitly stopped via `SIGTERM` or `SIGINT`. On shutdown, it flushes all state to disk via a final checkpoint.
 
 ---
 
@@ -80,9 +78,7 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 |------|-----------|-------------|
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes handle + device path |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
-| `REGISTER_SERVER_REQ` / `RESP` | client ↔ server | Register caller as an active server (prevents idle shutdown) |
 | `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
-| `UNREGISTER_SERVER_REQ` / `RESP` | client ↔ server | Unregister caller (allows idle shutdown) |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
 
@@ -99,7 +95,7 @@ Instead of passing file descriptors via `SCM_RIGHTS` (which only works over UDS)
 
 ### Client identity
 
-Requests that require owner tracking (`ALLOC_REQ`, `REGISTER_SERVER_REQ`, `UNREGISTER_SERVER_REQ`) include a `client_id` field in the payload (`hostname:pid` format). The server extracts the PID for allocation ownership and Reaper tracking.
+Requests that require owner tracking (`ALLOC_REQ`, `FREE_REQ`) include a `client_id` field in the payload (`hostname:pid` format). The server extracts the PID for allocation ownership and Reaper tracking.
 
 The `STATS_RESP` returns per-pool statistics. Each pool entry contains:
 
@@ -137,7 +133,7 @@ On startup, the **recovery sequence** proceeds as: (1) scan for current hardware
 
 ## 6. Reaper
 
-The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map. It also removes dead PIDs from the registered server set, ensuring idle shutdown proceeds after a server crash.
+The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
@@ -165,14 +161,13 @@ The server is configured via CLI arguments. On startup, the resource manager wri
 | `--port` | `9850` | TCP port |
 | `--state-dir` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `--idle-timeout` | `60` | Auto-shutdown after N seconds idle (0 to disable) |
+| `--num-workers` | `32` | Worker thread pool size |
 
 ```bash
 # Manual start with custom configuration
 maru-resource-manager --host 0.0.0.0 --port 9850 \
                       --state-dir /var/lib/maru \
-                      --log-level debug \
-                      --idle-timeout 120
+                      --log-level debug
 ```
 
 ### RM address propagation

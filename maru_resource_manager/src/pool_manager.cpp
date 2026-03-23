@@ -319,30 +319,6 @@ uint32_t PoolManager::allocationCount() const {
     return static_cast<uint32_t>(allocations_.size());
 }
 
-uint32_t PoolManager::registeredServerCount() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return static_cast<uint32_t>(registeredServers_.size());
-}
-
-void PoolManager::registerServer(const std::string &clientId) {
-    std::lock_guard<std::mutex> lock(mu_);
-    uint64_t st = 0;
-    if (isLocalClient(clientId)) {
-        pid_t pid = pidFromClientId(clientId);
-        if (pid > 0) st = getPidStartTime(pid);
-    }
-    registeredServers_[clientId] = st;
-    logf(LogLevel::Info, "server registered: %s (total=%zu)",
-         clientId.c_str(), registeredServers_.size());
-}
-
-void PoolManager::unregisterServer(const std::string &clientId) {
-    std::lock_guard<std::mutex> lock(mu_);
-    registeredServers_.erase(clientId);
-    logf(LogLevel::Info, "server unregistered: %s (total=%zu)",
-         clientId.c_str(), registeredServers_.size());
-}
-
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
     // Scan for DEV_DAX devices
@@ -994,50 +970,6 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 {
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
-
-    // Reap dead registered servers (local only, with PID-reuse detection)
-    for (auto it = registeredServers_.begin(); it != registeredServers_.end(); )
-    {
-        const std::string &cid = it->first;
-        uint64_t savedSt = it->second;
-
-        if (!isLocalClient(cid))
-        {
-            ++it;  // Skip remote clients — no local PID to check
-            continue;
-        }
-
-        pid_t pid = pidFromClientId(cid);
-        if (pid <= 0)
-        {
-            ++it;
-            continue;
-        }
-
-        if (::kill(pid, 0) != 0 && errno == ESRCH)
-        {
-            logf(LogLevel::Info, "reaper: removing dead server %s", cid.c_str());
-            it = registeredServers_.erase(it);
-        }
-        else if (savedSt != 0)
-        {
-            uint64_t currentSt = getPidStartTime(pid);
-            if (currentSt != 0 && currentSt != savedSt)
-            {
-                logf(LogLevel::Info,
-                     "reaper: removing server %s (PID reused)", cid.c_str());
-                it = registeredServers_.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-        else
-        {
-            ++it;
-        }
-    }
 
     std::vector<uint64_t> toFree;
     for (const auto &kv : allocations_)
