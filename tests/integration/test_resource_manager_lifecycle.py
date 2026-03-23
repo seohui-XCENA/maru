@@ -2,16 +2,16 @@
 # Copyright 2026 XCENA Inc.
 """Integration tests for resource manager lifecycle.
 
-Builds the maru-resource-manager binary from source via cmake, then runs
-lifecycle tests against it. Requires cmake and a C++17 compiler.
+Requires a pre-installed maru-resource-manager binary.
 
 Run with: pytest tests/integration/test_resource_manager_lifecycle.py -m integration
 
 Validates:
 - Idle timeout auto-shutdown
-- Auto-restart after shutdown
+- Manual restart after shutdown
 - Stats on empty pool
 - Multiple clients on same server
+- Client error when server is not running
 """
 
 import os
@@ -126,11 +126,11 @@ class TestIdleTimeout:
                     proc.wait(timeout=5)
 
 
-class TestAutoRestart:
-    """Test auto-restart after idle exit."""
+class TestManualRestart:
+    """Test manual restart after idle exit."""
 
     def test_restart_after_idle_exit(self, rm_binary):
-        """After idle exit, a new binary can be started on the same socket."""
+        """After idle exit, a new binary can be manually started on the same socket."""
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = os.path.join(tmpdir, "rm.sock")
             state_dir = os.path.join(tmpdir, "state")
@@ -147,13 +147,17 @@ class TestAutoRestart:
                     proc1.terminate()
                     proc1.wait(timeout=5)
 
+            # Client should fail with ConnectionError before restart
+            client = MaruShmClient(socket_path=sock_path)
+            with pytest.raises(ConnectionError):
+                client.stats()
+
             # Stale socket file may remain -- new server should handle it
-            # Start a new instance on the same socket
+            # Manually start a new instance on the same socket
             proc2 = _start_rm(rm_binary, sock_path, state_dir, idle_timeout=10)
             try:
                 assert _wait_for_socket(sock_path), "Restarted server failed to start"
 
-                client = MaruShmClient(socket_path=sock_path)
                 pools = client.stats()
                 assert isinstance(pools, list)
             finally:
