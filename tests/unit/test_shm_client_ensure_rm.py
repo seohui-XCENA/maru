@@ -7,7 +7,6 @@ These tests exercise the real MaruShmClient class (not the MockShmClient from
 conftest), using mock TCP servers and targeted patching.
 """
 
-import os
 import socket
 import threading
 from unittest.mock import patch
