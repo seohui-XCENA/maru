@@ -55,9 +55,6 @@ public:
 
     const std::string &stateDir() const { return stateDir_; }
     uint32_t allocationCount() const;
-    uint32_t registeredServerCount() const;
-    void registerServer(const std::string &clientId);
-    void unregisterServer(const std::string &clientId);
 
     int loadPools();
     int rescanDevices();
@@ -114,8 +111,6 @@ private:
     // client_id allocation refcount for O(1) reaper cleanup
     std::map<std::string, uint32_t> clientAllocCounts_;
 
-    // Registered servers: client_id → pid start time (in-memory only, not persisted)
-    std::map<std::string, uint64_t> registeredServers_;
 };
 
 }  // namespace maru

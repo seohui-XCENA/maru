@@ -395,18 +395,6 @@ bool TcpServer::handleOneRequest(int clientFd) {
         rh.payloadLen = respPayload.size();
         writeFull(clientFd, &rh, sizeof(rh));
         writeFull(clientFd, respPayload.data(), respPayload.size());
-    } else if (type == MsgType::REGISTER_SERVER_REQ) {
-        std::string cid = parseClientId(payload, 0);
-        RequestContext ctx{cid};
-        auto result = handler_.handleRegisterServer(ctx);
-        sendSimpleResp(clientFd, MsgType::REGISTER_SERVER_RESP,
-                        &result.resp, sizeof(result.resp));
-    } else if (type == MsgType::UNREGISTER_SERVER_REQ) {
-        std::string cid = parseClientId(payload, 0);
-        RequestContext ctx{cid};
-        auto result = handler_.handleUnregisterServer(ctx);
-        sendSimpleResp(clientFd, MsgType::UNREGISTER_SERVER_RESP,
-                        &result.resp, sizeof(result.resp));
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");
         return false;
