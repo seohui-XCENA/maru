@@ -41,7 +41,7 @@ class MsgType(IntEnum):
 
 
 # MsgHeader: magic(u32) + version(u16) + type(u16) + payload_len(u32) = 12 bytes
-_HEADER_FORMAT = "=IHHI"
+_HEADER_FORMAT = "<IHHI"
 HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
 
 
@@ -49,7 +49,7 @@ HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
 class MsgHeader:
     """IPC message header (12 bytes).
 
-    Wire layout (native byte order)::
+    Wire layout (little-endian byte order)::
 
         magic:       4 bytes (0x4D415255)
         version:     2 bytes
@@ -97,7 +97,7 @@ class MsgHeader:
 # =============================================================================
 
 # AllocReq: size(u64) + pool_id(u32) + reserved(u32) = 16 bytes
-_ALLOC_REQ_FORMAT = "=QII"
+_ALLOC_REQ_FORMAT = "<QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
 
@@ -109,12 +109,14 @@ class AllocReq:
     pool_id: int = ANY_POOL_ID
     reserved: int = 0
     client_id: str = ""
+    request_id: int = 0
 
     def pack(self) -> bytes:
         fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
         if self.client_id:
             id_bytes = self.client_id.encode("utf-8")
-            return fixed + struct.pack("=H", len(id_bytes)) + id_bytes
+            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        fixed += struct.pack("<Q", self.request_id)
         return fixed
 
     @classmethod
@@ -127,16 +129,26 @@ class AllocReq:
         client_id = ""
         off = _ALLOC_REQ_SIZE
         if off + 2 <= len(data):
-            (id_len,) = struct.unpack("=H", data[off : off + 2])
+            (id_len,) = struct.unpack("<H", data[off : off + 2])
             off += 2
             if id_len > 0 and off + id_len <= len(data):
                 client_id = data[off : off + id_len].decode("utf-8")
-        return cls(size=size, pool_id=pool_id, reserved=reserved, client_id=client_id)
+                off += id_len
+        request_id = 0
+        if off + 8 <= len(data):
+            (request_id,) = struct.unpack("<Q", data[off : off + 8])
+        return cls(
+            size=size,
+            pool_id=pool_id,
+            reserved=reserved,
+            client_id=client_id,
+            request_id=request_id,
+        )
 
 
 # AllocResp: status(i32) + accessType(u32) + Handle(32) + requested_size(u64) = 48 bytes
 # accessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE (future multi-node)
-_ALLOC_RESP_FORMAT = "=iIQQQQQ"
+_ALLOC_RESP_FORMAT = "<iIQQQQQ"
 _ALLOC_RESP_SIZE = struct.calcsize(_ALLOC_RESP_FORMAT)
 
 
@@ -162,7 +174,7 @@ class AllocResp:
             self.requested_size,
         )
         path_bytes = self.device_path.encode("utf-8")
-        path_header = struct.pack("=I", len(path_bytes))
+        path_header = struct.pack("<I", len(path_bytes))
         return fixed + path_header + path_bytes
 
     @classmethod
@@ -180,7 +192,7 @@ class AllocResp:
         device_path = ""
         offset = _ALLOC_RESP_SIZE
         if offset + 4 <= len(data):
-            (path_len,) = struct.unpack("=I", data[offset : offset + 4])
+            (path_len,) = struct.unpack("<I", data[offset : offset + 4])
             offset += 4
             if path_len > 0 and offset + path_len <= len(data):
                 device_path = data[offset : offset + path_len].decode("utf-8")
@@ -193,7 +205,7 @@ class AllocResp:
 
 
 # FreeReq: Handle(32) = 32 bytes
-_FREE_REQ_FORMAT = "=QQQQ"
+_FREE_REQ_FORMAT = "<QQQQ"
 _FREE_REQ_SIZE = struct.calcsize(_FREE_REQ_FORMAT)
 
 
@@ -203,13 +215,15 @@ class FreeReq:
 
     handle: MaruHandle | None = None
     client_id: str = ""
+    request_id: int = 0
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
         fixed = h.pack()
         if self.client_id:
             id_bytes = self.client_id.encode("utf-8")
-            return fixed + struct.pack("=H", len(id_bytes)) + id_bytes
+            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        fixed += struct.pack("<Q", self.request_id)
         return fixed
 
     @classmethod
@@ -218,15 +232,19 @@ class FreeReq:
         client_id = ""
         off = 32  # Handle size
         if off + 2 <= len(data):
-            (id_len,) = struct.unpack("=H", data[off : off + 2])
+            (id_len,) = struct.unpack("<H", data[off : off + 2])
             off += 2
             if id_len > 0 and off + id_len <= len(data):
                 client_id = data[off : off + id_len].decode("utf-8")
-        return cls(handle=handle, client_id=client_id)
+                off += id_len
+        request_id = 0
+        if off + 8 <= len(data):
+            (request_id,) = struct.unpack("<Q", data[off : off + 8])
+        return cls(handle=handle, client_id=client_id, request_id=request_id)
 
 
 # FreeResp: status(i32) = 4 bytes
-_FREE_RESP_FORMAT = "=i"
+_FREE_RESP_FORMAT = "<i"
 _FREE_RESP_SIZE = struct.calcsize(_FREE_RESP_FORMAT)
 
 
@@ -265,7 +283,7 @@ class GetAccessReq:
 
 
 # GetAccessResp: status(i32) + pathLen(u32) + path + offset(u64) + length(u64)
-_GET_ACCESS_RESP_HEADER_FORMAT = "=iI"
+_GET_ACCESS_RESP_HEADER_FORMAT = "<iI"
 _GET_ACCESS_RESP_HEADER_SIZE = struct.calcsize(_GET_ACCESS_RESP_HEADER_FORMAT)
 
 
@@ -283,7 +301,7 @@ class GetAccessResp:
         header = struct.pack(
             _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
         )
-        tail = struct.pack("=QQ", self.offset, self.length)
+        tail = struct.pack("<QQ", self.offset, self.length)
         return header + path_bytes + tail
 
     @classmethod
@@ -301,7 +319,7 @@ class GetAccessResp:
         offset = 0
         length = 0
         if off + 16 <= len(data):
-            offset, length = struct.unpack("=QQ", data[off : off + 16])
+            offset, length = struct.unpack("<QQ", data[off : off + 16])
         return cls(status=status, device_path=device_path, offset=offset, length=length)
 
 
@@ -319,11 +337,11 @@ class StatsReq:
 
 
 # StatsResp: num_pools(u32) + PoolInfo[num_pools]
-_STATS_RESP_HEADER_FORMAT = "=I"
+_STATS_RESP_HEADER_FORMAT = "<I"
 _STATS_RESP_HEADER_SIZE = struct.calcsize(_STATS_RESP_HEADER_FORMAT)
 
 # PoolInfo wire format for stats: pool_id(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
-_STATS_POOL_FORMAT = "=IIQQQ"
+_STATS_POOL_FORMAT = "<IIQQQ"
 _STATS_POOL_SIZE = struct.calcsize(_STATS_POOL_FORMAT)
 
 
@@ -378,7 +396,7 @@ class StatsResp:
 
 
 # ErrorResp: status(i32) + msg_len(u32) + message(variable)
-_ERROR_RESP_HEADER_FORMAT = "=iI"
+_ERROR_RESP_HEADER_FORMAT = "<iI"
 _ERROR_RESP_HEADER_SIZE = struct.calcsize(_ERROR_RESP_HEADER_FORMAT)
 
 

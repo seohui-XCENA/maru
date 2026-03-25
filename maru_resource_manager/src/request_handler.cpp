@@ -30,13 +30,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
 FreeResult RequestHandler::handleFree(const FreeReq &req,
                                       const RequestContext &ctx) {
     FreeResult result;
-
-    if (!pm_.verifyAuthToken(req.handle)) {
-        result.resp.status = -EACCES;
-        return result;
-    }
-
-    result.resp.status = pm_.free(req.handle, ctx.client_id);
+    result.resp.status = pm_.verifyAndFree(req.handle, ctx.client_id);
     return result;
 }
 
@@ -45,13 +39,8 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
     (void)ctx;
     GetAccessResult result;
 
-    if (!pm_.verifyAuthToken(req.handle)) {
-        result.status = -EACCES;
-        return result;
-    }
-
     std::string pathToOpen;
-    int status = pm_.getPathForHandle(req.handle, pathToOpen);
+    int status = pm_.verifyAndGetPath(req.handle, pathToOpen);
 
     if (status == 0) {
         result.devicePath = pathToOpen;

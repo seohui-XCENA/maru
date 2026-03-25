@@ -777,6 +777,11 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
                        std::string &devPath, uint32_t poolId,
                        uint64_t &requestedSizeOut)
 {
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+
     std::lock_guard<std::mutex> lock(mu_);
     if (pools_.empty())
     {
@@ -869,6 +874,11 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
 
 int PoolManager::free(const Handle &handle, const std::string &clientId)
 {
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+
     std::lock_guard<std::mutex> lock(mu_);
 
     auto globalIt = allocations_.find(handle.regionId);
@@ -878,7 +888,7 @@ int PoolManager::free(const Handle &handle, const std::string &clientId)
     }
 
     const Allocation &alloc = globalIt->second;
-    if (!clientId.empty() && std::strcmp(alloc.clientId, clientId.c_str()) != 0)
+    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
     {
         return -EPERM;
     }
@@ -1064,18 +1074,111 @@ void PoolManager::checkpoint()
     wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
 }
 
-bool PoolManager::verifyAuthToken(const Handle &handle)
+int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId)
+{
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
+
+    auto globalIt = allocations_.find(handle.regionId);
+    if (globalIt == allocations_.end())
+    {
+        return -ENOENT;
+    }
+
+    // Verify auth token
+    uint64_t expectedToken = computeAuthToken(handle, globalIt->second.nonce);
+    if (handle.authToken != expectedToken)
+    {
+        return -EACCES;
+    }
+
+    // Verify ownership
+    const Allocation &alloc = globalIt->second;
+    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
+    {
+        return -EPERM;
+    }
+
+    // Free the allocation
+    PoolState *targetPool = findPoolById(alloc.poolId);
+    if (!targetPool)
+    {
+        return -ENOENT;
+    }
+
+    if (targetPool->type == DaxType::FS_DAX)
+    {
+        deleteFsDaxFile(targetPool->devPath, handle.regionId);
+    }
+
+    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+    targetPool->freeSize += alloc.allocLength;
+
+    // Update client refcount
+    if (alloc.clientId[0] != '\0')
+    {
+        auto countIt = clientAllocCounts_.find(alloc.clientId);
+        if (countIt != clientAllocCounts_.end())
+        {
+            if (--countIt->second == 0)
+            {
+                clientAllocCounts_.erase(countIt);
+                if (isLocalClient(alloc.clientId))
+                {
+                    pid_t pid = pidFromClientId(alloc.clientId);
+                    if (pid > 0) pidStartTimes_.erase(pid);
+                }
+            }
+        }
+    }
+
+    allocations_.erase(globalIt);
+
+    wal_->appendFree(handle.regionId);
+    if (++opCount_ % checkpointInterval_ == 0)
+    {
+        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+    }
+    return 0;
+}
+
+int PoolManager::verifyAndGetPath(const Handle &handle, std::string &outPath)
 {
     std::lock_guard<std::mutex> lock(mu_);
 
-    auto it = allocations_.find(handle.regionId);
-    if (it == allocations_.end())
+    auto globalIt = allocations_.find(handle.regionId);
+    if (globalIt == allocations_.end())
     {
-        return false;
+        return -ENOENT;
     }
 
-    uint64_t expectedToken = computeAuthToken(handle, it->second.nonce);
-    return handle.authToken == expectedToken;
+    // Verify auth token
+    uint64_t expectedToken = computeAuthToken(handle, globalIt->second.nonce);
+    if (handle.authToken != expectedToken)
+    {
+        return -EACCES;
+    }
+
+    const Allocation &alloc = globalIt->second;
+    PoolState *pool = findPoolById(alloc.poolId);
+    if (!pool)
+    {
+        return -ENOENT;
+    }
+
+    if (pool->type == DaxType::FS_DAX)
+    {
+        outPath = makeFsDaxFilePath(pool->devPath, handle.regionId);
+    }
+    else
+    {
+        outPath = pool->devPath;
+    }
+    return 0;
 }
 
 }  // namespace maru

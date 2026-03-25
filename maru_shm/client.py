@@ -12,7 +12,7 @@ import os
 import socket
 import threading
 
-from .constants import ANY_POOL_ID, DEFAULT_ADDRESS, MAP_SHARED
+from .constants import ANY_POOL_ID, DEFAULT_ADDRESS
 from .ipc import (
     HEADER_SIZE,
     AllocReq,
@@ -38,6 +38,21 @@ def _make_client_id() -> str:
     import platform
 
     return f"{platform.node()}:{os.getpid()}"
+
+
+# Module-level request ID counter shared across all MaruShmClient instances.
+# Prevents idempotency cache collisions when multiple instances in the same
+# process have the same client_id (hostname:pid).
+_request_id_counter = 0
+_request_id_lock = threading.Lock()
+
+
+def _next_request_id() -> int:
+    """Generate a monotonically increasing request ID (process-global)."""
+    global _request_id_counter
+    with _request_id_lock:
+        _request_id_counter += 1
+        return _request_id_counter
 
 
 class MaruShmClient:
@@ -91,7 +106,9 @@ class MaruShmClient:
         host, port = self._parse_address(self._address)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            sock.settimeout(5.0)  # 5s connect timeout
             sock.connect((host, port))
+            sock.settimeout(None)  # restore blocking mode for RPC
         except OSError as e:
             sock.close()
             raise ConnectionError(
@@ -120,6 +137,8 @@ class MaruShmClient:
 
         Thread-safe: the entire send+recv cycle is serialized by _conn_lock.
         On connection error, closes and retries once with a fresh connection.
+        Idempotency for alloc/free is guaranteed by request_id in the payload;
+        the server deduplicates by request_id and returns cached responses.
 
         Returns:
             (response_header, response_payload)
@@ -183,7 +202,12 @@ class MaruShmClient:
         Raises:
             RuntimeError: On allocation failure.
         """
-        req = AllocReq(size=size, pool_id=pool_id, client_id=self._client_id)
+        req = AllocReq(
+            size=size,
+            pool_id=pool_id,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
         hdr, payload = self._rpc(MsgType.ALLOC_REQ, req.pack())
         self._check_error(hdr, payload, "Alloc failed")
 
@@ -211,7 +235,11 @@ class MaruShmClient:
         Args:
             handle: Handle from a previous alloc() call.
         """
-        req = FreeReq(handle=handle, client_id=self._client_id)
+        req = FreeReq(
+            handle=handle,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
         hdr, payload = self._rpc(MsgType.FREE_REQ, req.pack())
         self._check_error(hdr, payload, "Free failed")
 
@@ -234,7 +262,7 @@ class MaruShmClient:
             raise RuntimeError(f"GetAccess failed with status {resp.status}")
         return resp
 
-    def mmap(self, handle: MaruHandle, prot: int, flags: int = 0) -> mmap_module.mmap:
+    def mmap(self, handle: MaruHandle, prot: int) -> mmap_module.mmap:
         """Memory-map a handle into the calling process.
 
         Opens the device path directly and creates an mmap.
@@ -242,7 +270,6 @@ class MaruShmClient:
         Args:
             handle: Handle from alloc() or lookup.
             prot: Protection flags (PROT_READ | PROT_WRITE).
-            flags: Mapping flags (defaults to MAP_SHARED).
 
         Returns:
             Python mmap object with buffer protocol support.
@@ -265,9 +292,6 @@ class MaruShmClient:
                 return self._mmap_cache[handle.region_id]
 
             self._path_cache[handle.region_id] = path
-
-            if flags == 0:
-                flags = MAP_SHARED
 
             access = mmap_module.ACCESS_READ
             if prot & 0x2:  # PROT_WRITE
