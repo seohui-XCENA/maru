@@ -111,7 +111,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper(rm_address=self._config.rm_address)
+        self._mapper: DaxMapper | None = None
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -125,6 +125,87 @@ class MaruHandler:
         self._connected = False
 
         logger.debug("Created MaruHandler with config: %s", self._config)
+
+    # =========================================================================
+    # Public Accessors
+    # =========================================================================
+
+    @property
+    def mapper(self) -> DaxMapper | None:
+        """Deprecated: Use get_buffer_view() instead."""
+        return self._mapper
+
+    def get_buffer_view(
+        self, region_id: int, offset: int, size: int
+    ) -> memoryview | None:
+        """Get a memoryview slice from a mapped region.
+
+        Args:
+            region_id: The region ID (owned or shared).
+            offset: Byte offset within the region.
+            size: Number of bytes to view.
+
+        Returns:
+            Writable memoryview, or None if region not mapped.
+        """
+        return self._mapper.get_buffer_view(region_id, offset, size)
+
+    def get_region_page_count(self, region_id: int) -> int | None:
+        """Get page count for a region (owned or shared).
+
+        Args:
+            region_id: The region ID.
+
+        Returns:
+            Number of pages, or None if region not found.
+        """
+        if self._owned is not None:
+            region = self._owned.get_owned_region(region_id)
+            if region is not None:
+                return region.allocator.page_count
+        mapped = self._mapper.get_region(region_id)
+        if mapped is None:
+            return None
+        return mapped.size // self._config.chunk_size_bytes
+
+    def get_owned_region_ids(self) -> list[int]:
+        """Get list of currently owned region IDs.
+
+        Returns:
+            List of region IDs. Empty if not connected.
+        """
+        if self._owned is None:
+            return []
+        return self._owned.get_region_ids()
+
+    def get_chunk_size(self) -> int:
+        """Get the configured chunk size in bytes.
+
+        Returns:
+            Chunk size in bytes.
+        """
+        return self._config.chunk_size_bytes
+
+    def set_on_region_added(self, callback: Callable[[int, int], None] | None) -> None:
+        """Register callback invoked with (region_id, page_count) after region added.
+
+        On registration, replays callback for all existing owned regions
+        so the caller doesn't need separate init-time logic.
+
+        Args:
+            callback: Called with (region_id, page_count), or None to unregister.
+        """
+        self._on_region_added = callback
+        if callback is not None and self._owned is not None:
+            for rid in self._owned.get_region_ids():
+                region = self._owned.get_owned_region(rid)
+                if region is not None:
+                    logger.debug(
+                        "on_region_added replay: region=%d pages=%d",
+                        rid,
+                        region.allocator.page_count,
+                    )
+                    callback(rid, region.allocator.page_count)
 
     # =========================================================================
     # Connection Management
@@ -142,6 +223,15 @@ class MaruHandler:
         try:
             # 1. Connect RPC client
             self._rpc.connect()
+
+            # 1b. Handshake to get server config (rm_address)
+            try:
+                handshake_resp = self._rpc.handshake()
+                rm_address = handshake_resp.get("rm_address") or self._config.rm_address
+            except Exception:
+                logger.debug("Handshake failed, using config rm_address", exc_info=True)
+                rm_address = self._config.rm_address
+            self._mapper = DaxMapper(rm_address=rm_address)
 
             # 2. Initialize managers
             self._owned = OwnedRegionManager(
@@ -239,7 +329,8 @@ class MaruHandler:
                         logger.error("Failed to return region %d", rid, exc_info=True)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
-                self._mapper.close()
+                if self._mapper is not None:
+                    self._mapper.close()
 
                 # 4. Close RPC connection
                 self._rpc.close()

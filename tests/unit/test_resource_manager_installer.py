@@ -420,12 +420,16 @@ class TestMain:
         import runpy
         import sys
 
-        # Run without root — _check_root() returns 1 immediately.
-        with patch.object(sys, "argv", ["install-maru-resource-manager"]):
-            with pytest.raises(SystemExit) as exc_info:
-                runpy.run_module(
-                    "maru_common.resource_manager_installer",
-                    run_name="__main__",
-                    alter_sys=True,
-                )
-            assert exc_info.value.code == 1
+        # Remove from sys.modules to avoid RuntimeWarning about
+        # module already being imported before runpy re-executes it.
+        mod_name = "maru_common.resource_manager_installer"
+        saved = sys.modules.pop(mod_name, None)
+        try:
+            # Run without root — _check_root() returns 1 immediately.
+            with patch.object(sys, "argv", ["install-maru-resource-manager"]):
+                with pytest.raises(SystemExit) as exc_info:
+                    runpy.run_module(mod_name, run_name="__main__", alter_sys=True)
+                assert exc_info.value.code == 1
+        finally:
+            if saved is not None:
+                sys.modules[mod_name] = saved
