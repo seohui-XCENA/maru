@@ -312,6 +312,8 @@ void TcpServer::eventLoop() {
                     }
 
                     activeClients_.fetch_add(1);
+                    logf(LogLevel::Debug, "[CONN] new client fd=%d (active=%d)",
+                         cfd, activeClients_.load());
                     {
                         std::lock_guard<std::mutex> lk(fdSetMutex_);
                         connectedFds_.insert(cfd);
@@ -376,7 +378,9 @@ void TcpServer::workerLoop() {
 void TcpServer::removeClient(int fd) {
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
-    activeClients_.fetch_sub(1);
+    int remaining = activeClients_.fetch_sub(1) - 1;
+    logf(LogLevel::Debug, "[CONN] client disconnected fd=%d (active=%d)",
+         fd, remaining);
     std::lock_guard<std::mutex> lk(fdSetMutex_);
     connectedFds_.erase(fd);
 }

@@ -26,13 +26,19 @@ class MaruServer:
     """
 
     def __init__(self, rm_address: str | None = None):
+        self._rm_address = rm_address or "127.0.0.1:9850"
         self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
-        logger.info("MaruServer initialized")
+        logger.info("MaruServer initialized (rm_address=%s)", self._rm_address)
+
+    @property
+    def rm_address(self) -> str:
+        """Resource manager address used by this server."""
+        return self._rm_address
 
     # =========================================================================
     # Allocation Management
