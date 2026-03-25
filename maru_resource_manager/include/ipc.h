@@ -74,6 +74,10 @@ struct ErrorResp {
   uint32_t msgLen;
 };
 
+// Wire format uses little-endian byte order. On x86_64 this matches native
+// layout, so structs can be memcpy'd directly. If porting to a big-endian
+// architecture, all multi-byte fields must be byte-swapped before send/recv.
+//
 // Wire-format size assertions — must match Python maru_shm.ipc
 static_assert(sizeof(MsgHeader) == 12, "MsgHeader must be 12 bytes");
 static_assert(sizeof(AllocReq) == 16, "AllocReq must be 16 bytes");

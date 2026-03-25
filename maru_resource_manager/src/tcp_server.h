@@ -3,10 +3,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pool_manager.h"
@@ -24,11 +27,14 @@ public:
     void stop();
 
 private:
-    void acceptLoop();
+    /// epoll-based event loop: monitors listen socket + idle client connections.
+    /// Dispatches ready connections to the worker pool.
+    void eventLoop();
     void workerLoop();
-    void handleClient(int clientFd);
     /// Handle one request on a persistent connection. Returns false on EOF/error.
     bool handleOneRequest(int clientFd);
+    /// Remove a client fd from epoll, close it, and update tracking state.
+    void removeClient(int fd);
 
     PoolManager &pm_;
     RequestHandler handler_;
@@ -37,10 +43,11 @@ private:
     int numWorkers_;
 
     std::atomic<bool> stop_{false};
-    int listenFd_{-1};
+    std::atomic<int> listenFd_{-1};
+    int epollFd_{-1};
 
-    // Accept thread
-    std::thread acceptTh_;
+    // Event loop thread (replaces dedicated accept thread)
+    std::thread eventTh_;
 
     // Worker thread pool
     std::vector<std::thread> workers_;
@@ -48,8 +55,30 @@ private:
     std::mutex queueMutex_;
     std::condition_variable queueCv_;
 
+    // Track all connected client fds for graceful shutdown cleanup
+    std::mutex fdSetMutex_;
+    std::unordered_set<int> connectedFds_;
+
     static constexpr int kMaxClients = 256;
     std::atomic<int> activeClients_{0};
+
+    // Idempotency cache for alloc/free requests.
+    // Maps request_id -> (response MsgType, serialized payload).
+    // Prevents duplicate side effects when client retries after response loss.
+    struct CachedResponse {
+        uint16_t type;
+        std::vector<uint8_t> payload;
+    };
+    // Cache key: "client_id:request_id" to prevent cross-client collisions
+    std::mutex cacheMutex_;
+    std::unordered_map<std::string, CachedResponse> idempotencyCache_;
+    std::deque<std::string> cacheOrder_;  // insertion order for eviction
+    static constexpr size_t kMaxCacheEntries = 1024;
+
+    static std::string cacheKey(const std::string &clientId, uint64_t requestId);
+    bool cacheLookup(const std::string &clientId, uint64_t requestId, int clientFd);
+    void cacheInsert(const std::string &clientId, uint64_t requestId,
+                     uint16_t type, const void *payload, size_t payloadSize);
 };
 
 }  // namespace maru

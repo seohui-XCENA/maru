@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -70,6 +71,26 @@ int TcpServer::start() {
         ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 
+    // Create epoll instance for I/O multiplexing
+    epollFd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epollFd_ < 0) {
+        int err = -errno;
+        ::close(fd);
+        return err;
+    }
+
+    // Monitor listen socket (level-triggered, persistent — not ONESHOT)
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        int err = -errno;
+        ::close(fd);
+        ::close(epollFd_);
+        epollFd_ = -1;
+        return err;
+    }
+
     listenFd_ = fd;
     stop_ = false;
 
@@ -78,24 +99,24 @@ int TcpServer::start() {
         workers_.emplace_back(&TcpServer::workerLoop, this);
     }
 
-    // Start accept thread
-    acceptTh_ = std::thread(&TcpServer::acceptLoop, this);
+    // Start event loop thread
+    eventTh_ = std::thread(&TcpServer::eventLoop, this);
 
-    logf(LogLevel::Debug, "TcpServer: %d worker threads started", numWorkers_);
+    logf(LogLevel::Debug, "TcpServer: %d worker threads started (epoll)", numWorkers_);
     return 0;
 }
 
 void TcpServer::stop() {
     stop_ = true;
 
-    // Wake up accept thread
-    if (listenFd_ >= 0) {
-        ::shutdown(listenFd_, SHUT_RDWR);
-        ::close(listenFd_);
-        listenFd_ = -1;
+    // Wake up event loop by closing listen fd
+    int fd = listenFd_.exchange(-1);
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
     }
-    if (acceptTh_.joinable()) {
-        acceptTh_.join();
+    if (eventTh_.joinable()) {
+        eventTh_.join();
     }
 
     // Wake up all workers and join
@@ -107,11 +128,27 @@ void TcpServer::stop() {
     }
     workers_.clear();
 
-    // Drain any remaining fds in the queue
-    std::lock_guard<std::mutex> lk(queueMutex_);
-    while (!taskQueue_.empty()) {
-        ::close(taskQueue_.front());
-        taskQueue_.pop();
+    // Drain any remaining fds in the task queue (not yet picked up by workers)
+    {
+        std::lock_guard<std::mutex> lk(queueMutex_);
+        while (!taskQueue_.empty()) {
+            taskQueue_.pop();
+            // fds are tracked in connectedFds_, closed below
+        }
+    }
+
+    // Close all connected client fds
+    {
+        std::lock_guard<std::mutex> lk(fdSetMutex_);
+        for (int fd : connectedFds_) {
+            ::close(fd);
+        }
+        connectedFds_.clear();
+    }
+
+    if (epollFd_ >= 0) {
+        ::close(epollFd_);
+        epollFd_ = -1;
     }
 }
 
@@ -182,20 +219,28 @@ static std::vector<uint8_t> serializeGetAccessResp(
     return buf;
 }
 
-static void sendSimpleResp(int fd, MsgType type, const void *resp,
-                            size_t respSize) {
+/// Send a response with header + payload. Returns 0 on success, -errno on write failure.
+static int sendResp(int fd, MsgType type, const void *payload,
+                    size_t payloadSize) {
     MsgHeader rh{};
     rh.magic = kMagic;
     rh.version = kVersion;
     rh.type = static_cast<uint16_t>(type);
-    rh.payloadLen = respSize;
-    writeFull(fd, &rh, sizeof(rh));
-    writeFull(fd, resp, respSize);
+    rh.payloadLen = payloadSize;
+    int rc = writeFull(fd, &rh, sizeof(rh));
+    if (rc != 0) return rc;
+    if (payloadSize > 0) {
+        rc = writeFull(fd, payload, payloadSize);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
 
 /// Parse client_id string from payload after fixed-size request struct.
+/// Sets outEnd to the byte offset after client_id (for subsequent fields).
 static std::string parseClientId(const std::vector<uint8_t> &payload,
-                                  size_t fixedSize) {
+                                  size_t fixedSize, size_t &outEnd) {
+    outEnd = fixedSize;
     if (payload.size() <= fixedSize + 2) {
         return "";
     }
@@ -204,47 +249,98 @@ static std::string parseClientId(const std::vector<uint8_t> &payload,
     if (idLen == 0 || fixedSize + 2 + idLen > payload.size()) {
         return "";
     }
+    outEnd = fixedSize + 2 + idLen;
     return std::string(
         reinterpret_cast<const char *>(payload.data() + fixedSize + 2), idLen);
 }
 
+/// Parse request_id (uint64) from payload at the given offset.
+static uint64_t parseRequestId(const std::vector<uint8_t> &payload,
+                                size_t offset) {
+    if (offset + sizeof(uint64_t) > payload.size()) {
+        return 0;
+    }
+    uint64_t requestId = 0;
+    std::memcpy(&requestId, payload.data() + offset, sizeof(requestId));
+    return requestId;
+}
+
 // =============================================================================
-// Accept loop — pushes fds to task queue
+// Event loop — epoll-based I/O multiplexing for listen + idle connections
 // =============================================================================
 
-void TcpServer::acceptLoop() {
+void TcpServer::eventLoop() {
+    constexpr int kMaxEvents = 64;
+    struct epoll_event events[kMaxEvents];
+
     while (!stop_) {
-        int cfd = ::accept(listenFd_, nullptr, nullptr);
-        if (cfd < 0) {
+        int n = epoll_wait(epollFd_, events, kMaxEvents, 500 /* ms timeout */);
+        if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                continue;
+            break;  // epollFd_ closed or fatal error
+        }
+
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+
+            if (fd == listenFd_.load()) {
+                // Accept all pending connections (non-blocking listen socket)
+                while (true) {
+                    int cfd = ::accept(fd, nullptr, nullptr);
+                    if (cfd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+
+                    int flag = 1;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag,
+                               sizeof(flag));
+
+                    // Safety timeout for partial reads in workers
+                    struct timeval tv{};
+                    tv.tv_sec = 5;
+                    tv.tv_usec = 0;
+                    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                    if (activeClients_.load() >= kMaxClients) {
+                        logf(LogLevel::Warn,
+                             "TcpServer: max clients reached (%d), rejecting",
+                             kMaxClients);
+                        ::close(cfd);
+                        continue;
+                    }
+
+                    activeClients_.fetch_add(1);
+                    {
+                        std::lock_guard<std::mutex> lk(fdSetMutex_);
+                        connectedFds_.insert(cfd);
+                    }
+
+                    // Add to epoll with ONESHOT: fires once, then auto-disarms
+                    // until re-armed by the worker after handling a request.
+                    struct epoll_event cev{};
+                    cev.events = EPOLLIN | EPOLLONESHOT;
+                    cev.data.fd = cfd;
+                    if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, cfd, &cev) != 0) {
+                        removeClient(cfd);
+                    }
+                }
+            } else {
+                // Client fd has data ready — dispatch to worker pool.
+                // EPOLLONESHOT auto-disarms the fd so no duplicate dispatches.
+                {
+                    std::lock_guard<std::mutex> lk(queueMutex_);
+                    taskQueue_.push(fd);
+                }
+                queueCv_.notify_one();
             }
-            if (errno == EBADF || errno == ENOTSOCK) break;
-            break;
         }
-
-        int flag = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-        if (activeClients_.load() >= kMaxClients) {
-            logf(LogLevel::Warn,
-                 "TcpServer: max clients reached (%d), rejecting", kMaxClients);
-            ::close(cfd);
-            continue;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(queueMutex_);
-            taskQueue_.push(cfd);
-        }
-        queueCv_.notify_one();
     }
 }
 
 // =============================================================================
-// Worker loop — pops fds from task queue, handles persistent connections
+// Worker loop — handles one request per dispatch, then returns fd to epoll
 // =============================================================================
 
 void TcpServer::workerLoop() {
@@ -255,43 +351,80 @@ void TcpServer::workerLoop() {
             queueCv_.wait(lk, [this] {
                 return stop_ || !taskQueue_.empty();
             });
-            if (stop_ && taskQueue_.empty()) {
+            if (stop_) {
                 return;
             }
             cfd = taskQueue_.front();
             taskQueue_.pop();
         }
 
-        handleClient(cfd);
-    }
-}
-
-// =============================================================================
-// Client session — loops over requests on persistent connection
-// =============================================================================
-
-void TcpServer::handleClient(int clientFd) {
-    activeClients_.fetch_add(1);
-    struct ClientGuard {
-        std::atomic<int> &counter;
-        ~ClientGuard() { counter.fetch_sub(1); }
-    } guard{activeClients_};
-
-    // Set a read timeout so workers don't block forever on idle connections
-    struct timeval tv{};
-    tv.tv_sec = 60;  // 60s idle timeout per connection
-    tv.tv_usec = 0;
-    setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    // Persistent connection: handle multiple requests until EOF or error
-    while (!stop_) {
-        if (!handleOneRequest(clientFd)) {
-            break;
+        if (handleOneRequest(cfd)) {
+            // Request handled — return fd to epoll for next request
+            struct epoll_event ev{};
+            ev.events = EPOLLIN | EPOLLONESHOT;
+            ev.data.fd = cfd;
+            if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, cfd, &ev) != 0) {
+                removeClient(cfd);
+            }
+        } else {
+            // EOF or error — close connection
+            removeClient(cfd);
         }
     }
-
-    ::close(clientFd);
 }
+
+void TcpServer::removeClient(int fd) {
+    epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+    activeClients_.fetch_sub(1);
+    std::lock_guard<std::mutex> lk(fdSetMutex_);
+    connectedFds_.erase(fd);
+}
+
+// =============================================================================
+// Idempotency cache — prevents duplicate alloc/free on client retry
+// =============================================================================
+
+std::string TcpServer::cacheKey(const std::string &clientId,
+                                 uint64_t requestId) {
+    // "hostname:pid:requestId" — unique per client per request
+    return clientId + ":" + std::to_string(requestId);
+}
+
+bool TcpServer::cacheLookup(const std::string &clientId,
+                             uint64_t requestId, int clientFd) {
+    if (requestId == 0) return false;
+    std::string key = cacheKey(clientId, requestId);
+    std::lock_guard<std::mutex> lk(cacheMutex_);
+    auto it = idempotencyCache_.find(key);
+    if (it == idempotencyCache_.end()) return false;
+    // Send cached response
+    sendResp(clientFd, static_cast<MsgType>(it->second.type),
+             it->second.payload.data(), it->second.payload.size());
+    return true;
+}
+
+void TcpServer::cacheInsert(const std::string &clientId,
+                             uint64_t requestId, uint16_t type,
+                             const void *payload, size_t payloadSize) {
+    if (requestId == 0) return;
+    std::string key = cacheKey(clientId, requestId);
+    std::lock_guard<std::mutex> lk(cacheMutex_);
+    // Evict oldest entries if cache is full
+    while (cacheOrder_.size() >= kMaxCacheEntries) {
+        idempotencyCache_.erase(cacheOrder_.front());
+        cacheOrder_.pop_front();
+    }
+    auto &entry = idempotencyCache_[key];
+    entry.type = type;
+    entry.payload.assign(static_cast<const uint8_t *>(payload),
+                          static_cast<const uint8_t *>(payload) + payloadSize);
+    cacheOrder_.push_back(key);
+}
+
+// =============================================================================
+// Request handling — processes a single request on the connection
+// =============================================================================
 
 bool TcpServer::handleOneRequest(int clientFd) {
     MsgHeader hdr{};
@@ -329,19 +462,29 @@ bool TcpServer::handleOneRequest(int clientFd) {
         AllocReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        std::string cid = parseClientId(payload, sizeof(AllocReq));
-        RequestContext ctx{cid};
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, sizeof(AllocReq), cidEnd);
+        if (cid.empty()) {
+            sendError(clientFd, -EINVAL, "missing client_id");
+            return true;
+        }
+        uint64_t requestId = parseRequestId(payload, cidEnd);
 
+        // Check idempotency cache
+        if (cacheLookup(cid, requestId, clientFd)) {
+            return true;
+        }
+
+        RequestContext ctx{cid};
         auto result = handler_.handleAlloc(req, ctx);
 
         auto respPayload = serializeAllocResp(result.resp, result.devicePath);
-        MsgHeader rh{};
-        rh.magic = kMagic;
-        rh.version = kVersion;
-        rh.type = static_cast<uint16_t>(MsgType::ALLOC_RESP);
-        rh.payloadLen = respPayload.size();
-        writeFull(clientFd, &rh, sizeof(rh));
-        writeFull(clientFd, respPayload.data(), respPayload.size());
+        cacheInsert(cid, requestId, static_cast<uint16_t>(MsgType::ALLOC_RESP),
+                    respPayload.data(), respPayload.size());
+        if (sendResp(clientFd, MsgType::ALLOC_RESP,
+                     respPayload.data(), respPayload.size()) != 0) {
+            return false;
+        }
     } else if (type == MsgType::FREE_REQ) {
         if (payload.size() < sizeof(FreeReq)) {
             sendError(clientFd, -EPROTO, "bad free req");
@@ -350,26 +493,36 @@ bool TcpServer::handleOneRequest(int clientFd) {
         FreeReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        std::string cid = parseClientId(payload, sizeof(FreeReq));
-        RequestContext ctx{cid};
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, sizeof(FreeReq), cidEnd);
+        if (cid.empty()) {
+            sendError(clientFd, -EINVAL, "missing client_id");
+            return true;
+        }
+        uint64_t requestId = parseRequestId(payload, cidEnd);
 
+        // Check idempotency cache
+        if (cacheLookup(cid, requestId, clientFd)) {
+            return true;
+        }
+
+        RequestContext ctx{cid};
         auto result = handler_.handleFree(req, ctx);
         if (result.resp.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid authToken");
+            return true;  // protocol error, but keep connection open
+        }
+        cacheInsert(cid, requestId, static_cast<uint16_t>(MsgType::FREE_RESP),
+                    &result.resp, sizeof(result.resp));
+        if (sendResp(clientFd, MsgType::FREE_RESP,
+                     &result.resp, sizeof(result.resp)) != 0) {
             return false;
         }
-        sendSimpleResp(clientFd, MsgType::FREE_RESP,
-                        &result.resp, sizeof(result.resp));
     } else if (type == MsgType::STATS_REQ) {
         auto result = handler_.handleStats();
-        MsgHeader rh{};
-        rh.magic = kMagic;
-        rh.version = kVersion;
-        rh.type = static_cast<uint16_t>(MsgType::STATS_RESP);
-        rh.payloadLen = result.payload.size();
-        writeFull(clientFd, &rh, sizeof(rh));
-        if (!result.payload.empty()) {
-            writeFull(clientFd, result.payload.data(), result.payload.size());
+        if (sendResp(clientFd, MsgType::STATS_RESP,
+                     result.payload.data(), result.payload.size()) != 0) {
+            return false;
         }
     } else if (type == MsgType::GET_ACCESS_REQ) {
         if (payload.size() < sizeof(GetAccessReq)) {
@@ -383,18 +536,15 @@ bool TcpServer::handleOneRequest(int clientFd) {
         auto result = handler_.handleGetAccess(req, ctx);
         if (result.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid auth token");
-            return false;
+            return true;  // protocol error, but keep connection open
         }
 
         auto respPayload = serializeGetAccessResp(
             result.status, result.devicePath, result.offset, result.length);
-        MsgHeader rh{};
-        rh.magic = kMagic;
-        rh.version = kVersion;
-        rh.type = static_cast<uint16_t>(MsgType::GET_ACCESS_RESP);
-        rh.payloadLen = respPayload.size();
-        writeFull(clientFd, &rh, sizeof(rh));
-        writeFull(clientFd, respPayload.data(), respPayload.size());
+        if (sendResp(clientFd, MsgType::GET_ACCESS_RESP,
+                     respPayload.data(), respPayload.size()) != 0) {
+            return false;
+        }
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");
         return false;

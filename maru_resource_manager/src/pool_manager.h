@@ -62,10 +62,14 @@ public:
               std::string &devPath, uint32_t poolId, uint64_t &requestedSizeOut);
     int free(const Handle &handle, const std::string &clientId);
 
+    /// Atomically verify auth token and free. Returns -EACCES on bad token.
+    int verifyAndFree(const Handle &handle, const std::string &clientId);
+    /// Atomically verify auth token and get device path. Returns -EACCES on bad token.
+    int verifyAndGetPath(const Handle &handle, std::string &outPath);
+
     void getStats(std::vector<PoolState> &out);
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
-    bool verifyAuthToken(const Handle &handle);
 
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
