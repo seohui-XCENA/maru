@@ -34,7 +34,11 @@ from .cxl_primitives import clflush, ntstore
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Constants
+# Constants — must match maru_resource_manager/include/cxl_rpc_layout.h
+#
+# The C++ header (cxl_rpc_layout.h) is the canonical source of truth.
+# These values must be kept in sync. Both sides have static/compile-time
+# assertions to catch mismatches.
 # =============================================================================
 
 CACHELINE_SIZE = 64
@@ -52,12 +56,19 @@ PAYLOAD_MAX = 4096
 # Channel layout offsets
 HEADER_OFFSET = 0  # [0, 64)
 REQUEST_CTL_OFFSET = CACHELINE_SIZE  # [64, 128)
-REQUEST_PAYLOAD_OFFSET = 2 * CACHELINE_SIZE  # [128, 128+PAYLOAD_MAX)
+REQUEST_PAYLOAD_OFFSET = 2 * CACHELINE_SIZE  # [128, 4224)
 RESPONSE_CTL_OFFSET = 2 * CACHELINE_SIZE + PAYLOAD_MAX  # [4224, 4288)
-RESPONSE_PAYLOAD_OFFSET = 3 * CACHELINE_SIZE + PAYLOAD_MAX  # [4288, 4288+PAYLOAD_MAX)
+RESPONSE_PAYLOAD_OFFSET = 3 * CACHELINE_SIZE + PAYLOAD_MAX  # [4288, 8384)
 
 # Total channel size
 CHANNEL_SIZE = 3 * CACHELINE_SIZE + 2 * PAYLOAD_MAX  # 8384 bytes
+
+# Consistency checks (mirrors C++ static_assert in cxl_rpc_layout.h)
+assert REQUEST_CTL_OFFSET == CACHELINE_SIZE  # == sizeof(ChannelHeader)
+assert REQUEST_PAYLOAD_OFFSET == REQUEST_CTL_OFFSET + CACHELINE_SIZE  # + sizeof(ControlSlot)
+assert RESPONSE_CTL_OFFSET == REQUEST_PAYLOAD_OFFSET + PAYLOAD_MAX
+assert RESPONSE_PAYLOAD_OFFSET == RESPONSE_CTL_OFFSET + CACHELINE_SIZE
+assert CHANNEL_SIZE == RESPONSE_PAYLOAD_OFFSET + PAYLOAD_MAX == 8384
 
 # Control slot layout: status(4) + seq_num(4) + payload_len(4)
 CTL_FORMAT = "<III"  # little-endian: status, seq_num, payload_len
