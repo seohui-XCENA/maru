@@ -131,7 +131,9 @@ Every allocation receives a **cryptographic auth token** derived from the Handle
 
 The secret is generated on first start and persisted to the state directory. On restart, if allocations exist from a previous run, the secret is loaded; if it is missing, startup is aborted to prevent token verification failures.
 
-**Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity.
+**Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. The auth token is cryptographically bound to the `client_id`, preventing token forgery even if Handle fields are known.
+
+**PID reuse safety:** A new process may receive the same PID as a terminated one, but it cannot access the old allocations — the Handle (including auth token) existed only in the old process's memory. The Reaper detects PID reuse by comparing cached process start times (local clients) or via TCP disconnect grace period (remote clients). See §6 for details.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 

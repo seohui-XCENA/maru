@@ -11,6 +11,7 @@ find_package(OpenSSL REQUIRED)
 add_executable(maru_resource_manager
     src/util.cpp
     src/main.cpp
+    src/server_config.cpp
     src/log.cpp
     src/pool_manager.cpp
     src/metadata.cpp
