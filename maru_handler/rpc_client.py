@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""RPC Client for connecting to MaruServer."""
+"""RPC Client for connecting to MaruServer.
+
+Supports two transports:
+- ZMQ (default): TCP-based, works without CXL hardware
+- CXL-RPC: shared memory slots, requires CXL DAX device
+"""
+
+from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import zmq
 
@@ -26,14 +33,21 @@ from maru_common import (
 )
 from maru_shm import MaruHandle
 
+if TYPE_CHECKING:
+    from maru_common.cxl_rpc import CxlRpcClientTransport
+
 logger = logging.getLogger(__name__)
 
 
 class RpcClient:
     """
-    ZeroMQ-based RPC client for communicating with MaruServer.
+    RPC client for communicating with MaruServer.
 
-    This client uses binary format (MessagePack) for RPC communication.
+    Supports two transports:
+    - ZMQ (default): TCP-based, works without CXL hardware
+    - CXL-RPC: CXL shared memory slots, lowest latency
+
+    Uses binary format (MessagePack) for RPC communication.
     The server returns Handle objects for memory locations.
     """
 
@@ -41,22 +55,29 @@ class RpcClient:
         self,
         server_url: str = "tcp://localhost:5555",
         timeout_ms: int = 5000,
+        cxl_transport: CxlRpcClientTransport | None = None,
     ):
         """
         Initialize the RPC client.
 
         Args:
-            server_url: URL of the MaruServer (e.g., "tcp://localhost:5555")
+            server_url: URL of the MaruServer (e.g., "tcp://localhost:5555").
+                        Ignored when cxl_transport is provided.
             timeout_ms: Socket timeout in milliseconds (default: 5000ms)
+            cxl_transport: If provided, use CXL-RPC instead of ZMQ.
         """
         self._server_url = server_url
         self._timeout_ms = timeout_ms
+        self._cxl = cxl_transport
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
         self._serializer = Serializer()
 
     def connect(self) -> None:
-        """Connect to the server."""
+        """Connect to the server. No-op if using CXL-RPC transport."""
+        if self._cxl is not None:
+            logger.info("Using CXL-RPC transport (ZMQ connection skipped)")
+            return
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REQ)
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
@@ -67,6 +88,11 @@ class RpcClient:
 
     def close(self) -> None:
         """Close the connection."""
+        if self._cxl is not None:
+            self._cxl.close()
+            self._cxl = None
+            logger.info("CXL-RPC transport closed")
+            return
         if self._socket:
             self._socket.close()
         if self._context:
@@ -76,7 +102,27 @@ class RpcClient:
     def _send_request(
         self, msg_type: MessageType, data: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a request and wait for response using poll-based timeout."""
+        """Send a request and wait for response.
+
+        Routes to CXL-RPC or ZMQ based on the configured transport.
+        """
+        if self._cxl is not None:
+            return self._send_request_cxl(msg_type, data)
+        return self._send_request_zmq(msg_type, data)
+
+    def _send_request_cxl(
+        self, msg_type: MessageType, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Send request via CXL-RPC transport."""
+        encoded = self._serializer.encode(msg_type, data)
+        raw_resp = self._cxl.send_request(encoded, self._timeout_ms)
+        _, payload = self._serializer.decode(raw_resp)
+        return payload
+
+    def _send_request_zmq(
+        self, msg_type: MessageType, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Send request via ZMQ transport."""
         if self._socket is None:
             raise RuntimeError("Client not connected. Call connect() first.")
 
