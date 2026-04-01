@@ -2,15 +2,16 @@
 # Copyright 2026 XCENA Inc.
 """MaruShmClient — shared memory client for the Maru Resource Manager.
 
-Communicates with the resource manager over a persistent TCP connection
-using the binary IPC protocol defined in maru_shm.ipc.
+Communicates with the resource manager via a pluggable ClientTransport.
+Default transport is TcpClientTransport (persistent TCP connection).
 """
 
 import logging
 import mmap as mmap_module
 import os
-import socket
 import threading
+
+from maru_common.transport import ClientTransport
 
 from .constants import ANY_POOL_ID, DEFAULT_ADDRESS
 from .ipc import (
@@ -27,8 +28,8 @@ from .ipc import (
     StatsReq,
     StatsResp,
 )
+from .tcp_transport import TcpClientTransport
 from .types import MaruHandle, MaruPoolInfo
-from .uds_helpers import read_full, write_full
 
 logger = logging.getLogger(__name__)
 
@@ -58,130 +59,50 @@ def _next_request_id() -> int:
 class MaruShmClient:
     """Client for the Maru Resource Manager.
 
-    Maintains a persistent TCP connection to the resource manager.
-    Multiple RPC calls reuse the same connection. If the connection
-    drops, it is transparently re-established on the next call.
+    Uses a ClientTransport for communication. If no transport is provided,
+    creates a TcpClientTransport from the given address.
 
     Device paths received from alloc/get_access are cached by region_id.
     mmap() opens the device path directly to create Python mmap objects.
     """
 
-    def __init__(self, address: str | None = None):
-        self._address = address or DEFAULT_ADDRESS
+    def __init__(
+        self,
+        address: str | None = None,
+        transport: ClientTransport | None = None,
+    ):
+        if transport is not None:
+            self._transport = transport
+        else:
+            self._transport = TcpClientTransport(address or DEFAULT_ADDRESS)
         self._path_cache: dict[int, str] = {}  # region_id -> device path
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
         self._client_id = _make_client_id()
-        self._sock: socket.socket | None = None
-        self._conn_lock = threading.Lock()
-
-    @staticmethod
-    def _parse_address(address: str) -> tuple[str, int]:
-        """Parse 'host:port' string."""
-        host, _, port_str = address.rpartition(":")
-        if not host:
-            host = "127.0.0.1"
-        return host, int(port_str)
 
     def is_running(self) -> bool:
         """Check if the resource manager is reachable."""
-        host, port = self._parse_address(self._address)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.connect((host, port))
-            sock.close()
-            return True
-        except OSError:
-            sock.close()
-            return False
-
-    def _ensure_conn(self) -> socket.socket:
-        """Return the persistent connection, creating it if needed.
-
-        Must be called with _conn_lock held.
-        """
-        if self._sock is not None:
-            return self._sock
-
-        host, port = self._parse_address(self._address)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.settimeout(5.0)  # 5s connect timeout
-            sock.connect((host, port))
-            sock.settimeout(
-                10.0
-            )  # 10s RPC timeout (prevents infinite block on server hang)
-        except OSError as e:
-            sock.close()
-            raise ConnectionError(
-                f"Resource manager is not running "
-                f"(address: {self._address}).\n"
-                f"Start it first: maru-resource-manager "
-                f"--host {host} --port {port}"
-            ) from e
-
-        # Warn when connecting to a remote host over plaintext TCP
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            logger.warning(
-                "Connecting to remote host %s over PLAINTEXT TCP. "
-                "Auth tokens will be transmitted without encryption. "
-                "Use an encrypted tunnel for production deployments.",
-                host,
-            )
-
-        # Disable Nagle for low-latency RPC
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._sock = sock
-        return self._sock
-
-    def _close_conn(self) -> None:
-        """Close the persistent connection."""
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
+        if isinstance(self._transport, TcpClientTransport):
+            return self._transport.is_running()
+        return True
 
     def _rpc(self, msg_type: MsgType, payload: bytes) -> tuple[MsgHeader, bytes]:
-        """Execute a single RPC: send request, receive response.
+        """Execute a single RPC via the transport.
 
-        Thread-safe: the entire send+recv cycle is serialized by _conn_lock.
-        On connection error, closes and retries once with a fresh connection.
-        Idempotency for alloc/free is guaranteed by request_id in the payload;
-        the server deduplicates by request_id and returns cached responses.
+        Builds a MsgHeader, sends header+payload through the transport,
+        and parses the response header + payload from the raw bytes.
 
         Returns:
             (response_header, response_payload)
         """
-        for attempt in range(2):
-            with self._conn_lock:
-                sock = self._ensure_conn()
-                try:
-                    # Send
-                    hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
-                    write_full(sock, hdr.pack())
-                    if payload:
-                        write_full(sock, payload)
+        hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
+        raw_request = hdr.pack() + payload
 
-                    # Receive
-                    resp_data = read_full(sock, HEADER_SIZE)
-                    resp_hdr = MsgHeader.unpack(resp_data)
-                    if not resp_hdr.validate():
-                        raise ConnectionError(
-                            f"Invalid response header: magic=0x{resp_hdr.magic:08X}"
-                        )
+        raw_response = self._transport.send_request(raw_request)
 
-                    resp_payload = b""
-                    if resp_hdr.payload_len > 0:
-                        resp_payload = read_full(sock, resp_hdr.payload_len)
-
-                    return resp_hdr, resp_payload
-
-                except (ConnectionError, OSError):
-                    self._close_conn()
-                    if attempt == 1:
-                        raise
+        resp_hdr = MsgHeader.unpack(raw_response[:HEADER_SIZE])
+        resp_payload = raw_response[HEADER_SIZE:]
+        return resp_hdr, resp_payload
 
     def _check_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
         """Raise RuntimeError if response is an ERROR_RESP."""
@@ -346,9 +267,8 @@ class MaruShmClient:
         self._path_cache.pop(region_id, None)
 
     def close(self) -> None:
-        """Close persistent connection and all cached mmaps."""
-        with self._conn_lock:
-            self._close_conn()
+        """Close transport and all cached mmaps."""
+        self._transport.close()
         with self._lock:
             num_mmaps = len(self._mmap_cache)
             for region_id in list(self._mmap_cache.keys()):

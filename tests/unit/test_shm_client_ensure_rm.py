@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Tests for MaruShmClient: is_running, _ensure_conn, persistent connection,
-free edge cases, __del__, and other coverage gaps.
+"""Tests for MaruShmClient and TcpClientTransport: is_running, persistent
+connection, reconnect, free edge cases, __del__, and other coverage gaps.
 
 These tests exercise the real MaruShmClient class (not the MockShmClient from
 conftest), using mock TCP servers and targeted patching.
@@ -20,6 +20,7 @@ from maru_shm.ipc import (
     MsgHeader,
     MsgType,
 )
+from maru_shm.tcp_transport import TcpClientTransport
 from maru_shm.types import MaruHandle
 from maru_shm.uds_helpers import read_full, write_full
 
@@ -105,13 +106,13 @@ class TestIsRunning:
 
 
 # =============================================================================
-# _ensure_conn tests
+# TcpClientTransport connection tests
 # =============================================================================
 
 
 class TestEnsureConn:
     def test_creates_connection(self):
-        """_ensure_conn creates a TCP connection on first call."""
+        """TcpClientTransport creates a TCP connection on first use."""
 
         def handler(sock):
             pass
@@ -119,17 +120,17 @@ class TestEnsureConn:
         server = MockTcpServer(handler)
         addr = server.start()
         try:
-            client = MaruShmClient(address=addr)
-            with client._conn_lock:
-                sock = client._ensure_conn()
+            transport = TcpClientTransport(addr)
+            with transport._conn_lock:
+                sock = transport._ensure_conn()
             assert sock is not None
-            assert client._sock is sock
-            client.close()
+            assert transport._sock is sock
+            transport.close()
         finally:
             server.stop()
 
     def test_reuses_connection(self):
-        """_ensure_conn returns same socket on subsequent calls."""
+        """TcpClientTransport returns same socket on subsequent calls."""
 
         def handler(sock):
             pass
@@ -137,23 +138,23 @@ class TestEnsureConn:
         server = MockTcpServer(handler)
         addr = server.start()
         try:
-            client = MaruShmClient(address=addr)
-            with client._conn_lock:
-                sock1 = client._ensure_conn()
-                sock2 = client._ensure_conn()
+            transport = TcpClientTransport(addr)
+            with transport._conn_lock:
+                sock1 = transport._ensure_conn()
+                sock2 = transport._ensure_conn()
             assert sock1 is sock2
-            client.close()
+            transport.close()
         finally:
             server.stop()
 
     def test_raises_connection_error_when_not_running(self):
-        """_ensure_conn raises ConnectionError when server is not running."""
-        client = MaruShmClient(address="127.0.0.1:19999")
-        with client._conn_lock:
+        """TcpClientTransport raises ConnectionError when server is not running."""
+        transport = TcpClientTransport("127.0.0.1:19999")
+        with transport._conn_lock:
             with pytest.raises(
                 ConnectionError, match="Resource manager is not running"
             ):
-                client._ensure_conn()
+                transport._ensure_conn()
 
 
 # =============================================================================
@@ -163,7 +164,7 @@ class TestEnsureConn:
 
 class TestReconnect:
     def test_rpc_reconnects_after_server_drop(self):
-        """_rpc retries with a fresh connection if the first attempt fails."""
+        """MaruShmClient retries with a fresh connection if the first attempt fails."""
         call_count = 0
 
         def handler(sock):
@@ -184,8 +185,10 @@ class TestReconnect:
             client.free(handle)
             assert call_count == 1
 
-            # Simulate server dropping the connection
-            client._close_conn()
+            # Simulate server dropping the connection by closing transport socket
+            transport = client._transport
+            assert isinstance(transport, TcpClientTransport)
+            transport._close_conn()
 
             # Second call — should reconnect and succeed
             client.free(handle)

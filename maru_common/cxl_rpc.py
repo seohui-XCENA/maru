@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 
 from .cxl_primitives import clflush, ntstore
+from .transport import ClientTransport, ServerTransport
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,7 @@ class Channel:
 # =============================================================================
 
 
-class CxlRpcClientTransport:
+class CxlRpcClientTransport(ClientTransport):
     """CXL-RPC client transport. Replaces ZMQ REQ socket.
 
     Each client owns a dedicated Channel. send_request() is blocking:
@@ -275,7 +276,7 @@ class CxlRpcClientTransport:
 # =============================================================================
 
 
-class CxlRpcServerTransport:
+class CxlRpcServerTransport(ServerTransport):
     """CXL-RPC server transport. Replaces ZMQ REP socket.
 
     Polls all active channels in round-robin, dispatches requests
