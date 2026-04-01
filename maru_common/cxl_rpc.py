@@ -345,11 +345,14 @@ class CxlRpcServerTransport(ServerTransport):
     ) -> None:
         """Write response to a channel."""
         ch = self._channels[channel_id]
+        # Clear request status BEFORE marking response ready.
+        # This prevents a race where the client sees RESP_READY, sends the
+        # next request (setting REQ_READY), and then the server overwrites
+        # it with IDLE.
+        ch.req_ctl.write_status(IDLE)
         # Write payload first, then control (ordering matters)
         ch.resp_payload.write(payload)
         ch.resp_ctl.write(RESP_READY, seq, len(payload))
-        # Clear request status
-        ch.req_ctl.write_status(IDLE)
 
     def run_loop(
         self,
