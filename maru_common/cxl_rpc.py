@@ -388,3 +388,185 @@ class CxlRpcServerTransport(ServerTransport):
         """Signal the server loop to stop."""
         self._running = False
         logger.info("CXL-RPC server stopping")
+
+
+# =============================================================================
+# Channel Registration — dynamic channel allocation within a slot pool
+# =============================================================================
+
+
+class ChannelAllocator:
+    """Manages channel allocation within a slot pool region.
+
+    Channel 0 is reserved for registration requests. Channels 1..max-1
+    are assigned to clients on HANDSHAKE.
+
+    Used by both MetaServer (allocating channels for Handlers) and
+    RM (allocating channels for MetaServers).
+    """
+
+    def __init__(self, max_channels: int):
+        self._max_channels = max_channels
+        # Channel 0 = registration, 1..max-1 = client channels
+        self._allocated: list[str | None] = [None] * max_channels
+        self._allocated[0] = "__registration__"
+
+    def allocate(self, client_id: str) -> int | None:
+        """Allocate a channel for a client. Returns channel_id or None if full."""
+        for i in range(1, self._max_channels):
+            if self._allocated[i] is None:
+                self._allocated[i] = client_id
+                logger.debug(
+                    "Channel %d allocated for '%s'", i, client_id
+                )
+                return i
+        return None
+
+    def release(self, channel_id: int) -> None:
+        """Release a channel."""
+        if 1 <= channel_id < self._max_channels:
+            client = self._allocated[channel_id]
+            self._allocated[channel_id] = None
+            logger.debug(
+                "Channel %d released (was '%s')", channel_id, client
+            )
+
+    def get_client(self, channel_id: int) -> str | None:
+        """Get the client_id for a channel."""
+        if 0 <= channel_id < self._max_channels:
+            return self._allocated[channel_id]
+        return None
+
+    @property
+    def active_count(self) -> int:
+        """Number of allocated client channels (excluding registration)."""
+        return sum(1 for c in self._allocated[1:] if c is not None)
+
+
+class RmRpcRegion:
+    """Fixed RPC region at the start of CXL memory, managed by RM.
+
+    Layout:
+        [0, reg_size)        Registration channels (1 per node, for MetaServer→RM registration)
+        [reg_size, end)      RM channels (allocated to MetaServers for ongoing RPC)
+
+    The RM creates this region on startup. MetaServers connect to a
+    registration channel to request an RM channel.
+    """
+
+    def __init__(
+        self,
+        mm: mmap.mmap,
+        max_registration_channels: int = 4,
+        max_rm_channels: int = 64,
+    ):
+        self._mm = mm
+        self._max_reg = max_registration_channels
+        self._max_rm = max_rm_channels
+
+        # Registration region: channels for initial REGISTER requests
+        self._reg_offset = 0
+        self._reg_size = max_registration_channels * CHANNEL_SIZE
+
+        # RM channel region: channels for ongoing MetaServer ↔ RM RPC
+        self._rm_offset = self._reg_size
+        self._rm_size = max_rm_channels * CHANNEL_SIZE
+
+        self._allocator = ChannelAllocator(max_rm_channels)
+
+        # Server transport for RM channels (activated on allocation)
+        self._rm_transport = CxlRpcServerTransport(
+            mm, self._rm_offset, max_rm_channels
+        )
+
+        # Server transport for registration channels (always active)
+        self._reg_transport = CxlRpcServerTransport(
+            mm, self._reg_offset, max_registration_channels
+        )
+        for i in range(max_registration_channels):
+            self._reg_transport.activate_channel(i)
+
+    @property
+    def total_size(self) -> int:
+        """Total bytes consumed by the RPC region."""
+        return self._reg_size + self._rm_size
+
+    @property
+    def rm_transport(self) -> CxlRpcServerTransport:
+        """Server transport for RM channels (MetaServer ↔ RM RPC)."""
+        return self._rm_transport
+
+    @property
+    def reg_transport(self) -> CxlRpcServerTransport:
+        """Server transport for registration channels."""
+        return self._reg_transport
+
+    def allocate_rm_channel(self, client_id: str) -> int | None:
+        """Allocate an RM channel for a MetaServer. Returns channel_id or None."""
+        ch_id = self._allocator.allocate(client_id)
+        if ch_id is not None:
+            self._rm_transport.activate_channel(ch_id)
+        return ch_id
+
+    def release_rm_channel(self, channel_id: int) -> None:
+        """Release an RM channel."""
+        self._rm_transport.deactivate_channel(channel_id)
+        self._allocator.release(channel_id)
+
+    def rm_channel_offset(self, channel_id: int) -> int:
+        """Byte offset of an RM channel within the mmap."""
+        return self._rm_offset + channel_id * CHANNEL_SIZE
+
+    def reg_channel_offset(self, channel_id: int) -> int:
+        """Byte offset of a registration channel within the mmap."""
+        return self._reg_offset + channel_id * CHANNEL_SIZE
+
+
+class SlotPool:
+    """A pool of RPC channels allocated from CXL memory for Handler ↔ MetaServer.
+
+    Created by MetaServer after receiving a slot pool allocation from RM.
+    Channel 0 is reserved for Handler registration (HANDSHAKE).
+    """
+
+    def __init__(
+        self,
+        mm: mmap.mmap,
+        pool_offset: int,
+        max_channels: int = 32,
+    ):
+        self._mm = mm
+        self._pool_offset = pool_offset
+        self._max_channels = max_channels
+        self._allocator = ChannelAllocator(max_channels)
+
+        # Server transport for this slot pool
+        self._transport = CxlRpcServerTransport(
+            mm, pool_offset, max_channels
+        )
+        # Channel 0 = registration, always active
+        self._transport.activate_channel(0)
+
+    @property
+    def transport(self) -> CxlRpcServerTransport:
+        return self._transport
+
+    @property
+    def pool_offset(self) -> int:
+        return self._pool_offset
+
+    def allocate_channel(self, client_id: str) -> int | None:
+        """Allocate a channel for a Handler. Returns channel_id or None."""
+        ch_id = self._allocator.allocate(client_id)
+        if ch_id is not None:
+            self._transport.activate_channel(ch_id)
+        return ch_id
+
+    def release_channel(self, channel_id: int) -> None:
+        """Release a Handler channel."""
+        self._transport.deactivate_channel(channel_id)
+        self._allocator.release(channel_id)
+
+    def channel_offset(self, channel_id: int) -> int:
+        """Absolute byte offset of a channel within the mmap."""
+        return self._pool_offset + channel_id * CHANNEL_SIZE
