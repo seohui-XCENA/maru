@@ -14,7 +14,8 @@ int readFull(int fd, void *buf, size_t len);
 uint64_t nowSec();
 
 int initSecret(const std::string &stateDir, bool hasExistingAllocations);
-uint64_t computeAuthToken(const Handle &h, uint64_t nonce);
+uint64_t computeAuthToken(const Handle &h, uint64_t nonce,
+                          const std::string &clientId);
 uint64_t generateNonce();
 
 uint32_t crc32(const void *data, size_t len);

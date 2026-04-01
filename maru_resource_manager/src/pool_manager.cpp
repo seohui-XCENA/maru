@@ -110,7 +110,12 @@ static uint64_t alignUp(uint64_t v, uint64_t align)
     {
         return v;
     }
-    return v + (align - rem);
+    uint64_t result = v + (align - rem);
+    if (result < v)
+    {
+        return UINT64_MAX; // overflow guard
+    }
+    return result;
 }
 
 static bool findMountPoint(const std::string &deviceName,
@@ -306,8 +311,8 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
-PoolManager::PoolManager(const std::string &stateDir)
-    : stateDir_(stateDir)
+PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
+    : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec)
 {
     metadata_ = std::make_unique<MetadataStore>(stateDir);
     wal_ = std::make_unique<WalStore>(stateDir);
@@ -543,6 +548,15 @@ int PoolManager::loadPoolsLocked()
     if (walRc != 0 && walRc != -ENOENT)
     {
         return walRc;
+    }
+
+    // Recompute auth tokens for all restored allocations.
+    // Tokens now include client_id in the HMAC input; legacy tokens
+    // (computed without client_id) would fail verification after this change.
+    for (auto &[regionId, alloc] : allocations_)
+    {
+        alloc.handle.authToken = computeAuthToken(
+            alloc.handle, alloc.nonce, std::string(alloc.clientId));
     }
 
     for (auto &pool : pools_)
@@ -782,6 +796,12 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     {
         return -EINVAL;
     }
+    // Reject zero or unreasonably large sizes to prevent alignUp() overflow
+    // and nonsensical allocations. 256 TiB is well beyond any CXL device.
+    if (size == 0 || size > (1ULL << 48))
+    {
+        return -EINVAL;
+    }
 
     std::lock_guard<std::mutex> lock(mu_);
     if (pools_.empty())
@@ -832,7 +852,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         }
     }
 
-    alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce);
+    alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce, clientId);
 
     // Cache owner PID start time for reaper PID-reuse detection (local only)
     if (!clientId.empty())
@@ -950,7 +970,7 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             now - it->second).count();
-        if (elapsed >= kDisconnectGraceSec)
+        if (elapsed >= gracePeriodSec_)
         {
             logf(LogLevel::Info, "reaping disconnected client: %s (disconnected %lds ago)",
                  it->first.c_str(), static_cast<long>(elapsed));
@@ -1034,7 +1054,7 @@ void PoolManager::clientDisconnected(const std::string &clientId)
     {
         disconnectedClients_[clientId] = SteadyClock::now();
         logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
-             clientId.c_str(), kDisconnectGraceSec);
+             clientId.c_str(), gracePeriodSec_);
     }
 }
 
@@ -1066,15 +1086,16 @@ int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId
         return -ENOENT;
     }
 
-    // Verify auth token
-    uint64_t expectedToken = computeAuthToken(handle, globalIt->second.nonce);
+    // Verify auth token (bound to the allocating client_id)
+    const Allocation &alloc = globalIt->second;
+    uint64_t expectedToken = computeAuthToken(handle, alloc.nonce,
+                                               std::string(alloc.clientId));
     if (handle.authToken != expectedToken)
     {
         return -EACCES;
     }
 
     // Verify ownership
-    const Allocation &alloc = globalIt->second;
     if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
     {
         return -EPERM;
@@ -1145,14 +1166,15 @@ int PoolManager::verifyAndGetPath(const Handle &handle, std::string &outPath)
         return -ENOENT;
     }
 
-    // Verify auth token
-    uint64_t expectedToken = computeAuthToken(handle, globalIt->second.nonce);
+    // Verify auth token (bound to the allocating client_id)
+    const Allocation &alloc = globalIt->second;
+    uint64_t expectedToken = computeAuthToken(handle, alloc.nonce,
+                                               std::string(alloc.clientId));
     if (handle.authToken != expectedToken)
     {
         return -EACCES;
     }
 
-    const Allocation &alloc = globalIt->second;
     PoolState *pool = findPoolById(alloc.poolId);
     if (!pool)
     {

@@ -16,15 +16,16 @@
 #include <vector>
 
 #include "ipc.h"
+#include "ipc_serialize.h"
 #include "log.h"
 #include "util.h"
 
 namespace maru {
 
 TcpServer::TcpServer(PoolManager &pm, const std::string &host, uint16_t port,
-                     int numWorkers)
+                     int numWorkers, int maxClients)
     : pm_(pm), handler_(pm), host_(host), port_(port),
-      numWorkers_(numWorkers) {}
+      numWorkers_(numWorkers), maxClients_(maxClients) {}
 
 TcpServer::~TcpServer() { stop(); }
 
@@ -48,7 +49,19 @@ int TcpServer::start() {
     addr.sin_port = htons(port_);
     if (host_ == "0.0.0.0" || host_.empty()) {
         addr.sin_addr.s_addr = INADDR_ANY;
-    } else {
+        logf(LogLevel::Warn,
+             "Binding to 0.0.0.0 — server is accessible from ALL network "
+             "interfaces. Auth tokens and device paths are sent in PLAINTEXT. "
+             "Use 127.0.0.1 for local-only access or an encrypted tunnel "
+             "(WireGuard, SSH) for multi-node deployments.");
+    } else if (host_ != "127.0.0.1" && host_ != "localhost") {
+        logf(LogLevel::Warn,
+             "Binding to non-loopback address '%s' — traffic including auth "
+             "tokens will be sent in PLAINTEXT. Use an encrypted tunnel for "
+             "production multi-node deployments.",
+             host_.c_str());
+    }
+    if (host_ != "0.0.0.0" && !host_.empty()) {
         if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
             ::close(fd);
             return -EINVAL;
@@ -156,90 +169,6 @@ void TcpServer::stop() {
     }
 }
 
-// =============================================================================
-// Serialization helpers (static, no state)
-// =============================================================================
-
-static int sendError(int fd, int32_t status, const std::string &msg) {
-    ErrorResp er{};
-    er.status = status;
-    er.msgLen = msg.size();
-
-    MsgHeader hdr{};
-    hdr.magic = kMagic;
-    hdr.version = kVersion;
-    hdr.type = static_cast<uint16_t>(MsgType::ERROR_RESP);
-    hdr.payloadLen = sizeof(ErrorResp) + er.msgLen;
-
-    int rc = writeFull(fd, &hdr, sizeof(hdr));
-    if (rc != 0) return rc;
-    rc = writeFull(fd, &er, sizeof(er));
-    if (rc != 0) return rc;
-    if (er.msgLen > 0) {
-        rc = writeFull(fd, msg.data(), er.msgLen);
-        if (rc != 0) return rc;
-    }
-    return 0;
-}
-
-static std::vector<uint8_t> serializeAllocResp(const AllocResp &resp,
-                                                const std::string &path) {
-    uint32_t pathLen = path.size();
-    size_t totalSize = sizeof(resp) + sizeof(pathLen) + pathLen;
-    std::vector<uint8_t> buf(totalSize);
-
-    size_t off = 0;
-    std::memcpy(buf.data() + off, &resp, sizeof(resp));
-    off += sizeof(resp);
-    std::memcpy(buf.data() + off, &pathLen, sizeof(pathLen));
-    off += sizeof(pathLen);
-    if (pathLen > 0) {
-        std::memcpy(buf.data() + off, path.data(), pathLen);
-    }
-    return buf;
-}
-
-static std::vector<uint8_t> serializeGetAccessResp(
-    int32_t status, const std::string &path,
-    uint64_t offset, uint64_t length) {
-    uint32_t pathLen = path.size();
-    GetAccessResp resp{};
-    resp.status = status;
-    resp.pathLen = pathLen;
-
-    size_t totalSize = sizeof(resp) + pathLen + sizeof(offset) + sizeof(length);
-    std::vector<uint8_t> buf(totalSize);
-
-    size_t off = 0;
-    std::memcpy(buf.data() + off, &resp, sizeof(resp));
-    off += sizeof(resp);
-    if (pathLen > 0) {
-        std::memcpy(buf.data() + off, path.data(), pathLen);
-        off += pathLen;
-    }
-    std::memcpy(buf.data() + off, &offset, sizeof(offset));
-    off += sizeof(offset);
-    std::memcpy(buf.data() + off, &length, sizeof(length));
-    return buf;
-}
-
-/// Send a response with header + payload. Returns 0 on success, -errno on write failure.
-static int sendResp(int fd, MsgType type, const void *payload,
-                    size_t payloadSize) {
-    MsgHeader rh{};
-    rh.magic = kMagic;
-    rh.version = kVersion;
-    rh.type = static_cast<uint16_t>(type);
-    rh.payloadLen = payloadSize;
-    int rc = writeFull(fd, &rh, sizeof(rh));
-    if (rc != 0) return rc;
-    if (payloadSize > 0) {
-        rc = writeFull(fd, payload, payloadSize);
-        if (rc != 0) return rc;
-    }
-    return 0;
-}
-
 /// Parse client_id string from payload after fixed-size request struct.
 /// Sets outEnd to the byte offset after client_id (for subsequent fields).
 static std::string parseClientId(const std::vector<uint8_t> &payload,
@@ -253,9 +182,18 @@ static std::string parseClientId(const std::vector<uint8_t> &payload,
     if (idLen == 0 || fixedSize + 2 + idLen > payload.size()) {
         return "";
     }
+    // Reject oversized client_id that would be truncated in Allocation::clientId
+    if (idLen >= kMaxClientIdLen) {
+        return "";
+    }
+    const auto *start = payload.data() + fixedSize + 2;
+    // Reject embedded null bytes — they cause mismatch between std::string
+    // keys and null-terminated char[] stored in Allocation
+    if (std::memchr(start, '\0', idLen) != nullptr) {
+        return "";
+    }
     outEnd = fixedSize + 2 + idLen;
-    return std::string(
-        reinterpret_cast<const char *>(payload.data() + fixedSize + 2), idLen);
+    return std::string(reinterpret_cast<const char *>(start), idLen);
 }
 
 /// Parse request_id (uint64) from payload at the given offset.
@@ -290,7 +228,7 @@ void TcpServer::eventLoop() {
             if (fd == listenFd_.load()) {
                 // Accept all pending connections (non-blocking listen socket)
                 while (true) {
-                    int cfd = ::accept(fd, nullptr, nullptr);
+                    int cfd = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
                     if (cfd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         if (errno == EINTR) continue;
@@ -301,16 +239,25 @@ void TcpServer::eventLoop() {
                     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag,
                                sizeof(flag));
 
+                    // Enable TCP keepalive to detect dead remote clients
+                    setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+                    int idle = 10;  // seconds before first probe
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                    int intvl = 5;  // seconds between probes
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+                    int cnt = 3;    // failed probes before disconnect
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
                     // Safety timeout for partial reads in workers
                     struct timeval tv{};
                     tv.tv_sec = 30;
                     tv.tv_usec = 0;
                     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-                    if (activeClients_.load() >= kMaxClients) {
+                    if (activeClients_.load() >= maxClients_) {
                         logf(LogLevel::Warn,
                              "TcpServer: max clients reached (%d), rejecting",
-                             kMaxClients);
+                             maxClients_);
                         ::close(cfd);
                         continue;
                     }
@@ -380,6 +327,18 @@ void TcpServer::workerLoop() {
 }
 
 void TcpServer::removeClient(int fd) {
+    // Guard against double-close: only proceed if fd was in connectedFds_.
+    // This prevents closing an fd that was already removed (and potentially
+    // reassigned to a new connection by the kernel).
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lk(fdSetMutex_);
+        removed = connectedFds_.erase(fd) > 0;
+    }
+    if (!removed) {
+        return;
+    }
+
     // Notify PoolManager of client disconnect before closing
     {
         std::lock_guard<std::mutex> lk(fdClientMutex_);
@@ -391,25 +350,29 @@ void TcpServer::removeClient(int fd) {
     }
 
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
-    {
-        std::lock_guard<std::mutex> lk(fdSetMutex_);
-        connectedFds_.erase(fd);
-    }
     ::close(fd);
     int remaining = activeClients_.fetch_sub(1) - 1;
     logf(LogLevel::Debug, "[CONN] client disconnected fd=%d (active=%d)",
          fd, remaining);
 }
 
-void TcpServer::trackClientId(int fd, const std::string &clientId) {
-    if (clientId.empty()) return;
+bool TcpServer::trackClientId(int fd, const std::string &clientId) {
+    if (clientId.empty()) return false;
     std::lock_guard<std::mutex> lk(fdClientMutex_);
-    auto it = fdClientMap_.find(fd);
-    if (it == fdClientMap_.end()) {
+    auto [it, inserted] = fdClientMap_.emplace(fd, clientId);
+    if (inserted) {
         // First request on this connection — record and cancel any pending grace period
-        fdClientMap_[fd] = clientId;
         pm_.clientReconnected(clientId);
+        return true;
     }
+    // Connection already has a pinned client_id — reject if different
+    if (it->second != clientId) {
+        logf(LogLevel::Warn,
+             "fd=%d client_id mismatch: pinned='%s', received='%s' — rejected",
+             fd, it->second.c_str(), clientId.c_str());
+        return false;
+    }
+    return true;
 }
 
 // =============================================================================
@@ -472,12 +435,14 @@ void TcpServer::cacheInsert(const std::string &clientId,
         idempotencyCache_.erase(cacheOrder_.front());
         cacheOrder_.pop_front();
     }
-    auto &entry = idempotencyCache_[key];
-    entry.type = type;
-    entry.payload.assign(static_cast<const uint8_t *>(payload),
-                          static_cast<const uint8_t *>(payload) + payloadSize);
-    entry.insertedAt = SteadyClock::now();
-    cacheOrder_.push_back(key);
+    auto [it, inserted] = idempotencyCache_.emplace(key, CachedResponse{});
+    it->second.type = type;
+    it->second.payload.assign(static_cast<const uint8_t *>(payload),
+                               static_cast<const uint8_t *>(payload) + payloadSize);
+    it->second.insertedAt = SteadyClock::now();
+    if (inserted) {
+        cacheOrder_.push_back(key);
+    }
 }
 
 // =============================================================================
@@ -526,7 +491,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
         }
-        trackClientId(clientFd, cid);
+        if (!trackClientId(clientFd, cid)) {
+            sendError(clientFd, -EPERM, "client_id mismatch on connection");
+            return false;  // close connection
+        }
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache
@@ -558,7 +526,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
         }
-        trackClientId(clientFd, cid);
+        if (!trackClientId(clientFd, cid)) {
+            sendError(clientFd, -EPERM, "client_id mismatch on connection");
+            return false;  // close connection
+        }
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache
@@ -592,7 +563,16 @@ bool TcpServer::handleOneRequest(int clientFd) {
         GetAccessReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        RequestContext ctx{""};
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, sizeof(GetAccessReq), cidEnd);
+        if (!cid.empty()) {
+            if (!trackClientId(clientFd, cid)) {
+                sendError(clientFd, -EPERM, "client_id mismatch on connection");
+                return false;
+            }
+        }
+
+        RequestContext ctx{cid};
         auto result = handler_.handleGetAccess(req, ctx);
         if (result.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid auth token");

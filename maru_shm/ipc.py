@@ -263,21 +263,32 @@ class FreeResp:
         return cls(status=status)
 
 
-# GetAccessReq: Handle(32) = 32 bytes
+# GetAccessReq: Handle(32) + optional client_id (u16 len + bytes)
 @dataclass
 class GetAccessReq:
     """Get access info request payload."""
 
     handle: MaruHandle | None = None
+    client_id: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return h.pack()
+        fixed = h.pack()
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        return fixed
 
     @classmethod
     def unpack(cls, data: bytes) -> "GetAccessReq":
         handle = MaruHandle.unpack(data)
-        return cls(handle=handle)
+        client_id = ""
+        offset = 32  # Handle size
+        if len(data) > offset + 2:
+            (id_len,) = struct.unpack_from("<H", data, offset)
+            if id_len > 0 and offset + 2 + id_len <= len(data):
+                client_id = data[offset + 2 : offset + 2 + id_len].decode("utf-8")
+        return cls(handle=handle, client_id=client_id)
 
 
 # GetAccessResp: status(i32) + pathLen(u32) + path + offset(u64) + length(u64)

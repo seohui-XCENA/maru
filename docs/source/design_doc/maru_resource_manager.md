@@ -143,7 +143,7 @@ The server is configured via CLI arguments. On startup, the resource manager wri
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--host`, `-H` | `0.0.0.0` | TCP bind address |
+| `--host`, `-H` | `127.0.0.1` | TCP bind address (use `0.0.0.0` for remote access — see security note below) |
 | `--port`, `-p` | `9850` | TCP port |
 | `--state-dir`, `-d` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
 | `--log-level`, `-l` | `info` | Log level: `debug`, `info`, `warn`, `error` |
@@ -162,10 +162,14 @@ To customize options, use `sudo systemctl edit maru-resource-manager` and overri
 ### Direct mode (development/debugging)
 
 ```bash
-maru-resource-manager --host 0.0.0.0 --port 9850 \
+maru-resource-manager --host 127.0.0.1 --port 9850 \
                       --state-dir /var/lib/maru \
                       --log-level debug
 ```
+
+> **Security note:** The default bind address is `127.0.0.1` (local-only). When binding to
+> `0.0.0.0` for multi-node deployments, auth tokens and device paths are transmitted in
+> plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) to protect the traffic.
 
 ### RM address propagation
 

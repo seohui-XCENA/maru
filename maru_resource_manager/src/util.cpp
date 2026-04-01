@@ -8,9 +8,12 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <mutex>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <vector>
 
+#include "log.h"
 #include "util.h"
 
 namespace maru {
@@ -56,8 +59,8 @@ uint64_t nowSec() {
 }
 
 static constexpr size_t kSecretLen = 32;
+static std::once_flag g_secretOnce;
 static std::string g_hmacSecret;
-static bool g_secretInitialized = false;
 
 static bool secureRandomFill(void *buf, size_t len) {
   return RAND_bytes(static_cast<unsigned char *>(buf), static_cast<int>(len)) ==
@@ -99,36 +102,36 @@ static bool saveSecretToFile(const std::string &stateDir,
 }
 
 int initSecret(const std::string &stateDir, bool hasExistingAllocations) {
-  if (g_secretInitialized) {
-    return 0;
-  }
+  int result = 0;
+  std::call_once(g_secretOnce, [&] {
+    std::string secretPath = stateDir + "/secret";
 
-  std::string secretPath = stateDir + "/secret";
+    if (loadSecretFromFile(secretPath)) {
+      return;
+    }
 
-  if (loadSecretFromFile(secretPath)) {
-    g_secretInitialized = true;
-    return 0;
-  }
+    // Secret file not found or invalid
+    if (hasExistingAllocations) {
+      // Cannot recover - existing allocations need the old secret
+      result = -ENOKEY;
+      return;
+    }
 
-  // Secret file not found or invalid
-  if (hasExistingAllocations) {
-    // Cannot recover - existing allocations need the old secret
-    return -ENOKEY;
-  }
+    // No existing allocations - safe to generate new secret
+    g_hmacSecret = generateRandomSecret();
+    if (g_hmacSecret.empty()) {
+      result = -EIO; // RAND_bytes failed
+      return;
+    }
 
-  // No existing allocations - safe to generate new secret
-  g_hmacSecret = generateRandomSecret();
-  if (g_hmacSecret.empty()) {
-    return -EIO; // RAND_bytes failed
-  }
-
-  if (!saveSecretToFile(stateDir, secretPath)) {
-    // Failed to persist, but secret is valid in memory
-    // Log warning but continue
-  }
-
-  g_secretInitialized = true;
-  return 0;
+    if (!saveSecretToFile(stateDir, secretPath)) {
+      logf(LogLevel::Warn,
+           "Failed to persist HMAC secret to %s/secret — "
+           "existing allocations will become invalid after restart",
+           stateDir.c_str());
+    }
+  });
+  return result;
 }
 
 static const std::string &getHmacSecret() {
@@ -136,29 +139,35 @@ static const std::string &getHmacSecret() {
   return g_hmacSecret;
 }
 
-uint64_t computeAuthToken(const Handle &h, uint64_t nonce) {
+uint64_t computeAuthToken(const Handle &h, uint64_t nonce,
+                          const std::string &clientId) {
   unsigned char hmacResult[EVP_MAX_MD_SIZE];
   unsigned int hmacLen = 0;
 
-  // Calculate required buffer size based on actual field sizes
-  constexpr size_t kDataLen =
+  // Fixed fields: regionId + offset + length + nonce
+  constexpr size_t kFixedLen =
       sizeof(h.regionId) + sizeof(h.offset) + sizeof(h.length) + sizeof(nonce);
-  unsigned char data[kDataLen];
-  std::memset(data, 0, sizeof(data));
+  // Include clientId in HMAC input to bind token to the allocating client,
+  // preventing identity spoofing after UDS→TCP migration (no SO_PEERCRED).
+  const size_t totalLen = kFixedLen + clientId.size();
+  std::vector<unsigned char> data(totalLen);
 
-  // Concatenate fields instead of XOR for stronger uniqueness
   size_t off = 0;
-  std::memcpy(data + off, &h.regionId, sizeof(h.regionId));
+  std::memcpy(data.data() + off, &h.regionId, sizeof(h.regionId));
   off += sizeof(h.regionId);
-  std::memcpy(data + off, &h.offset, sizeof(h.offset));
+  std::memcpy(data.data() + off, &h.offset, sizeof(h.offset));
   off += sizeof(h.offset);
-  std::memcpy(data + off, &h.length, sizeof(h.length));
+  std::memcpy(data.data() + off, &h.length, sizeof(h.length));
   off += sizeof(h.length);
-  std::memcpy(data + off, &nonce, sizeof(nonce));
+  std::memcpy(data.data() + off, &nonce, sizeof(nonce));
+  off += sizeof(nonce);
+  if (!clientId.empty()) {
+    std::memcpy(data.data() + off, clientId.data(), clientId.size());
+  }
 
   const std::string &secret = getHmacSecret();
   HMAC(EVP_sha256(), reinterpret_cast<const unsigned char *>(secret.data()),
-       secret.size(), data, sizeof(data), hmacResult, &hmacLen);
+       secret.size(), data.data(), data.size(), hmacResult, &hmacLen);
 
   uint64_t token = 0;
   std::memcpy(&token, hmacResult, sizeof(uint64_t));

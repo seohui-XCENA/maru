@@ -13,7 +13,7 @@ sudo systemctl start maru-resource-manager
 **Development/debugging** — run directly with custom options:
 
 ```bash
-# Default (0.0.0.0:9850)
+# Default (127.0.0.1:9850)
 sudo maru-resource-manager --log-level debug
 
 # Custom port

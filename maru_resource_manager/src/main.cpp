@@ -21,11 +21,13 @@ static void onSignal(int) { gStop = 1; }
 static void onRescan(int) { gRescan = 1; }
 
 struct ServerConfig {
-    std::string host = "0.0.0.0";
+    std::string host = "127.0.0.1";
     uint16_t port = 9850;
     std::string stateDir = "/var/lib/maru-resourced";
     maru::LogLevel logLevel = maru::LogLevel::Info;
     int numWorkers = 32;
+    int gracePeriodSec = 30;
+    int maxClients = 256;
 };
 
 static void writeConfigFile(const ServerConfig &cfg) {
@@ -65,11 +67,13 @@ static void printUsage(const char *prog) {
         "Usage: %s [OPTIONS]\n\n"
         "Maru Resource Manager — CXL/DAX shared memory pool server.\n\n"
         "Options:\n"
-        "  -H, --host ADDR           TCP bind address (default: 0.0.0.0)\n"
+        "  -H, --host ADDR           TCP bind address (default: 127.0.0.1)\n"
         "  -p, --port PORT           TCP port (default: 9850)\n"
         "  -d, --state-dir PATH      State directory for WAL/metadata (default: /var/lib/maru-resourced)\n"
         "  -l, --log-level LEVEL     Log level: debug, info, warn, error (default: info)\n"
         "  -w, --num-workers N       Worker thread pool size (default: 32)\n"
+        "  -g, --grace-period SEC    Disconnect grace period in seconds (default: 30)\n"
+        "  -m, --max-clients N       Maximum concurrent client connections (default: 256)\n"
         "  -h, --help                Show this help\n",
         prog);
 }
@@ -82,12 +86,14 @@ static ServerConfig parseArgs(int argc, char **argv) {
         {"state-dir",    required_argument, nullptr, 'd'},
         {"log-level",    required_argument, nullptr, 'l'},
         {"num-workers",  required_argument, nullptr, 'w'},
+        {"grace-period", required_argument, nullptr, 'g'},
+        {"max-clients",  required_argument, nullptr, 'm'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': {
@@ -108,6 +114,24 @@ static ServerConfig parseArgs(int argc, char **argv) {
                 std::exit(1);
             }
             cfg.numWorkers = w;
+            break;
+        }
+        case 'g': {
+            int g = std::atoi(optarg);
+            if (g < 0) {
+                std::fprintf(stderr, "invalid grace-period: %s (must be >= 0)\n", optarg);
+                std::exit(1);
+            }
+            cfg.gracePeriodSec = g;
+            break;
+        }
+        case 'm': {
+            int m = std::atoi(optarg);
+            if (m <= 0) {
+                std::fprintf(stderr, "invalid max-clients: %s (must be >= 1)\n", optarg);
+                std::exit(1);
+            }
+            cfg.maxClients = m;
             break;
         }
         case 'h': printUsage(argv[0]); std::exit(0);
@@ -133,6 +157,8 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "  state dir  : %s", cfg.stateDir.c_str());
     maru::logf(maru::LogLevel::Info, "  log level  : %s", maru::logLevelStr(cfg.logLevel));
     maru::logf(maru::LogLevel::Info, "  workers    : %d", cfg.numWorkers);
+    maru::logf(maru::LogLevel::Info, "  grace period: %ds", cfg.gracePeriodSec);
+    maru::logf(maru::LogLevel::Info, "  max clients : %d", cfg.maxClients);
 
     // Signal handlers
     std::signal(SIGINT, onSignal);
@@ -141,14 +167,14 @@ int main(int argc, char **argv) {
     std::signal(SIGPIPE, SIG_IGN);
 
     // Initialize components with explicit config injection
-    maru::PoolManager pm(cfg.stateDir);
+    maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec);
     int rc = pm.loadPools();
     if (rc != 0) {
         maru::logf(maru::LogLevel::Warn,
                     "no CXL/DAX devices found — starting with empty pool");
     }
 
-    maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers);
+    maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers, cfg.maxClients);
     rc = server.start();
     if (rc != 0) {
         if (rc == -EADDRINUSE) {

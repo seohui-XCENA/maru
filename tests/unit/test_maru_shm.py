@@ -253,11 +253,21 @@ class TestFreeReqResp:
 class TestGetAccessReqResp:
     def test_get_access_req_roundtrip(self):
         h = MaruHandle(region_id=7, offset=100, length=500, auth_token=42)
-        req = GetAccessReq(handle=h)
+        req = GetAccessReq(handle=h, client_id="host-a:1234")
         data = req.pack()
         req2 = GetAccessReq.unpack(data)
         assert req2.handle.region_id == 7
         assert req2.handle.offset == 100
+        assert req2.client_id == "host-a:1234"
+
+    def test_get_access_req_no_client_id(self):
+        """GetAccessReq without client_id is backward-compatible."""
+        h = MaruHandle(region_id=7, offset=100, length=500, auth_token=42)
+        req = GetAccessReq(handle=h)
+        data = req.pack()
+        req2 = GetAccessReq.unpack(data)
+        assert req2.handle.region_id == 7
+        assert req2.client_id == ""
 
     def test_get_access_resp_roundtrip(self):
         resp = GetAccessResp(status=0, device_path="/dev/dax0.0", offset=0, length=4096)
@@ -441,10 +451,11 @@ class TestIPCNoneDefaults:
 
     def test_get_access_req_none_handle(self):
         """GetAccessReq with handle=None uses default MaruHandle."""
-        req = GetAccessReq(handle=None)
+        req = GetAccessReq(handle=None, client_id="host:1")
         data = req.pack()
         req2 = GetAccessReq.unpack(data)
         assert req2.handle.region_id == 0
+        assert req2.client_id == "host:1"
 
     def test_alloc_resp_none_handle(self):
         """AllocResp with handle=None uses default MaruHandle."""

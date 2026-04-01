@@ -108,7 +108,7 @@ Available CLI options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--host`, `-H` | `0.0.0.0` | TCP bind address |
+| `--host`, `-H` | `127.0.0.1` | TCP bind address (use `0.0.0.0` for remote access — see security note below) |
 | `--port`, `-p` | `9850` | TCP port |
 | `--state-dir`, `-d` | `/var/lib/maru-resourced` | State directory for WAL and metadata |
 | `--log-level`, `-l` | `info` | Log level: `debug`, `info`, `warn`, `error` |

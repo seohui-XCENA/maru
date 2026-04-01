@@ -108,7 +108,9 @@ class MaruShmClient:
         try:
             sock.settimeout(5.0)  # 5s connect timeout
             sock.connect((host, port))
-            sock.settimeout(None)  # restore blocking mode for RPC
+            sock.settimeout(
+                10.0
+            )  # 10s RPC timeout (prevents infinite block on server hang)
         except OSError as e:
             sock.close()
             raise ConnectionError(
@@ -117,6 +119,15 @@ class MaruShmClient:
                 f"Start it first: maru-resource-manager "
                 f"--host {host} --port {port}"
             ) from e
+
+        # Warn when connecting to a remote host over plaintext TCP
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(
+                "Connecting to remote host %s over PLAINTEXT TCP. "
+                "Auth tokens will be transmitted without encryption. "
+                "Use an encrypted tunnel for production deployments.",
+                host,
+            )
 
         # Disable Nagle for low-latency RPC
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -253,7 +264,7 @@ class MaruShmClient:
 
     def _request_access(self, handle: MaruHandle) -> GetAccessResp:
         """Request access info from the resource manager via GET_ACCESS_REQ."""
-        req = GetAccessReq(handle=handle)
+        req = GetAccessReq(handle=handle, client_id=self._client_id)
         hdr, payload = self._rpc(MsgType.GET_ACCESS_REQ, req.pack())
         self._check_error(hdr, payload, "GetAccess failed")
 

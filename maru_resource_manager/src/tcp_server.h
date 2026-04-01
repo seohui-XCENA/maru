@@ -21,7 +21,7 @@ namespace maru {
 class TcpServer {
 public:
     TcpServer(PoolManager &pm, const std::string &host, uint16_t port,
-              int numWorkers = 32);
+              int numWorkers = 32, int maxClients = 256);
     ~TcpServer();
 
     int start();
@@ -60,12 +60,16 @@ private:
     std::mutex fdSetMutex_;
     std::unordered_set<int> connectedFds_;
 
-    // Map fd -> client_id for disconnect notification
+    // Map fd -> client_id for disconnect notification and identity pinning.
+    // Once a connection sends its first client_id, it is pinned — subsequent
+    // requests on the same connection must use the same client_id.
     std::mutex fdClientMutex_;
     std::unordered_map<int, std::string> fdClientMap_;
-    void trackClientId(int fd, const std::string &clientId);
+    /// Pin client_id to this fd. Returns false if a different client_id was
+    /// already pinned (identity spoofing attempt).
+    bool trackClientId(int fd, const std::string &clientId);
 
-    static constexpr int kMaxClients = 256;
+    int maxClients_;
     std::atomic<int> activeClients_{0};
 
     // Idempotency cache for alloc/free requests.

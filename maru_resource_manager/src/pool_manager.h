@@ -51,17 +51,17 @@ class WalStore;
 class PoolManager
 {
 public:
-    explicit PoolManager(const std::string &stateDir);
+    explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30);
     ~PoolManager();
 
     const std::string &stateDir() const { return stateDir_; }
+    int gracePeriodSec() const { return gracePeriodSec_; }
     uint32_t allocationCount() const;
 
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
               std::string &devPath, uint32_t poolId, uint64_t &requestedSizeOut);
-    int free(const Handle &handle, const std::string &clientId);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.
     int verifyAndFree(const Handle &handle, const std::string &clientId);
@@ -79,9 +79,6 @@ public:
     void clientDisconnected(const std::string &clientId);
     /// Notify that a client has reconnected. Cancels the grace period timer.
     void clientReconnected(const std::string &clientId);
-
-    /// Grace period before reaping a disconnected remote client's allocations.
-    static constexpr int kDisconnectGraceSec = 30;
 
 private:
     struct DeviceInfo
@@ -103,12 +100,15 @@ private:
     void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
+    /// Free without auth token verification (internal use only).
+    int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
     /// Caller MUST hold mu_.
     int doFreeAllocation(uint64_t regionId);
 
     mutable std::mutex mu_;
     std::string stateDir_;
+    int gracePeriodSec_;
     std::vector<PoolState> pools_;
     uint64_t opCount_{0};
     uint64_t checkpointInterval_{100};
