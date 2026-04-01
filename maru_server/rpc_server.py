@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""RpcServer - ZeroMQ-based RPC server for MaruServer."""
+"""RpcServer - RPC server for MaruServer.
+
+Supports two transports:
+- ZMQ (default): TCP-based, works without CXL hardware
+- CXL-RPC: shared memory slots, requires CXL DAX device
+"""
+
+from __future__ import annotations
 
 import logging
 import threading
@@ -13,6 +20,8 @@ from maru_common import MessageHeader, Serializer
 from .rpc_handler_mixin import RpcHandlerMixin
 
 if TYPE_CHECKING:
+    from maru_common.cxl_rpc import CxlRpcServerTransport
+
     from .server import MaruServer
 
 logger = logging.getLogger(__name__)
@@ -20,16 +29,27 @@ logger = logging.getLogger(__name__)
 
 class RpcServer(RpcHandlerMixin):
     """
-    ZeroMQ-based RPC server for MaruServer.
+    RPC server for MaruServer.
 
-    Handles incoming requests and dispatches them to the appropriate
-    MaruServer methods. Uses binary protocol (MessagePack).
+    Supports two transports:
+    - ZMQ (default): TCP-based REP socket
+    - CXL-RPC: CXL shared memory slot polling
+
+    Dispatches requests to RpcHandlerMixin._handle_message() regardless
+    of transport. The 13 handler methods are transport-independent.
     """
 
-    def __init__(self, server: "MaruServer", host: str = "127.0.0.1", port: int = 5555):
+    def __init__(
+        self,
+        server: "MaruServer",
+        host: str = "127.0.0.1",
+        port: int = 5555,
+        cxl_transport: CxlRpcServerTransport | None = None,
+    ):
         self._server = server
         self._host = host
         self._port = port
+        self._cxl = cxl_transport
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
         self._running = False
@@ -42,7 +62,27 @@ class RpcServer(RpcHandlerMixin):
         return f"tcp://{self._host}:{self._port}"
 
     def start(self) -> None:
-        """Start the RPC server."""
+        """Start the RPC server using the configured transport."""
+        if self._cxl is not None:
+            self._start_cxl()
+        else:
+            self._start_zmq()
+
+    def _start_cxl(self) -> None:
+        """Start CXL-RPC server loop."""
+        self._running = True
+        logger.info("RPC Server started (CXL-RPC transport)")
+
+        def handler(channel_id: int, seq: int, raw_request: bytes) -> bytes:
+            header, request = self._serializer.decode_request(raw_request)
+            response = self._handle_message(header.msg_type, request)
+            return self._serializer.encode_response(header, response)
+
+        self._cxl.run_loop(handler)
+        self._stopped_event.set()
+
+    def _start_zmq(self) -> None:
+        """Start ZMQ server loop (existing behavior)."""
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REP)
         self._socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout to check _running
@@ -96,6 +136,8 @@ class RpcServer(RpcHandlerMixin):
     def stop(self) -> None:
         """Stop the RPC server."""
         self._running = False
+        if self._cxl is not None:
+            self._cxl.stop()
         # Wait for server loop to exit (it checks _running every 100ms)
         self._stopped_event.wait(timeout=2.0)
         if self._socket:
