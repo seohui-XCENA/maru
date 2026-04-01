@@ -53,6 +53,9 @@ void printUsage(const char *prog) {
         "  -w, --num-workers N       Worker thread pool size (default: 32)\n"
         "  -g, --grace-period SEC    Disconnect grace period in seconds (default: 30)\n"
         "  -m, --max-clients N       Maximum concurrent client connections (default: 256)\n"
+        "  -t, --transport MODE      Transport: tcp or cxl-rpc (default: tcp)\n"
+        "      --dax-path PATH       DAX device path (required for cxl-rpc transport)\n"
+        "      --max-channels N      Max CXL-RPC channels (default: 64)\n"
         "  -h, --help                Show this help\n",
         prog);
 }
@@ -67,12 +70,15 @@ ServerConfig parseArgs(int argc, char **argv) {
         {"num-workers",  required_argument, nullptr, 'w'},
         {"grace-period", required_argument, nullptr, 'g'},
         {"max-clients",  required_argument, nullptr, 'm'},
+        {"transport",    required_argument, nullptr, 't'},
+        {"dax-path",     required_argument, nullptr, 'D'},
+        {"max-channels", required_argument, nullptr, 'C'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:t:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': {
@@ -113,10 +119,35 @@ ServerConfig parseArgs(int argc, char **argv) {
             cfg.maxClients = m;
             break;
         }
+        case 't': {
+            std::string t = optarg;
+            if (t != "tcp" && t != "cxl-rpc") {
+                std::fprintf(stderr, "invalid transport: %s (must be 'tcp' or 'cxl-rpc')\n", optarg);
+                std::exit(1);
+            }
+            cfg.transport = t;
+            break;
+        }
+        case 'D': cfg.daxPath = optarg; break;
+        case 'C': {
+            int c = std::atoi(optarg);
+            if (c <= 0) {
+                std::fprintf(stderr, "invalid max-channels: %s (must be >= 1)\n", optarg);
+                std::exit(1);
+            }
+            cfg.maxChannels = c;
+            break;
+        }
         case 'h': printUsage(argv[0]); std::exit(0);
         default:  printUsage(argv[0]); std::exit(1);
         }
     }
+
+    if (cfg.transport == "cxl-rpc" && cfg.daxPath.empty()) {
+        std::fprintf(stderr, "error: --dax-path is required for cxl-rpc transport\n");
+        std::exit(1);
+    }
+
     return cfg;
 }
 

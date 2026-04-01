@@ -4,8 +4,10 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <thread>
 
+#include "cxl_rpc_server.h"
 #include "log.h"
 #include "pool_manager.h"
 #include "reaper.h"
@@ -37,6 +39,7 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "  workers    : %d", cfg.numWorkers);
     maru::logf(maru::LogLevel::Info, "  grace period: %ds", cfg.gracePeriodSec);
     maru::logf(maru::LogLevel::Info, "  max clients : %d", cfg.maxClients);
+    maru::logf(maru::LogLevel::Info, "  transport  : %s", cfg.transport.c_str());
 
     // Signal handlers
     std::signal(SIGINT, onSignal);
@@ -52,28 +55,44 @@ int main(int argc, char **argv) {
                     "no CXL/DAX devices found — starting with empty pool");
     }
 
-    maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers, cfg.maxClients);
-    rc = server.start();
-    if (rc != 0) {
-        if (rc == -EADDRINUSE) {
+    // Start server transport based on config
+    std::unique_ptr<maru::TcpServer> tcpServer;
+    std::unique_ptr<maru::CxlRpcServer> cxlServer;
+
+    if (cfg.transport == "cxl-rpc") {
+        cxlServer = std::make_unique<maru::CxlRpcServer>(
+            pm, cfg.daxPath, cfg.maxChannels);
+        rc = cxlServer->start();
+        if (rc != 0) {
             maru::logf(maru::LogLevel::Error,
-                        "port %u is already in use — "
-                        "another maru-resource-manager may be running. "
-                        "Use --port to specify a different port.",
-                        cfg.port);
-        } else {
-            maru::logf(maru::LogLevel::Error,
-                        "failed to start server on %s:%u: %s",
-                        cfg.host.c_str(), cfg.port, std::strerror(-rc));
+                        "failed to start CXL-RPC server on %s: %s",
+                        cfg.daxPath.c_str(), std::strerror(-rc));
+            return 1;
         }
-        return 1;
+    } else {
+        tcpServer = std::make_unique<maru::TcpServer>(
+            pm, cfg.host, cfg.port, cfg.numWorkers, cfg.maxClients);
+        rc = tcpServer->start();
+        if (rc != 0) {
+            if (rc == -EADDRINUSE) {
+                maru::logf(maru::LogLevel::Error,
+                            "port %u is already in use — "
+                            "another maru-resource-manager may be running. "
+                            "Use --port to specify a different port.",
+                            cfg.port);
+            } else {
+                maru::logf(maru::LogLevel::Error,
+                            "failed to start server on %s:%u: %s",
+                            cfg.host.c_str(), cfg.port, std::strerror(-rc));
+            }
+            return 1;
+        }
+        maru::logf(maru::LogLevel::Info, "ready — listening on %s:%u",
+                    cfg.host.c_str(), cfg.port);
     }
 
     maru::Reaper reaper(pm);
     reaper.start();
-
-    maru::logf(maru::LogLevel::Info, "ready — listening on %s:%u",
-               cfg.host.c_str(), cfg.port);
 
     // Main loop — runs until SIGINT/SIGTERM
     while (!gStop) {
@@ -88,7 +107,8 @@ int main(int argc, char **argv) {
     // Graceful shutdown
     maru::logf(maru::LogLevel::Info, "shutting down...");
     reaper.stop();
-    server.stop();
+    if (tcpServer) tcpServer->stop();
+    if (cxlServer) cxlServer->stop();
     pm.checkpoint();
     maru::logf(maru::LogLevel::Info, "shutdown complete");
     return 0;

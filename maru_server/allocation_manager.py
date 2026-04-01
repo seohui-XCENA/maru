@@ -2,12 +2,18 @@
 # Copyright 2026 XCENA Inc.
 """Allocation Manager - Server-side memory allocation lifecycle management."""
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from maru_common.protocol import ANY_POOL_ID
 from maru_shm import MaruHandle, MaruShmClient
+
+if TYPE_CHECKING:
+    from maru_common.cxl_rpc import CxlRpcClientTransport
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +31,15 @@ class AllocationInfo:
 class AllocationManager:
     """Manages memory allocation lifecycle."""
 
-    def __init__(self, rm_address: str | None = None):
-        self._client = MaruShmClient(address=rm_address)
+    def __init__(
+        self,
+        rm_address: str | None = None,
+        cxl_transport: CxlRpcClientTransport | None = None,
+    ):
+        if cxl_transport is not None:
+            self._client = MaruShmClient(transport=cxl_transport)
+        else:
+            self._client = MaruShmClient(address=rm_address)
         if not self._client.is_running():
             addr = rm_address or "127.0.0.1:9850"
             raise ConnectionError(

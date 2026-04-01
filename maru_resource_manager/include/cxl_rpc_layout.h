@@ -102,7 +102,7 @@ struct Channel {
     uint8_t       reqPayload[PAYLOAD_MAX];    // [128, 4224)
     ControlSlot   respCtl;                    // [4224, 4288)
     uint8_t       respPayload[PAYLOAD_MAX];   // [4288, 8384)
-} __attribute__((packed));
+};
 
 /* =========================================================================
  * Compile-time assertions — catch layout mismatches at build time

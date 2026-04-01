@@ -15,6 +15,9 @@ struct ServerConfig {
     int numWorkers = 32;
     int gracePeriodSec = 30;
     int maxClients = 256;
+    std::string transport = "tcp";  // "tcp" or "cxl-rpc"
+    std::string daxPath;            // CXL-RPC mode: DAX device path
+    int maxChannels = 64;           // CXL-RPC mode: max RPC channels
 };
 
 ServerConfig parseArgs(int argc, char **argv);

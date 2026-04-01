@@ -19,11 +19,12 @@ add_executable(maru_resource_manager
     src/reaper.cpp
     src/request_handler.cpp
     src/tcp_server.cpp
+    src/cxl_rpc_server.cpp
 )
 
 target_include_directories(maru_resource_manager PRIVATE include src)
 
-target_compile_options(maru_resource_manager PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(maru_resource_manager PRIVATE -Wall -Wextra -Wpedantic -msse2)
 
 target_link_libraries(maru_resource_manager PRIVATE pthread OpenSSL::Crypto)
 
