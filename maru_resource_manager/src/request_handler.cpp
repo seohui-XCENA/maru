@@ -16,7 +16,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     std::string devPath;
     uint64_t requestedSize = 0;
     int32_t status =
-        pm_.alloc(req.size, ctx.client_id, handle, devPath, req.poolId, requestedSize);
+        pm_.alloc(req.size, ctx.client_id, handle, devPath, ctx.dax_path, requestedSize);
 
     result.resp.status = status;
     result.resp.handle = handle;
@@ -26,18 +26,18 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
 
     if (status == 0) {
         logf(LogLevel::Debug,
-             "[ALLOC] client=%s, size=%llu, pool_id=%u -> region_id=%llu, path=%s",
+             "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s",
              ctx.client_id.c_str(),
              (unsigned long long)req.size,
-             req.poolId,
+             ctx.dax_path.c_str(),
              (unsigned long long)handle.regionId,
              devPath.c_str());
     } else {
         logf(LogLevel::Warn,
-             "[ALLOC] client=%s, size=%llu, pool_id=%u -> FAILED (status=%d)",
+             "[ALLOC] client=%s, size=%llu, pool=%s -> FAILED (status=%d)",
              ctx.client_id.c_str(),
              (unsigned long long)req.size,
-             req.poolId,
+             ctx.dax_path.c_str(),
              status);
     }
 
@@ -106,7 +106,7 @@ StatsResult RequestHandler::handleStats() {
 
     for (const auto &p : pools) {
         PoolInfo pi{};
-        pi.poolId = p.poolId;
+        pi.devPathLen = static_cast<uint32_t>(p.devPath.size());
         pi.type = p.type;
         pi.totalSize = p.totalSize;
         pi.freeSize = p.freeSize;
@@ -115,6 +115,8 @@ StatsResult RequestHandler::handleStats() {
         size_t old = result.payload.size();
         result.payload.resize(old + sizeof(pi));
         std::memcpy(result.payload.data() + old, &pi, sizeof(pi));
+        // Append device path bytes immediately after the fixed struct
+        result.payload.insert(result.payload.end(), p.devPath.begin(), p.devPath.end());
     }
 
     return result;

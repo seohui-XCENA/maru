@@ -15,7 +15,6 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from .constants import ANY_POOL_ID
 from .types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants
@@ -96,7 +95,7 @@ class MsgHeader:
 # Request / Response payloads
 # =============================================================================
 
-# AllocReq: size(u64) + pool_id(u32) + reserved(u32) = 16 bytes
+# AllocReq: size(u64) + daxPathLen(u32) + reserved(u32) = 16 bytes
 _ALLOC_REQ_FORMAT = "<QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
@@ -106,13 +105,17 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    pool_id: int = ANY_POOL_ID
+    dax_path: str = ""  # "" = any pool
     reserved: int = 0
     client_id: str = ""
     request_id: int = 0
 
     def pack(self) -> bytes:
-        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
+        path_bytes = self.dax_path.encode("utf-8")
+        fixed = struct.pack(
+            _ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved
+        )
+        fixed += path_bytes  # pool path BEFORE client_id
         id_bytes = self.client_id.encode("utf-8")
         fixed += struct.pack("<H", len(id_bytes)) + id_bytes
         fixed += struct.pack("<Q", self.request_id)
@@ -122,11 +125,20 @@ class AllocReq:
     def unpack(cls, data: bytes) -> "AllocReq":
         if len(data) < _ALLOC_REQ_SIZE:
             raise ValueError(f"AllocReq too short: {len(data)} < {_ALLOC_REQ_SIZE}")
-        size, pool_id, reserved = struct.unpack(
+        size, dax_path_len, reserved = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
-        client_id = ""
         off = _ALLOC_REQ_SIZE
+        dax_path = ""
+        if dax_path_len > 0:
+            if off + dax_path_len > len(data):
+                raise ValueError(
+                    f"AllocReq dax_path truncated: need {dax_path_len} bytes at "
+                    f"offset {off}, only {len(data) - off} available"
+                )
+            dax_path = data[off : off + dax_path_len].decode("utf-8")
+            off += dax_path_len
+        client_id = ""
         if off + 2 <= len(data):
             (id_len,) = struct.unpack("<H", data[off : off + 2])
             off += 2
@@ -138,7 +150,7 @@ class AllocReq:
             (request_id,) = struct.unpack("<Q", data[off : off + 8])
         return cls(
             size=size,
-            pool_id=pool_id,
+            dax_path=dax_path,
             reserved=reserved,
             client_id=client_id,
             request_id=request_id,
@@ -158,7 +170,7 @@ class AllocResp:
     status: int = 0
     handle: MaruHandle | None = None
     requested_size: int = 0
-    device_path: str = ""
+    dax_path: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
@@ -172,7 +184,7 @@ class AllocResp:
             h.auth_token,
             self.requested_size,
         )
-        path_bytes = self.device_path.encode("utf-8")
+        path_bytes = self.dax_path.encode("utf-8")
         path_header = struct.pack("<I", len(path_bytes))
         return fixed + path_header + path_bytes
 
@@ -187,19 +199,19 @@ class AllocResp:
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
         requested_size = vals[6]
-        # Parse optional device_path extension
-        device_path = ""
+        # Parse optional dax_path extension
+        dax_path = ""
         offset = _ALLOC_RESP_SIZE
         if offset + 4 <= len(data):
             (path_len,) = struct.unpack("<I", data[offset : offset + 4])
             offset += 4
             if path_len > 0 and offset + path_len <= len(data):
-                device_path = data[offset : offset + path_len].decode("utf-8")
+                dax_path = data[offset : offset + path_len].decode("utf-8")
         return cls(
             status=status,
             handle=handle,
             requested_size=requested_size,
-            device_path=device_path,
+            dax_path=dax_path,
         )
 
 
@@ -301,12 +313,12 @@ class GetAccessResp:
     """Get access info response — device path, offset, length."""
 
     status: int = 0
-    device_path: str = ""
+    dax_path: str = ""
     offset: int = 0
     length: int = 0
 
     def pack(self) -> bytes:
-        path_bytes = self.device_path.encode("utf-8")
+        path_bytes = self.dax_path.encode("utf-8")
         header = struct.pack(
             _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
         )
@@ -321,15 +333,15 @@ class GetAccessResp:
             _GET_ACCESS_RESP_HEADER_FORMAT, data[:_GET_ACCESS_RESP_HEADER_SIZE]
         )
         off = _GET_ACCESS_RESP_HEADER_SIZE
-        device_path = ""
+        dax_path = ""
         if path_len > 0 and off + path_len <= len(data):
-            device_path = data[off : off + path_len].decode("utf-8")
+            dax_path = data[off : off + path_len].decode("utf-8")
             off += path_len
         offset = 0
         length = 0
         if off + 16 <= len(data):
             offset, length = struct.unpack("<QQ", data[off : off + 16])
-        return cls(status=status, device_path=device_path, offset=offset, length=length)
+        return cls(status=status, dax_path=dax_path, offset=offset, length=length)
 
 
 # StatsReq: empty payload (0 bytes)
@@ -349,7 +361,8 @@ class StatsReq:
 _STATS_RESP_HEADER_FORMAT = "<I"
 _STATS_RESP_HEADER_SIZE = struct.calcsize(_STATS_RESP_HEADER_FORMAT)
 
-# PoolInfo wire format for stats: pool_id(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
+# PoolInfo wire format: devPathLen(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
+# followed by devPathLen bytes of UTF-8 device path (e.g. "/dev/dax0.0")
 _STATS_POOL_FORMAT = "<IIQQQ"
 _STATS_POOL_SIZE = struct.calcsize(_STATS_POOL_FORMAT)
 
@@ -364,16 +377,18 @@ class StatsResp:
         pools = self.pools or []
         parts = [struct.pack(_STATS_RESP_HEADER_FORMAT, len(pools))]
         for p in pools:
+            path_bytes = p.dax_path.encode("utf-8")
             parts.append(
                 struct.pack(
                     _STATS_POOL_FORMAT,
-                    p.pool_id,
+                    len(path_bytes),
                     int(p.dax_type),
                     p.total_size,
                     p.free_size,
                     p.align_bytes,
                 )
             )
+            parts.append(path_bytes)
         return b"".join(parts)
 
     @classmethod
@@ -388,19 +403,25 @@ class StatsResp:
         for _ in range(num_pools):
             if offset + _STATS_POOL_SIZE > len(data):
                 raise ValueError("StatsResp truncated")
-            pool_id, dax_type, total_size, free_size, align_bytes = struct.unpack(
+            dax_path_len, dax_type, total_size, free_size, align_bytes = struct.unpack(
                 _STATS_POOL_FORMAT, data[offset : offset + _STATS_POOL_SIZE]
             )
+            offset += _STATS_POOL_SIZE
+            dax_path = ""
+            if dax_path_len > 0:
+                if offset + dax_path_len > len(data):
+                    raise ValueError("StatsResp dax_path truncated")
+                dax_path = data[offset : offset + dax_path_len].decode("utf-8")
+                offset += dax_path_len
             pools.append(
                 MaruPoolInfo(
-                    pool_id=pool_id,
+                    dax_path=dax_path,
                     dax_type=DaxType(dax_type),
                     total_size=total_size,
                     free_size=free_size,
                     align_bytes=align_bytes,
                 )
             )
-            offset += _STATS_POOL_SIZE
         return cls(pools=pools)
 
 

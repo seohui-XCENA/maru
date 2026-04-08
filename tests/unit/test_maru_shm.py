@@ -13,7 +13,6 @@ import socket
 import pytest
 
 from maru_shm.constants import (
-    ANY_POOL_ID,
     MAP_PRIVATE,
     MAP_SHARED,
     PROT_EXEC,
@@ -110,16 +109,16 @@ class TestHandle:
 class TestPoolInfo:
     def test_pack_unpack_roundtrip(self):
         p = MaruPoolInfo(
-            pool_id=1,
+            dax_path="/dev/dax1.0",
             dax_type=DaxType.FS_DAX,
             total_size=1 << 30,
             free_size=1 << 29,
             align_bytes=2 * 1024 * 1024,
         )
         data = p.pack()
-        assert len(data) == 32
+        assert len(data) == 32 + len("/dev/dax1.0")
         p2 = MaruPoolInfo.unpack(data)
-        assert p2.pool_id == 1
+        assert p2.dax_path == "/dev/dax1.0"
         assert p2.dax_type == DaxType.FS_DAX
         assert p2.total_size == 1 << 30
         assert p2.free_size == 1 << 29
@@ -127,7 +126,7 @@ class TestPoolInfo:
 
     def test_to_dict_from_dict_roundtrip(self):
         p = MaruPoolInfo(
-            pool_id=5,
+            dax_path="/dev/dax0.0",
             dax_type=DaxType.DEV_DAX,
             total_size=100,
             free_size=50,
@@ -135,7 +134,7 @@ class TestPoolInfo:
         )
         d = p.to_dict()
         p2 = MaruPoolInfo.from_dict(d)
-        assert p2.pool_id == p.pool_id
+        assert p2.dax_path == p.dax_path
         assert p2.dax_type == p.dax_type
         assert p2.total_size == p.total_size
 
@@ -204,15 +203,15 @@ class TestMsgHeader:
 
 class TestAllocReq:
     def test_roundtrip(self):
-        req = AllocReq(size=4096, pool_id=1)
+        req = AllocReq(size=4096, dax_path="/dev/dax0.0")
         data = req.pack()
         req2 = AllocReq.unpack(data)
         assert req2.size == 4096
-        assert req2.pool_id == 1
+        assert req2.dax_path == "/dev/dax0.0"
 
-    def test_default_pool_id(self):
+    def test_default_dax_path(self):
         req = AllocReq(size=1024)
-        assert req.pool_id == ANY_POOL_ID
+        assert req.dax_path == ""  # "" means any pool
 
 
 class TestAllocResp:
@@ -270,11 +269,11 @@ class TestGetAccessReqResp:
         assert req2.client_id == ""
 
     def test_get_access_resp_roundtrip(self):
-        resp = GetAccessResp(status=0, device_path="/dev/dax0.0", offset=0, length=4096)
+        resp = GetAccessResp(status=0, dax_path="/dev/dax0.0", offset=0, length=4096)
         data = resp.pack()
         resp2 = GetAccessResp.unpack(data)
         assert resp2.status == 0
-        assert resp2.device_path == "/dev/dax0.0"
+        assert resp2.dax_path == "/dev/dax0.0"
         assert resp2.offset == 0
         assert resp2.length == 4096
 
@@ -296,14 +295,14 @@ class TestStatsReqResp:
     def test_stats_resp_with_pools(self):
         pools = [
             MaruPoolInfo(
-                pool_id=0,
+                dax_path="/dev/dax0.0",
                 dax_type=DaxType.DEV_DAX,
                 total_size=1 << 30,
                 free_size=1 << 29,
                 align_bytes=2 << 20,
             ),
             MaruPoolInfo(
-                pool_id=1,
+                dax_path="/dev/dax1.0",
                 dax_type=DaxType.FS_DAX,
                 total_size=1 << 31,
                 free_size=1 << 30,
@@ -314,9 +313,9 @@ class TestStatsReqResp:
         data = resp.pack()
         resp2 = StatsResp.unpack(data)
         assert len(resp2.pools) == 2
-        assert resp2.pools[0].pool_id == 0
+        assert resp2.pools[0].dax_path == "/dev/dax0.0"
         assert resp2.pools[0].dax_type == DaxType.DEV_DAX
-        assert resp2.pools[1].pool_id == 1
+        assert resp2.pools[1].dax_path == "/dev/dax1.0"
         assert resp2.pools[1].dax_type == DaxType.FS_DAX
 
 
@@ -377,8 +376,9 @@ class TestConstants:
         assert MAP_SHARED == 0x01
         assert MAP_PRIVATE == 0x02
 
-    def test_any_pool_id(self):
-        assert ANY_POOL_ID == 0xFFFFFFFF
+    def test_any_dax_path_default(self):
+        req = AllocReq(size=1024)
+        assert req.dax_path == ""  # "" means any pool
 
 
 # =============================================================================
@@ -393,6 +393,17 @@ class TestIPCUnpackValidation:
         """Test AllocReq.unpack with data too short."""
         with pytest.raises(ValueError, match="AllocReq too short"):
             AllocReq.unpack(b"\x00" * 10)
+
+    def test_alloc_req_unpack_dax_path_truncated(self):
+        """Test AllocReq.unpack raises ValueError when dax_path bytes are truncated."""
+        import struct
+
+        # Header: size=4096, dax_path_len=10, reserved=0
+        # But only provide 5 bytes of path data instead of 10
+        header = struct.pack("<QII", 4096, 10, 0)
+        truncated_data = header + b"/dev/d"  # 6 bytes, less than dax_path_len=10
+        with pytest.raises(ValueError, match="AllocReq dax_path truncated"):
+            AllocReq.unpack(truncated_data)
 
     def test_alloc_resp_unpack_too_short(self):
         """Test AllocResp.unpack with data too short."""
@@ -477,19 +488,19 @@ class TestPoolInfoFromDictDefaults:
     """Test MaruPoolInfo.from_dict with missing optional fields."""
 
     def test_missing_dax_type_defaults_to_dev_dax(self):
-        d = {"pool_id": 1, "total_size": 1000, "free_size": 500}
+        d = {"dax_path": "/dev/dax0.0", "total_size": 1000, "free_size": 500}
         p = MaruPoolInfo.from_dict(d)
         assert p.dax_type == DaxType.DEV_DAX
 
     def test_missing_align_bytes_defaults_to_zero(self):
-        d = {"pool_id": 2, "total_size": 2000, "free_size": 1000}
+        d = {"dax_path": "/dev/dax1.0", "total_size": 2000, "free_size": 1000}
         p = MaruPoolInfo.from_dict(d)
         assert p.align_bytes == 0
 
     def test_all_optional_fields_missing(self):
-        d = {"pool_id": 3, "total_size": 3000, "free_size": 1500}
+        d = {"dax_path": "/dev/dax0.0", "total_size": 3000, "free_size": 1500}
         p = MaruPoolInfo.from_dict(d)
-        assert p.pool_id == 3
+        assert p.dax_path == "/dev/dax0.0"
         assert p.dax_type == DaxType.DEV_DAX
         assert p.align_bytes == 0
 
@@ -515,7 +526,7 @@ class TestMaruPoolInfoRepr:
     def test_pool_info_repr(self):
         """Test MaruPoolInfo.__repr__ returns expected format."""
         pool = MaruPoolInfo(
-            pool_id=5,
+            dax_path="/dev/dax0.0",
             dax_type=DaxType.FS_DAX,
             total_size=1000000,
             free_size=500000,
@@ -523,7 +534,7 @@ class TestMaruPoolInfoRepr:
         )
         repr_str = repr(pool)
         assert "<MaruPoolInfo" in repr_str
-        assert "pool_id=5" in repr_str
+        assert "dax_path=" in repr_str
         assert "dax_type=FS_DAX" in repr_str
         assert "total_size=1000000" in repr_str
         assert "free_size=500000" in repr_str

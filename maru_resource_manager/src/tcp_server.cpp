@@ -10,6 +10,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -485,8 +486,31 @@ bool TcpServer::handleOneRequest(int clientFd) {
         AllocReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
+        // Extract pool path (variable-length, before client_id)
+        std::string daxPath;
+        size_t daxPathEnd = sizeof(AllocReq);
+        if (req.daxPathLen > 0) {
+            if (req.daxPathLen > PATH_MAX) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path too long");
+                return false;
+            }
+            if (daxPathEnd + req.daxPathLen > payload.size()) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path truncated");
+                return false;
+            }
+            daxPath.assign(
+                reinterpret_cast<const char*>(payload.data()) + daxPathEnd,
+                req.daxPathLen);
+            if (std::memchr(payload.data() + daxPathEnd, '\0', req.daxPathLen) != nullptr) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path contains null byte");
+                return false;
+            }
+        }
+        daxPathEnd += req.daxPathLen;
+
+        // client_id parsing now starts at daxPathEnd (was sizeof(AllocReq))
         size_t cidEnd = 0;
-        std::string cid = parseClientId(payload, sizeof(AllocReq), cidEnd);
+        std::string cid = parseClientId(payload, daxPathEnd, cidEnd);
         if (cid.empty()) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
@@ -502,7 +526,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             return true;
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, daxPath};
         auto result = handler_.handleAlloc(req, ctx);
 
         auto respPayload = serializeAllocResp(result.resp, result.devicePath);
@@ -537,7 +561,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             return true;
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, {}};
         auto result = handler_.handleFree(req, ctx);
         if (result.resp.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid authToken");
@@ -572,7 +596,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             }
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, {}};
         auto result = handler_.handleGetAccess(req, ctx);
         if (result.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid auth token");

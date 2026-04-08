@@ -138,7 +138,6 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
-
     cfg = MaruConfig(
         server_url=server_url,
         pool_size=pool_size,
