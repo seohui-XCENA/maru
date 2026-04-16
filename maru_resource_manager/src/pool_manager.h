@@ -61,6 +61,7 @@ public:
 
     int loadPools();
     int rescanDevices();
+    int rescanIfEmpty();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
               std::string &devPath, std::string &deviceUuid,
               const std::string &daxPath, uint64_t &requestedSizeOut);

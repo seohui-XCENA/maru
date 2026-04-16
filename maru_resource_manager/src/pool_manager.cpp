@@ -565,6 +565,16 @@ int PoolManager::rescanDevices()
     return rescanDevicesLocked();
 }
 
+int PoolManager::rescanIfEmpty()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pools_.empty())
+    {
+        return 0;
+    }
+    return rescanDevicesLocked();
+}
+
 int PoolManager::loadPoolsLocked()
 {
     std::vector<DeviceInfo> devices;
@@ -640,7 +650,10 @@ int PoolManager::rescanDevicesLocked()
         rc = loadPoolFromDevice(dev.poolId, dev.devPath, dev.type);
         if (rc != 0)
         {
-            return rc;
+            logf(LogLevel::Warn,
+                 "rescan: failed to load pool from %s: %d",
+                 dev.devPath.c_str(), rc);
+            continue;
         }
     }
 

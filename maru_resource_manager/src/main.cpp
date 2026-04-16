@@ -76,10 +76,18 @@ int main(int argc, char **argv) {
                cfg.host.c_str(), cfg.port);
 
     // Main loop — runs until SIGINT/SIGTERM
+    auto lastRescan = std::chrono::steady_clock::now();
     while (!gStop) {
         if (gRescan) {
             gRescan = 0;
             pm.rescanDevices();
+            lastRescan = std::chrono::steady_clock::now();
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastRescan > std::chrono::seconds(10)) {
+            pm.rescanIfEmpty();
+            lastRescan = now;
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
