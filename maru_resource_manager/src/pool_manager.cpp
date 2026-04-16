@@ -570,9 +570,14 @@ int PoolManager::rescanIfEmpty()
     std::lock_guard<std::mutex> lock(mu_);
     if (!pools_.empty())
     {
-        return 0;
+        return 1;
     }
-    return rescanDevicesLocked();
+    int rc = rescanDevicesLocked();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    return pools_.empty() ? 0 : 1;
 }
 
 int PoolManager::loadPoolsLocked()
@@ -581,6 +586,7 @@ int PoolManager::loadPoolsLocked()
     int rc = scanDevices(devices);
     if (rc != 0)
     {
+        logf(LogLevel::Error, "loadPools: device scan failed: %d", rc);
         return rc;
     }
 
@@ -602,6 +608,7 @@ int PoolManager::loadPoolsLocked()
     int walRc = wal_->replay(pools_, allocations_, nextRegionId_);
     if (walRc != 0 && walRc != -ENOENT)
     {
+        logf(LogLevel::Error, "loadPools: WAL replay failed: %d", walRc);
         return walRc;
     }
 
