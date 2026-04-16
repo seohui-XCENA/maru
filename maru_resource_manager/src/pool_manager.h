@@ -74,6 +74,8 @@ public:
     int verifyAndGetPath(const Handle &handle, std::string &outPath);
 
     void getStats(std::vector<PoolState> &out);
+    /// Lightweight check: returns true if at least one pool is loaded.
+    bool hasPools() const;
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
 

@@ -52,9 +52,7 @@ int main(int argc, char **argv) {
     }
     // loadPools returns 0 even when no devices found (scanDevices succeeds
     // with empty list). Check actual pool state for auto-rescan decision.
-    std::vector<maru::PoolState> stats;
-    pm.getStats(stats);
-    bool needsRescan = stats.empty();
+    bool needsRescan = !pm.hasPools();
     if (needsRescan) {
         maru::logf(maru::LogLevel::Warn,
                     "no CXL/DAX devices found — starting with empty pool");
@@ -103,6 +101,9 @@ int main(int argc, char **argv) {
                     maru::logf(maru::LogLevel::Info,
                                "CXL/DAX devices found, auto-rescan complete");
                     needsRescan = false;
+                } else if (ret < 0) {
+                    maru::logf(maru::LogLevel::Warn,
+                               "auto-rescan failed (rc=%d), will retry", ret);
                 }
             }
         }
