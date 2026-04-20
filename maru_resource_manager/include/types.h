@@ -9,7 +9,8 @@ namespace maru {
 /** @brief DAX device/allocation type. */
 enum class DaxType : uint32_t {
   DEV_DAX = 0, ///< Character device (/dev/daxX.Y)
-  FS_DAX = 1,  ///< File-based DAX (mounted filesystem)
+  FS_DAX = 1,  ///< File-based DAX (mounted pmem filesystem)
+  MARUFS = 2,  ///< Marufs filesystem mounted on top of a DEV_DAX device
 };
 
 /** @brief Handle for an allocation within a pool-backed DAX device. */

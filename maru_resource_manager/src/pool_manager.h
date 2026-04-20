@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "log.h"
+#include "pool_backend.h"
 #include "types.h"
 
 namespace maru
@@ -44,6 +45,10 @@ struct PoolState
     uint64_t alignBytes;
     DaxType type;
     std::vector<Extent> freeList;
+    /// Allocation strategy for this pool. Shared across pools with the same
+    /// semantics (all MaruBackend-style pools share a single stateless
+    /// instance owned by PoolManager). shared_ptr keeps PoolState copyable.
+    std::shared_ptr<PoolBackend> backend;
 };
 
 class MetadataStore;
@@ -101,9 +106,6 @@ private:
     int rescanDevicesLocked();
     void recomputeFreeSize(PoolState &pool);
 
-    void coalesceFreeList(PoolState &pool);
-    void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
-    bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
     PoolState *findPoolForRegion(uint64_t regionId);
@@ -122,6 +124,13 @@ private:
 
     std::unique_ptr<MetadataStore> metadata_;
     std::unique_ptr<WalStore> wal_;
+    /// Shared allocation strategies. One instance of each is created at
+    /// PoolManager construction and reused across all pools of the matching
+    /// type. Strategies are stateless — per-pool state lives in PoolState.
+    ///   - maruBackend_   : DEV_DAX (bare device mmap at offset)
+    ///   - maruFsBackend_ : FS_DAX + MARUFS (file-per-region)
+    std::shared_ptr<PoolBackend> maruBackend_;
+    std::shared_ptr<PoolBackend> maruFsBackend_;
     uint64_t alignBytes_{2ULL << 20};  // 2 MiB
 
     // Global allocation tracking by regionId

@@ -20,6 +20,8 @@
 #include <unordered_set>
 
 #include "device_header.h"
+#include "maru_backend.h"
+#include "maru_fs_backend.h"
 #include "metadata.h"
 #include "util.h"
 #include "wal.h"
@@ -100,25 +102,6 @@ static constexpr const char *kProcMounts = "/proc/mounts";
 // Common paths
 static constexpr const char *kSizeAttr = "/size";
 
-static uint64_t alignUp(uint64_t v, uint64_t align)
-{
-    if (align == 0)
-    {
-        return v;
-    }
-    uint64_t rem = v % align;
-    if (rem == 0)
-    {
-        return v;
-    }
-    uint64_t result = v + (align - rem);
-    if (result < v)
-    {
-        return UINT64_MAX; // overflow guard
-    }
-    return result;
-}
-
 static bool findMountPoint(const std::string &deviceName,
                            std::string &mountPointOut)
 {
@@ -147,6 +130,68 @@ static bool findMountPoint(const std::string &deviceName,
 
     endmntent(fp);
     return found;
+}
+
+/// Extract the value of `daxdev=...` from a mount option string.
+/// Returns empty string if not present.
+static std::string extractDaxdevOption(const char *opts)
+{
+    if (!opts)
+    {
+        return "";
+    }
+    static constexpr const char *kKey = "daxdev=";
+    const char *p = std::strstr(opts, kKey);
+    if (!p)
+    {
+        return "";
+    }
+    p += std::strlen(kKey);
+    const char *end = std::strchr(p, ',');
+    if (!end)
+    {
+        end = p + std::strlen(p);
+    }
+    return std::string(p, static_cast<size_t>(end - p));
+}
+
+/// Collect marufs mounts keyed by backing daxdev name (e.g., "dax1.0").
+/// When the same daxdev appears in multiple mount points, keep the shortest
+/// mount path — different mounts of the same device see the same underlying
+/// filesystem, so registering each as a distinct pool would double-count
+/// capacity.
+static void scanMarufsMounts(std::map<std::string, std::string> &byDax)
+{
+    FILE *fp = setmntent(kProcMounts, "r");
+    if (!fp)
+    {
+        return;
+    }
+    struct mntent *entry;
+    while ((entry = getmntent(fp)) != nullptr)
+    {
+        if (!entry->mnt_type || std::strcmp(entry->mnt_type, "marufs") != 0)
+        {
+            continue;
+        }
+        std::string daxdevPath = extractDaxdevOption(entry->mnt_opts);
+        if (daxdevPath.empty())
+        {
+            continue;
+        }
+        std::string daxName = daxdevPath.substr(daxdevPath.find_last_of('/') + 1);
+        std::string mountPath = entry->mnt_dir ? entry->mnt_dir : "";
+        if (daxName.empty() || mountPath.empty())
+        {
+            continue;
+        }
+        auto it = byDax.find(daxName);
+        if (it == byDax.end() || mountPath.size() < it->second.size())
+        {
+            byDax[daxName] = mountPath;
+        }
+    }
+    endmntent(fp);
 }
 
 static bool readSysfsSizeBytes(const std::string &path, uint64_t &sizeOut)
@@ -237,40 +282,6 @@ static bool parseRegionIndexFromTarget(const std::string &target,
     return true;
 }
 
-static std::string makeFsDaxFilePath(const std::string &mountPoint,
-                                     uint64_t regionId)
-{
-    char filename[512];
-    std::snprintf(filename, sizeof(filename), "%s/maru_%llu.dat", mountPoint.c_str(), (unsigned long long)regionId);
-    return std::string(filename);
-}
-
-static int createFsDaxFile(const std::string &mountPoint, uint64_t regionId,
-                           uint64_t size)
-{
-    std::string filename = makeFsDaxFilePath(mountPoint, regionId);
-    int fd = ::open(filename.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
-    if (fd < 0)
-    {
-        return -errno;
-    }
-    if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
-    {
-        int err = errno;
-        ::close(fd);
-        ::unlink(filename.c_str());
-        return -err;
-    }
-    ::close(fd);
-    return 0;
-}
-
-static void deleteFsDaxFile(const std::string &mountPoint, uint64_t regionId)
-{
-    std::string filename = makeFsDaxFilePath(mountPoint, regionId);
-    ::unlink(filename.c_str());
-}
-
 static bool getRegionIndexForDax(const std::string &devName,
                                  uint32_t &outIndex)
 {
@@ -317,6 +328,8 @@ PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
 {
     metadata_ = std::make_unique<MetadataStore>(stateDir);
     wal_ = std::make_unique<WalStore>(stateDir);
+    maruBackend_ = std::make_shared<MaruBackend>();
+    maruFsBackend_ = std::make_shared<MaruFsBackend>();
 }
 
 PoolManager::~PoolManager() = default;
@@ -328,7 +341,20 @@ uint32_t PoolManager::allocationCount() const {
 
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
-    // Scan for DEV_DAX devices
+    // poolId namespace (collision avoidance — see plan.md):
+    //   DEV_DAX: raw region number (0 ~ 999)
+    //   FS_DAX : region number + 10000
+    //   MARUFS : dax region number + 20000
+    // Long-term fix (P4) is reading pool_id from the Device Header.
+    static constexpr uint32_t kFsDaxPoolIdOffset = 10000;
+    static constexpr uint32_t kMarufsPoolIdOffset = 20000;
+
+    // Phase 0: collect marufs mounts first so DEV_DAX scan can skip the
+    // daxdev that's backing a marufs filesystem.
+    std::map<std::string, std::string> marufsByDax;  // dax name -> shortest mount path
+    scanMarufsMounts(marufsByDax);
+
+    // Phase 1: DEV_DAX scan (excluding marufs-backing daxdevs)
     std::map<uint32_t, std::string> byRegion;
     DIR *dir = ::opendir(kSysBusDaxDevices);
     if (dir)
@@ -343,6 +369,14 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
             }
             if (std::strncmp(name, "dax", 3) != 0)
             {
+                continue;
+            }
+            if (marufsByDax.count(name))
+            {
+                logf(LogLevel::Debug,
+                     "scanDevices: /dev/%s is backing a marufs mount, "
+                     "skipping DEV_DAX registration",
+                     name);
                 continue;
             }
             uint32_t regionId = 0;
@@ -361,7 +395,7 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
         outDevices.push_back(DeviceInfo{kv.first, kv.second, DaxType::DEV_DAX});
     }
 
-    // Scan for FS_DAX devices (pmem block devices)
+    // Phase 2: FS_DAX scan (pmem block devices mounted with `dax` option)
     std::map<uint32_t, std::string> byPool;
     dir = ::opendir(kSysClassBlock);
     if (dir)
@@ -410,7 +444,29 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 
     for (const auto &kv : byPool)
     {
-        outDevices.push_back(DeviceInfo{kv.first, kv.second, DaxType::FS_DAX});
+        outDevices.push_back(DeviceInfo{kv.first + kFsDaxPoolIdOffset,
+                                         kv.second, DaxType::FS_DAX});
+    }
+
+    // Phase 3: MARUFS mounts
+    for (const auto &kv : marufsByDax)
+    {
+        const std::string &daxName = kv.first;
+        const std::string &mountPath = kv.second;
+        uint32_t regionId = 0;
+        if (!getRegionIndexForDax(daxName, regionId))
+        {
+            logf(LogLevel::Warn,
+                 "scanDevices: could not extract DAX region number from %s; "
+                 "skipping marufs mount %s",
+                 daxName.c_str(), mountPath.c_str());
+            continue;
+        }
+        logf(LogLevel::Debug,
+             "scanDevices: found MARUFS mount %s (backing %s, region=%u)",
+             mountPath.c_str(), daxName.c_str(), regionId);
+        outDevices.push_back(DeviceInfo{regionId + kMarufsPoolIdOffset,
+                                         mountPath, DaxType::MARUFS});
     }
 
     return 0;
@@ -549,6 +605,10 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         pool = loaded;
     }
 
+    // Dispatch backend strategy by pool type. DEV_DAX pools manage their
+    // own offsets; FS-style pools (FS_DAX, MARUFS) delegate per-region
+    // storage to the filesystem.
+    pool.backend = (type == DaxType::DEV_DAX) ? maruBackend_ : maruFsBackend_;
     pools_.push_back(pool);
     return 0;
 }
@@ -676,84 +736,6 @@ void PoolManager::recomputeFreeSize(PoolState &pool)
     }
 }
 
-void PoolManager::coalesceFreeList(PoolState &pool)
-{
-    std::sort(
-        pool.freeList.begin(),
-        pool.freeList.end(),
-        [](const Extent &a, const Extent &b)
-        {
-            return a.offset < b.offset;
-        });
-    std::vector<Extent> merged;
-    for (const auto &ex : pool.freeList)
-    {
-        if (merged.empty())
-        {
-            merged.push_back(ex);
-            continue;
-        }
-        Extent &last = merged.back();
-        if (last.offset + last.length >= ex.offset)
-        {
-            uint64_t end = std::max(last.offset + last.length, ex.offset + ex.length);
-            last.length = end - last.offset;
-        }
-        else
-        {
-            merged.push_back(ex);
-        }
-    }
-    pool.freeList.swap(merged);
-}
-
-void PoolManager::insertExtentSorted(PoolState &pool, uint64_t offset,
-                                     uint64_t length)
-{
-    // Binary search for insertion point in sorted free list
-    auto it = std::lower_bound(
-        pool.freeList.begin(),
-        pool.freeList.end(),
-        offset,
-        [](const Extent &e, uint64_t off)
-        {
-            return e.offset < off;
-        });
-
-    // Try merge with previous extent
-    if (it != pool.freeList.begin())
-    {
-        auto prev = std::prev(it);
-        if (prev->offset + prev->length >= offset)
-        {
-            uint64_t newEnd = std::max(prev->offset + prev->length, offset + length);
-            prev->length = newEnd - prev->offset;
-            // Try merge with next extent too
-            if (it != pool.freeList.end() &&
-                prev->offset + prev->length >= it->offset)
-            {
-                uint64_t end =
-                    std::max(prev->offset + prev->length, it->offset + it->length);
-                prev->length = end - prev->offset;
-                pool.freeList.erase(it);
-            }
-            return;
-        }
-    }
-
-    // Try merge with next extent
-    if (it != pool.freeList.end() && offset + length >= it->offset)
-    {
-        uint64_t newEnd = std::max(offset + length, it->offset + it->length);
-        it->offset = offset;
-        it->length = newEnd - offset;
-        return;
-    }
-
-    // No merge possible, insert new extent
-    pool.freeList.insert(it, Extent{offset, length});
-}
-
 PoolState *PoolManager::findPoolById(uint32_t poolId)
 {
     for (auto &pool : pools_)
@@ -764,73 +746,6 @@ PoolState *PoolManager::findPoolById(uint32_t poolId)
         }
     }
     return nullptr;
-}
-
-bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
-                                   Allocation &outAlloc)
-{
-    uint64_t alignedSize = alignUp(size, pool.alignBytes);
-    for (size_t i = 0; i < pool.freeList.size(); ++i)
-    {
-        Extent ex = pool.freeList[i];
-        uint64_t aligned = alignUp(ex.offset, pool.alignBytes);
-        uint64_t end = aligned + alignedSize;
-        if (end > ex.offset + ex.length)
-        {
-            continue;
-        }
-
-        bool hasFront = (aligned > ex.offset);
-        bool hasBack = (end < ex.offset + ex.length);
-
-        if (hasFront && hasBack)
-        {
-            // Split: keep front fragment in place, insert back after it
-            pool.freeList[i] = Extent{ex.offset, aligned - ex.offset};
-            pool.freeList.insert(pool.freeList.begin() +
-                                     static_cast<std::ptrdiff_t>(i) + 1,
-                                 Extent{end, (ex.offset + ex.length) - end});
-        }
-        else if (hasFront)
-        {
-            // Only front fragment remains
-            pool.freeList[i] = Extent{ex.offset, aligned - ex.offset};
-        }
-        else if (hasBack)
-        {
-            // Only back fragment remains
-            pool.freeList[i] = Extent{end, (ex.offset + ex.length) - end};
-        }
-        else
-        {
-            // Exact fit: remove
-            pool.freeList.erase(pool.freeList.begin() +
-                                static_cast<std::ptrdiff_t>(i));
-        }
-
-        uint64_t regionId = nextRegionId_++;
-
-        if (pool.type == DaxType::FS_DAX)
-        {
-            if (createFsDaxFile(pool.devPath, regionId, alignedSize) != 0)
-            {
-                return false;
-            }
-        }
-
-        Handle h{};
-        h.regionId = regionId;
-        h.offset = (pool.type == DaxType::FS_DAX) ? 0 : aligned;
-        h.length = alignedSize;
-        outAlloc.handle = h;
-        outAlloc.nonce = generateNonce();
-        outAlloc.requestedSize = size;
-        outAlloc.allocLength = alignedSize;
-        outAlloc.poolId = pool.poolId;
-        outAlloc.realOffset = aligned;
-        return true;
-    }
-    return false;
 }
 
 // TODO(kihwan): normalize devPath with realpath() to handle symlinks/trailing slashes
@@ -875,8 +790,9 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     {
         return -EINVAL;
     }
-    // Reject zero or unreasonably large sizes to prevent alignUp() overflow
-    // and nonsensical allocations. 256 TiB is well beyond any CXL device.
+    // Reject zero or unreasonably large sizes to prevent overflow in the
+    // backend's alignment math and nonsensical allocations. 256 TiB is well
+    // beyond any CXL device.
     if (size == 0 || size > (1ULL << 48))
     {
         return -EINVAL;
@@ -888,8 +804,23 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         return -ENODEV;
     }
 
-    Allocation alloc{};
     PoolState *selectedPool = nullptr;
+    AllocOutcome outcome{};
+    uint64_t regionId = 0;
+
+    // Try to allocate from one pool. Only commits nextRegionId_ on success.
+    auto tryAllocate = [&](PoolState &pool) -> int {
+        uint64_t candidateRid = nextRegionId_;
+        int rc = pool.backend->allocate(pool, size, candidateRid, outcome);
+        if (rc != 0)
+        {
+            return rc;
+        }
+        nextRegionId_++;
+        regionId = candidateRid;
+        selectedPool = &pool;
+        return 0;
+    };
 
     if (!daxPath.empty())
     {
@@ -898,22 +829,18 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         {
             return -ENOENT;
         }
-        if (!allocateFromPool(*selectedPool, size, alloc))
+        int rc = tryAllocate(*selectedPool);
+        if (rc != 0)
         {
-            return -ENOMEM;
+            return rc;
         }
-        setClientId(alloc.clientId, kMaxClientIdLen, clientId);
-        selectedPool->freeSize -= alloc.allocLength;
     }
     else
     {
         for (auto &pool : pools_)
         {
-            if (allocateFromPool(pool, size, alloc))
+            if (tryAllocate(pool) == 0)
             {
-                setClientId(alloc.clientId, kMaxClientIdLen, clientId);
-                pool.freeSize -= alloc.allocLength;
-                selectedPool = &pool;
                 break;
             }
         }
@@ -923,41 +850,42 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         }
     }
 
-    alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce, clientId);
+    Allocation allocRec{};
+    allocRec.handle.regionId = regionId;
+    allocRec.handle.offset = outcome.handleOffset;
+    allocRec.handle.length = outcome.allocLength;
+    setClientId(allocRec.clientId, kMaxClientIdLen, clientId);
+    allocRec.nonce = generateNonce();
+    allocRec.requestedSize = size;
+    allocRec.allocLength = outcome.allocLength;
+    allocRec.poolId = selectedPool->poolId;
+    allocRec.realOffset = outcome.realOffset;
+    allocRec.handle.authToken =
+        computeAuthToken(allocRec.handle, allocRec.nonce, clientId);
+
+    selectedPool->freeSize -= outcome.allocLength;
 
     // Cache owner PID start time for reaper PID-reuse detection (local only)
-    if (!clientId.empty())
+    ++clientAllocCounts_[clientId];
+    if (isLocalClient(clientId))
     {
-        ++clientAllocCounts_[clientId];
-        if (isLocalClient(clientId))
+        pid_t pid = pidFromClientId(clientId);
+        if (pid > 0 && pidStartTimes_.find(pid) == pidStartTimes_.end())
         {
-            pid_t pid = pidFromClientId(clientId);
-            if (pid > 0 && pidStartTimes_.find(pid) == pidStartTimes_.end())
+            uint64_t st = getPidStartTime(pid);
+            if (st != 0)
             {
-                uint64_t st = getPidStartTime(pid);
-                if (st != 0)
-                {
-                    pidStartTimes_[pid] = st;
-                }
+                pidStartTimes_[pid] = st;
             }
         }
     }
 
-    allocations_[alloc.handle.regionId] = alloc;
-
-    if (selectedPool->type == DaxType::FS_DAX)
-    {
-        devPath = makeFsDaxFilePath(selectedPool->devPath, alloc.handle.regionId);
-    }
-    else
-    {
-        devPath = selectedPool->devPath;
-    }
-
+    allocations_[regionId] = allocRec;
+    devPath = selectedPool->backend->dataPath(*selectedPool, regionId);
     deviceUuid = selectedPool->deviceUuid;
-    requestedSizeOut = alloc.requestedSize;
-    out = alloc.handle;
-    wal_->appendAlloc(alloc);
+    requestedSizeOut = size;
+    out = allocRec.handle;
+    wal_->appendAlloc(allocRec);
     if (++opCount_ % checkpointInterval_ == 0)
     {
         wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
@@ -1019,14 +947,7 @@ int PoolManager::getPathForHandle(const Handle &handle, std::string &outPath)
         return -ENOENT;
     }
 
-    if (pool->type == DaxType::FS_DAX)
-    {
-        outPath = makeFsDaxFilePath(pool->devPath, handle.regionId);
-    }
-    else
-    {
-        outPath = pool->devPath;
-    }
+    outPath = pool->backend->dataPath(*pool, handle.regionId);
     return 0;
 }
 
@@ -1192,12 +1113,8 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
         return -ENOENT;
     }
 
-    if (targetPool->type == DaxType::FS_DAX)
-    {
-        deleteFsDaxFile(targetPool->devPath, regionId);
-    }
-
-    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+    targetPool->backend->freeAlloc(*targetPool, regionId,
+                                    alloc.realOffset, alloc.allocLength);
     targetPool->freeSize += alloc.allocLength;
 
     // Update client refcount
@@ -1253,14 +1170,7 @@ int PoolManager::verifyAndGetPath(const Handle &handle, std::string &outPath)
         return -ENOENT;
     }
 
-    if (pool->type == DaxType::FS_DAX)
-    {
-        outPath = makeFsDaxFilePath(pool->devPath, handle.regionId);
-    }
-    else
-    {
-        outPath = pool->devPath;
-    }
+    outPath = pool->backend->dataPath(*pool, handle.regionId);
     return 0;
 }
 

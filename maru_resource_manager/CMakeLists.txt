@@ -15,6 +15,8 @@ add_executable(maru_resource_manager
     src/server_config.cpp
     src/log.cpp
     src/pool_manager.cpp
+    src/maru_backend.cpp
+    src/maru_fs_backend.cpp
     src/metadata.cpp
     src/wal.cpp
     src/reaper.cpp
@@ -59,6 +61,8 @@ if(MARU_BUILD_TESTS)
         src/server_config.cpp
         src/log.cpp
         src/pool_manager.cpp
+        src/maru_backend.cpp
+        src/maru_fs_backend.cpp
         src/metadata.cpp
         src/wal.cpp
         src/reaper.cpp

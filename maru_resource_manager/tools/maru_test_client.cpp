@@ -481,7 +481,8 @@ static int cmdStats()
         }
 
         const char *typeStr =
-            (pi.type == DaxType::DEV_DAX) ? "DEV_DAX" : "FS_DAX";
+            (pi.type == DaxType::DEV_DAX) ? "DEV_DAX" :
+            (pi.type == DaxType::MARUFS)  ? "MARUFS"  : "FS_DAX";
         double usedPct =
             (pi.totalSize > 0)
                 ? 100.0 * (1.0 - static_cast<double>(pi.freeSize) / pi.totalSize)
