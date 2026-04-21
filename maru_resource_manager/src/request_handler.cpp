@@ -1,5 +1,6 @@
 #include "request_handler.h"
 
+#include <cerrno>
 #include <cstring>
 
 #include "log.h"
@@ -16,8 +17,9 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     std::string devPath;
     std::string deviceUuid;
     uint64_t requestedSize = 0;
-    int32_t status =
-        pm_.alloc(req.size, ctx.client_id, handle, devPath, deviceUuid, ctx.dax_path, requestedSize);
+    int32_t status = pm_.alloc(req.size, ctx.client_id, handle, devPath,
+                                deviceUuid, ctx.dax_path, requestedSize,
+                                static_cast<BackendTag>(req.preferBackend));
 
     result.resp.status = status;
     result.resp.handle = handle;

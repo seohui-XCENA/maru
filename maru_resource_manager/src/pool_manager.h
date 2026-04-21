@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "ipc.h"
 #include "log.h"
 #include "pool_backend.h"
 #include "types.h"
@@ -64,11 +65,16 @@ public:
     int gracePeriodSec() const { return gracePeriodSec_; }
     uint32_t allocationCount() const;
 
+    /// Does a pool of `poolType` satisfy a session's `tag` preference?
+    /// MARU = DEV_DAX | FS_DAX, MARUFS = MARUFS, UNSPECIFIED = any.
+    static bool backendMatchesPool(BackendTag tag, DaxType poolType);
+
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
               std::string &devPath, std::string &deviceUuid,
-              const std::string &daxPath, uint64_t &requestedSizeOut);
+              const std::string &daxPath, uint64_t &requestedSizeOut,
+              BackendTag preferBackend = BackendTag::UNSPECIFIED);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.
     int verifyAndFree(const Handle &handle, const std::string &clientId);

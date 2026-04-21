@@ -323,6 +323,19 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
+bool PoolManager::backendMatchesPool(BackendTag tag, DaxType poolType)
+{
+    switch (tag) {
+        case BackendTag::MARU:
+            return poolType == DaxType::DEV_DAX || poolType == DaxType::FS_DAX;
+        case BackendTag::MARUFS:
+            return poolType == DaxType::MARUFS;
+        case BackendTag::UNSPECIFIED:
+            return true;
+    }
+    return false;
+}
+
 PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
     : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec)
 {
@@ -341,11 +354,9 @@ uint32_t PoolManager::allocationCount() const {
 
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
-    // poolId namespace (collision avoidance — see plan.md):
-    //   DEV_DAX: raw region number (0 ~ 999)
-    //   FS_DAX : region number + 10000
-    //   MARUFS : dax region number + 20000
-    // Long-term fix (P4) is reading pool_id from the Device Header.
+    // Per-backend poolId offsets prevent collisions when the raw region
+    // numbers from different backends overlap (e.g. DEV_DAX /dev/dax2.0
+    // and a MARUFS mount backed by the same region both yield region=2).
     static constexpr uint32_t kFsDaxPoolIdOffset = 10000;
     static constexpr uint32_t kMarufsPoolIdOffset = 20000;
 
@@ -784,7 +795,8 @@ std::string PoolManager::getDeviceUuidForRegion(uint64_t regionId)
 
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
                        std::string &devPath, std::string &deviceUuid,
-                       const std::string &daxPath, uint64_t &requestedSizeOut)
+                       const std::string &daxPath, uint64_t &requestedSizeOut,
+                       BackendTag preferBackend)
 {
     if (clientId.empty())
     {
@@ -829,6 +841,11 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         {
             return -ENOENT;
         }
+        if (!backendMatchesPool(preferBackend, selectedPool->type))
+        {
+            selectedPool = nullptr;
+            return -EACCES;
+        }
         int rc = tryAllocate(*selectedPool);
         if (rc != 0)
         {
@@ -839,6 +856,10 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     {
         for (auto &pool : pools_)
         {
+            if (!backendMatchesPool(preferBackend, pool.type))
+            {
+                continue;
+            }
             if (tryAllocate(pool) == 0)
             {
                 break;

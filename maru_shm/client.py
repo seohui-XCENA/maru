@@ -205,12 +205,20 @@ class MaruShmClient:
         resp = StatsResp.unpack(payload)
         return resp.pools or []
 
-    def alloc(self, size: int, dax_path: str = "") -> MaruHandle:
+    def alloc(
+        self,
+        size: int,
+        dax_path: str = "",
+        prefer_backend: int = 0,
+    ) -> MaruHandle:
         """Allocate shared memory from the resource manager.
 
         Args:
             size: Requested allocation size in bytes.
             dax_path: DAX device path (e.g. "/dev/dax0.0"), or "" for any pool.
+            prefer_backend: BackendTag value — 0=UNSPECIFIED, 1=MARU,
+                2=MARUFS. When non-zero, RM restricts fill-first to pools of
+                the matching backend kind.
 
         Returns:
             Handle for the allocation.
@@ -221,6 +229,7 @@ class MaruShmClient:
         req = AllocReq(
             size=size,
             dax_path=dax_path,
+            prefer_backend=prefer_backend,
             client_id=self._client_id,
             request_id=_next_request_id(),
         )

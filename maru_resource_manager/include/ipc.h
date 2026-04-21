@@ -27,6 +27,13 @@ enum class MsgType : uint16_t {
   ERROR_RESP = 255
 };
 
+/// Selector tag sent via REGISTER_SESSION. UNSPECIFIED means "any pool".
+enum class BackendTag : uint8_t {
+  UNSPECIFIED = 0,
+  MARU        = 1,
+  MARUFS      = 2,
+};
+
 struct MsgHeader {
   uint32_t magic;
   uint16_t version;
@@ -37,7 +44,8 @@ struct MsgHeader {
 struct AllocReq {
   uint64_t size;
   uint32_t daxPathLen;
-  uint32_t reserved;
+  uint8_t  preferBackend;       // BackendTag
+  uint8_t  reserved[3];
 };
 
 struct AllocResp {

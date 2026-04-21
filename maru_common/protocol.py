@@ -492,6 +492,8 @@ class HandshakeResponse:
     server_version: int = PROTOCOL_VERSION
     rm_address: str | None = None
     error: str | None = None
+    backend: str = "maru"                         # "maru" | "marufs"
+    expected_mounts: list[str] = field(default_factory=list)
 
 
 @dataclass

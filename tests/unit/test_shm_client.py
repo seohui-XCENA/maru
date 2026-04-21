@@ -215,6 +215,46 @@ class TestShmClientAlloc:
                 except OSError:
                     pass
 
+    def test_alloc_forwards_prefer_backend(self):
+        """`prefer_backend` argument is serialized onto the wire."""
+        from maru_shm.ipc import BackendTag
+
+        captured = []
+        tmp_paths = []
+
+        def handler(sock):
+            while True:
+                try:
+                    hdr, payload = _recv_request(sock)
+                except (ConnectionError, OSError):
+                    break
+                if hdr.msg_type == MsgType.ALLOC_REQ:
+                    req = AllocReq.unpack(payload)
+                    captured.append(req.prefer_backend)
+                    handle = MaruHandle(
+                        region_id=2, offset=0, length=4096, auth_token=1
+                    )
+                    tmp_path = _make_temp_file(size=4096)
+                    tmp_paths.append(tmp_path)
+                    _send_alloc_resp_with_path(sock, handle, req.size, tmp_path)
+
+        server = MockResourceManagerServer(handler)
+        address = server.start()
+        try:
+            client = MaruShmClient(address=address)
+            client.alloc(4096, prefer_backend=int(BackendTag.MARUFS))
+            client.alloc(4096)  # default = UNSPECIFIED
+            client.close()
+        finally:
+            server.stop()
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+        assert captured == [int(BackendTag.MARUFS), int(BackendTag.UNSPECIFIED)]
+
 
 # =============================================================================
 # Free tests

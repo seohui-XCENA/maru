@@ -213,6 +213,37 @@ class TestAllocReq:
         req = AllocReq(size=1024)
         assert req.dax_path == ""  # "" means any pool
 
+    def test_default_prefer_backend_is_unspecified(self):
+        req = AllocReq(size=1024)
+        assert req.prefer_backend == 0  # BackendTag.UNSPECIFIED
+
+    def test_prefer_backend_roundtrip_marufs(self):
+        from maru_shm.ipc import BackendTag
+        req = AllocReq(
+            size=4096,
+            dax_path="/mnt/marufs",
+            prefer_backend=int(BackendTag.MARUFS),
+            client_id="host:1",
+            request_id=7,
+        )
+        req2 = AllocReq.unpack(req.pack())
+        assert req2.prefer_backend == int(BackendTag.MARUFS)
+        assert req2.dax_path == "/mnt/marufs"
+        assert req2.client_id == "host:1"
+        assert req2.request_id == 7
+
+    def test_prefer_backend_roundtrip_maru(self):
+        from maru_shm.ipc import BackendTag
+        req = AllocReq(size=8192, prefer_backend=int(BackendTag.MARU))
+        req2 = AllocReq.unpack(req.pack())
+        assert req2.prefer_backend == int(BackendTag.MARU)
+        assert req2.dax_path == ""
+
+    def test_fixed_header_is_16_bytes(self):
+        """Wire size of the fixed header must stay 16B for C++ static_assert parity."""
+        from maru_shm.ipc import _ALLOC_REQ_SIZE
+        assert _ALLOC_REQ_SIZE == 16
+
 
 class TestAllocResp:
     def test_roundtrip(self):

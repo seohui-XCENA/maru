@@ -282,7 +282,8 @@ static int doAlloc(uint64_t size, const std::string &daxPath, AllocResp *resp,
     AllocReq req{};
     req.size = size;
     req.daxPathLen = static_cast<uint32_t>(daxPath.size());
-    req.reserved = 0;
+    req.preferBackend = static_cast<uint8_t>(BackendTag::UNSPECIFIED);
+    std::memset(req.reserved, 0, sizeof(req.reserved));
 
     auto payload = buildAllocPayload(req, daxPath, g_clientId, g_requestSeq++);
     if (sendRequest(fd, MsgType::ALLOC_REQ, payload.data(),

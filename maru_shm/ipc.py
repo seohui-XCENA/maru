@@ -39,6 +39,14 @@ class MsgType(IntEnum):
     ERROR_RESP = 255
 
 
+class BackendTag(IntEnum):
+    """Selector tag sent via REGISTER_SESSION. UNSPECIFIED means 'any pool'."""
+
+    UNSPECIFIED = 0
+    MARU = 1
+    MARUFS = 2
+
+
 # MsgHeader: magic(u32) + version(u16) + type(u16) + payload_len(u32) = 12 bytes
 _HEADER_FORMAT = "<IHHI"
 HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
@@ -95,8 +103,8 @@ class MsgHeader:
 # Request / Response payloads
 # =============================================================================
 
-# AllocReq: size(u64) + daxPathLen(u32) + reserved(u32) = 16 bytes
-_ALLOC_REQ_FORMAT = "<QII"
+# AllocReq: size(u64) + daxPathLen(u32) + preferBackend(u8) + reserved(3B) = 16 bytes
+_ALLOC_REQ_FORMAT = "<QIB3x"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
 
@@ -105,15 +113,16 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    dax_path: str = ""  # "" = any pool
-    reserved: int = 0
+    dax_path: str = ""  # "" = any pool matching preferBackend filter
+    prefer_backend: int = 0  # BackendTag: 0=UNSPECIFIED, 1=MARU, 2=MARUFS
     client_id: str = ""
     request_id: int = 0
 
     def pack(self) -> bytes:
         path_bytes = self.dax_path.encode("utf-8")
         fixed = struct.pack(
-            _ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved
+            _ALLOC_REQ_FORMAT, self.size, len(path_bytes),
+            int(self.prefer_backend) & 0xFF,
         )
         fixed += path_bytes  # pool path BEFORE client_id
         id_bytes = self.client_id.encode("utf-8")
@@ -125,7 +134,7 @@ class AllocReq:
     def unpack(cls, data: bytes) -> "AllocReq":
         if len(data) < _ALLOC_REQ_SIZE:
             raise ValueError(f"AllocReq too short: {len(data)} < {_ALLOC_REQ_SIZE}")
-        size, dax_path_len, reserved = struct.unpack(
+        size, dax_path_len, prefer_backend = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
         off = _ALLOC_REQ_SIZE
@@ -151,7 +160,7 @@ class AllocReq:
         return cls(
             size=size,
             dax_path=dax_path,
-            reserved=reserved,
+            prefer_backend=prefer_backend,
             client_id=client_id,
             request_id=request_id,
         )
