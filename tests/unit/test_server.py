@@ -251,3 +251,46 @@ class TestMain:
                 main()
             # argparse exits with code 2 for invalid choices
             assert exc_info.value.code == 2
+
+
+class TestMainPreferBackend:
+    """CLI --prefer-backend parsing and propagation to MaruServer."""
+
+    def _run_main(self, argv, mock_server_cls):
+        with (
+            patch("sys.argv", argv),
+            patch("maru_server.server.setup_logging"),
+            patch("maru_server.server.MaruServer", mock_server_cls),
+            patch("maru_server.rpc_server.RpcServer"),
+            patch("signal.signal"),
+        ):
+            main()
+
+    def test_default_is_unspecified(self):
+        """No --prefer-backend → MaruServer gets prefer_backend=UNSPECIFIED (0)."""
+        mock_server_cls = MagicMock()
+        self._run_main(["maru-server"], mock_server_cls)
+        assert mock_server_cls.call_args.kwargs["prefer_backend"] == 0
+
+    def test_maru(self):
+        """--prefer-backend=maru → BackendTag.MARU (1)."""
+        mock_server_cls = MagicMock()
+        self._run_main(
+            ["maru-server", "--prefer-backend", "maru"], mock_server_cls
+        )
+        assert mock_server_cls.call_args.kwargs["prefer_backend"] == 1
+
+    def test_marufs(self):
+        """--prefer-backend=marufs → BackendTag.MARUFS (2)."""
+        mock_server_cls = MagicMock()
+        self._run_main(
+            ["maru-server", "--prefer-backend", "marufs"], mock_server_cls
+        )
+        assert mock_server_cls.call_args.kwargs["prefer_backend"] == 2
+
+    def test_invalid_choice_rejected(self):
+        """Unknown --prefer-backend value → argparse SystemExit(2)."""
+        with patch("sys.argv", ["maru-server", "--prefer-backend", "wat"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2

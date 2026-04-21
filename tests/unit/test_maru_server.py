@@ -290,8 +290,8 @@ class TestMaruServerEdgeCases:
 
         # Mock the allocation manager to return None
         original_alloc = server._allocation_manager.allocate
-        server._allocation_manager.allocate = lambda instance_id, size, dax_path="": (
-            None
+        server._allocation_manager.allocate = (
+            lambda instance_id, size, dax_path="", prefer_backend=0: None
         )  # type: ignore
 
         result = server.request_alloc("instance1", 4096)
@@ -357,3 +357,25 @@ class TestMaruServerEdgeCases:
         assert results[1] is not None  # Valid
         assert results[1]["handle"].region_id == region_id2
         assert results[2] is None  # Key doesn't exist
+
+
+class TestMaruServerPreferBackend:
+    """Backend preference is stored and forwarded on every allocation."""
+
+    def test_default_prefer_backend_is_unspecified(self):
+        """No constructor arg → UNSPECIFIED (0), legacy any-pool behavior."""
+        server = MaruServer()
+        assert server._prefer_backend == 0
+
+    def test_prefer_backend_stored(self):
+        """prefer_backend ctor value is stored as an int."""
+        server = MaruServer(prefer_backend=2)
+        assert server._prefer_backend == 2
+
+    def test_request_alloc_forwards_prefer_backend(self):
+        """request_alloc propagates prefer_backend to the ShmClient."""
+        server = MaruServer(prefer_backend=2)
+        handle = server.request_alloc("inst1", 4096)
+        assert handle is not None
+        client = server._allocation_manager._client
+        assert client.last_prefer_backend == 2

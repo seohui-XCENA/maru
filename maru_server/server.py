@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_shm.ipc import BackendTag
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -29,9 +30,11 @@ class MaruServer:
         self,
         rm_address: str | None = None,
         dax_paths: list[str] | None = None,
+        prefer_backend: int = 0,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
         self._dax_paths = dax_paths
+        self._prefer_backend = int(prefer_backend)
         self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
         self._stats_manager = StatsManager()
@@ -44,9 +47,11 @@ class MaruServer:
             self._validate_dax_paths()
 
         logger.info(
-            "MaruServer initialized (rm_address=%s, dax_paths=%s)",
+            "MaruServer initialized (rm_address=%s, dax_paths=%s, "
+            "prefer_backend=%s)",
             self._rm_address,
             self._dax_paths,
+            BackendTag(self._prefer_backend).name,
         )
 
     def _validate_dax_paths(self) -> None:
@@ -85,7 +90,12 @@ class MaruServer:
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
-            handle = self._allocation_manager.allocate(instance_id, size, dax_path=path)
+            handle = self._allocation_manager.allocate(
+                instance_id,
+                size,
+                dax_path=path,
+                prefer_backend=self._prefer_backend,
+            )
             if handle:
                 logger.info(
                     "Allocated %d bytes for %s from %s: region_id=%d",
@@ -344,12 +354,32 @@ def main() -> None:
             "If omitted, any available pool is used."
         ),
     )
+    parser.add_argument(
+        "--prefer-backend",
+        choices=["maru", "marufs"],
+        default=None,
+        help=(
+            "Restrict allocations to a backend pool kind on the resource "
+            "manager. 'maru' = DEV_DAX or FS_DAX; 'marufs' = MARUFS only. "
+            "Omit to allow any pool."
+        ),
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
+    prefer_backend = {
+        None: BackendTag.UNSPECIFIED,
+        "maru": BackendTag.MARU,
+        "marufs": BackendTag.MARUFS,
+    }[args.prefer_backend]
+
     # Create server
-    server = MaruServer(rm_address=args.rm_address, dax_paths=args.dax_paths)
+    server = MaruServer(
+        rm_address=args.rm_address,
+        dax_paths=args.dax_paths,
+        prefer_backend=prefer_backend,
+    )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

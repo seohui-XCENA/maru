@@ -36,17 +36,25 @@ class AllocationManager:
         self._lock = RLock()
 
     def allocate(
-        self, instance_id: str, size: int, dax_path: str = ""
+        self,
+        instance_id: str,
+        size: int,
+        dax_path: str = "",
+        prefer_backend: int = 0,
     ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership."""
         try:
-            handle = self._client.alloc(size, dax_path=dax_path)
+            handle = self._client.alloc(
+                size, dax_path=dax_path, prefer_backend=prefer_backend
+            )
         except RuntimeError as e:
             logger.warning(
-                "alloc failed for instance=%s size=%d dax_path=%s: %s",
+                "alloc failed for instance=%s size=%d dax_path=%s "
+                "prefer_backend=%d: %s",
                 instance_id,
                 size,
                 dax_path,
+                prefer_backend,
                 e,
             )
             return None

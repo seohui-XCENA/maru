@@ -168,7 +168,7 @@ class TestAllocationManagerEdgeCases:
 
         # Mock the client to return None
         original_alloc = manager._client.alloc
-        manager._client.alloc = lambda size, dax_path="": None  # type: ignore
+        manager._client.alloc = lambda size, dax_path="", prefer_backend=0: None  # type: ignore
 
         result = manager.allocate("instance1", 4096)
         assert result is None
@@ -330,3 +330,16 @@ class TestAllocationManagerStatsEdgeCases:
         # Final decrement triggers free
         manager.decrement_kv_ref(h.region_id)
         assert manager.get_handle(h.region_id) is None
+
+    def test_allocate_forwards_prefer_backend(self):
+        """allocate() forwards prefer_backend to the underlying ShmClient."""
+        manager = AllocationManager()
+        h = manager.allocate("inst1", 4096, prefer_backend=2)
+        assert h is not None
+        assert manager._client.last_prefer_backend == 2
+
+    def test_allocate_default_prefer_backend_is_zero(self):
+        """allocate() defaults prefer_backend to 0 (UNSPECIFIED)."""
+        manager = AllocationManager()
+        manager.allocate("inst1", 4096)
+        assert manager._client.last_prefer_backend == 0

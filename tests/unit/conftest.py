@@ -32,9 +32,10 @@ class MockShmClient:
     def stats(self):
         return []
 
-    def alloc(self, size, dax_path=""):
+    def alloc(self, size, dax_path="", prefer_backend=0):
         global _alloc_counter
         _alloc_counter += 1
+        self.last_prefer_backend = prefer_backend
         return MaruHandle(
             region_id=_alloc_counter, offset=0, length=size, auth_token=12345
         )
