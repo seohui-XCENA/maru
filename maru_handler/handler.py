@@ -19,6 +19,7 @@ Example:
 """
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -200,6 +201,32 @@ class MaruHandler:
     # Connection Management
     # =========================================================================
 
+    def _check_backend_readiness(self, handshake_resp: dict) -> bool:
+        """Verify the local filesystem matches the server's advertised backend.
+
+        For the marufs backend, every mount path advertised by the server
+        must exist locally; otherwise this Handler cannot map regions.
+        The maru backend has nothing for the Handler to check here.
+        """
+        backend = handshake_resp.get("backend", "maru")
+        expected_mounts = handshake_resp.get("expected_mounts") or []
+
+        if backend != "marufs" or not expected_mounts:
+            return True
+
+        missing = [m for m in expected_mounts if not os.path.isdir(m)]
+        if missing:
+            logger.error(
+                "Server reports backend=marufs but mount paths %s are not "
+                "present on this host. Mount them before connecting.",
+                missing,
+            )
+            return False
+        logger.debug(
+            "backend=marufs readiness OK (mounts verified: %s)", expected_mounts
+        )
+        return True
+
     def connect(self) -> bool:
         """Connect to the server and request a memory allocation.
 
@@ -226,12 +253,17 @@ class MaruHandler:
                     "Multi-node UUID resolution will not work."
                 )
 
+            handshake_resp: dict = {}
             try:
                 handshake_resp = self._rpc.handshake()
-                rm_address = handshake_resp.get("rm_address") or self._config.rm_address
             except Exception:
                 logger.debug("Handshake failed, using config rm_address", exc_info=True)
-                rm_address = self._config.rm_address
+
+            rm_address = handshake_resp.get("rm_address") or self._config.rm_address
+
+            if not self._check_backend_readiness(handshake_resp):
+                return False
+
             self._mapper = DaxMapper(rm_address=rm_address, device_table=device_table)
 
             # 2. Initialize managers
