@@ -20,6 +20,10 @@ _mmap_objects: list[mmap.mmap] = []
 class MockShmClient:
     """Mock MaruShmClient for unit tests that don't need a running resource manager."""
 
+    # Class-level pool fixture tests can set before constructing MaruServer.
+    # Reset to [] by the autouse fixture between tests.
+    mock_pools: list = []
+
     def __init__(self, *args, **kwargs):
         self._device_table = kwargs.get("device_table") or {}
 
@@ -30,7 +34,7 @@ class MockShmClient:
         return True
 
     def stats(self):
-        return []
+        return list(MockShmClient.mock_pools)
 
     def alloc(self, size, dax_path="", prefer_backend=0):
         global _alloc_counter
@@ -70,6 +74,7 @@ def _mock_shm_client():
     global _alloc_counter, _mmap_objects
     _alloc_counter = 0
     _mmap_objects = []
+    MockShmClient.mock_pools = []
 
     with (
         patch("maru_shm.client.MaruShmClient", MockShmClient),

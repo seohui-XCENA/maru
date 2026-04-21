@@ -252,4 +252,6 @@ class RpcHandlerMixin:
         return {
             "success": True,
             "rm_address": self._server.rm_address,
+            "backend": self._server.backend,
+            "expected_mounts": self._server.expected_mounts,
         }

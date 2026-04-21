@@ -208,3 +208,33 @@ class TestRpcHandlerMixin:
         ]
         for msg_type in expected_types:
             assert msg_type.value in handlers
+
+
+class TestHandshakeHandler:
+    """Handshake response advertises backend and expected_mounts."""
+
+    def _make_handler(self, **server_kwargs):
+        server = MaruServer(**server_kwargs)
+        return ConcreteHandler(server), server
+
+    def test_handshake_default_backend_maru(self):
+        """Default server advertises backend='maru' with no expected mounts."""
+        handler, server = self._make_handler()
+        resp = handler._handle_handshake(MockRequest())
+        assert resp["success"] is True
+        assert resp["rm_address"] == server.rm_address
+        assert resp["backend"] == "maru"
+        assert resp["expected_mounts"] == []
+
+    def test_handshake_marufs_includes_mounts(self):
+        """prefer=MARUFS server advertises 'marufs' and collected mount paths."""
+        from maru_shm import DaxType, MaruPoolInfo
+        from tests.unit.conftest import MockShmClient
+
+        MockShmClient.mock_pools = [
+            MaruPoolInfo(dax_path="/mnt/marufs", dax_type=DaxType.MARUFS),
+        ]
+        handler, _ = self._make_handler(prefer_backend=2)
+        resp = handler._handle_handshake(MockRequest())
+        assert resp["backend"] == "marufs"
+        assert resp["expected_mounts"] == ["/mnt/marufs"]

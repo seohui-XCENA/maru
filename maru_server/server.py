@@ -8,7 +8,7 @@ import signal
 from threading import RLock
 
 from maru_shm.ipc import BackendTag
-from maru_shm.types import MaruHandle
+from maru_shm.types import DaxType, MaruHandle
 
 from .allocation_manager import AllocationManager
 from .kv_manager import DeleteResult, KVManager
@@ -46,13 +46,39 @@ class MaruServer:
         if self._dax_paths:
             self._validate_dax_paths()
 
+        self._expected_mounts: list[str] = self._collect_expected_mounts()
+
         logger.info(
             "MaruServer initialized (rm_address=%s, dax_paths=%s, "
-            "prefer_backend=%s)",
+            "prefer_backend=%s, expected_mounts=%s)",
             self._rm_address,
             self._dax_paths,
             BackendTag(self._prefer_backend).name,
+            self._expected_mounts,
         )
+
+    def _collect_expected_mounts(self) -> list[str]:
+        """Fetch mount paths of MARUFS pools the Handler should see.
+
+        Only populated when this server prefers the MARUFS backend; other
+        backends have nothing for the Handler to check on its local FS.
+        """
+        if self._prefer_backend != BackendTag.MARUFS:
+            return []
+        try:
+            pools = self._allocation_manager.pool_stats()
+        except Exception:
+            logger.warning(
+                "Could not fetch expected_mounts from resource manager",
+                exc_info=True,
+            )
+            return []
+        mounts = sorted({p.dax_path for p in pools if p.dax_type == DaxType.MARUFS})
+        if not mounts:
+            logger.warning(
+                "prefer_backend=marufs but resource manager reports no MARUFS pools"
+            )
+        return mounts
 
     def _validate_dax_paths(self) -> None:
         """Warn if any --dax-path values don't match resource manager pools."""
@@ -76,6 +102,16 @@ class MaruServer:
     def rm_address(self) -> str:
         """Resource manager address used by this server."""
         return self._rm_address
+
+    @property
+    def backend(self) -> str:
+        """Backend name advertised to Handlers in the handshake response."""
+        return "marufs" if self._prefer_backend == BackendTag.MARUFS else "maru"
+
+    @property
+    def expected_mounts(self) -> list[str]:
+        """Mount paths the Handler should verify locally before using this server."""
+        return list(self._expected_mounts)
 
     # =========================================================================
     # Allocation Management

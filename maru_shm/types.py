@@ -17,6 +17,7 @@ class DaxType(IntEnum):
 
     DEV_DAX = 0  # Character device (/dev/daxX.Y)
     FS_DAX = 1  # File-based DAX (mounted filesystem)
+    MARUFS = 2  # marufs mount on top of a DEV_DAX device
 
 
 # Handle binary layout: 4 x uint64 = 32 bytes, little-endian byte order

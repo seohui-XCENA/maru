@@ -379,3 +379,52 @@ class TestMaruServerPreferBackend:
         assert handle is not None
         client = server._allocation_manager._client
         assert client.last_prefer_backend == 2
+
+
+class TestMaruServerHandshakeMetadata:
+    """backend name + expected_mounts advertised on the handshake."""
+
+    def test_backend_defaults_to_maru(self):
+        """UNSPECIFIED → 'maru' (legacy default)."""
+        server = MaruServer()
+        assert server.backend == "maru"
+        assert server.expected_mounts == []
+
+    def test_backend_maru(self):
+        """prefer=MARU → 'maru', no expected_mounts."""
+        server = MaruServer(prefer_backend=1)
+        assert server.backend == "maru"
+        assert server.expected_mounts == []
+
+    def test_backend_marufs_collects_mount_paths(self):
+        """prefer=MARUFS → 'marufs' + expected_mounts sourced from RM stats."""
+        from maru_shm import DaxType, MaruPoolInfo
+        from tests.unit.conftest import MockShmClient
+
+        MockShmClient.mock_pools = [
+            MaruPoolInfo(dax_path="/mnt/marufs", dax_type=DaxType.MARUFS),
+            MaruPoolInfo(dax_path="/dev/dax0.0", dax_type=DaxType.DEV_DAX),
+            MaruPoolInfo(dax_path="/mnt/marufs2", dax_type=DaxType.MARUFS),
+        ]
+        server = MaruServer(prefer_backend=2)
+        assert server.backend == "marufs"
+        # MARUFS-only, deduped and sorted for determinism
+        assert server.expected_mounts == ["/mnt/marufs", "/mnt/marufs2"]
+
+    def test_expected_mounts_empty_when_no_marufs_pool(self):
+        """prefer=MARUFS with no MARUFS pools → empty list, warning logged."""
+        from maru_shm import DaxType, MaruPoolInfo
+        from tests.unit.conftest import MockShmClient
+
+        MockShmClient.mock_pools = [
+            MaruPoolInfo(dax_path="/dev/dax0.0", dax_type=DaxType.DEV_DAX),
+        ]
+        server = MaruServer(prefer_backend=2)
+        assert server.expected_mounts == []
+
+    def test_expected_mounts_returns_copy(self):
+        """expected_mounts property returns a defensive copy."""
+        server = MaruServer()
+        first = server.expected_mounts
+        first.append("x")
+        assert server.expected_mounts == []
