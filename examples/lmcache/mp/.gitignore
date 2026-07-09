@@ -1,0 +1,4 @@
+*.log
+.logs/
+.results/
+bench_results/
