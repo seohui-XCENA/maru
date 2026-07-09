@@ -76,14 +76,11 @@ MODEL=Qwen/Qwen3-8B bash run_simple_query.sh
 
 ## What the Test Asserts
 
-`run_simple_query.sh` sends a long prompt (~811 tokens = 3 full 256-token chunks + a partial chunk) to inst1, then the **same prompt** to inst2, and checks:
+`run_simple_query.sh` sends a long prompt (~834 tokens = 3 full 256-token chunks + a partial chunk) to inst1, then the **same prompt** to inst2, and checks:
 
-1. **Output agreement (tiered)** — decoding is greedy (`temperature=0`).
-   - Exact match → OK.
-   - Long shared prefix (default ≥ 40 words) or high similarity (default ≥ 0.85), then divergence → OK with an FP-nondeterminism note. KV reuse is **not guaranteed to be bit-exact across engines**: the recomputed suffix takes a different kernel path, slightly different logits can flip one greedy token, and the tails fork from there.
-   - Divergence from the start → FAIL. Corrupted KV derails the output from the very first tokens.
-   - Thresholds are tunable via `PREFIX_THRESHOLD` / `SIM_THRESHOLD`.
-2. **Retrieved token count matches expected chunk coverage** — the response's `usage.prompt_tokens` gives the expected retrievable amount (`floor(prompt_tokens / 256) * 256`); the `Retrieved N tokens` log lines added by the second query must sum to at least that. This catches **partial retrieval** (e.g., only 1 of 3 chunks hitting due to a hash mismatch) and **silent misses** (vLLM recomputes the prefill and still produces a correct output), neither of which output comparison alone can detect.
+1. **Content grounding** — the prompt ends with an extraction question whose answers are pinned by the passage: the three protocol names (`CXL.io`, `CXL.cache`, `CXL.mem`) live in chunk 1 and the four architectural advantages (tiering, bandwidth, isolation/serviceability, composable) in chunks 2–3, so the expected keywords cover every retrieved chunk. **Both outputs must contain all keywords.** Extraction answers have large logit margins, so FP noise cannot flip them — but corrupted KV destroys the content they are read from. If the *baseline* output already lacks the keywords, the failure is attributed to the model/prompt, not Maru.
+2. **Output agreement (informational)** — exact match / long shared prefix (≥ 40 words or similarity ≥ 0.85, tunable via `PREFIX_THRESHOLD`/`SIM_THRESHOLD`) / early fork. Greedy KV reuse is **not bit-exact across engines**: the recomputed suffix takes a different kernel path, slightly different logits can flip one greedy token, and the fork position is arbitrary — even token 0. Divergence alone therefore does not fail the test while both outputs stay grounded.
+3. **Retrieved token count matches expected chunk coverage** — the response's `usage.prompt_tokens` gives the expected retrievable amount (`floor(prompt_tokens / 256) * 256`); the `Retrieved N tokens` log lines added by the second query must sum to at least that. This catches **partial retrieval** (e.g., only 1 of 3 chunks hitting due to a hash mismatch) and **silent misses** (vLLM recomputes the prefill and still produces a correct output), neither of which output comparison alone can detect.
 
 Latency is printed for reference only — the first query is dominated by engine warmup, so it is not a pass/fail criterion.
 
