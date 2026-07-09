@@ -76,17 +76,21 @@ MODEL=Qwen/Qwen3-8B bash run_simple_query.sh
 
 ## What the Test Asserts
 
-`run_simple_query.sh` sends a long prompt (several 256-token chunks) to inst1, then the **same prompt** to inst2, and checks:
+`run_simple_query.sh` sends a long prompt (~811 tokens = 3 full 256-token chunks + a partial chunk) to inst1, then the **same prompt** to inst2, and checks:
 
-1. **Outputs match exactly** — decoding is greedy (`temperature=0`), so if the retrieved KV is intact the outputs must be identical; corrupted KV produces garbage immediately.
-2. **Retrieve evidence appears in the logs** — on a cache miss vLLM silently recomputes the prefill and still produces a correct output, so output equality alone would be a false positive. The script counts `Retrieved ...` log lines before/after the second query and fails if none were added.
+1. **Output agreement (tiered)** — decoding is greedy (`temperature=0`).
+   - Exact match → OK.
+   - Long shared prefix (default ≥ 40 words) or high similarity (default ≥ 0.85), then divergence → OK with an FP-nondeterminism note. KV reuse is **not guaranteed to be bit-exact across engines**: the recomputed suffix takes a different kernel path, slightly different logits can flip one greedy token, and the tails fork from there.
+   - Divergence from the start → FAIL. Corrupted KV derails the output from the very first tokens.
+   - Thresholds are tunable via `PREFIX_THRESHOLD` / `SIM_THRESHOLD`.
+2. **Retrieved token count matches expected chunk coverage** — the response's `usage.prompt_tokens` gives the expected retrievable amount (`floor(prompt_tokens / 256) * 256`); the `Retrieved N tokens` log lines added by the second query must sum to at least that. This catches **partial retrieval** (e.g., only 1 of 3 chunks hitting due to a hash mismatch) and **silent misses** (vLLM recomputes the prefill and still produces a correct output), neither of which output comparison alone can detect.
 
-It also prints per-query latency; the second query should be noticeably faster for long prompts.
+Latency is printed for reference only — the first query is dominated by engine warmup, so it is not a pass/fail criterion.
 
-Example retrieve evidence (in `mp1.log` / `mp2.log` / `inst2.log`):
+Example retrieve evidence (in `mp1.log` / `mp2.log`):
 
 ```
-LMCache INFO: Retrieved 1002 out of total 1002 tokens. size: 0.1223 gb, cost 60.3595 ms, throughput: 2.0264 GB/s
+LMCache INFO: Retrieved 768 tokens in 0.010 seconds (lmcache_driven_transfer.py:1304:...)
 ```
 
 ---

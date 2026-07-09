@@ -4,10 +4,21 @@
 # --single:     store and re-query on inst1 only (quick smoke test)
 #
 # PASS criteria:
-#   1. Outputs of the two queries are identical (greedy decoding)
-#   2. Retrieve evidence appears in the logs after the second query
-#      (a miss silently falls back to recompute, so output match alone
-#       is NOT sufficient to prove the cache was used)
+#   1. Output agreement (tiered): exact match passes; a long shared prefix
+#      followed by divergence also passes, because KV reuse is not
+#      guaranteed to be bit-exact across engines - the recomputed suffix
+#      takes a different kernel path, slightly different logits can flip
+#      one greedy token and the tails fork. Real KV corruption derails the
+#      output from the very first tokens, which still fails.
+#   2. Retrieved token count matches expected full-chunk coverage of the
+#      prompt (floor(prompt_tokens / chunk_size) * chunk_size), computed
+#      from the response's usage.prompt_tokens and compared against the
+#      "Retrieved N tokens" log lines added by the second query. A silent
+#      miss recomputes the prefill and still produces a good output, so
+#      output comparison alone would be a false pass.
+#
+# Latency is printed for reference only (first-query latency is dominated
+# by engine warmup, so it is not a reliable pass/fail signal).
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 [ -f "env.sh" ] && source env.sh
@@ -15,6 +26,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 MODEL="${MODEL:-Qwen/Qwen2.5-0.5B}"
 PORT1="${LMCACHE_INST1_PORT:-12030}"
 PORT2="${LMCACHE_INST2_PORT:-12031}"
+CHUNK="${CHUNK_SIZE:-256}"
+MAX_TOKENS="${MAX_TOKENS:-200}"
+
+# Output-agreement thresholds (see PASS criteria above)
+PREFIX_THRESHOLD="${PREFIX_THRESHOLD:-40}"   # leading identical words
+SIM_THRESHOLD="${SIM_THRESHOLD:-0.85}"       # difflib similarity ratio
 
 SINGLE=0
 if [[ "$1" == "--single" ]]; then
@@ -25,47 +42,94 @@ fi
 # Logs scanned for retrieve evidence (whichever exist)
 EVIDENCE_LOGS=(inst1.log inst2.log mp1.log mp2.log)
 
-PROMPT="Explain CXL memory technology in detail. CXL stands for Compute Express Link, which is a high-speed CPU-to-device and CPU-to-memory interconnect designed to accelerate next-generation data center performance. It enables memory expansion and sharing between host processors and accelerators. CXL builds on the PCI Express (PCIe) physical and electrical interface, adding a set of protocols that allow coherent memory access between CPUs and attached devices. The CXL specification defines three protocols: CXL.io for device discovery and configuration based on PCIe, CXL.cache for device-to-host cache coherency allowing devices to cache host memory with low latency, and CXL.mem for host-managed device memory that enables the host processor to access memory attached to CXL devices using standard load and store instructions. CXL technology is particularly relevant for modern data centers where memory capacity and bandwidth requirements are growing rapidly. Applications such as large language model inference, in-memory databases, and real-time analytics benefit significantly from the ability to expand memory pools beyond what is directly attached to a single CPU socket. CXL Type 3 devices, which are memory expansion devices, allow servers to access additional DRAM or persistent memory through the CXL interface, effectively creating a larger memory pool. This is especially valuable in scenarios where memory capacity is the bottleneck rather than compute power. The CXL 2.0 specification introduced memory pooling and switching capabilities, enabling multiple hosts to share a common pool of CXL-attached memory through a CXL switch. This allows for more efficient memory utilization across a cluster of servers, as memory can be dynamically allocated to the hosts that need it most. CXL 3.0 further extended these capabilities with support for fabric-attached memory, enabling even larger scale memory sharing across multiple levels of switches.\n\nSummarize the key benefits of CXL technology:"
+# ~3 full 256-token chunks + a trailing partial chunk, so multi-chunk
+# retrieval (chunk ordering, boundary handling) is exercised
+PROMPT="Explain CXL memory technology in detail. CXL stands for Compute Express Link, which is a high-speed CPU-to-device and CPU-to-memory interconnect designed to accelerate next-generation data center performance. It enables memory expansion and sharing between host processors and accelerators. CXL builds on the PCI Express (PCIe) physical and electrical interface, adding a set of protocols that allow coherent memory access between CPUs and attached devices. The CXL specification defines three protocols: CXL.io for device discovery and configuration based on PCIe, CXL.cache for device-to-host cache coherency allowing devices to cache host memory with low latency, and CXL.mem for host-managed device memory that enables the host processor to access memory attached to CXL devices using standard load and store instructions. CXL technology is particularly relevant for modern data centers where memory capacity and bandwidth requirements are growing rapidly. Applications such as large language model inference, in-memory databases, and real-time analytics benefit significantly from the ability to expand memory pools beyond what is directly attached to a single CPU socket. CXL Type 3 devices, which are memory expansion devices, allow servers to access additional DRAM or persistent memory through the CXL interface, effectively creating a larger memory pool. This is especially valuable in scenarios where memory capacity is the bottleneck rather than compute power. The CXL 2.0 specification introduced memory pooling and switching capabilities, enabling multiple hosts to share a common pool of CXL-attached memory through a CXL switch. This allows for more efficient memory utilization across a cluster of servers, as memory can be dynamically allocated to the hosts that need it most. CXL 3.0 further extended these capabilities with support for fabric-attached memory, enabling even larger scale memory sharing across multiple levels of switches. Beyond raw capacity expansion, CXL brings several architectural advantages to system designers. First, memory tiering becomes practical: hot data can live in fast direct-attached DRAM while warm and cold data reside in CXL-attached memory, with the operating system or a hardware controller migrating pages between tiers based on access frequency. Studies of real workloads show that a large fraction of application memory is accessed infrequently, which makes tiering attractive for reducing total cost of ownership without hurting performance. Second, CXL enables memory bandwidth expansion. Modern processors with many cores are often starved for memory bandwidth because the number of DDR channels per socket grows slowly. CXL links attached through PCIe lanes provide additional parallel paths to memory, so bandwidth-hungry workloads such as scientific computing and deep learning training can see substantial speedups. Third, CXL improves failure isolation and serviceability. Memory modules behind a CXL controller can be hot-plugged, taken offline for maintenance, or replaced without rebooting the host, which matters for data centers that target very high availability. Fourth, the technology opens the door to composable infrastructure, where compute, memory, and accelerators are disaggregated into resource pools and composed on demand into logical servers that match the exact needs of each workload. Compared with RDMA-based remote memory approaches, CXL offers much lower latency because accesses are performed by hardware load and store instructions rather than by network packets processed through software stacks. Typical CXL memory access latency is in the range of a few hundred nanoseconds, roughly comparable to a remote NUMA node access, whereas RDMA round trips are measured in microseconds. This latency profile allows applications to treat CXL memory as just another memory tier rather than as a storage device. In the context of large language model serving, key value caches produced during inference can be placed in CXL memory and shared across multiple GPU servers, so that a prefix computed by one server can be reused by another without recomputation, saving both GPU time and energy. Industry adoption of CXL has been accelerating, with major processor vendors shipping CXL capable CPUs, memory vendors offering CXL expansion modules, and hyperscale operators publishing reference designs for CXL based memory pooling appliances.\n\nSummarize the key benefits of CXL technology:"
 
-send_query() {
+query_endpoint() {
     local port="$1"
     curl -sS "http://localhost:${port}/v1/completions" \
       -H "Content-Type: application/json" \
-      -d "{\"model\": \"${MODEL}\", \"prompt\": \"$PROMPT\", \"max_tokens\": 200, \"temperature\": 0.0, \"ignore_eos\": true}" 2>&1 \
-      | python3 -c "
+      -d "{\"model\": \"${MODEL}\", \"prompt\": \"$PROMPT\", \"max_tokens\": ${MAX_TOKENS}, \"temperature\": 0.0, \"ignore_eos\": true}" 2>/dev/null
+}
+
+extract_text() {
+    python3 -c "
 import sys, json
-output = []
-for line in sys.stdin:
-    line = line.strip()
-    if not line or line == 'data: [DONE]':
-        continue
-    if line.startswith('data: '):
-        line = line[6:]
-    try:
-        data = json.loads(line)
-        output.append(data['choices'][0]['text'])
-    except (json.JSONDecodeError, KeyError, IndexError):
-        pass
-print(''.join(output))
+try:
+    data = json.load(sys.stdin)
+    print(data['choices'][0]['text'])
+except Exception:
+    pass
 "
 }
 
-count_retrieve_evidence() {
-    local total=0 c
-    for f in "${EVIDENCE_LOGS[@]}"; do
+extract_prompt_tokens() {
+    python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('usage', {}).get('prompt_tokens', ''))
+except Exception:
+    pass
+"
+}
+
+# classification: 'exact', 'fp' (long shared prefix / high similarity), 'diverged'
+compare_outputs() {
+    python3 -c "
+import sys, difflib
+a = open(sys.argv[1]).read()
+b = open(sys.argv[2]).read()
+if a == b:
+    print('exact 0 1.000')
+    sys.exit(0)
+aw, bw = a.split(), b.split()
+prefix = 0
+for x, y in zip(aw, bw):
+    if x != y:
+        break
+    prefix += 1
+ratio = difflib.SequenceMatcher(None, aw, bw).ratio()
+cls = 'fp' if (prefix >= int(sys.argv[3]) or ratio >= float(sys.argv[4])) else 'diverged'
+print(f'{cls} {prefix} {ratio:.3f}')
+" "$1" "$2" "$PREFIX_THRESHOLD" "$SIM_THRESHOLD"
+}
+
+declare -a LOG_SNAP
+snapshot_logs() {
+    local i f
+    for i in "${!EVIDENCE_LOGS[@]}"; do
+        f="${EVIDENCE_LOGS[$i]}"
         if [ -f "$f" ]; then
-            c=$(grep -ci "retriev" "$f" 2>/dev/null) || c=0
-            total=$((total + c))
+            LOG_SNAP[$i]=$(wc -l < "$f")
+        else
+            LOG_SNAP[$i]=0
         fi
+    done
+}
+
+# Sum of "Retrieved N ..." token counts in log lines added since snapshot_logs
+new_retrieved_tokens() {
+    local total=0 i f n
+    for i in "${!EVIDENCE_LOGS[@]}"; do
+        f="${EVIDENCE_LOGS[$i]}"
+        [ -f "$f" ] || continue
+        n=$(tail -n +"$(( ${LOG_SNAP[$i]:-0} + 1 ))" "$f" \
+            | grep -oiE 'Retrieved [0-9]+' | awk '{s+=$2} END {print s+0}')
+        total=$((total + ${n:-0}))
     done
     echo "$total"
 }
 
-show_retrieve_evidence() {
-    for f in "${EVIDENCE_LOGS[@]}"; do
-        if [ -f "$f" ] && grep -qi "retriev" "$f" 2>/dev/null; then
+show_new_retrieve_lines() {
+    local i f
+    for i in "${!EVIDENCE_LOGS[@]}"; do
+        f="${EVIDENCE_LOGS[$i]}"
+        [ -f "$f" ] || continue
+        if tail -n +"$(( ${LOG_SNAP[$i]:-0} + 1 ))" "$f" | grep -qi "retriev"; then
             echo "--- $f ---"
-            grep -i "retriev" "$f" | tail -3
+            tail -n +"$(( ${LOG_SNAP[$i]:-0} + 1 ))" "$f" | grep -i "retriev" | tail -5
         fi
     done
 }
@@ -81,17 +145,19 @@ else
     echo "=== inst1 - Store KV (port ${PORT1}) ==="
 fi
 t0=$(date +%s%N)
-OUT1=$(send_query "$PORT1")
+RESP1=$(query_endpoint "$PORT1")
 t1=$(date +%s%N)
 LAT1=$(( (t1 - t0) / 1000000 ))
+OUT1=$(printf '%s' "$RESP1" | extract_text)
+PROMPT_TOKENS=$(printf '%s' "$RESP1" | extract_prompt_tokens)
 echo "$OUT1"
-echo "(latency: ${LAT1} ms)"
+echo "(latency: ${LAT1} ms, prompt tokens: ${PROMPT_TOKENS:-unknown})"
 echo ""
 
 # Give the async store path time to flush KV into Maru
 sleep 3
 
-BEFORE=$(count_retrieve_evidence)
+snapshot_logs
 
 # Step 2: Query the second endpoint; must hit the KV stored in Maru
 if [ "$SINGLE" -eq 1 ]; then
@@ -100,43 +166,89 @@ else
     echo "=== inst2 - Retrieve via Maru (port ${PORT2}) ==="
 fi
 t0=$(date +%s%N)
-OUT2=$(send_query "$PORT2")
+RESP2=$(query_endpoint "$PORT2")
 t1=$(date +%s%N)
 LAT2=$(( (t1 - t0) / 1000000 ))
+OUT2=$(printf '%s' "$RESP2" | extract_text)
 echo "$OUT2"
 echo "(latency: ${LAT2} ms)"
 echo ""
 
-AFTER=$(count_retrieve_evidence)
+# Give log tee a moment to flush
+sleep 1
+
+RETRIEVED=$(new_retrieved_tokens)
 
 # --- Verdict ---
 echo "==================== RESULT ===================="
 PASS=1
 
+# 1. Output agreement (tiered)
 if [ -z "$OUT1" ] || [ -z "$OUT2" ]; then
     echo "[FAIL] Empty output (query 1: ${#OUT1} chars, query 2: ${#OUT2} chars)"
     PASS=0
-elif [ "$OUT1" == "$OUT2" ]; then
-    echo "[OK]   Outputs match exactly (greedy decoding)"
 else
-    echo "[FAIL] Outputs differ - KV cache may be corrupted"
-    echo "--- output 1 ---"
-    echo "$OUT1"
-    echo "--- output 2 ---"
-    echo "$OUT2"
-    PASS=0
+    TMP1=$(mktemp) && TMP2=$(mktemp)
+    printf '%s' "$OUT1" > "$TMP1"
+    printf '%s' "$OUT2" > "$TMP2"
+    read -r CLS PREFIX RATIO <<< "$(compare_outputs "$TMP1" "$TMP2")"
+    rm -f "$TMP1" "$TMP2"
+
+    case "$CLS" in
+        exact)
+            echo "[OK]   Outputs match exactly"
+            ;;
+        fp)
+            echo "[OK]   Outputs share a long common prefix (${PREFIX} words, similarity ${RATIO})"
+            echo "       Divergence attributed to FP nondeterminism of the recomputed"
+            echo "       suffix, not KV corruption (corruption derails from token 1)"
+            ;;
+        *)
+            echo "[FAIL] Outputs diverge from the start (${PREFIX} common words, similarity ${RATIO})"
+            echo "       - KV cache may be corrupted"
+            echo "--- output 1 ---"
+            echo "$OUT1"
+            echo "--- output 2 ---"
+            echo "$OUT2"
+            PASS=0
+            ;;
+    esac
 fi
 
-if [ "$AFTER" -gt "$BEFORE" ]; then
-    echo "[OK]   Retrieve evidence found in logs (+$((AFTER - BEFORE)) lines)"
-    show_retrieve_evidence
+# 2. Retrieved token count vs expected full-chunk coverage
+if [ -n "$PROMPT_TOKENS" ] && [ "$PROMPT_TOKENS" -gt 0 ] 2>/dev/null; then
+    EXPECTED=$(( PROMPT_TOKENS / CHUNK * CHUNK ))
+    if [ "$EXPECTED" -eq 0 ]; then
+        echo "[FAIL] Prompt too short (${PROMPT_TOKENS} tokens < chunk size ${CHUNK}) -"
+        echo "       nothing can be cached, test is meaningless"
+        PASS=0
+    elif [ "$RETRIEVED" -ge "$EXPECTED" ]; then
+        echo "[OK]   Retrieved ${RETRIEVED} tokens >= expected ${EXPECTED}"
+        echo "       (prompt ${PROMPT_TOKENS} tokens = $(( PROMPT_TOKENS / CHUNK )) full chunks x ${CHUNK})"
+        show_new_retrieve_lines
+    else
+        echo "[FAIL] Retrieved ${RETRIEVED} tokens, expected ${EXPECTED}"
+        echo "       (prompt ${PROMPT_TOKENS} tokens = $(( PROMPT_TOKENS / CHUNK )) full chunks x ${CHUNK})"
+        if [ "$RETRIEVED" -gt 0 ]; then
+            echo "       Partial retrieval - later chunks may have missed (hash mismatch?)"
+            show_new_retrieve_lines
+        else
+            echo "       No retrieval - second query recomputed the prefill (silent miss)"
+        fi
+        PASS=0
+    fi
 else
-    echo "[FAIL] No new retrieve evidence in logs - second query likely"
-    echo "       recomputed the prefill instead of hitting the cache"
-    PASS=0
+    # usage.prompt_tokens unavailable; fall back to evidence-exists check
+    if [ "$RETRIEVED" -gt 0 ]; then
+        echo "[WARN] usage.prompt_tokens unavailable; retrieved ${RETRIEVED} tokens (> 0)"
+        show_new_retrieve_lines
+    else
+        echo "[FAIL] No retrieve evidence in logs after the second query"
+        PASS=0
+    fi
 fi
 
-echo "latency: query1=${LAT1} ms, query2=${LAT2} ms"
+echo "latency: query1=${LAT1} ms, query2=${LAT2} ms (reference only, not a criterion)"
 
 if [ "$PASS" -eq 1 ]; then
     echo "================ PASS ================"
