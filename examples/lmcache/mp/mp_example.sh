@@ -145,6 +145,7 @@ launch_mp_server() {
         > >(tee "$log_file") 2>&1 &
     local pid=$!
     PIDS+=($pid)
+    LAUNCHED_MP_PID=$pid
     echo "[$(date +%T)] LMCache MP server '$name' PID: $pid (log: $log_file)"
     sleep 2
     if ! kill -0 $pid 2>/dev/null; then
@@ -153,6 +154,34 @@ launch_mp_server() {
         return 1
     fi
     wait_for_tcp_port "LMCache MP server '$name'" "$port"
+}
+
+print_server_summary() {
+    echo "==================================================="
+    echo "All servers are up (mode: $MODE)."
+    echo ""
+    echo "  MaruServer   : localhost:${MARU_SERVER_PORT} ${MARU_STATE}"
+    if [ -z "${MARU_REUSED:-}" ]; then
+        echo "                 dax: ${DAX_PATHS[*]:-(any available pool)}"
+    fi
+    echo "  LMCache mp1  : localhost:${LMCACHE_MP1_PORT} (pid ${MP1_PID}, log: ${LOG_MP1})"
+    echo "                 http :${LMCACHE_MP1_HTTP_PORT}, prometheus :${LMCACHE_MP1_PROM_PORT}, maru pool ${MARU_POOL_SIZE_GB} GB, chunk ${CHUNK_SIZE}"
+    if [[ "$MODE" == "separate" ]]; then
+        echo "  LMCache mp2  : localhost:${LMCACHE_MP2_PORT} (pid ${MP2_PID}, log: ${LOG_MP2})"
+        echo "                 http :${LMCACHE_MP2_HTTP_PORT}, prometheus :${LMCACHE_MP2_PROM_PORT}, maru pool ${MARU_POOL_SIZE_GB} GB, chunk ${CHUNK_SIZE}"
+    fi
+    echo "  vLLM inst1   : http://localhost:${LMCACHE_INST1_PORT} -> mp1 :${INST1_MP_PORT} (GPU ${INST1_DEVICE}, pid ${inst1_pid}, log: ${LOG_INST1})"
+    if [[ "$MODE" == "separate" ]]; then
+        echo "  vLLM inst2   : http://localhost:${LMCACHE_INST2_PORT} -> mp2 :${INST2_MP_PORT} (GPU ${INST2_DEVICE}, pid ${inst2_pid}, log: ${LOG_INST2})"
+    else
+        echo "  vLLM inst2   : http://localhost:${LMCACHE_INST2_PORT} -> mp1 :${INST2_MP_PORT} (GPU ${INST2_DEVICE}, pid ${inst2_pid}, log: ${LOG_INST2})"
+    fi
+    echo "  model        : ${_MODEL:-${MODEL:-Qwen/Qwen2.5-0.5B}}"
+    echo ""
+    echo "Run the correctness test in another terminal:"
+    echo "  bash run_simple_query.sh"
+    echo "Press Ctrl-C to terminate all instances."
+    echo "==================================================="
 }
 
 main() {
@@ -165,8 +194,11 @@ main() {
     trap cleanup INT TERM USR1 EXIT
 
     # Launch MaruServer
+    LOG_MARU="${LOG_MARU:-${LOG_DIR:-.}/maru_server.log}"
     if timeout 1 bash -c "echo >/dev/tcp/localhost/$MARU_SERVER_PORT" 2>/dev/null; then
         echo "[$(date +%T)] MaruServer already running on port $MARU_SERVER_PORT, skipping launch..."
+        MARU_REUSED=1
+        MARU_STATE="(already running - reused, not managed by this script)"
     else
         echo "[$(date +%T)] Launching MaruServer on port $MARU_SERVER_PORT..."
         echo "[$(date +%T)] maru package: $(python3 -c 'import maru; print(maru.__file__)' 2>&1)"
@@ -174,14 +206,15 @@ main() {
             --rm-address "${MARU_RM_ADDRESS:-127.0.0.1:9850}" \
             --log-level "${_LOG_LEVEL:-INFO}" \
             "${DAX_ARGS[@]}" \
-            > >(tee "${LOG_DIR:-.}/maru_server.log") 2>&1 &
+            > >(tee "$LOG_MARU") 2>&1 &
         maru_server_pid=$!
         PIDS+=($maru_server_pid)
-        echo "[$(date +%T)] MaruServer PID: $maru_server_pid (log: ${LOG_DIR:-.}/maru_server.log)"
+        MARU_STATE="(pid ${maru_server_pid}, log: ${LOG_MARU})"
+        echo "[$(date +%T)] MaruServer PID: $maru_server_pid (log: $LOG_MARU)"
         sleep 2
         if ! kill -0 $maru_server_pid 2>/dev/null; then
             echo "[$(date +%T)] ERROR: MaruServer process died! Log:"
-            cat "${LOG_DIR:-.}/maru_server.log" 2>/dev/null || true
+            cat "$LOG_MARU" 2>/dev/null || true
             return 1
         fi
         wait_for_tcp_port "MaruServer" $MARU_SERVER_PORT
@@ -200,11 +233,14 @@ main() {
     #           emulating multiple MP servers on different nodes sharing a CXL pool)
     if [[ "$MODE" == "shared" ]]; then
         launch_mp_server "mp1" "$LMCACHE_MP1_PORT" "$LMCACHE_MP1_HTTP_PORT" "$LMCACHE_MP1_PROM_PORT" "$LOG_MP1" || return 1
+        MP1_PID=$LAUNCHED_MP_PID
         INST1_MP_PORT=$LMCACHE_MP1_PORT
         INST2_MP_PORT=$LMCACHE_MP1_PORT
     else
         launch_mp_server "mp1" "$LMCACHE_MP1_PORT" "$LMCACHE_MP1_HTTP_PORT" "$LMCACHE_MP1_PROM_PORT" "$LOG_MP1" || return 1
+        MP1_PID=$LAUNCHED_MP_PID
         launch_mp_server "mp2" "$LMCACHE_MP2_PORT" "$LMCACHE_MP2_HTTP_PORT" "$LMCACHE_MP2_PROM_PORT" "$LOG_MP2" || return 1
+        MP2_PID=$LAUNCHED_MP_PID
         INST1_MP_PORT=$LMCACHE_MP1_PORT
         INST2_MP_PORT=$LMCACHE_MP2_PORT
     fi
@@ -226,14 +262,7 @@ main() {
     PIDS+=($inst2_pid)
     wait_for_vllm $LMCACHE_INST2_PORT "$LOG_INST2"
 
-    echo "==================================================="
-    echo "All servers are up (mode: $MODE)."
-    echo "  inst1: localhost:$LMCACHE_INST1_PORT -> MP server :$INST1_MP_PORT"
-    echo "  inst2: localhost:$LMCACHE_INST2_PORT -> MP server :$INST2_MP_PORT"
-    echo "Run the correctness test in another terminal:"
-    echo "  bash run_simple_query.sh"
-    echo "Press Ctrl-C to terminate all instances."
-    echo "==================================================="
+    print_server_summary
 
     while true; do
         sleep 1
@@ -282,6 +311,7 @@ MODE="shared"
 _LOG_LEVEL=""
 _MODEL=""
 DAX_ARGS=()
+DAX_PATHS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -289,7 +319,7 @@ while [[ $# -gt 0 ]]; do
         --mode)      MODE="$2"; shift 2 ;;
         --log-level) _LOG_LEVEL="$2"; shift 2 ;;
         --model)     _MODEL="$2"; shift 2 ;;
-        --dax-path)  DAX_ARGS+=(--dax-path "$2"); shift 2 ;;
+        --dax-path)  DAX_ARGS+=(--dax-path "$2"); DAX_PATHS+=("$2"); shift 2 ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
