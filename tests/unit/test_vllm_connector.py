@@ -2060,6 +2060,24 @@ class TestFusedLoad:
         assert ok is False
         assert ops.single_layer_kv_transfer.call_count == 0
 
+    def test_fused_survives_shim_ops_without_format_enum(self):
+        """LMCache 0.4.8rc5+ exposes c_ops through a device-ops shim that has
+        no EngineKVFormat attribute at all — the enum access itself raises
+        AttributeError. The lookup must absorb that and fall back instead of
+        letting the exception escape into the forward pass."""
+        worker = self._make_worker()
+        ops = self._fake_ops()
+        del ops.EngineKVFormat  # MagicMock: access now raises AttributeError
+        worker._lmc_ops = ops
+        worker._chunk_object_bytes = lambda: 128
+        kv_layer = torch.zeros(4, 2, 4, 1, 2)
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is False
+        assert ops.single_layer_kv_transfer.call_count == 0
+
     def test_fused_refuses_non_contiguous_cache(self):
         """A cache with HND strides whose layout resolved to an NHD format
         (the case _vllm_kv_cache_layout warns about: physical layout
@@ -2447,6 +2465,32 @@ class TestPackedStorage:
             kernel, metadata
         )
         assert worker._queued_store_batches == []
+
+    def test_packed_kernel_ctx_survives_shim_ops_without_format_enum(self):
+        """Same shim guard for the packed kernel resolution: a device-ops
+        shim lacking EngineKVFormat must resolve the ctx to None (per-layer
+        fallback) instead of raising out of save_kv_layer — the pre-guard
+        code killed the EngineCore here on the first request."""
+        worker, _ = self._make_worker()
+        ops = MagicMock()
+        del ops.EngineKVFormat  # access now raises AttributeError, like the shim
+        worker._lmc_ops = ops
+        worker._kv_layout = SimpleNamespace(
+            format_name="NL_X_NB_TWO_BS_NH_HS",
+            block_size=self.BLOCK,
+            head_size=2,
+            page_buffer_size=64,
+        )
+        fake_layer = SimpleNamespace(
+            device=SimpleNamespace(type="cuda"), data_ptr=lambda: 0x1000
+        )
+        layers = [("model.layers.0.self_attn", fake_layer, 0)]
+
+        with patch("torch.cuda.is_available", return_value=True):
+            ctx = worker._packed_load_kernel_ctx(layers, MagicMock())
+
+        assert ctx is None
+        assert ops.multi_layer_kv_transfer.call_count == 0
 
     def test_kernel_ctx_caching_contract(self):
         """_packed_store_kernel_ctx resolves once and caches the outcome:

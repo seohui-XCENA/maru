@@ -2226,7 +2226,15 @@ class MaruWorkerConnector:
         if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
             return False
         ops = self._lmc_ops
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        # getattr on ops itself as well: newer LMCache builds expose c_ops via
+        # a device-ops shim that has no EngineKVFormat at all, and only the
+        # inner lookup was guarded before — the shim raised out of the load path.
+        kv_format_enum = getattr(ops, "EngineKVFormat", None)
+        kv_format = (
+            getattr(kv_format_enum, layout.format_name, None)
+            if kv_format_enum is not None
+            else None
+        )
         if kv_format is None:
             logger.warning(
                 "Maru fused load: kernel has no format %s; using memcpy fallback",
@@ -2426,9 +2434,16 @@ class MaruWorkerConnector:
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
         ops = self._lmc_ops
-        # An older c_ops build may not carry every format; take the per-layer
-        # fallback rather than raising out of the load path.
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        # An older c_ops build may not carry every format — and newer LMCache
+        # builds expose c_ops via a device-ops shim with no EngineKVFormat at
+        # all — so guard both lookups and take the per-layer fallback rather
+        # than raising out of the load path.
+        kv_format_enum = getattr(ops, "EngineKVFormat", None)
+        kv_format = (
+            getattr(kv_format_enum, layout.format_name, None)
+            if kv_format_enum is not None
+            else None
+        )
         if kv_format is None:
             logger.warning(
                 "Maru packed load: kernel has no format %s; using per-layer "
