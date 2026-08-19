@@ -1951,6 +1951,116 @@ class TestWriteBehindStoreLifecycle:
 # =============================================================================
 
 
+class TestResolveLmcOps:
+    """_resolve_lmc_ops must bundle kernels+enums across LMCache generations:
+    old builds carry everything on ``lmcache.c_ops``; newer upstream routes
+    c_ops through a device-ops shim (kernels only) and relocates the enums
+    into ``lmcache.lmcache_native``."""
+
+    def _fake_c_ops(self, with_enums):
+        import types as _types
+
+        mod = _types.ModuleType("lmcache.c_ops")
+        mod.multi_layer_kv_transfer = lambda *a, **k: None
+        mod.single_layer_kv_transfer = lambda *a, **k: None
+        if with_enums:
+            mod.EngineKVFormat = SimpleNamespace(NL_X_TWO_NB_BS_NH_HS="F")
+            mod.TransferDirection = SimpleNamespace(H2D="H2D", D2H="D2H")
+        return mod
+
+    def _fake_native(self):
+        import types as _types
+
+        mod = _types.ModuleType("lmcache.lmcache_native")
+        mod.EngineKVFormat = SimpleNamespace(NL_X_TWO_NB_BS_NH_HS="F")
+        mod.TransferDirection = SimpleNamespace(H2D="H2D", D2H="D2H")
+        return mod
+
+    def test_old_style_everything_on_c_ops(self, monkeypatch):
+        import sys
+
+        from maru_vllm.connector import _resolve_lmc_ops
+
+        monkeypatch.setitem(sys.modules, "lmcache.c_ops", self._fake_c_ops(True))
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_native", None)
+        ops = _resolve_lmc_ops()
+        assert ops is not None
+        assert ops.TransferDirection.H2D == "H2D"
+
+    def test_new_style_enums_from_lmcache_native(self, monkeypatch):
+        import sys
+
+        from maru_vllm.connector import _resolve_lmc_ops
+
+        monkeypatch.setitem(sys.modules, "lmcache.c_ops", self._fake_c_ops(False))
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_native", self._fake_native())
+        ops = _resolve_lmc_ops()
+        assert ops is not None
+        assert ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS == "F"
+        assert callable(ops.multi_layer_kv_transfer)
+
+    def test_enums_nowhere_returns_none(self, monkeypatch):
+        import sys
+
+        from maru_vllm.connector import _resolve_lmc_ops
+
+        monkeypatch.setitem(sys.modules, "lmcache.c_ops", self._fake_c_ops(False))
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_native", None)
+        assert _resolve_lmc_ops() is None
+
+    def test_kernels_missing_returns_none(self, monkeypatch):
+        import sys
+        import types as _types
+
+        from maru_vllm.connector import _resolve_lmc_ops
+
+        empty = _types.ModuleType("lmcache.c_ops")
+        monkeypatch.setitem(sys.modules, "lmcache.c_ops", empty)
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_native", self._fake_native())
+        assert _resolve_lmc_ops() is None
+
+
+class TestUseLmcacheKernelsFlag:
+    """maru_use_lmcache_kernels=false must force the per-layer paths without
+    ever attempting kernel resolution, regardless of what lmcache provides."""
+
+    def _make_worker(self, **extra):
+        from maru_vllm.connector import MaruWorkerConnector
+
+        return MaruWorkerConnector(block_size=4, kv_chunk_tokens=8, extra_config=extra)
+
+    def test_packed_kernel_ctx_skips_resolution_when_disabled(self):
+        worker = self._make_worker(maru_use_lmcache_kernels=False)
+        worker._kv_layout = SimpleNamespace(
+            format_name="NL_X_NB_TWO_BS_NH_HS",
+            block_size=4,
+            head_size=2,
+            page_buffer_size=64,
+        )
+        fake_layer = SimpleNamespace(
+            device=SimpleNamespace(type="cuda"), data_ptr=lambda: 0x1000
+        )
+        layers = [("model.layers.0.self_attn", fake_layer, 0)]
+
+        with patch("torch.cuda.is_available", return_value=True):
+            ctx = worker._packed_load_kernel_ctx(layers, MagicMock())
+
+        assert ctx is None
+        assert worker._lmc_ops is None  # resolution never attempted
+
+    def test_fused_load_disabled_when_kernels_off(self):
+        worker = self._make_worker(
+            maru_use_lmcache_kernels=False, maru_enable_fused_load=True
+        )
+        assert worker._ensure_fused_ops() is False
+        assert worker._fused_load is False
+        assert worker._lmc_ops is None
+
+    def test_default_keeps_kernels_enabled(self):
+        worker = self._make_worker()
+        assert worker._use_lmc_kernels is True
+
+
 class TestFusedLoad:
     CHUNK = 8
 
