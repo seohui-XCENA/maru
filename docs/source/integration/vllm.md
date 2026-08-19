@@ -195,11 +195,38 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_enable_deferred_loading` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
-| `maru_enable_write_behind` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
-| `maru_load_admission_window` | int | `0` | Cap on deferred loads in flight; `0` submits all |
-| `maru_use_layerwise` | bool | `false` | Store one CXL object per (chunk, layer) instead of one packed object per chunk |
-| `maru_enable_layerwise_overlap` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
+| `maru_async_load` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
+| `maru_overlap_load_with_compute` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
+
+Storage format — how a request's KV is grouped into CXL objects:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `maru_use_layerwise` | bool | `false` | `false` = chunkwise: one object per chunk holding every layer. `true` = layerwise: one object per (chunk, layer) |
+
+Diagnostics and fallback guards — leave these at their defaults in normal
+operation:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
+| `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
+
+#### Renamed parameters
+
+These three knobs were renamed to name the axis a deployer chooses. The
+former names are still accepted and log a deprecation warning:
+
+| Former name | Current name |
+|-------------|--------------|
+| `maru_enable_deferred_loading` | `maru_async_load` |
+| `maru_enable_write_behind` | `maru_async_store` |
+| `maru_enable_layerwise_overlap` | `maru_overlap_load_with_compute` |
+
+`maru_enable_async_loading` and `maru_enable_fused_load` were removed. They
+gated a load path that the packed storage layout never entered, and no
+measurement ever exercised it.
 
 ### Asynchronous load and store
 
@@ -207,30 +234,64 @@ By default both the cache-hit load and the populate store run to completion
 inside the model worker's forward pass. The two settings below move that work
 off the critical path; they are independent and can be enabled separately.
 
-`maru_enable_deferred_loading` parks a cache-hit request while a background
-thread performs the Maru lookup and the CXL→GPU transfer, then reports
-completion through a CUDA event. The forward pass no longer waits on the
-retrieve RPC.
+`maru_async_load` parks a cache-hit request while a background thread
+performs the Maru lookup and the CXL→GPU transfer, then reports completion
+through a CUDA event. The forward pass no longer waits on the retrieve RPC.
+This is the mechanism vLLM itself calls an asynchronous load: the request
+waits in `WAITING_FOR_REMOTE_KVS`.
 
-`maru_enable_write_behind` lets the store finish after the forward pass
-returns, so the first token of the current step is not delayed by the
-GPU→CXL copy and the metadata registration.
+`maru_async_store` lets the store finish after the forward pass returns, so
+the first token of the current step is not delayed by the GPU→CXL copy and
+the metadata registration.
 
-`maru_load_admission_window` bounds how many deferred loads may be in flight
-at once. The default `0` submits every load immediately. Set a positive value
-only if you need request-level backpressure.
+`maru_load_admission_window` bounds how many asynchronous loads may be in
+flight at once. The default `0` submits every load immediately. Set a
+positive value only if you need request-level backpressure.
 
 ### Storage granularity and overlap
 
-`maru_use_layerwise` selects the storage layout. The default (`false`) packs
-every layer of a chunk into one CXL object, so a request resolves one key per
-chunk rather than one per (chunk, layer). Setting it to `true` restores the
-per-layer objects.
+`maru_use_layerwise` selects how a request's KV is grouped into CXL objects.
+The two layouts differ throughout the store and load paths:
 
-`maru_enable_layerwise_overlap` applies only to the packed layout and requires
-`maru_enable_deferred_loading`; it pipelines a request's per-layer transfers
+| | chunkwise (`false`, default) | layerwise (`true`) |
+|---|---|---|
+| One CXL object holds | every layer of one chunk | one (chunk, layer) pair |
+| Key | `<chunk_key>` | `<chunk_key>_L<layer_idx>` |
+| Keys per request | chunks | chunks x layers |
+| CXL page size | per-layer size x layers | per-layer size |
+| Completion marker | the chunk key itself, registered once every layer is written | a separate `_DONE` key |
+| Store | one gathered D2H per chunk | one write per layer |
+| Load | whole slab per chunk, contiguous pages coalesced | one retrieve per (layer, chunk) |
+
+The key count is the practical difference: a 64k prompt on a 32-layer model
+resolves 59 keys chunkwise versus 1,888 layerwise, and that ratio carries
+straight into retrieve metadata RPC volume. Chunkwise is the default for that
+reason; layerwise remains available for deployments that need per-layer
+object granularity.
+
+`maru_overlap_load_with_compute` applies only to the packed layout and
+requires `maru_async_load`; it pipelines a request's per-layer transfers
 against attention compute. The connector logs a warning and disables it when
 those prerequisites are not met.
+
+![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
+
+The loader thread queues the per-layer copies while the request is still
+parked and the request is released once its first layer has landed, so its
+prefill compute runs while the remaining layers arrive rather than after them.
+A cache-hit request computes only the tokens left over past its cached chunks,
+so one layer of compute is shorter than one layer of transfer: the compute
+fits inside the transfer and the transfer time is what sets time to first
+token. All parked-request transfers share one stream. That keeps each at full
+CXL bandwidth — splitting them across streams makes each transfer take as many
+times longer as there are loading requests, raising that floor — and it means
+a later request's first layer only lands once the earlier one has finished, so
+requests take their turn without any extra admission mechanism.
+
+The knob therefore applies at any concurrency. On a 16k prompt it lowered
+cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and
+raised throughput throughout; per-token generation time rose 4-5% at 4 and 8
+concurrent requests, which is the cost of every request starting earlier.
 
 ### maru_kv_chunk_tokens
 

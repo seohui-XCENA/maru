@@ -23,6 +23,7 @@ import hashlib
 import re
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -57,6 +58,33 @@ logger = init_logger(__name__)
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
 
+# Knobs renamed to name the axis the deployer actually chooses, mapped to the
+# name each one replaced. The former names stay accepted for one release so
+# existing recipes and launch scripts keep working; _get_knob warns when one
+# is used. "async"/"deferred" previously named two different things — the
+# retired maru_enable_async_loading held the "async" name while
+# maru_enable_deferred_loading was the mechanism vLLM itself calls async
+# loading (the request parks in WAITING_FOR_REMOTE_KVS).
+_RENAMED_KNOBS: dict[str, str] = {
+    "maru_async_load": "maru_enable_deferred_loading",
+    "maru_async_store": "maru_enable_write_behind",
+    "maru_overlap_load_with_compute": "maru_enable_layerwise_overlap",
+}
+
+# Parked-request transfers all share one stream so each runs at full CXL
+# bandwidth. Splitting them across streams makes the per-layer transfer time
+# scale with the number of loading requests (measured: about 2 ms alone,
+# 17 ms with eight), which overruns the roughly 3 ms of per-layer prefill
+# compute and stalls the batch at every layer. One stream also means a later
+# request's first layer only lands once the earlier one has finished, so
+# requests take their turn without any extra admission mechanism.
+_LAYERWISE_STREAM_COUNT = 1
+
+# A parked request is released once this many of its layers have landed. The
+# rest arrive while its own attention runs. Waiting for more only delays the
+# start: the transfer already outruns compute at full bandwidth.
+_LAYERWISE_RELEASE_AFTER_LAYERS = 1
+
 _cuda_runtime: Any = None
 _cuda_memcpy2d_async: Any = None
 _cuda_memcpy2d_unavailable = False
@@ -65,6 +93,34 @@ _cuda_memcpy2d_unavailable = False
 # ============================================================================
 # Utilities
 # ============================================================================
+
+
+def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> Any:
+    """Read a connector knob, accepting the deprecated name it replaced.
+
+    The current name wins whenever it is present, so a config carrying both
+    behaves the same as one carrying only the current name.
+
+    Args:
+        extra_config: vLLM kv_connector_extra_config dict.
+        key: Current knob name; see ``_RENAMED_KNOBS`` for the ones that
+            have a deprecated alias.
+        default: Value returned when neither name is present.
+
+    Returns:
+        The configured value, or ``default``.
+    """
+    if key in extra_config:
+        return extra_config[key]
+    legacy = _RENAMED_KNOBS.get(key)
+    if legacy is not None and legacy in extra_config:
+        logger.warning(
+            "Maru: %s is deprecated and will be removed; use %s instead",
+            legacy,
+            key,
+        )
+        return extra_config[legacy]
+    return default
 
 
 def _emit_timing(msg: str) -> None:
@@ -78,6 +134,19 @@ def _emit_timing(msg: str) -> None:
     import sys
 
     print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
+
+
+def _drain_events(events: Iterable[Any]) -> None:
+    """Wait out queued copies whose destination blocks are being reclaimed.
+
+    Best effort: a device already torn down raises here, and there is nothing
+    left to protect in that case.
+    """
+    for event in events:
+        try:
+            event.synchronize()
+        except Exception as e:
+            logger.warning("Maru: could not drain a queued layer copy: %s", e)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -275,6 +344,11 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # preempted after the previous step. The worker drains its store stream
     # before the next forward can reuse those block IDs.
     preempted_req_ids: set[str] = field(default_factory=set)
+    # Requests that finished or were aborted between the previous and the
+    # current step. A request aborted while parked keeps its blocks only until
+    # the connector reports its load complete, so the worker must drain the
+    # copies it queued for that request before that report goes out.
+    finished_req_ids: set[str] = field(default_factory=set)
     # Deferred packed loads whose metadata RPC completed between steps. The
     # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
     # can overlap layer k compute without changing the packed storage format.
@@ -297,54 +371,70 @@ class MaruKVConnector(KVConnectorBase_V1):
     Partial prefix reuse is supported: if the first N chunks of a prompt
     are cached, only the remaining tokens need to be computed.
 
-    Configuration via kv_connector_extra_config:
+    Configuration via kv_connector_extra_config.
+
+    Deployment wiring:
         maru_server_url: str    - MaruServer address (default: tcp://localhost:5555)
         maru_pool_size: str|int - CXL pool size (default: 1G, supports '4G', '500M')
         maru_instance_id: str   - Unique instance ID (default: auto-generated)
         maru_chunk_size: str|int - Maru page size for CXL pages (default: 4M)
         maru_eager_map: bool    - Pre-map shared regions on connect (default: true)
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
-        maru_enable_async_loading: bool - Overlap CXL->GPU load with compute
-            through a dedicated CUDA stream (default: false)
-        maru_enable_deferred_loading: bool - Load matched KV between scheduler
-            steps: the request is parked in WAITING_FOR_REMOTE_KVS while a
-            background loader thread performs the whole load (Maru retrieve
-            RPC + CXL->GPU transfer on a dedicated stream), so neither the
-            RPC wait nor the copy ever blocks the engine's forward passes —
-            the in-process analog of the MP server's separate-process
-            retrieve (default: false)
-        maru_load_admission_window: int - With deferred loading, cap how many
+
+    Performance axes — the knobs a deployer actually chooses between:
+        maru_async_load: bool - Load matched KV between scheduler steps: the
+            request is parked in WAITING_FOR_REMOTE_KVS while a background
+            loader thread performs the whole load (Maru retrieve RPC +
+            CXL->GPU transfer on a dedicated stream), so neither the RPC wait
+            nor the copy ever blocks the engine's forward passes — the
+            in-process analog of the MP server's separate-process retrieve.
+            This is what vLLM itself calls an async load
+            (get_num_new_matched_tokens returns async_load=True).
+            (default: false; was maru_enable_deferred_loading)
+        maru_async_store: bool - Gather completed prompt chunks into a
+            reusable GPU staging slab after the forward, then copy them to CXL
+            with asynchronous D2H DMA. Metadata registration finishes on a
+            background thread; finished requests retain their GPU blocks until
+            get_finished() reports the store complete
+            (default: false; was maru_enable_write_behind)
+        maru_overlap_load_with_compute: bool - With maru_async_load and packed
+            storage, queue a parked request's per-layer transfers while it
+            waits and release it once its first layer has landed, so the
+            remaining layers arrive during its own attention. The transfers
+            share one stream, which keeps each at full bandwidth and makes a
+            later request's first layer land only after the earlier one has
+            finished. Applies at any concurrency. Requires
+            maru_async_load=true and maru_use_layerwise=false
+            (default: false; was maru_enable_layerwise_overlap)
+
+    Storage format — how a request's KV is grouped into CXL objects:
+        maru_use_layerwise: bool - False (default) is chunkwise: one CXL
+            object per chunk holding every layer, keyed by the chunk key,
+            registered only once all layers are written (the key is its own
+            completion marker). True is layerwise: one object per
+            (chunk, layer), keyed <chunk>_L<idx>, with a separate _DONE
+            marker. Chunkwise resolves one key per chunk instead of
+            chunks x layers — 59 vs 1,888 keys for a 64k prompt on 32 layers
+            — which is why it is the default; the same ratio applies to
+            retrieve metadata RPC volume. Chunkwise transfers use LMCache's
+            multi_layer_kv_transfer kernel directly on the pinned CXL slab
+            (no staging) when available — load scatters a whole slab into the
+            paged cache per chunk, store gathers one D2H per chunk — falling
+            back to per-layer copies otherwise. See design note P6.
+
+    Diagnostics and fallback guards — leave these alone in normal operation:
+        maru_load_admission_window: int - With maru_async_load, cap how many
             requests' packed loads may be enqueued on the deferred stream but
             not yet complete. The loader thread blocks before each GPU
             enqueue until fewer than this many loads are outstanding,
             bounding same-CUDA-context interference with model steps.
             Default: 0 (submit all loads immediately). Set a positive value
             to enable the cap as a fallback safety guard.
-        maru_enable_write_behind: bool - Gather completed prompt chunks into a
-            reusable GPU staging slab after the forward, then copy them to CXL
-            with asynchronous D2H DMA. Metadata registration finishes on a
-            background thread; finished requests retain their GPU blocks until
-            get_finished() reports the store complete (default: false)
-        maru_enable_layerwise_overlap: bool - With deferred loading and packed
-            storage, park only through the Maru retrieve RPC. The resumed
-            forward transfers each layer on a dedicated CUDA stream and waits
-            on per-layer events, overlapping layer k+1 load with layer k
-            compute. Requires maru_enable_deferred_loading=true and
-            maru_use_layerwise=false (default: false)
-        maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
-            two-stage load with one fused gather-scatter kernel that reads
-            the CXL pages directly (LMCache single_layer_kv_transfer).
-            Requires maru_enable_async_loading and the Flash KV layout;
-            falls back to memcpy otherwise (default: false)
-        maru_use_layerwise: bool - Store one CXL object per (chunk, layer)
-            (True) or one packed object per chunk holding all layers (False,
-            default — mirrors LMCache use_layerwise=False). Packed cuts
-            retrieve metadata 32x (1,888->59 keys/req) and drops the _DONE
-            marker. Both packed transfers use LMCache's
-            multi_layer_kv_transfer kernel directly on the pinned CXL slab
-            (no staging) when available — load scatters a whole slab into the
-            paged cache per chunk, store gathers one D2H transfer per chunk —
-            falling back to per-layer copies otherwise. See design note P6.
+        maru_log_timing: bool - Emit per-request timing diagnostics to stderr
+            (default: false)
+
+    The former names listed above are still accepted and log a deprecation
+    warning; see ``_RENAMED_KNOBS``.
     """
 
     def __init__(
@@ -554,24 +644,24 @@ class MaruSchedulerConnector:
         self._requests_need_load: dict[str, tuple[Request, int]] = {}
         # req_id -> (request, num_matched_chunks)
 
-        # Deferred (between-step) loading: matched KV is transferred while the
+        # Asynchronous load (between-step): matched KV is transferred while the
         # request waits in WAITING_FOR_REMOTE_KVS instead of stalling its
-        # first forward pass. Mirrors LMCache's enable_async_loading.
-        self._deferred_loading = bool(
-            extra_config.get("maru_enable_deferred_loading", False)
-        )
-        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
+        # first forward pass. This is the mechanism vLLM itself calls async
+        # loading — get_num_new_matched_tokens returns async_load=True.
+        self._deferred_loading = bool(_get_knob(extra_config, "maru_async_load"))
+        self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
-        self._layerwise_overlap = bool(
-            extra_config.get("maru_enable_layerwise_overlap", False)
-            and self._deferred_loading
-            and not self._use_layerwise
+        overlap_requested = bool(
+            _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        if extra_config.get("maru_enable_layerwise_overlap", False) and not (
+        self._layerwise_overlap = bool(
+            overlap_requested and self._deferred_loading and not self._use_layerwise
+        )
+        if overlap_requested and not (
             self._deferred_loading and not self._use_layerwise
         ):
             logger.warning(
-                "Maru packed-layerwise overlap requires deferred loading and "
+                "Maru packed-layerwise overlap requires maru_async_load=true and "
                 "maru_use_layerwise=false; disabling it"
             )
         # Deferred loads registered by update_state_after_alloc, emitted once
@@ -778,23 +868,23 @@ class MaruSchedulerConnector:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MaruConnectorMetadata(
-            preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
+            preempted_req_ids=set(scheduler_output.preempted_req_ids or ()),
+            finished_req_ids=set(scheduler_output.finished_req_ids or ()),
         )
 
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
         # emitted exactly once here, from state stashed at allocation time.
-        layerwise_singleton = (
-            self._layerwise_overlap
-            and len(self._pending_deferred_loads) == 1
-            and len(self._active_deferred_req_ids) == 1
-        )
+        # Every deferred hit takes the layerwise path. The transfers are
+        # serialised on one stream, so a request's own layers arrive faster
+        # than its attention consumes them however many requests are loading.
+        layerwise_load = self._layerwise_overlap
         for req_id, (
             request,
             num_chunks,
             block_ids,
         ) in self._pending_deferred_loads.items():
-            if layerwise_singleton:
+            if layerwise_load:
                 self._deferred_layerwise_waiting.add(req_id)
             meta.requests.append(
                 MaruReqMeta(
@@ -804,7 +894,7 @@ class MaruSchedulerConnector:
                     is_store=False,
                     num_matched_chunks=num_chunks,
                     deferred_load=True,
-                    layerwise_load=layerwise_singleton,
+                    layerwise_load=layerwise_load,
                 )
             )
         self._pending_deferred_loads.clear()
@@ -986,10 +1076,11 @@ class MaruWorkerConnector:
         # Resolved once in register_kv_caches; None when the layout is not
         # recognized, which keeps every caller on its existing fallback.
         self._kv_layout: KVLayout | None = None
-        self._async_loading = bool(extra_config.get("maru_enable_async_loading", False))
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
-        self._layer_load_events: dict[str, torch.cuda.Event] = {}
+        # layer_name -> events to wait on before that layer's compute. A
+        # list because pre-issued requests each contribute their own event.
+        self._layer_load_events: dict[str, list[torch.cuda.Event]] = {}
         self._effective_page_size_bytes: int | None = None
         # Keep mmap-backed MemoryInfo and pinned/device slot mappings alive
         # while their queued H2D copies may still read them: one (event, refs)
@@ -1010,6 +1101,13 @@ class MaruWorkerConnector:
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        # Loads the background thread has taken but not yet accounted for, and
+        # those among them whose request was abandoned meanwhile. A request
+        # aborted while parked keeps its blocks until this connector reports
+        # its load complete; these two sets are what let that report wait for
+        # copies queued after the abort was seen.
+        self._inflight_deferred_req_ids: set[str] = set()
+        self._abandoned_req_ids: set[str] = set()
         # True-async deferred loads (packed path): a single background thread
         # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
         # so neither the RPC wait nor the copy blocks the engine thread's
@@ -1034,14 +1132,18 @@ class MaruWorkerConnector:
         self._deferred_layerwise_loads: dict[
             str, tuple[MaruReqMeta, int, torch.Tensor, list[Any]]
         ] = {}
+        # Per-layer copies queued by the loader thread while the request was
+        # parked; the resumed forward waits on these instead of issuing
+        # anything. req_id -> {layer_name: event}.
+        self._deferred_layerwise_events: dict[str, dict[str, torch.cuda.Event]] = {}
+        self._layerwise_streams: list[torch.cuda.Stream] = []
+        self._layerwise_stream_device: torch.device | None = None
+        self._layerwise_stream_rr = 0
         # Last non-None attention metadata; deferred loads run between steps
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
-        # P5: fused UVA gather-scatter load. SMs read the host-registered CXL
-        # pages directly and scatter into the paged KV cache in one kernel
-        # (LMCache single_layer_kv_transfer), replacing the two-stage
-        # cudaMemcpy H2D + inject path whose DMA tops out ~20 GiB/s.
-        self._fused_load = bool(extra_config.get("maru_enable_fused_load", False))
+        # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
+        # for LMCache's multi_layer_kv_transfer kernel on the packed path.
         self._lmc_ops: Any = None
 
         # P6: storage granularity. Default (off) packs all layers of a chunk
@@ -1050,17 +1152,16 @@ class MaruWorkerConnector:
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
         # objects and the layer-wise async overlap path.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
-        self._layerwise_overlap = bool(
-            extra_config.get("maru_enable_layerwise_overlap", False)
-            and extra_config.get("maru_enable_deferred_loading", False)
-            and not self._use_layerwise
+        async_load = bool(_get_knob(extra_config, "maru_async_load"))
+        overlap_requested = bool(
+            _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        if extra_config.get("maru_enable_layerwise_overlap", False) and not (
-            extra_config.get("maru_enable_deferred_loading", False)
-            and not self._use_layerwise
-        ):
+        self._layerwise_overlap = bool(
+            overlap_requested and async_load and not self._use_layerwise
+        )
+        if overlap_requested and not (async_load and not self._use_layerwise):
             logger.warning(
-                "Maru packed-layerwise overlap requires deferred loading and "
+                "Maru packed-layerwise overlap requires maru_async_load=true and "
                 "maru_use_layerwise=false; disabling it"
             )
         # Packed store accumulates a chunk's per-layer slices across the
@@ -1088,7 +1189,7 @@ class MaruWorkerConnector:
         # a background thread waits for its event and registers the ready keys.
         # All state below is protected by _store_lock because the engine and
         # completion thread both update key/request lifetimes.
-        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
+        self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._store_executor: ThreadPoolExecutor | None = None
         self._store_lock = threading.Lock()
         self._pending_store_keys: set[str] = set()
@@ -1264,11 +1365,23 @@ class MaruWorkerConnector:
         self._layer_load_events.clear()
         self._release_completed_load_refs()
         if metadata.layerwise_load_req_ids:
-            self._schedule_deferred_packed_layerwise_loads(
-                layers,
-                metadata.layerwise_load_req_ids,
-                attn_metadata,
-            )
+            # Requests whose copies the loader thread already queued hand over
+            # their per-layer events; the rest are issued here as before.
+            issue_here: set[str] = set()
+            with self._deferred_lock:
+                for req_id in metadata.layerwise_load_req_ids:
+                    pre_issued = self._deferred_layerwise_events.pop(req_id, None)
+                    if pre_issued is None:
+                        issue_here.add(req_id)
+                        continue
+                    for layer_name, event in pre_issued.items():
+                        self._layer_load_events.setdefault(layer_name, []).append(event)
+            if issue_here:
+                self._schedule_deferred_packed_layerwise_loads(
+                    layers,
+                    issue_here,
+                    attn_metadata,
+                )
 
         for req_meta in metadata.requests:
             if req_meta.is_store:
@@ -1380,17 +1493,11 @@ class MaruWorkerConnector:
             )
             return
 
-        async_scheduled = False
-        if self._async_loading:
-            async_scheduled = self._schedule_async_loads(layers, inline, attn_metadata)
-        if not async_scheduled:
-            self._load_sync(layers, inline, attn_metadata)
+        self._load_sync(layers, inline, attn_metadata)
 
-        mode = "async-scheduled" if async_scheduled else "loaded"
         for req_meta, num_chunks, _, _ in inline:
             logger.info(
-                "Maru: batch-%s %d layers x %d chunks (%d tokens) for req %s",
-                mode,
+                "Maru: batch-loaded %d layers x %d chunks (%d tokens) for req %s",
                 len(layers),
                 num_chunks,
                 num_chunks * self._kv_chunk_tokens,
@@ -1425,6 +1532,11 @@ class MaruWorkerConnector:
             self._deferred_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="maru-deferred-load"
             )
+        # Marked before the job can run: until it queues its copies there is
+        # nothing for handle_preemptions to drain, so an abort arriving in
+        # that window is recorded against this id instead.
+        with self._deferred_lock:
+            self._inflight_deferred_req_ids.add(req_meta.req_id)
         self._deferred_executor.submit(
             self._deferred_packed_load_job, req_meta, layers, device
         )
@@ -1475,25 +1587,65 @@ class MaruWorkerConnector:
                 return
 
             if req_meta.layerwise_load:
-                # The RPC/mmap part is complete. Unpark the request now and
-                # retain the packed CXL views for its resumed forward, where
-                # H2D is issued layer-major and gated by per-layer events.
-                # This preserves packed keys/pages while making the bulk load
-                # overlap the request's own compute.
+                # The RPC/mmap part is complete. Either queue the per-layer
+                # copies here, while the request is still parked, or retain
+                # the packed CXL views so the resumed forward issues them.
+                # Either way the packed keys/pages are preserved and the bulk
+                # load overlaps the request's own compute.
+                events = self._issue_layerwise_copies_offthread(
+                    req_meta, num_chunks, slot_mapping, infos, layers, device
+                )
+                gate = (
+                    self._unpark_gate_event(events, layers)
+                    if events is not None
+                    else None
+                )
                 with self._deferred_lock:
-                    self._deferred_layerwise_loads[req_meta.req_id] = (
-                        req_meta,
-                        num_chunks,
-                        slot_mapping,
-                        infos,
+                    # Checked and published under one lock: a drain running in
+                    # between would otherwise mark the request abandoned after
+                    # this thread had already decided it was live.
+                    abandoned = req_meta.req_id in self._abandoned_req_ids
+                    self._abandoned_req_ids.discard(req_meta.req_id)
+                    if not abandoned:
+                        if events is not None:
+                            self._deferred_layerwise_events[req_meta.req_id] = events
+                            if gate is not None:
+                                # Hold the request until enough layers have
+                                # landed. get_finished_loading promotes it when
+                                # the gate event fires, so nothing blocks the
+                                # loader thread.
+                                self._deferred_events[req_meta.req_id] = gate
+                        else:
+                            self._deferred_layerwise_loads[req_meta.req_id] = (
+                                req_meta,
+                                num_chunks,
+                                slot_mapping,
+                                infos,
+                            )
+                        if events is None or gate is None:
+                            self._deferred_done.add(req_meta.req_id)
+                if abandoned:
+                    # The request was aborted while this load ran, so no
+                    # forward will wait per layer and the completion report is
+                    # what frees its blocks. The copies finish first, on this
+                    # thread rather than the engine's.
+                    logger.info(
+                        "Maru: draining abandoned layerwise load for req %s",
+                        req_meta.req_id,
                     )
-                    self._deferred_done.add(req_meta.req_id)
+                    _drain_events(events.values() if events else ())
+                    with self._deferred_lock:
+                        self._deferred_done.add(req_meta.req_id)
+                    return
                 logger.info(
                     "Maru: deferred retrieve ready for packed-layerwise load "
-                    "%d chunks (%d tokens) for req %s",
+                    "%d chunks (%d tokens) for req %s (%s)",
                     num_chunks,
                     total_tokens,
                     req_meta.req_id,
+                    "copies queued off-thread"
+                    if events is not None
+                    else "issue in resumed forward",
                 )
                 return
 
@@ -1585,6 +1737,12 @@ class MaruWorkerConnector:
                 except Exception:
                     pass
             self._fail_deferred_load(req_meta)
+        finally:
+            # This load is accounted for now, however it ended. An abort
+            # arriving after this point finds the queued copies themselves.
+            with self._deferred_lock:
+                self._inflight_deferred_req_ids.discard(req_meta.req_id)
+                self._abandoned_req_ids.discard(req_meta.req_id)
 
     def _wait_for_load_admission(self, req_id: str) -> None:
         """Block until fewer than the admission window of loads are in flight.
@@ -1618,6 +1776,142 @@ class MaruWorkerConnector:
                 f"admission wait {(time.monotonic() - wait_t0) * 1000:.2f} ms "
                 f"(req {req_id})"
             )
+
+    def _unpark_gate_event(
+        self,
+        events: dict[str, torch.cuda.Event],
+        layers: list[tuple[str, torch.Tensor, int]],
+    ) -> torch.cuda.Event | None:
+        """Pick the layer whose arrival releases the request, or None.
+
+        Waking a request the moment its copies are queued pushes the whole
+        transfer into the forward, where every request in the batch waits for
+        it. Holding it until every layer has landed is the background path and
+        overlaps nothing. Releasing after a fraction of the layers keeps the
+        part that cannot hide behind compute in the parked wait, where it
+        blocks nobody, and lets only the tail overlap.
+
+        Args:
+            events: layer_name -> completion event for this request.
+            layers: (layer_name, kv tensor, layer index) for every layer;
+                the index gives execution order, which the dict does not.
+
+        Returns:
+            The event to gate on, or None to release immediately.
+        """
+        if not events:
+            return None
+        ordered = [name for name, _, _ in sorted(layers, key=lambda item: item[2])]
+        ordered = [name for name in ordered if name in events]
+        if not ordered:
+            return None
+        count = min(_LAYERWISE_RELEASE_AFTER_LAYERS, len(ordered))
+        return events[ordered[count - 1]]
+
+    def _layerwise_stream_for(self, device: torch.device) -> torch.cuda.Stream:
+        """Hand out one of the pooled layerwise streams, round-robin.
+
+        Requests need independent ordering: on a shared stream, a request
+        queued second would not reach its layer 0 until the first request's
+        layer 31 had finished, which defeats the pipeline. Only the loader
+        thread calls this, so the round-robin cursor needs no lock.
+        """
+        if self._layerwise_stream_device != device or not self._layerwise_streams:
+            self._layerwise_streams = [
+                torch.cuda.Stream(device=device, priority=-1)
+                for _ in range(_LAYERWISE_STREAM_COUNT)
+            ]
+            self._layerwise_stream_device = device
+            self._layerwise_stream_rr = 0
+        stream = self._layerwise_streams[
+            self._layerwise_stream_rr % len(self._layerwise_streams)
+        ]
+        self._layerwise_stream_rr += 1
+        return stream
+
+    def _issue_layerwise_copies_offthread(
+        self,
+        req_meta: MaruReqMeta,
+        num_chunks: int,
+        slot_mapping: torch.Tensor,
+        infos: list[Any],
+        layers: list[tuple[str, torch.Tensor, int]],
+        device: torch.device,
+    ) -> dict[str, torch.cuda.Event] | None:
+        """Queue one parked request's per-layer H2D from the loader thread.
+
+        The request is parked in WAITING_FOR_REMOTE_KVS with its blocks
+        already allocated, so its paged KV can be written now — this is what
+        the default deferred path does for the whole request. Here the copies
+        are issued layer by layer with an event after each, so the resumed
+        forward waits per layer instead of issuing anything itself. The
+        transfer also gets a head start over the forward.
+
+        Args:
+            req_meta: Metadata of the parked request.
+            num_chunks: Chunks matched for this request.
+            slot_mapping: Host slot mapping covering those chunks.
+            infos: Retrieved CXL views, one per chunk.
+            layers: (layer_name, paged kv tensor, layer index) for every layer.
+            device: CUDA device holding the paged KV.
+
+        Returns:
+            layer_name -> event, or None when the copies could not be queued.
+            On None the caller retains the CXL views so the resumed forward
+            issues them the old way.
+        """
+        stream: torch.cuda.Stream | None = None
+        try:
+            torch.cuda.set_device(device)
+            stream = self._layerwise_stream_for(device)
+            pinned = self._pin_slot_mapping_for_async_h2d(slot_mapping)
+            attn = self._last_attn_metadata
+            tokens = num_chunks * self._kv_chunk_tokens
+            _t0 = time.monotonic()
+            events: dict[str, torch.cuda.Event] = {}
+            with torch.cuda.stream(stream):
+                slot_gpu = pinned.to(device, non_blocking=True)
+                for layer_name, kv_cache_layer, true_idx in layers:
+                    layer_dev = self._copy_packed_layer_to_device(
+                        infos, num_chunks, true_idx, kv_cache_layer, stream
+                    )
+                    self._inject_kv_into_layer(
+                        kv_cache_layer,
+                        layer_dev,
+                        slot_gpu[:tokens],
+                        attn,
+                        layer_name,
+                        num_chunks=num_chunks,
+                    )
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    events[layer_name] = event
+            # The CXL views and slot mappings must outlive the queued copies;
+            # release rides on the last layer's completion.
+            done_event = torch.cuda.Event()
+            done_event.record(stream)
+            with self._deferred_lock:
+                self._active_load_refs.append((done_event, [infos, pinned, slot_gpu]))
+            if self._timing:
+                _emit_timing(
+                    f"offthread layerwise issue {len(layers)}L x 1r = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms "
+                    f"(req {req_meta.req_id})"
+                )
+            return events
+        except Exception as e:
+            logger.error(
+                "Maru off-thread layerwise issue failed for req %s: %s — "
+                "falling back to in-forward issue",
+                req_meta.req_id,
+                e,
+            )
+            if stream is not None:
+                try:
+                    stream.synchronize()
+                except Exception:
+                    pass
+            return None
 
     def _schedule_deferred_packed_layerwise_loads(
         self,
@@ -1694,6 +1988,12 @@ class MaruWorkerConnector:
         ]
 
         _t0 = time.monotonic()
+        # Collected locally and published only once every layer is queued.
+        # _layer_load_events already holds the events of requests whose copies
+        # the loader thread issued ahead of this forward, and a failure here
+        # says nothing about those: they are loading correctly and their
+        # forward must still wait on them.
+        issued: dict[str, torch.cuda.Event] = {}
         try:
             with torch.cuda.stream(load_stream):
                 slot_mappings_gpu = [
@@ -1721,7 +2021,7 @@ class MaruWorkerConnector:
                         )
                     event = torch.cuda.Event()
                     event.record(load_stream)
-                    self._layer_load_events[layer_name] = event
+                    issued[layer_name] = event
         except Exception as e:
             logger.error("Maru packed-layerwise activation failed: %s", e)
             try:
@@ -1731,8 +2031,10 @@ class MaruWorkerConnector:
             with self._deferred_lock:
                 for req_meta, *_ in entries:
                     self._failed_load_blocks.update(req_meta.block_ids)
-            self._layer_load_events.clear()
             return
+
+        for layer_name, event in issued.items():
+            self._layer_load_events.setdefault(layer_name, []).append(event)
 
         # CXL views and slot mappings must outlive the queued H2D copies: a
         # batch event recorded after every copy gates the release of these
@@ -1988,7 +2290,16 @@ class MaruWorkerConnector:
         return done or None
 
     def handle_preemptions(self, metadata: MaruConnectorMetadata) -> None:
-        """Drain D2H before preempted block IDs can be reused by a forward.
+        """Drain transfers before the scheduler reclaims the blocks they write.
+
+        vLLM calls this before the step's forward and before
+        ``get_finished_loading``, which makes it the one place that covers both
+        ways a parked request's blocks are taken away:
+
+        - Preemption returns the blocks to the pool right away.
+        - A request that finished or was aborted while parked keeps its blocks
+          until the connector reports its load complete, and vLLM frees them
+          the moment that report arrives.
 
         Metadata registration may continue in the background because it no
         longer reads the GPU cache. Only the store stream must be complete at
@@ -2000,13 +2311,56 @@ class MaruWorkerConnector:
             and self._store_stream is not None
         ):
             self._store_stream.synchronize()
-        if self._layerwise_overlap and metadata.preempted_req_ids:
-            # Retained entries have not queued H2D yet, so their CXL views can
-            # be dropped immediately. A resumed request will receive fresh
-            # blocks and run the normal match/load handshake again.
+
+        if not self._layerwise_overlap:
+            return
+        if metadata.preempted_req_ids:
+            self._drain_layerwise_copies(metadata.preempted_req_ids, report=False)
+        if metadata.finished_req_ids:
+            self._drain_layerwise_copies(metadata.finished_req_ids, report=True)
+
+    def _drain_layerwise_copies(self, req_ids: set[str], report: bool) -> None:
+        """Complete the queued copies of requests losing their blocks.
+
+        Entries whose copies were never issued are simply dropped — a
+        preempted request redoes the match/load handshake on fresh blocks, and
+        a finished one wants nothing. Copies already queued off-thread are
+        writing into blocks about to be reassigned, so they are drained first.
+        Preemption and abort are both rare, so paying a synchronize is the
+        right trade.
+
+        Args:
+            req_ids: Requests whose blocks the scheduler is reclaiming.
+            report: Whether the reclaim is waiting on a completion report.
+                The gate releases a request once its first layer lands, so a
+                request that will never run a forward still owes its remaining
+                layers before that report may go out. The report is still
+                owed — withholding it strands the blocks — so it is queued
+                here, now that the copies are complete. A request whose gate
+                fired in an earlier step is drained without reporting again:
+                vLLM has already freed it and would reject a second report.
+                A load still running on the background thread has no copies to
+                drain yet, so the abort is recorded against it instead and the
+                loader honours it once it has queued them.
+        """
+        drain: list[torch.cuda.Event] = []
+        owed: set[str] = set()
+        with self._deferred_lock:
+            for req_id in req_ids:
+                self._deferred_layerwise_loads.pop(req_id, None)
+                pre_issued = self._deferred_layerwise_events.pop(req_id, None)
+                if not pre_issued:
+                    if report and req_id in self._inflight_deferred_req_ids:
+                        self._abandoned_req_ids.add(req_id)
+                    continue
+                drain.extend(pre_issued.values())
+                if report and self._deferred_events.pop(req_id, None) is not None:
+                    self._deferred_refs.pop(req_id, None)
+                    owed.add(req_id)
+        _drain_events(drain)
+        if owed:
             with self._deferred_lock:
-                for req_id in metadata.preempted_req_ids:
-                    self._deferred_layerwise_loads.pop(req_id, None)
+                self._deferred_done |= owed
 
     def take_failed_load_blocks(self) -> set[int]:
         """Return (and clear) block ids whose deferred load failed."""
@@ -2044,215 +2398,6 @@ class MaruWorkerConnector:
                         )
             except Exception as e:
                 self._fail_load(req_meta, e)
-
-    def _schedule_async_loads(
-        self,
-        layers: list[tuple[str, torch.Tensor, int]],
-        prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
-        attn_metadata: AttentionMetadata,
-    ) -> bool:
-        """Schedule layer-major CXL->GPU loads on a dedicated CUDA stream.
-
-        One event is recorded after every layer. ``wait_for_layer_load`` makes
-        the model's current stream wait only for that layer, allowing later
-        layer transfers to overlap with attention compute.
-
-        Returns:
-            True when asynchronous loads were scheduled. CPU or mixed-device
-            layouts return False and use the synchronous fallback.
-        """
-        devices = {layer.device for _, layer, _ in layers}
-        if len(devices) != 1:
-            logger.warning(
-                "Maru async load requires one CUDA device; falling back to sync"
-            )
-            return False
-        device = next(iter(devices))
-        if device.type != "cuda" or not torch.cuda.is_available():
-            logger.warning(
-                "Maru async load requires CUDA tensors; falling back to sync"
-            )
-            return False
-
-        if self._load_stream is None or self._load_stream_device != device:
-            # Highest priority: cache-hit loads gate TTFT directly.
-            self._load_stream = torch.cuda.Stream(device=device, priority=-1)
-            self._load_stream_device = device
-
-        load_stream = self._load_stream
-        load_stream.wait_stream(torch.cuda.current_stream(device))
-        slot_mappings_host = [
-            self._pin_slot_mapping_for_async_h2d(slot_mapping)
-            for _, _, slot_mapping, _ in prepared_requests
-        ]
-        with torch.cuda.stream(load_stream):
-            slot_mappings_gpu = [
-                slot_mapping.to(device, non_blocking=True)
-                for slot_mapping in slot_mappings_host
-            ]
-            # Layer-major ordering is essential for inflight >1: layer 0 for
-            # every request must become ready before work for later layers.
-            failed: set[int] = set()
-            for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                use_fused = self._use_fused_load(attn_metadata, layer_name)
-                for ri, (
-                    (req_meta, num_chunks, _, infos),
-                    slot_mapping_gpu,
-                ) in enumerate(zip(prepared_requests, slot_mappings_gpu, strict=True)):
-                    if ri in failed:
-                        continue
-                    try:
-                        base = li * num_chunks
-                        for chunk_start, run_chunks, run_view in self._chunk_runs(
-                            infos[base : base + num_chunks]
-                        ):
-                            token_start = chunk_start * self._kv_chunk_tokens
-                            token_end = (
-                                chunk_start + run_chunks
-                            ) * self._kv_chunk_tokens
-                            chunk_slots = slot_mapping_gpu[token_start:token_end]
-                            if use_fused and self._fused_run_transfer(
-                                kv_cache_layer, run_view, run_chunks, chunk_slots
-                            ):
-                                continue
-                            chunk_tensor = torch.frombuffer(
-                                run_view, dtype=kv_cache_layer.dtype
-                            )
-                            self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                chunk_tensor.to(device, non_blocking=True),
-                                chunk_slots,
-                                attn_metadata,
-                                layer_name,
-                                num_chunks=run_chunks,
-                            )
-                    except Exception as e:
-                        failed.add(ri)
-                        self._fail_load(req_meta, e)
-                event = torch.cuda.Event()
-                event.record(load_stream)
-                self._layer_load_events[layer_name] = event
-
-        # A batch event recorded after every copy gates the release of these
-        # refs (next start_load_kv).
-        batch_event = torch.cuda.Event()
-        batch_event.record(load_stream)
-        refs: list[Any] = [infos for _, _, _, infos in prepared_requests]
-        refs.extend(slot_mappings_host)
-        refs.extend(slot_mappings_gpu)
-        self._active_load_refs.append((batch_event, refs))
-        return True
-
-    def _ensure_fused_ops(self) -> bool:
-        """Resolve ``lmcache.c_ops`` lazily; disable fused load if absent."""
-        if not self._fused_load:
-            return False
-        if self._lmc_ops is not None:
-            return True
-        try:
-            import lmcache.c_ops as lmc_ops
-
-            self._lmc_ops = lmc_ops
-            return True
-        except ImportError:
-            logger.warning(
-                "maru_enable_fused_load: lmcache.c_ops unavailable; "
-                "using memcpy+inject path"
-            )
-            self._fused_load = False
-            return False
-
-    def _use_fused_load(self, attn_metadata: Any, layer_name: str) -> bool:
-        """Fused load applies only to the Flash paged-KV layout.
-
-        MLA/Triton layouts keep the memcpy+inject path; layout dispatch
-        mirrors ``_inject_kv_into_layer``.
-        """
-        if not self._ensure_fused_ops():
-            return False
-        from vllm.model_executor.layers.attention.mla_attention import (
-            MLACommonMetadata,
-        )
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-
-        layer_meta = (
-            attn_metadata[layer_name]
-            if isinstance(attn_metadata, dict)
-            else attn_metadata
-        )
-        return not isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata))
-
-    def _fused_run_transfer(
-        self,
-        kv_cache_layer: torch.Tensor,
-        run_view: memoryview,
-        run_chunks: int,
-        chunk_slots: torch.Tensor,
-    ) -> bool:
-        """Scatter a CXL page run into paged KV with one kernel per chunk.
-
-        The kernel (LMCache ``single_layer_kv_transfer``) reads the
-        host-registered CXL bytes directly from device (UVA) — no staging
-        copy. Sources per chunk are ``[K/V, chunk_tokens, hidden]``
-        (``token_major=False``); the paged layer's dimensions and engine KV
-        format both come from the layout resolved at registration.
-
-        Returns:
-            True when the run was handled; False to fall back to memcpy.
-        """
-        if not self._fused_load:
-            return False
-        layout = self._layout_for(kv_cache_layer)
-        if layout is None or layout.format_name is None:
-            # Unrecognized, or a layout the kernel constants cannot describe
-            # (MLA, fused K/V): keep the memcpy+inject fallback.
-            return False
-        kernel_layer = kv_cache_layer
-        if layout.format_name.endswith("NH_BS_HS"):
-            # HND: the kernel reads NH from size(2) and BS from size(3) and
-            # expects physical (.., NH, BS, HS) order, but vLLM hands out the
-            # logical (.., BS, NH, HS) shape with permuted strides. Undo the
-            # permutation (LMCache does the same before its kernel calls).
-            # Both HND formats maru resolves are rank-5 with NH at 3, BS at 2.
-            kernel_layer = kv_cache_layer.movedim(3, 2)
-        if not kernel_layer.is_contiguous():
-            # Strides that match neither an NHD nor a pure HND allocation —
-            # the kernel walks raw memory, so nothing would catch the misread.
-            # NB: this check alone cannot carry the HND permute above, because
-            # is_contiguous() ignores strides of size-1 dims and an HND cache
-            # with one KV head per rank slips through as "contiguous".
-            return False
-        obj_bytes = self._chunk_object_bytes()
-        if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
-            return False
-        ops = self._lmc_ops
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
-        if kv_format is None:
-            logger.warning(
-                "Maru fused load: kernel has no format %s; using memcpy fallback",
-                layout.format_name,
-            )
-            return False
-        ct = self._kv_chunk_tokens
-        try:
-            for i in range(run_chunks):
-                src = torch.frombuffer(
-                    run_view[i * obj_bytes : (i + 1) * obj_bytes],
-                    dtype=kv_cache_layer.dtype,
-                ).view(2, ct, -1)
-                ops.single_layer_kv_transfer(
-                    src,
-                    kernel_layer,
-                    chunk_slots[i * ct : (i + 1) * ct],
-                    ops.TransferDirection.H2D,
-                    kv_format,
-                    token_major=False,
-                )
-        except Exception as e:
-            logger.error("Maru fused load failed (%s); disabling fused path", e)
-            self._fused_load = False
-            return False
-        return True
 
     def _load_packed(
         self,
@@ -2376,9 +2521,8 @@ class MaruWorkerConnector:
         Returns ``(ops, kv_cache_pointers, page_buffer_size, block_size,
         head_size, engine_kv_format)`` when the fused no-staging kernel is
         usable: Flash layout, CUDA, and ``lmcache.c_ops`` importable. This is
-        the DEFAULT packed load whenever available (not gated on
-        maru_enable_fused_load — that flag is the separate P5 single-layer
-        experiment). The pointer table is indexed by each layer's true
+        the DEFAULT packed load whenever available — it is not gated on any
+        configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration.
@@ -2404,7 +2548,7 @@ class MaruWorkerConnector:
         )
         if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
             return None
-        # Resolve lmcache.c_ops (independent of maru_enable_fused_load).
+        # Resolve lmcache.c_ops lazily.
         if self._lmc_ops is None:
             try:
                 import lmcache.c_ops as lmc_ops
@@ -2501,10 +2645,19 @@ class MaruWorkerConnector:
         return runs
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Make the model stream wait for an asynchronously loaded layer."""
-        event = self._layer_load_events.get(layer_name)
-        if event is not None:
-            torch.cuda.current_stream().wait_event(event)
+        """Make the model stream wait for an asynchronously loaded layer.
+
+        One event per request contributed a copy for this layer, so all of
+        them are awaited. Enqueuing a wait costs far less than issuing the
+        copy itself, which is what lets this path run with several requests
+        loading at once.
+        """
+        events = self._layer_load_events.get(layer_name)
+        if not events:
+            return
+        stream = torch.cuda.current_stream()
+        for event in events:
+            stream.wait_event(event)
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
@@ -2517,11 +2670,12 @@ class MaruWorkerConnector:
         queued, and the pinned slot mappings and CXL mmap views must outlive
         those copies.
         """
-        if not self._active_load_refs:
-            return
-        self._active_load_refs = [
-            entry for entry in self._active_load_refs if not entry[0].query()
-        ]
+        with self._deferred_lock:
+            if not self._active_load_refs:
+                return
+            self._active_load_refs = [
+                entry for entry in self._active_load_refs if not entry[0].query()
+            ]
 
     def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
@@ -3367,13 +3521,27 @@ class MaruWorkerConnector:
             except Exception as e:
                 logger.error("Error synchronizing Maru load stream: %s", e)
             self._load_stream = None
-            self._layer_load_events.clear()
-            self._active_load_refs.clear()
+        # Copies the loader thread queued read pinned buffers and CXL views
+        # that the lines below drop and unmap. A run where every request took
+        # the off-thread path never created _load_stream, so these streams are
+        # the only thing still holding that memory.
+        for stream in self._layerwise_streams:
+            try:
+                stream.synchronize()
+            except Exception as e:
+                logger.error("Error synchronizing Maru layerwise stream: %s", e)
+        self._layerwise_streams = []
+        self._layerwise_stream_device = None
+        self._layer_load_events.clear()
+        self._active_load_refs.clear()
         with self._deferred_lock:
             self._deferred_layerwise_loads.clear()
+            self._deferred_layerwise_events.clear()
             self._deferred_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
+            self._inflight_deferred_req_ids.clear()
+            self._abandoned_req_ids.clear()
         if self._handler is not None:
             try:
                 self._handler.close()

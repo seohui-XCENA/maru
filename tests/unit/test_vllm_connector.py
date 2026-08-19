@@ -16,8 +16,10 @@ pytest.importorskip("torch", reason="torch not installed")
 import torch
 
 from maru_vllm.connector import (
+    _RENAMED_KNOBS,
     _align_down,
     _chunk_keys,
+    _get_knob,
     _parse_size,
 )
 from tests.unit.vllm_connector_helpers import (
@@ -38,6 +40,103 @@ from tests.unit.vllm_connector_helpers import (
 # =============================================================================
 # _parse_size
 # =============================================================================
+
+
+class TestRenamedKnobs:
+    """The current knob names, and the deprecated ones they replaced."""
+
+    def test_current_name_is_read(self):
+        assert _get_knob({"maru_async_load": True}, "maru_async_load") is True
+
+    def test_deprecated_name_is_still_accepted(self):
+        for current, legacy in _RENAMED_KNOBS.items():
+            assert _get_knob({legacy: True}, current) is True
+
+    def test_current_name_wins_over_deprecated(self):
+        config = {"maru_async_load": False, "maru_enable_deferred_loading": True}
+        assert _get_knob(config, "maru_async_load") is False
+
+    def test_deprecated_name_warns(self, caplog):
+        with caplog.at_level("WARNING"):
+            _get_knob({"maru_enable_write_behind": True}, "maru_async_store")
+        assert "maru_enable_write_behind is deprecated" in caplog.text
+        assert "maru_async_store" in caplog.text
+
+    def test_current_name_does_not_warn(self, caplog):
+        with caplog.at_level("WARNING"):
+            _get_knob({"maru_async_store": True}, "maru_async_store")
+        assert "deprecated" not in caplog.text
+
+    def test_default_when_neither_name_present(self):
+        assert _get_knob({}, "maru_async_load") is False
+        assert _get_knob({}, "maru_async_load", default=True) is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"maru_async_load": True, "maru_async_store": True},
+            {"maru_enable_deferred_loading": True, "maru_enable_write_behind": True},
+        ],
+        ids=["current-names", "deprecated-names"],
+    )
+    def test_scheduler_wiring_matches_under_either_name(self, config):
+        scheduler = make_scheduler(block_size=4, kv_chunk_tokens=4, extra_config=config)
+        assert scheduler._deferred_loading is True
+        assert scheduler._write_behind is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"maru_async_load": True, "maru_overlap_load_with_compute": True},
+            {
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        ],
+        ids=["current-names", "deprecated-names"],
+    )
+    def test_layerwise_overlap_enables_under_either_name(self, config):
+        for connector in (
+            make_scheduler(block_size=4, kv_chunk_tokens=4, extra_config=config),
+            make_worker(block_size=4, kv_chunk_tokens=4, extra_config=config),
+        ):
+            assert connector._layerwise_overlap is True
+
+    def test_overlap_still_requires_async_load(self):
+        scheduler = make_scheduler(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_overlap_load_with_compute": True},
+        )
+        assert scheduler._layerwise_overlap is False
+
+    def test_naru_current_output_still_wires_through(self):
+        """The extra_config naru emits today must keep working as-is.
+
+        naru writes the deprecated names and still passes the two removed
+        knobs; neither may crash or silently change the wiring.
+        """
+        naru_extra = {
+            "maru_enable_deferred_loading": True,
+            "maru_enable_write_behind": True,
+            "maru_enable_layerwise_overlap": False,
+            "maru_load_admission_window": 1,
+            "maru_use_layerwise": False,
+            "maru_enable_async_loading": True,
+            "maru_enable_fused_load": False,
+            "maru_log_timing": False,
+        }
+        scheduler = make_scheduler(
+            block_size=4, kv_chunk_tokens=4, extra_config=naru_extra
+        )
+        worker = make_worker(block_size=4, kv_chunk_tokens=4, extra_config=naru_extra)
+
+        assert scheduler._deferred_loading is True
+        assert scheduler._write_behind is True
+        assert worker._write_behind is True
+        assert worker._load_admission_window == 1
+        assert scheduler._layerwise_overlap is False
+        assert worker._layerwise_overlap is False
 
 
 class TestParseSize:
@@ -498,27 +597,42 @@ class TestRegisterKVCaches:
         assert worker._handler_retry_after == 0.0
 
 
-class TestAsyncLayerLoad:
-    def test_cpu_layout_falls_back_to_sync(self):
-        worker = make_worker(
-            block_size=4,
-            kv_chunk_tokens=4,
-            extra_config={"maru_enable_async_loading": True},
-        )
-        layers = [("layer", torch.empty(2, 1, 4, 2), 0)]
-
-        assert not worker._schedule_async_loads(layers, [], MagicMock())
-
+class TestLayerLoadHelpers:
     def test_wait_for_layer_joins_event_on_current_stream(self, monkeypatch):
         worker = make_worker(block_size=4, kv_chunk_tokens=4)
         event = MagicMock()
         current_stream = MagicMock()
-        worker._layer_load_events = {"layer": event}
+        worker._layer_load_events = {"layer": [event]}
         monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
 
         worker.wait_for_layer_load("layer")
 
         current_stream.wait_event.assert_called_once_with(event)
+
+    def test_wait_for_layer_joins_every_requests_event(self, monkeypatch):
+        """Each request that loaded this layer contributes its own event."""
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
+        first, second = MagicMock(), MagicMock()
+        current_stream = MagicMock()
+        worker._layer_load_events = {"layer": [first, second]}
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+
+        worker.wait_for_layer_load("layer")
+
+        assert [c.args[0] for c in current_stream.wait_event.call_args_list] == [
+            first,
+            second,
+        ]
+
+    def test_wait_for_layer_without_events_is_a_no_op(self, monkeypatch):
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
+        current_stream = MagicMock()
+        worker._layer_load_events = {}
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+
+        worker.wait_for_layer_load("layer")
+
+        current_stream.wait_event.assert_not_called()
 
     def test_chunk_runs_coalesce_consecutive_full_pages(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=4)
@@ -1350,7 +1464,13 @@ class TestDeferredLoading:
         assert second.layerwise_load_req_ids == {"r1"}
         assert sched.build_connector_meta(empty).layerwise_load_req_ids == set()
 
-    def test_concurrent_deferred_batch_keeps_whole_request_dma(self):
+    def test_every_request_in_a_concurrent_batch_takes_the_layerwise_path(self):
+        """Request count no longer gates the path.
+
+        The transfers are serialised on one stream, so each request's own
+        layers arrive faster than its attention consumes them however many
+        requests are loading at once.
+        """
         sched = self._make_scheduler(layerwise_overlap=True)
         for req_id in ("r1", "r2"):
             request = SimpleNamespace(
@@ -1366,10 +1486,27 @@ class TestDeferredLoading:
         metadata = sched.build_connector_meta(output)
 
         assert len(metadata.requests) == 2
+        assert all(request.layerwise_load for request in metadata.requests)
+        assert sched._deferred_layerwise_waiting == {"r1", "r2"}
+
+    def test_overlap_off_keeps_every_request_on_the_whole_request_path(self):
+        sched = self._make_scheduler(layerwise_overlap=False)
+        for req_id in ("r1", "r2"):
+            request = SimpleNamespace(
+                request_id=req_id,
+                prompt_token_ids=list(range(64)),
+            )
+            sched._last_match_result[req_id] = 8
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([3, 4, 5],)
+            sched.update_state_after_alloc(request, blocks, 64)
+
+        metadata = sched.build_connector_meta(fake_scheduler_output())
+
         assert not any(request.layerwise_load for request in metadata.requests)
         assert sched._deferred_layerwise_waiting == set()
 
-    def test_staggered_admission_sees_live_deferred_concurrency(self):
+    def test_staggered_admission_tracks_live_deferred_requests(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         output = fake_scheduler_output()
 
@@ -1391,7 +1528,7 @@ class TestDeferredLoading:
         sched.update_state_after_alloc(second_request, second_blocks, 64)
         second = sched.build_connector_meta(output)
 
-        assert not second.requests[0].layerwise_load
+        assert second.requests[0].layerwise_load
         assert sched._active_deferred_req_ids == {"r1", "r2"}
 
         finished = SimpleNamespace(**vars(output))
@@ -1761,6 +1898,302 @@ class TestAsyncDeferredPackedLoad:
         assert worker.take_failed_load_blocks() == set(range(16))
 
 
+class TestPreIssuedLayerwiseHandoff:
+    """Copies queued while a request was parked reach the forward as events.
+
+    The forward must not re-issue them, and a batch may mix pre-issued
+    requests with ones whose copies still have to be issued in the forward.
+    """
+
+    LAYERS = ("model.layers.0.self_attn", "model.layers.1.self_attn")
+
+    def _worker(self):
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        return worker
+
+    def _forward(self):
+        kv = [torch.zeros(2, 1, 4, 1) for _ in self.LAYERS]
+        return SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=t)
+                for name, t in zip(self.LAYERS, kv, strict=True)
+            },
+            attn_metadata=None,
+        )
+
+    def test_pre_issued_events_install_without_reissuing(self, monkeypatch):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        reissued: list[set[str]] = []
+        monkeypatch.setattr(
+            worker,
+            "_schedule_deferred_packed_layerwise_loads",
+            lambda layers, req_ids, attn: reissued.append(set(req_ids)),
+        )
+
+        worker.start_load_kv(
+            self._forward(),
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+
+        assert reissued == []
+        assert worker._layer_load_events == {
+            name: [event] for name, event in events.items()
+        }
+        assert worker._deferred_layerwise_events == {}
+
+    def test_mixed_batch_issues_only_the_request_without_queued_copies(
+        self, monkeypatch
+    ):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        reissued: list[set[str]] = []
+        monkeypatch.setattr(
+            worker,
+            "_schedule_deferred_packed_layerwise_loads",
+            lambda layers, req_ids, attn: reissued.append(set(req_ids)),
+        )
+
+        worker.start_load_kv(
+            self._forward(),
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1", "r2"}),
+        )
+
+        assert reissued == [{"r2"}]
+        assert worker._layer_load_events == {
+            name: [event] for name, event in events.items()
+        }
+
+    def test_release_gate_is_the_first_layer_in_execution_order(self, monkeypatch):
+        """Layer index orders the wait; the events dict does not carry it."""
+        worker = self._worker()
+        first, second = MagicMock(), MagicMock()
+        # Dict order reversed against execution order on purpose.
+        events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+
+        assert worker._unpark_gate_event(events, layers) is first
+
+    def test_release_gate_is_none_without_queued_copies(self):
+        worker = self._worker()
+        layers = [(name, None, i) for i, name in enumerate(self.LAYERS)]
+
+        assert worker._unpark_gate_event({}, layers) is None
+
+    def test_release_gate_clamps_to_the_layers_that_exist(self, monkeypatch):
+        import maru_vllm.connector as connector
+
+        monkeypatch.setattr(connector, "_LAYERWISE_RELEASE_AFTER_LAYERS", 99)
+        worker = self._worker()
+        first, second = MagicMock(), MagicMock()
+        events = {self.LAYERS[0]: first, self.LAYERS[1]: second}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+
+        assert worker._unpark_gate_event(events, layers) is second
+
+    def test_preempting_a_request_drains_its_queued_copies(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+
+        worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r1"}))
+
+        # The blocks are about to be reassigned, so the copies must finish
+        # rather than be forgotten while still writing.
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker._deferred_layerwise_events == {}
+
+    def test_aborting_a_parked_request_drains_before_reporting_it(self):
+        """An aborted request's blocks are freed the moment loading is
+        reported, and its forward never runs to wait on the later layers."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        # Gate has not fired: the request is still parked mid-transfer.
+        gate = MagicMock()
+        gate.query.return_value = False
+        worker._deferred_events["r1"] = gate
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker._deferred_layerwise_events == {}
+        # The report is still owed — vLLM holds the blocks until it arrives —
+        # but only now that every copy has landed.
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker._deferred_events == {}
+        # And exactly once: the request is gone from vLLM after the free.
+        assert worker.get_finished_loading() is None
+
+    def test_aborting_mid_retrieve_defers_the_report_to_the_loader(self, monkeypatch):
+        """The abort can land while the loader thread is still retrieving,
+        when there is nothing queued yet for the drain to wait on."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        worker._inflight_deferred_req_ids.add("r1")
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        # Nothing to report yet — the copies do not exist.
+        assert worker.get_finished_loading() is None
+        assert worker._abandoned_req_ids == {"r1"}
+
+        # The loader queues them a moment later and finds the request gone.
+        events = {name: MagicMock() for name in self.LAYERS}
+        meta = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_matched_chunks=2,
+        )
+        meta.layerwise_load = True
+        monkeypatch.setattr(
+            worker, "_batch_retrieve_all", lambda keys: [MagicMock(), MagicMock()]
+        )
+        monkeypatch.setattr(
+            worker,
+            "_issue_layerwise_copies_offthread",
+            lambda *args, **kwargs: events,
+        )
+
+        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+
+        # Copies finished before the report that frees the blocks.
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() == {"r1"}
+        # No handoff was installed for a request that will never run.
+        assert worker._deferred_layerwise_events == {}
+        assert worker._deferred_events == {}
+        assert worker._abandoned_req_ids == set()
+        assert worker._inflight_deferred_req_ids == set()
+
+    def test_abort_landing_between_queueing_and_publishing_is_not_lost(
+        self, monkeypatch
+    ):
+        """The narrowest window: the engine thread drains while the loader is
+        between queueing its copies and publishing them."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        worker._inflight_deferred_req_ids.add("r1")
+        events = {name: MagicMock() for name in self.LAYERS}
+        meta = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_matched_chunks=2,
+        )
+        meta.layerwise_load = True
+        monkeypatch.setattr(
+            worker, "_batch_retrieve_all", lambda keys: [MagicMock(), MagicMock()]
+        )
+
+        def issue_then_abort(*args, **kwargs):
+            worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+            return events
+
+        monkeypatch.setattr(
+            worker, "_issue_layerwise_copies_offthread", issue_then_abort
+        )
+
+        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker._deferred_events == {}
+
+    def test_draining_an_already_reported_request_does_not_report_again(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        # No gate: get_finished_loading() already reported this request.
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() is None
+
+    def test_finishing_a_request_that_never_parked_costs_nothing(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r9"}))
+
+        assert worker.get_finished_loading() is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_issue_failure_spares_the_events_of_other_requests(self, monkeypatch):
+        """A forward-issue failure says nothing about requests whose copies
+        the loader thread already queued and handed over."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        pre_issued = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(pre_issued)
+        failing = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[7, 8],
+            num_matched_chunks=2,
+        )
+        worker._deferred_layerwise_loads["r2"] = (
+            failing,
+            2,
+            torch.arange(8),
+            [MagicMock(), MagicMock()],
+        )
+        monkeypatch.setattr(
+            worker,
+            "_copy_packed_layer_to_device",
+            MagicMock(side_effect=RuntimeError("copy failed")),
+        )
+        kv = [torch.zeros(2, 2, 4, 1, device="cuda") for _ in self.LAYERS]
+        forward = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=t)
+                for name, t in zip(self.LAYERS, kv, strict=True)
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1", "r2"}),
+        )
+
+        # r1 is loading correctly; its forward must still wait per layer.
+        assert worker._layer_load_events == {
+            name: [event] for name, event in pre_issued.items()
+        }
+        # Only the request that failed is recomputed.
+        assert worker.take_failed_load_blocks() == {7, 8}
+
+
 class _FakeAdmissionEvent:
     """Stand-in CUDA event: query() flips true after synchronize()."""
 
@@ -1945,216 +2378,27 @@ class TestWriteBehindStoreLifecycle:
         )
         assert worker._queued_store_batches == []
 
-
-# =============================================================================
-# Fused UVA gather-scatter load (P5)
-# =============================================================================
-
-
-class TestFusedLoad:
-    CHUNK = 8
-
-    def _make_worker(self, fused=True):
-        return make_worker(
-            block_size=4,
-            kv_chunk_tokens=self.CHUNK,
-            extra_config={"maru_enable_fused_load": fused},
-        )
-
-    def _fake_ops(self):
-        ops = MagicMock()
-        ops.TransferDirection.H2D = "H2D"
-        # A real namespace, not a MagicMock: the connector probes formats with
-        # getattr(..., None), which a MagicMock would satisfy for any name.
-        ops.EngineKVFormat = SimpleNamespace(
-            NL_X_TWO_NB_BS_NH_HS="FLASH",
-            NL_X_NB_TWO_BS_NH_HS="FLASH023",
-            NL_X_TWO_NB_NH_BS_HS="ROCM_HND",
-            NL_X_NB_TWO_NH_BS_HS="FLASH_HND",
-        )
-        return ops
-
-    def _hnd_cache(self, nb, bs, nh, hs):
-        """An HND cache exactly as vLLM allocates one: physical (NB, 2, NH,
-        BS, HS) storage permuted back to the logical (NB, 2, BS, NH, HS)
-        shape (gpu_model_runner), so only the strides say HND."""
-        order = (0, 1, 3, 2, 4)  # flash_attn get_kv_cache_stride_order() HND
-        logical = (nb, 2, bs, nh, hs)
-        phys = tuple(logical[i] for i in order)
-        inv = [order.index(i) for i in range(5)]
-        return torch.zeros(phys).permute(inv)
-
-    def test_disabled_flag_skips_fused(self):
-        worker = self._make_worker(fused=False)
-        assert worker._ensure_fused_ops() is False
-
-    def test_flash_meta_selects_fused_and_dict_meta_dispatches(self):
+    def test_shutdown_drains_layerwise_streams_before_unmapping(self):
+        """Copies queued off-thread read pinned buffers and CXL views that
+        closing the handler unmaps, and they run on no other stream."""
         worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        flash_meta = MagicMock()
-        flash_meta.__class__ = type("FlashMetadata", (), {})
-        assert worker._use_fused_load(flash_meta, "l0") is True
-        assert worker._use_fused_load({"l0": flash_meta}, "l0") is True
+        order: list[str] = []
+        stream = MagicMock()
+        stream.synchronize.side_effect = lambda: order.append("drain")
+        worker._layerwise_streams = [stream]
+        handler = MagicMock()
+        handler.close.side_effect = lambda: order.append("unmap")
+        worker._handler = handler
+        worker._active_load_refs.append((MagicMock(), ["cxl view"]))
+        # A run where every request took the off-thread path never creates
+        # _load_stream, which is what the release used to hang off.
+        assert worker._load_stream is None
 
-    @pytest.mark.parametrize(
-        "shape,expected_format",
-        [
-            ((2, 4, 4, 1, 2), "FLASH"),  # legacy [2, NB, BS, NH, HS]
-            ((4, 2, 4, 1, 2), "FLASH023"),  # vLLM 0.23+ [NB, 2, BS, NH, HS]
-        ],
-        ids=["legacy", "vllm023"],
-    )
-    def test_fused_run_transfer_calls_kernel_per_chunk(self, shape, expected_format):
-        """The kernel format must follow the cache's actual axis order.
+        worker.shutdown()
 
-        The pre-fix code hardcoded NL_X_TWO_NB_BS_NH_HS, so on vLLM 0.23+ the
-        kernel walked raw memory with the K/V and block axes swapped.
-        """
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        worker._lmc_ops = ops
-        # (chunk x layer) object: [2, 8 tokens, hidden=2] fp32 = 128 B
-        obj_bytes = 2 * self.CHUNK * 2 * 4
-        worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = torch.zeros(*shape)
-        run_view = memoryview(bytearray(range(0, 256)))[: 2 * obj_bytes]
-        slots = torch.arange(2 * self.CHUNK)
-
-        ok = worker._fused_run_transfer(kv_layer, run_view, 2, slots)
-        assert ok is True
-        assert ops.single_layer_kv_transfer.call_count == 2
-        args, kwargs = ops.single_layer_kv_transfer.call_args_list[1]
-        src, dst, slot_arg = args[0], args[1], args[2]
-        assert src.shape == (2, self.CHUNK, 2) and src.dtype == kv_layer.dtype
-        assert dst is kv_layer
-        assert slot_arg.tolist() == list(range(self.CHUNK, 2 * self.CHUNK))
-        assert args[3] == "H2D" and args[4] == expected_format
-        assert kwargs == {"token_major": False}
-
-    def test_fused_refuses_layout_without_kernel_format(self):
-        """rank-3 (sparse MLA) and fused caches carry no kernel format and
-        must fall back to memcpy+inject, mirroring _packed_load_kernel_ctx."""
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(4, 4, 4)  # rank-3, block_size=4
-
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
-        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
-
-    def test_fused_refuses_missing_format_constant(self):
-        """An older c_ops build without the needed constant falls back."""
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        del ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
-        worker._lmc_ops = ops
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(4, 2, 4, 1, 2)
-
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
-        assert ops.single_layer_kv_transfer.call_count == 0
-
-    def test_fused_refuses_non_contiguous_cache(self):
-        """A cache with HND strides whose layout resolved to an NHD format
-        (the case _vllm_kv_cache_layout warns about: physical layout
-        misreported as NHD) gets no permute, and the kernel would read
-        swapped head/token axes. Fall back instead."""
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(4, 2, 2, 4, 2).permute(0, 1, 3, 2, 4)
-        assert tuple(kv_layer.shape) == (4, 2, 4, 2, 2)
-        assert not kv_layer.is_contiguous()
-
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
-        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
-
-    @pytest.mark.parametrize("nh", [1, 2], ids=["nh1", "nh2"])
-    def test_fused_hnd_cache_hands_kernel_the_physical_view(self, nh):
-        """On HND the kernel reads NH from size(2) and BS from size(3) of the
-        tensor it is handed (mem_kernels.cu positional reads), so the cache
-        must arrive in physical (NB, 2, NH, BS, HS) order.
-
-        nh=1 is the trap: torch.is_contiguous() ignores strides of size-1
-        dims, so a contiguity guard passes the logical view through and the
-        kernel swaps NH and BS. nh=1 is common — a model with as many KV
-        heads as the TP degree runs one head per rank.
-        """
-        from maru_vllm.kv_layout import _detect_kv_layout
-
-        hs = 2
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        worker._lmc_ops = ops
-        obj_bytes = 2 * self.CHUNK * nh * hs * 4
-        worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = self._hnd_cache(nb=4, bs=4, nh=nh, hs=hs)
-        worker._kv_layout = _detect_kv_layout(
-            tuple(kv_layer.shape), 4, "HND", num_kv_heads=nh, head_size=hs
-        )
-        assert worker._kv_layout.format_name == "NL_X_NB_TWO_NH_BS_HS"
-
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(obj_bytes)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is True
-        args, _ = ops.single_layer_kv_transfer.call_args
-        dst = args[1]
-        assert (dst.size(2), dst.size(3)) == (nh, 4)  # physical NH, BS
-        assert dst.is_contiguous()
-        assert dst.data_ptr() == kv_layer.data_ptr()  # a view, not a copy
-        assert args[4] == "FLASH_HND"
-
-    def test_fused_hnd_cache_with_foreign_strides_falls_back(self):
-        """An HND-format layout whose tensor is not a pure HND allocation
-        (here: a strided slice) cannot be fixed by the permute; refuse it."""
-        from maru_vllm.kv_layout import _detect_kv_layout
-
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(4, 2, 4, 2, 4)[..., ::2]  # (4, 2, 4, 2, 2)
-        worker._kv_layout = _detect_kv_layout(
-            tuple(kv_layer.shape), 4, "HND", num_kv_heads=2, head_size=2
-        )
-        assert worker._kv_layout.format_name == "NL_X_NB_TWO_NH_BS_HS"
-
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
-        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
-
-    def test_fused_run_transfer_kernel_error_disables_and_falls_back(self):
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        ops.single_layer_kv_transfer.side_effect = RuntimeError("boom")
-        worker._lmc_ops = ops
-        obj_bytes = 2 * self.CHUNK * 2 * 4
-        worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
-        run_view = memoryview(bytearray(obj_bytes))
-        ok = worker._fused_run_transfer(kv_layer, run_view, 1, torch.arange(self.CHUNK))
-        assert ok is False and worker._fused_load is False
-
-    def test_insufficient_run_bytes_falls_back(self):
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(100)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
+        assert order == ["drain", "unmap"]
+        assert worker._layerwise_streams == []
+        assert worker._active_load_refs == []
 
 
 # =============================================================================
