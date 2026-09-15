@@ -45,6 +45,9 @@ def _make_mock_handler(pool_size=4096, chunk_size=1024):
     )
     handler.get_owned_region_ids.return_value = [region_id]
     handler.get_chunk_size.return_value = chunk_size
+    handler.is_region_staged.return_value = False
+    handler.get_region_allocated_pages.return_value = 0
+    handler.get_mapping_status.return_value.active_users = 0
 
     # set_on_region_added: capture callback and replay for existing regions
     _callback_holder = [None]
@@ -107,6 +110,78 @@ class TestAddressEncoding:
 
     def test_encode_is_deterministic(self):
         assert CxlMemoryAdapter.encode_address(1, 2) == (1 << 32) | 2
+
+
+class TestRegionPoolCleanup:
+    def test_remove_pool_is_idempotent(self):
+        handler = _make_mock_handler()
+        adapter = _make_adapter(handler)
+        assert adapter.has_region_pool(100)
+        assert adapter.remove_region_pool(100)
+        assert not adapter.has_region_pool(100)
+        assert not adapter.remove_region_pool(100)
+        assert adapter.ensure_region_pool(100)
+        adapter.close()
+
+    @pytest.mark.parametrize("busy", ["allocation", "lease"])
+    def test_live_region_refuses_pool_removal(self, busy):
+        handler = _make_mock_handler()
+        adapter = _make_adapter(handler)
+        if busy == "allocation":
+            handler.get_region_allocated_pages.return_value = 1
+        else:
+            handler.get_mapping_status.return_value.active_users = 1
+        with pytest.raises(RuntimeError):
+            adapter.remove_region_pool(100)
+        assert adapter.has_region_pool(100)
+        adapter.close()
+
+    def test_staged_group_failure_drops_real_tensor_views(self, monkeypatch):
+        from unittest.mock import patch
+
+        from maru_common import MaruConfig
+        from maru_handler import MaruHandler
+        from maru_shm import MaruHandle
+
+        rpc = MagicMock()
+        rpc.request_alloc.return_value = MagicMock(
+            success=True, handle=MaruHandle(100, 0, 4096, 12345)
+        )
+        rpc.return_alloc.return_value = True
+        config = MaruConfig(
+            pool_size=4096,
+            chunk_size_bytes=1024,
+            auto_connect=False,
+            use_async_rpc=False,
+            eager_map=False,
+        )
+        with patch("maru_handler.handler.RpcClient", return_value=rpc):
+            handler = MaruHandler(config)
+        assert handler.connect()
+        adapter = _make_adapter(handler)
+        original = handler.get_buffer_view
+
+        def fail_second_region(rid, offset, size):
+            if rid == 300 and offset == 1024:
+                return None
+            return original(rid, offset, size)
+
+        monkeypatch.setattr(handler, "get_buffer_view", fail_second_region)
+        with pytest.raises(RuntimeError, match="Failed to prepare adapter pool"):
+            handler.prepare_regions(
+                [
+                    MaruHandle(200, 0, 4096, 12345),
+                    MaruHandle(300, 0, 4096, 12345),
+                ]
+            )
+        assert adapter.has_region_pool(100)
+        for rid in [200, 300]:
+            assert not adapter.has_region_pool(rid)
+            assert not handler.get_mapping_status(rid).is_mapped
+        assert handler.get_staged_region_ids() == []
+        assert {call.args[1] for call in rpc.return_alloc.call_args_list} == {200, 300}
+        adapter.close()
+        handler.close()
 
 
 class TestPoolCreation:

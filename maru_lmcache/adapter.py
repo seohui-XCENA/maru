@@ -61,7 +61,12 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         self._pool: dict[int, list[TensorMemoryObj]] = {}
 
         # Register callback — replays for existing regions, fires on expansion
-        self._handler.set_on_region_added(self._on_region_added)
+        self._handler.set_on_region_removed(self.remove_region_pool)
+        try:
+            self._handler.set_on_region_added(self._on_region_added)
+        except Exception:
+            self.close()
+            raise
 
     # =========================================================================
     # Address Encoding
@@ -93,6 +98,10 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         """
         logger.debug("[Maru] on_region_added region=%d pages=%d", region_id, page_count)
         self._build_region_pool(region_id, page_count)
+        if self._handler.is_region_staged(region_id) and not self.has_region_pool(
+            region_id
+        ):
+            raise RuntimeError(f"Failed to prepare adapter pool for region {region_id}")
 
     def _build_region_pool(self, region_id: int, page_count: int) -> None:
         """Pre-create MemoryObjs for all pages in a region.
@@ -104,31 +113,41 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         chunk_size = self._chunk_size
         objs: list[TensorMemoryObj] = []
 
-        for pid in range(page_count):
-            offset = pid * chunk_size
-            buf = self._handler.get_buffer_view(region_id, offset, chunk_size)
-            if buf is None:
-                logger.error(
-                    "[Maru] buffer view failed region=%d page=%d, aborting pool",
-                    region_id,
-                    pid,
+        buf = None
+        tensor = None
+        try:
+            for pid in range(page_count):
+                offset = pid * chunk_size
+                buf = self._handler.get_buffer_view(region_id, offset, chunk_size)
+                if buf is None:
+                    logger.error(
+                        "[Maru] buffer view failed region=%d page=%d, aborting pool",
+                        region_id,
+                        pid,
+                    )
+                    return
+
+                flat_dtype = self._dtypes[0]
+                tensor = torch.frombuffer(buf, dtype=flat_dtype)
+
+                metadata = MemoryObjMetadata(
+                    shape=self._shapes[0],
+                    dtype=flat_dtype,
+                    address=self.encode_address(region_id, pid),
+                    phy_size=chunk_size,
+                    ref_count=1,
+                    fmt=self._fmt,
+                    shapes=self._shapes if len(self._shapes) > 1 else None,
+                    dtypes=self._dtypes if len(self._dtypes) > 1 else None,
                 )
-                return
-
-            flat_dtype = self._dtypes[0]
-            tensor = torch.frombuffer(buf, dtype=flat_dtype)
-
-            metadata = MemoryObjMetadata(
-                shape=self._shapes[0],
-                dtype=flat_dtype,
-                address=self.encode_address(region_id, pid),
-                phy_size=chunk_size,
-                ref_count=1,
-                fmt=self._fmt,
-                shapes=self._shapes if len(self._shapes) > 1 else None,
-                dtypes=self._dtypes if len(self._dtypes) > 1 else None,
-            )
-            objs.append(TensorMemoryObj(tensor, metadata, parent_allocator=None))
+                objs.append(TensorMemoryObj(tensor, metadata, parent_allocator=None))
+        except Exception:
+            # Tracebacks retain locals: drop views before Handler rollback unmaps.
+            objs.clear()
+            raise
+        finally:
+            buf = None
+            tensor = None
 
         with self._lock:
             self._pool[region_id] = objs
@@ -159,6 +178,31 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
 
         self._build_region_pool(region_id, page_count)
         return region_id in self._pool
+
+    def has_region_pool(self, region_id: int) -> bool:
+        """Return whether region_id has a prepared pool, without creating one."""
+        with self._lock:
+            return region_id in self._pool
+
+    def remove_region_pool(self, region_id: int) -> bool:
+        """Drop cached tensor views for region_id before allocator/mapping release.
+
+        Returns False if already absent. External tensor/view references must also
+        be dropped; strict mapper release rejects exported buffers that remain.
+        GPU users must hold Handler.hold_region until completion.
+
+        Raises:
+            RuntimeError: If live owned pages or explicit in-flight users remain.
+        """
+        with self._lock:
+            if region_id not in self._pool:
+                return False
+            if self._handler.get_region_allocated_pages(region_id):
+                raise RuntimeError(f"Region {region_id} has live allocations")
+            if self._handler.get_mapping_status(region_id).active_users:
+                raise RuntimeError(f"Region {region_id} has active users")
+            del self._pool[region_id]
+            return True
 
     # =========================================================================
     # MemoryAllocatorInterface
@@ -293,6 +337,7 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
     def close(self) -> None:
         """Clean up adapter state and unregister callback."""
         self._handler.set_on_region_added(None)
+        self._handler.set_on_region_removed(None)
         with self._lock:
             self._pool.clear()
 

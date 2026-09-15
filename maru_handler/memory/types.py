@@ -15,6 +15,16 @@ if TYPE_CHECKING:
     from .allocator import PagedMemoryAllocator
 
 
+@dataclass(frozen=True)
+class MappingStatus:
+    """Snapshot of a region's mapping, successful CUDA pin, and explicit users."""
+
+    region_id: int
+    is_mapped: bool
+    cuda_pinned: bool
+    active_users: int
+
+
 @dataclass
 class MappedRegion:
     """A memory-mapped region via MaruShmClient.
@@ -49,6 +59,55 @@ class MappedRegion:
     def is_mapped(self) -> bool:
         """Check if the region is currently mapped."""
         return self._mmap_obj is not None
+
+    @property
+    def cuda_pinned(self) -> bool:
+        """Whether CUDA registration succeeded and has not been undone."""
+        return self._cuda_pinned
+
+    def unregister_cuda(self) -> None:
+        """Unregister pinned memory, retaining pin state on failure for retry.
+
+        Raises:
+            RuntimeError: If CUDA is unavailable or unregister fails.
+        """
+        if not self._cuda_pinned:
+            return
+        import ctypes
+
+        import torch
+
+        if not torch.cuda.is_available() or self._buffer_view is None:
+            raise RuntimeError(f"Cannot unregister pinned region {self.region_id}")
+        addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buffer_view))
+        ret = torch.cuda.cudart().cudaHostUnregister(addr)
+        rc = int(ret[0]) if isinstance(ret, tuple) else int(ret)
+        if rc != 0:
+            raise RuntimeError(
+                f"CUDA unregister failed for region {self.region_id}: {rc}"
+            )
+        self._cuda_pinned = False
+
+    def close_mapping(self) -> None:
+        """Close an unpinned mapping, retaining it on exported-buffer failure.
+
+        Raises:
+            RuntimeError: If still CUDA pinned.
+            BufferError: If a caller still holds an exported buffer.
+        """
+        if self._cuda_pinned:
+            raise RuntimeError(f"Region {self.region_id} is still CUDA pinned")
+        if self._mmap_obj is None:
+            return
+        if self._buffer_view is not None:
+            self._buffer_view.release()
+            self._buffer_view = None
+        try:
+            self._mmap_obj.close()
+        except Exception:
+            self._buffer_view = memoryview(self._mmap_obj)
+            raise
+        self._mmap_obj = None
 
     def get_buffer_view(self, offset: int, size: int) -> memoryview | None:
         """Return a zero-copy memoryview slice.

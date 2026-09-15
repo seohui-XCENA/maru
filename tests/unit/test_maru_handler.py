@@ -5,12 +5,291 @@
 Uses mocked RPC — no real ZMQ server needed.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import _make_handle
 
 from maru import MaruConfig, MaruHandler
+
+
+def _make_staging_handler(policy: str | None = None) -> tuple[MaruHandler, MagicMock]:
+    rpc = MagicMock()
+    rpc.request_alloc.return_value = MagicMock(
+        success=True, handle=_make_handle(100, 8192)
+    )
+    rpc.return_alloc.return_value = True
+    rpc.list_allocations.return_value = []
+    config = MaruConfig(
+        pool_size=8192,
+        chunk_size_bytes=1024,
+        auto_connect=False,
+        use_async_rpc=False,
+        eager_map=False,
+        **({"placement_policy": policy} if policy is not None else {}),
+    )
+    with patch("maru_handler.handler.RpcClient", return_value=rpc):
+        handler = MaruHandler(config)
+    return handler, rpc
+
+
+class TestStagedRegionLifecycle:
+    def test_close_waits_for_preparation_and_cleans_pending_region(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        preparing = threading.Event()
+        finish_preparing = threading.Event()
+        closing = threading.Event()
+
+        def added(rid, pages):
+            if rid == 200:
+                preparing.set()
+                assert finish_preparing.wait(timeout=5)
+
+        def close():
+            closing.set()
+            handler.close()
+
+        handler.set_on_region_removed(lambda rid: None)
+        handler.set_on_region_added(added)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            prepared = executor.submit(handler.prepare_regions, [_make_handle(200)])
+            assert preparing.wait(timeout=5)
+            closed = executor.submit(close)
+            assert closing.wait(timeout=5)
+            finish_preparing.set()
+            assert prepared.result(timeout=5) == [200]
+            closed.result(timeout=5)
+        assert handler.get_staged_region_ids() == []
+        assert not handler.connected
+        assert {call.args[1] for call in rpc.return_alloc.call_args_list} == {100, 200}
+
+    @pytest.mark.parametrize("policy", [None, "fill_first"])
+    def test_off_connect_expand_close_never_use_staged_path(self, policy, monkeypatch):
+        from maru_handler.memory import DaxMapper, OwnedRegionManager
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("OFF entered staged lifecycle")
+
+        monkeypatch.setattr(OwnedRegionManager, "stage_region", unexpected)
+        monkeypatch.setattr(DaxMapper, "release_region", unexpected)
+        handler, rpc = _make_staging_handler(policy)
+        assert handler.connect()
+        events = []
+        handler.set_on_region_added(lambda rid, pages: events.append(rid))
+        rpc.request_alloc.return_value = MagicMock(
+            success=True, handle=_make_handle(200)
+        )
+        handles = [handler.alloc(16) for _ in range(9)]
+        assert [h.region_id for h in handles] == [100] * 8 + [200]
+        assert events == [100, 200]
+        assert handler.get_staged_region_ids() == []
+        for handle in handles:
+            handler.free(handle)
+            handle.buf.release()
+        handler.close()
+        assert {call.args[1] for call in rpc.return_alloc.call_args_list} == {100, 200}
+
+    def test_close_refuses_pending_busy_region_and_allows_retry(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        handler.prepare_regions([_make_handle(200)])
+        view = handler.get_buffer_view(200, 0, 16)
+        with pytest.raises(ExceptionGroup):
+            handler.close()
+        assert handler.connected
+        assert handler.get_owned_region_ids() == [100]
+        rpc.return_alloc.assert_not_called()
+        view.release()
+        handler.close()
+        assert not handler.connected
+        assert handler.get_staged_region_ids() == []
+
+    def test_prepare_commit_preserves_legacy_order_and_replays_callbacks(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        events = []
+        handler.set_on_region_removed(lambda rid: events.append(("remove", rid)))
+        handler.set_on_region_added(lambda rid, pages: events.append(("add", rid)))
+        assert events == [("add", 100)]
+        ids = handler.prepare_regions([_make_handle(200), _make_handle(300)])
+        assert ids == [200, 300]
+        assert handler.get_owned_region_ids() == [100]
+        assert handler.get_region_page_count(200) == 4
+        handle = handler.alloc(16)
+        assert handle.region_id == 100
+        handler.free(handle)
+        handle.buf.release()
+        handler.commit_regions(ids)
+        assert handler.get_staged_region_ids() == []
+        assert handler.get_owned_region_ids() == [100, 200, 300]
+        assert events == [("add", 100), ("add", 200), ("add", 300)]
+        rpc.return_alloc.assert_not_called()
+        handler.close()
+
+    @pytest.mark.parametrize("failure", ["allocator", "callback", "mapping"])
+    def test_second_region_failure_rolls_back_only_new_handles(
+        self, failure, monkeypatch
+    ):
+        from maru_handler.memory import DaxMapper
+
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        removed = []
+
+        def added(rid, pages):
+            assert handler.get_owned_region_ids() == [100]
+            if rid == 300 and failure == "callback":
+                raise RuntimeError("callback failed")
+
+        original_map = DaxMapper.map_region
+
+        def map_region(mapper, handle, **kwargs):
+            if handle.region_id == 300 and failure == "mapping":
+                raise RuntimeError("mapping failed")
+            return original_map(mapper, handle, **kwargs)
+
+        monkeypatch.setattr(DaxMapper, "map_region", map_region)
+        handler.set_on_region_removed(removed.append)
+        handler.set_on_region_added(added)
+        with pytest.raises((ValueError, RuntimeError)):
+            handler.prepare_regions(
+                [
+                    _make_handle(200),
+                    _make_handle(300, 512 if failure == "allocator" else 4096),
+                    _make_handle(400),
+                ]
+            )
+        assert handler.get_owned_region_ids() == [100]
+        assert handler.get_staged_region_ids() == []
+        assert {call.args[1] for call in rpc.return_alloc.call_args_list} == {
+            200,
+            300,
+            400,
+        }
+        for rid in [200, 300, 400]:
+            assert not handler.get_mapping_status(rid).is_mapped
+        assert 200 in removed
+        assert 100 not in removed
+        handler.close()
+
+    def test_cleanup_order_and_idempotence(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        views = {}
+        events = []
+
+        def added(rid, pages):
+            views[rid] = handler.get_buffer_view(rid, 0, 16)
+
+        def removed(rid):
+            assert handler.is_region_mapped(rid)
+            events.append(("view", rid))
+            views.pop(rid).release()
+
+        def returned(instance, rid):
+            assert not handler.get_mapping_status(rid).is_mapped
+            events.append(("return", rid))
+            return True
+
+        handler.set_on_region_removed(removed)
+        handler.set_on_region_added(added)
+        rpc.return_alloc.side_effect = returned
+        ids = handler.prepare_regions([_make_handle(200), _make_handle(300)])
+        handler.rollback_regions(ids)
+        handler.rollback_regions(ids)
+        assert events == [
+            ("view", 300),
+            ("return", 300),
+            ("view", 200),
+            ("return", 200),
+        ]
+        assert list(views) == [100]
+        views.pop(100).release()
+        rpc.return_alloc.side_effect = None
+        handler.close()
+
+    def test_buffer_and_lease_block_return_until_released(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        handler.prepare_regions([_make_handle(200)])
+        view = handler.get_buffer_view(200, 0, 16)
+        with handler.hold_region(200):
+            with pytest.raises(ExceptionGroup, match="rollback failed"):
+                handler.rollback_regions([200])
+        with pytest.raises(ExceptionGroup):
+            handler.rollback_regions([200])
+        assert handler.get_staged_region_ids() == [200]
+        rpc.return_alloc.assert_not_called()
+        with pytest.raises(ValueError):
+            handler.commit_regions([200])
+        view.release()
+        handler.rollback_regions([200])
+        assert not handler.get_mapping_status(200).is_mapped
+        assert rpc.return_alloc.call_count == 1
+        handler.close()
+
+    def test_callback_cleanup_failure_retained_and_other_regions_cleaned(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        handler.set_on_region_added(lambda rid, pages: None)
+        remove = MagicMock(side_effect=RuntimeError("view busy"))
+        handler.set_on_region_removed(remove)
+        handler.prepare_regions([_make_handle(200)])
+        with pytest.raises(ExceptionGroup):
+            handler.rollback_regions([200])
+        rpc.return_alloc.assert_not_called()
+        assert handler.get_mapping_status(200).is_mapped
+        remove.side_effect = None
+        handler.rollback_regions([200])
+        assert handler.get_staged_region_ids() == []
+        handler.close()
+
+    def test_return_failure_can_retry_without_remapping(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        handler.prepare_regions([_make_handle(200)])
+        rpc.return_alloc.return_value = False
+        with pytest.raises(ExceptionGroup):
+            handler.rollback_regions([200])
+        assert not handler.get_mapping_status(200).is_mapped
+        assert handler.get_staged_region_ids() == [200]
+        rpc.return_alloc.return_value = True
+        handler.rollback_regions([200])
+        assert handler.get_staged_region_ids() == []
+        handler.close()
+
+    def test_reject_existing_and_duplicate_handles_before_taking_ownership(self):
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()
+        for handles in ([_make_handle(100)], [_make_handle(200), _make_handle(200)]):
+            with pytest.raises(ValueError):
+                handler.prepare_regions(handles)
+        with pytest.raises(ValueError):
+            handler.rollback_regions([100])
+        rpc.return_alloc.assert_not_called()
+        handler.close()
+
+    def test_pin_requirement_is_opt_in(self, monkeypatch):
+        import sys
+
+        torch = MagicMock()
+        torch.cuda.is_available.return_value = True
+        torch.cuda.cudart().cudaHostRegister.return_value = (2,)
+        monkeypatch.setitem(sys.modules, "torch", torch)
+        handler, rpc = _make_staging_handler()
+        assert handler.connect()  # Legacy initialization still tolerates pin failure.
+        handler.prepare_regions([_make_handle(200)])
+        assert not handler.get_mapping_status(200).cuda_pinned
+        with pytest.raises(RuntimeError, match="requires successful CUDA pinning"):
+            handler.prepare_regions([_make_handle(300)], require_cuda_pin=True)
+        assert handler.get_staged_region_ids() == [200]
+        assert handler.get_owned_region_ids() == [100]
+        handler.rollback_regions([200])
+        handler.close()
 
 
 class TestMaruHandlerConfig:

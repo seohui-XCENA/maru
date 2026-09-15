@@ -53,6 +53,7 @@ class OwnedRegionManager:
         self._lock = threading.Lock()
 
         self._regions: dict[int, OwnedRegion] = {}
+        self._staged: dict[int, OwnedRegion] = {}
         self._region_order: list[int] = []
         self._active_region_id: int | None = None
 
@@ -103,6 +104,70 @@ class OwnedRegionManager:
         )
         return region
 
+    def stage_region(self, handle: MaruHandle) -> OwnedRegion:
+        """Prepare handle without making it available to allocate or queries.
+
+        Returns the staged allocator. The caller owns rollback of mapping failures.
+
+        Raises:
+            ValueError: If the region already exists or cannot hold a page.
+            RuntimeError: If mapping fails.
+        """
+        with self._lock:
+            rid = handle.region_id
+            if rid in self._regions or rid in self._staged:
+                raise ValueError(f"Region {rid} already exists")
+            allocator = PagedMemoryAllocator(rid, handle.length, self._chunk_size)
+            self._mapper.map_region(handle)
+            region = OwnedRegion(rid, allocator)
+            self._staged[rid] = region
+            return region
+
+    def commit_regions(self, region_ids: list[int]) -> None:
+        """Atomically publish staged region_ids in order to the existing allocator.
+
+        Raises:
+            ValueError: If IDs repeat or any ID is not staged; nothing is published.
+        """
+        with self._lock:
+            if len(set(region_ids)) != len(region_ids) or any(
+                rid not in self._staged for rid in region_ids
+            ):
+                raise ValueError("Expected distinct staged region IDs")
+            for rid in region_ids:
+                self._regions[rid] = self._staged.pop(rid)
+                self._region_order.append(rid)
+            if self._active_region_id is None and self._region_order:
+                self._active_region_id = self._region_order[0]
+
+    def remove_region(self, region_id: int) -> bool:
+        """Remove an empty active or staged allocator, without unmapping it.
+
+        The caller must release adapter views first, then unmap and return the
+        server allocation. Returns False for an absent region (idempotent).
+
+        Raises:
+            RuntimeError: If pages are allocated or explicit mapping users exist.
+        """
+        with self._lock:
+            region = self._regions.get(region_id) or self._staged.get(region_id)
+            if region is None:
+                return False
+            if region.allocator.num_allocated:
+                raise RuntimeError(f"Region {region_id} has live allocations")
+            if self._mapper.get_mapping_status(region_id).active_users:
+                raise RuntimeError(f"Region {region_id} has active users")
+            region.allocator.close()
+            self._staged.pop(region_id, None)
+            self._regions.pop(region_id, None)
+            if region_id in self._region_order:
+                self._region_order.remove(region_id)
+            if self._active_region_id == region_id:
+                self._active_region_id = (
+                    self._region_order[0] if self._region_order else None
+                )
+            return True
+
     def close(self) -> list[int]:
         """Close all owned regions: allocator cleanup only.
 
@@ -112,8 +177,13 @@ class OwnedRegionManager:
 
         Returns:
             List of region_ids that were closed.
+
+        Raises:
+            RuntimeError: If staged regions still require explicit rollback.
         """
         with self._lock:
+            if self._staged:
+                raise RuntimeError("Remove staged regions before closing the manager")
             region_ids = list(self._region_order)
 
             for rid in region_ids:

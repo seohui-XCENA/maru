@@ -12,12 +12,13 @@ Provides:
 from .allocator import PagedMemoryAllocator
 from .mapper import DaxMapper
 from .owned_region_manager import OwnedRegionManager
-from .types import AllocHandle, MappedRegion, MemoryInfo, OwnedRegion
+from .types import AllocHandle, MappedRegion, MappingStatus, MemoryInfo, OwnedRegion
 
 __all__ = [
     "AllocHandle",
     "DaxMapper",
     "MappedRegion",
+    "MappingStatus",
     "MemoryInfo",
     "OwnedRegion",
     "OwnedRegionManager",

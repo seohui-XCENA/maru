@@ -12,10 +12,12 @@ import mmap as mmap_module
 import os
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from maru_shm import PROT_READ, PROT_WRITE, MaruHandle, MaruShmClient
 
-from .types import MappedRegion
+from .types import MappedRegion, MappingStatus
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,7 @@ class DaxMapper:
         self._client = MaruShmClient(address=rm_address, device_table=device_table)
         self._lock = threading.Lock()
         self._regions: dict[int, MappedRegion] = {}
+        self._active_users: dict[int, int] = {}
 
     # =========================================================================
     # Map / Unmap
@@ -336,6 +339,68 @@ class DaxMapper:
     def get_region(self, region_id: int) -> MappedRegion | None:
         """Get a mapped region by ID."""
         return self._regions.get(region_id)
+
+    def get_mapping_status(self, region_id: int) -> MappingStatus:
+        """Return a snapshot for region_id; unknown regions are unmapped/unpinned."""
+        with self._lock:
+            region = self._regions.get(region_id)
+            return MappingStatus(
+                region_id=region_id,
+                is_mapped=region is not None and region.is_mapped,
+                cuda_pinned=region is not None and region.cuda_pinned,
+                active_users=self._active_users.get(region_id, 0),
+            )
+
+    @contextmanager
+    def hold_region(self, region_id: int) -> Iterator[None]:
+        """Prevent strict release of region_id until the context exits.
+
+        Callers of the staged API must hold this lease until asynchronous GPU work
+        completes, not just until it is submitted. Legacy close/unmap is unchanged.
+
+        Raises:
+            KeyError: If region_id is not mapped.
+        """
+        with self._lock:
+            region = self._regions.get(region_id)
+            if region is None or not region.is_mapped:
+                raise KeyError(region_id)
+            self._active_users[region_id] = self._active_users.get(region_id, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_users[region_id] -= 1
+                if self._active_users[region_id] == 0:
+                    del self._active_users[region_id]
+
+    def release_region(self, region_id: int) -> bool:
+        """Strictly unregister and close region_id for staged rollback.
+
+        Unlike legacy unmap_region, failure is raised and state retained for retry.
+        Callers must release adapter views and allocators first and use hold_region
+        for in-flight work. False means already absent; True means fully closed.
+
+        Raises:
+            RuntimeError: If leased or CUDA unregister fails.
+            BufferError: If exported buffers still exist.
+            Exception: If the underlying mapping/client cleanup fails.
+        """
+        with self._lock:
+            region = self._regions.get(region_id)
+            if region is None:
+                return False
+            if self._active_users.get(region_id, 0):
+                raise RuntimeError(f"Region {region_id} has active users")
+            try:
+                region.unregister_cuda()
+            except Exception:
+                _clear_cuda_sticky_error()
+                raise
+            region.close_mapping()
+            self._client.munmap(region.handle)
+            del self._regions[region_id]
+            return True
 
     def get_dax_path(self, region_id: int) -> str | None:
         """Return the DAX device path for a mapped region, or None."""

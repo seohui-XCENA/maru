@@ -21,9 +21,9 @@ maru-server --allocation-policy fill_first --dax-path /dev/dax0.0
 
 **OFF는 기존 region 요청, page 할당, 자동 확장 기본값, GPU 전송과 KV read/write 경로를 유지한다.** 기존 DAX 상대 경로·alias와 fallback 순서도 그대로 전달하도록 회귀 테스트한다. 새 범위 옵션의 충돌 검사는 별도이며, 전체 환경에서 성능 변화가 0이라고 단정하는 것은 아니다.
 
-실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. 아래 C02 이후 항목은 앞으로 진행할 계획이다.
+실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. C02의 준비·정리 API도 구현됐으며, 아래 C03 이후 항목은 앞으로 진행할 계획이다.
 
-> 상태: C01 구현 완료. C02–C12는 구현 예정이며, ON 실행은 아직 미지원.
+> 상태: C01–C02 구현 완료. C03–C12는 구현 예정이며, ON 실행은 아직 미지원.
 > 기반: [다중 CXL 장치 chunk 분산 디자인](maru_multi_device_chunk_interleaving_design.md).
 > 원칙: 기본 OFF, 기존 handle 및 KV 위치 형식 유지, 각 기능 커밋에 해당 테스트 포함, 본문 hard wrapping 금지.
 
@@ -128,6 +128,48 @@ LMCache 새 branch/PR은 저장소 지침에 따라 `dev`를 기준으로 한다
 **테스트:** `tests/unit/test_owned_region_manager.py`, `test_maru_handler.py`, `test_cxl_memory_adapter.py`를 확장한다. 두 번째 region 준비나 callback이 실패해도 첫 번째 신규 region이 정리되고 기존 region은 남아야 한다. 반복 cleanup과 제거 거부도 테스트한다.
 
 **완료 조건:** C04에서 그룹 준비 전체를 rollback할 수 있고 benchmark가 public API로 pin 성공 여부를 확인할 수 있다.
+
+#### C02 구현 결과와 API 계약
+
+**구현 완료. 신규 config는 없으며, 기존 OFF의 connect/확장/전송은 staged API를 호출하지 않는다.** 이 단계는 그룹 준비를 위한 기반 API만 제공한다. C03의 서버 그룹 RPC와 C04의 ON 연결·분산 할당은 아직 구현하지 않았다.
+
+| Public API | 계약 |
+|---|---|
+| `OwnedRegionManager.stage_region(handle)` | mmap/allocator를 준비하되 일반 할당·용량 통계·기존 region 조회에 공개하지 않음 |
+| `OwnedRegionManager.commit_regions(ids)` | 전체 ID를 검증한 뒤 지정 순서로 allocator에 공개 |
+| `OwnedRegionManager.remove_region(id)` | allocator만 제거; live page 또는 명시적 사용 참조가 있으면 거부; 없는 ID는 no-op |
+| `MaruHandler.prepare_regions(handles, require_cuda_pin=False)` | 새 서버 handle의 준비를 인수하고 callback까지 실행; 아직 alloc 대상으로 공개하지 않음 |
+| `MaruHandler.commit_regions(ids)` | 준비 성공한 region을 공개; 기존 fill-first 순서를 유지하며 RR은 C04 대상 |
+| `MaruHandler.rollback_regions(ids)` | 이번 준비의 region만 역순으로 정리·반납; 기존 active region은 거부 |
+| `MaruHandler.get_staged_region_ids()` | 아직 준비 중이거나 cleanup/반납 재시도가 필요한 ID 조회 |
+| `MaruHandler.set_on_region_removed(callback)` | region별 adapter view 정리 callback 등록; 기존 add callback의 초기 replay/확장 호출은 유지 |
+| `MaruHandler.get_mapping_status(id)` | 불변 snapshot: `is_mapped`, 실제 pin 성공 여부 `cuda_pinned`, 명시적 lease 수 `active_users` |
+| `MaruHandler.hold_region(id)` | context 종료까지 staged rollback 방지; GPU 비동기 작업은 launch가 아니라 완료까지 유지해야 함 |
+| `CxlMemoryAdapter.has_region_pool(id)` / `remove_region_pool(id)` | pool 존재 조회와 region별 tensor/view 제거; 사용 중인 region 제거 거부 |
+| `DaxMapper.release_region(id)` | 엄격한 CUDA unregister → mmap close; 실패를 숨기지 않고 재시도 상태 유지 |
+
+`prepare_regions`의 입력 중복·기존 region·callback 짝 검증이 실패하면 handle 소유권은 호출자에게 남는다. 검증 후 준비를 인수한 경우에는 두 번째 region에서 실패해도 아직 시도하지 않은 handle까지 포함해 이번 입력 전체를 정리한다. add callback이 있으면 remove callback도 필요하며, callback 안에서는 lifecycle API 재진입이나 page 할당을 하지 않는다. callback에서 조회해야 하는 staged 여부는 `is_region_staged(id)`를 사용한다.
+
+```python
+# 향후 C03/C04 호출부 예시: handles는 이번 instance가 새로 받은 서버 allocations.
+# 기존 connected Handler에서도 API 자체를 검증할 수 있지만 OFF 연결이 자동 호출하지는 않는다.
+region_ids = handler.prepare_regions(handles, require_cuda_pin=True)
+try:
+    for region_id in region_ids:
+        status = handler.get_mapping_status(region_id)
+        assert status.is_mapped and status.cuda_pinned
+    handler.commit_regions(region_ids)
+except Exception:
+    handler.rollback_regions(region_ids)
+    raise
+```
+
+정리 순서는 **adapter tensor/view → owned allocator → CUDA unregister → mmap close → 서버 return_alloc**이다. 외부 memoryview/tensor가 남아 mmap close가 실패하거나 CUDA unregister/서버 반납이 실패하면 그 ID를 pending으로 유지한다. 다른 신규 region의 정리는 계속하며, 실패는 `ExceptionGroup`으로 보고한다. 남은 참조를 해제한 뒤 `rollback_regions(handler.get_staged_region_ids())`로 재시도할 수 있다. 반납 RPC의 응답 유실에 대한 서버 측 중복 억제와 재시작 복구는 각각 C03/C12 범위다.
+
+**lease는 기존 GPU 작업을 자동 감지하는 장치가 아니다.** 새 경로에서 비동기 작업을 실행하는 호출자가 완료까지 명시적으로 유지해야 한다. 기존 close/unmap의 수명 계약은 바꾸지 않는다. 다만 staged region이 남은 상태에서 Handler `close()`를 호출하면 먼저 rollback하며, 이것이 실패하면 기존 연결과 active region을 유지하고 오류를 반환한다. 성공한 cleanup의 반복 호출은 no-op이다.
+
+**검증:** CPU 기본 환경의 CI 대상 테스트 837 passed / 4 skipped, 실제 PyTorch·LMCache를 import한 CPU adapter/Handler/mapper/allocator 테스트 218 passed. 기본값과 명시적 `fill_first`에서 connect → region 확장 → close가 staged 경로를 호출하지 않는 회귀 테스트를 포함한다. pin 성공/실패 및 unregister 실패는 CUDA mock으로 검증했고 실제 GPU/CXL 성능은 측정하지 않았다.
+
 
 ### C03 — MaruServer의 그룹 할당 RPC
 

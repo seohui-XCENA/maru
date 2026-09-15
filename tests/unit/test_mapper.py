@@ -11,6 +11,65 @@ from conftest import _make_handle
 from maru_handler.memory import DaxMapper
 
 
+class TestStrictRegionRelease:
+    def test_unknown_and_repeated_release(self):
+        mapper = DaxMapper()
+        assert not mapper.get_mapping_status(42).is_mapped
+        assert not mapper.release_region(42)
+        mapper.map_region(_make_handle(42))
+        assert mapper.release_region(42)
+        assert not mapper.release_region(42)
+
+    def test_exported_buffer_blocks_close_and_can_retry(self):
+        mapper = DaxMapper()
+        mapper.map_region(_make_handle(42))
+        view = mapper.get_buffer_view(42, 0, 16)
+        view[:] = b"x" * 16
+        with pytest.raises(BufferError):
+            mapper.release_region(42)
+        assert mapper.get_mapping_status(42).is_mapped
+        assert bytes(view) == b"x" * 16
+        view.release()
+        assert mapper.release_region(42)
+
+    def test_lease_blocks_release(self):
+        mapper = DaxMapper()
+        mapper.map_region(_make_handle(42))
+        with mapper.hold_region(42):
+            with mapper.hold_region(42):
+                assert mapper.get_mapping_status(42).active_users == 2
+                with pytest.raises(RuntimeError, match="active users"):
+                    mapper.release_region(42)
+        assert mapper.get_mapping_status(42).active_users == 0
+        assert mapper.release_region(42)
+        with pytest.raises(KeyError), mapper.hold_region(42):
+            pass
+
+    @pytest.mark.parametrize("pin_rc", [0, 2])
+    def test_pin_status_tracks_success_only(self, pin_rc):
+        torch, _ = _mock_torch_cuda()
+        torch.cuda.cudart().cudaHostRegister.return_value = (pin_rc,)
+        mapper = DaxMapper()
+        with patch.dict("sys.modules", {"torch": torch}):
+            mapper.map_region(_make_handle(42))
+            assert mapper.get_mapping_status(42).cuda_pinned == (pin_rc == 0)
+            mapper.release_region(42)
+        assert torch.cuda.cudart().cudaHostUnregister.call_count == (pin_rc == 0)
+
+    def test_unregister_failure_retains_pin_and_mapping(self):
+        torch, _ = _mock_torch_cuda()
+        mapper = DaxMapper()
+        with patch.dict("sys.modules", {"torch": torch}):
+            mapper.map_region(_make_handle(42))
+            torch.cuda.cudart().cudaHostUnregister.return_value = (2,)
+            with pytest.raises(RuntimeError, match="unregister failed"):
+                mapper.release_region(42)
+            status = mapper.get_mapping_status(42)
+            assert status.cuda_pinned and status.is_mapped
+            torch.cuda.cudart().cudaHostUnregister.return_value = (0,)
+            assert mapper.release_region(42)
+
+
 class TestDaxMapperMap:
     """Test map/unmap operations."""
 

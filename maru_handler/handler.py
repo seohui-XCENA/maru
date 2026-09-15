@@ -21,7 +21,8 @@ Example:
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 from maru_common import MaruConfig
 from maru_shm import MaruHandle
@@ -33,6 +34,7 @@ from .memory import (
     OwnedRegionManager,
     PagedMemoryAllocator,
 )
+from .memory.types import MappingStatus
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
 
@@ -117,6 +119,10 @@ class MaruHandler:
 
         # Region-added callback (set by CxlMemoryAdapter)
         self._on_region_added: Callable[[int, int], None] | None = None
+        self._on_region_removed: Callable[[int], None] | None = None
+        self._staged_handles: dict[int, MaruHandle] = {}
+        self._staged_ready: set[int] = set()
+        self._staged_callbacks: set[int] = set()
 
         # Expansion policy
         self._auto_expand = self._config.auto_expand
@@ -254,6 +260,164 @@ class MaruHandler:
                         region.allocator.page_count,
                     )
                     callback(rid, region.allocator.page_count)
+
+    def set_on_region_removed(self, callback: Callable[[int], None] | None) -> None:
+        """Set the idempotent view-cleanup callback for staged rollback.
+
+        callback receives a region ID before its allocator/mapping is removed.
+        It must raise if cleanup is unsafe. None unregisters it. No initial replay.
+        Legacy connect, expansion, and close keep their existing behavior.
+        """
+        self._on_region_removed = callback
+
+    def get_mapping_status(self, region_id: int) -> MappingStatus:
+        """Return mapping/pin/user state for region_id, including staged regions."""
+        if self._mapper is None:
+            return MappingStatus(region_id, False, False, 0)
+        return self._mapper.get_mapping_status(region_id)
+
+    @contextmanager
+    def hold_region(self, region_id: int) -> Iterator[None]:
+        """Lease region_id against staged rollback until work completes.
+
+        Keep the context open until GPU completion, including asynchronous copies.
+        This does not change the existing Handler close contract.
+
+        Raises:
+            RuntimeError: If the mapper is unavailable.
+            KeyError: If region_id is unmapped.
+        """
+        with self._write_lock:
+            if self._mapper is None:
+                raise RuntimeError("Mapper is not initialized")
+            lease = self._mapper.hold_region(region_id)
+            lease.__enter__()
+        try:
+            yield
+        finally:
+            lease.__exit__(None, None, None)
+
+    def get_staged_region_ids(self) -> list[int]:
+        """Return pending region IDs, including failed cleanup for explicit retry."""
+        with self._write_lock:
+            return list(self._staged_handles)
+
+    def is_region_staged(self, region_id: int) -> bool:
+        """Return whether region_id is pending preparation/cleanup; callback-safe."""
+        return region_id in self._staged_handles
+
+    def get_region_allocated_pages(self, region_id: int) -> int:
+        """Return live owned page count for region_id; staged/unknown regions yield 0."""
+        region = self._owned.get_owned_region(region_id) if self._owned else None
+        return region.allocator.num_allocated if region else 0
+
+    def prepare_regions(
+        self, handles: list[MaruHandle], *, require_cuda_pin: bool = False
+    ) -> list[int]:
+        """Take ownership of newly allocated handles and stage them for commit.
+
+        Maps every region and runs the existing add callback before publication.
+        Callbacks may inspect mappings but must not allocate or reenter lifecycle
+        APIs. An add callback requires a matching remove callback for rollback.
+        Validation errors leave ownership with the caller. Once accepted, any
+        preparation failure rolls back ALL supplied handles, including unattempted
+        ones. Cleanup failures remain visible via get_staged_region_ids for retry.
+
+        Args:
+            handles: Fresh server allocations belonging to this instance.
+            require_cuda_pin: Reject unpinned mappings only for this preparation.
+
+        Returns:
+            Ordered IDs to pass to commit_regions or rollback_regions.
+
+        Raises:
+            ValueError: If IDs repeat or refer to existing mappings/owned regions.
+            RuntimeError: If uninitialized, callbacks are unpaired, or pin is required.
+            Exception: Preparation error, or ExceptionGroup if rollback also fails.
+        """
+        with self._write_lock:
+            if self._closing.is_set():
+                raise RuntimeError("Handler is closing")
+            if self._owned is None or self._mapper is None:
+                raise RuntimeError("Memory managers are not initialized")
+            ids = [handle.region_id for handle in handles]
+            if len(set(ids)) != len(ids) or any(
+                rid in self._staged_handles
+                or self._owned.is_owned(rid)
+                or self._mapper.get_region(rid) is not None
+                for rid in ids
+            ):
+                raise ValueError("Expected fresh, distinct region handles")
+            if self._on_region_added is not None and self._on_region_removed is None:
+                raise RuntimeError(
+                    "Staged preparation requires a region removal callback"
+                )
+            self._staged_handles.update((h.region_id, h) for h in handles)
+            try:
+                for handle in handles:
+                    region = self._owned.stage_region(handle)
+                    rid = handle.region_id
+                    if (
+                        require_cuda_pin
+                        and not self.get_mapping_status(rid).cuda_pinned
+                    ):
+                        raise RuntimeError(
+                            f"Region {rid} requires successful CUDA pinning"
+                        )
+                    if self._on_region_added is not None:
+                        self._staged_callbacks.add(rid)
+                        self._on_region_added(rid, region.allocator.page_count)
+                    self._staged_ready.add(rid)
+            except Exception as error:
+                failures = self._rollback_regions_locked(ids)
+                if failures:
+                    raise ExceptionGroup(
+                        "Region preparation and rollback failed", [error, *failures]
+                    ) from None
+                raise
+            return ids
+
+    def commit_regions(self, region_ids: list[int]) -> None:
+        """Publish prepared region_ids atomically, preserving their allocation order.
+
+        Raises:
+            ValueError: If any region is unprepared or cleanup has begun.
+            RuntimeError: If memory managers are uninitialized.
+        """
+        with self._write_lock:
+            if self._closing.is_set():
+                raise RuntimeError("Handler is closing")
+            if self._owned is None:
+                raise RuntimeError("Memory managers are not initialized")
+            if any(rid not in self._staged_ready for rid in region_ids):
+                raise ValueError("Only fully prepared regions may be committed")
+            self._owned.commit_regions(region_ids)
+            for rid in region_ids:
+                del self._staged_handles[rid]
+                self._staged_ready.remove(rid)
+                self._staged_callbacks.discard(rid)
+
+    def rollback_regions(self, region_ids: list[int]) -> None:
+        """Release staged region_ids: views, allocator, CUDA pin, mmap, then RPC.
+
+        Repeating a successful rollback is a no-op. Committed/legacy owned regions
+        are rejected. A failed cleanup is retained for retry and other requested
+        regions are still cleaned. No server return occurs before local release.
+
+        Raises:
+            ValueError: If any requested region is already active.
+            ExceptionGroup: If cleanup, active users, or server return block release.
+        """
+        with self._write_lock:
+            if self._owned is not None and any(
+                self._owned.is_owned(rid) for rid in region_ids
+            ):
+                raise ValueError("Cannot roll back active owned regions")
+            failures = self._rollback_regions_locked(region_ids)
+            if failures:
+                raise ExceptionGroup(
+                    "Region rollback failed; retry pending regions", failures
+                )
 
     # =========================================================================
     # Connection Management
@@ -416,11 +580,35 @@ class MaruHandler:
 
         Sets ``_closing`` event to reject new operations, then acquires
         ``_write_lock`` to wait for in-flight writes before teardown.
+
+        Raises:
+            ExceptionGroup: If pending staged rollback fails. The connection and
+                existing owned regions remain available so cleanup can be retried.
         """
-        if not self._connected:
+        if not self._connected and not self._staged_handles:
             return
 
+        was_closing = self._closing.is_set()
         self._closing.set()  # reject new operations + wake flush thread
+        try:
+            # Wait for any preparation already in progress before taking the
+            # rollback snapshot. New prepare calls now fail the closing check.
+            with self._write_lock:
+                failures = (
+                    self._rollback_regions_locked(list(self._staged_handles))
+                    if self._staged_handles
+                    else []
+                )
+            if failures:
+                raise ExceptionGroup(
+                    "Pending region rollback failed during close", failures
+                )
+        except Exception:
+            if not was_closing:
+                self._closing.clear()
+            raise
+        if not self._connected:
+            return
 
         # Stop stats: close dedicated RPC first (unblocks flush thread),
         # then join thread. Flush loop does one final flush before exiting.
@@ -1212,6 +1400,35 @@ class MaruHandler:
     # =========================================================================
     # Helpers
     # =========================================================================
+
+    def _rollback_regions_locked(self, region_ids: list[int]) -> list[Exception]:
+        """Clean accepted staged handles while holding the lifecycle/write lock."""
+        failures: list[Exception] = []
+        for rid in reversed(region_ids):
+            if rid not in self._staged_handles:
+                continue
+            self._staged_ready.discard(rid)
+            try:
+                if self._owned is None or self._mapper is None:
+                    raise RuntimeError("Memory managers are not initialized")
+                instance_id = self._config.instance_id
+                if instance_id is None:
+                    raise RuntimeError("Instance ID is not initialized")
+                if self.get_mapping_status(rid).active_users:
+                    raise RuntimeError(f"Region {rid} has active users")
+                if rid in self._staged_callbacks:
+                    if self._on_region_removed is None:
+                        raise RuntimeError(f"Missing removal callback for region {rid}")
+                    self._on_region_removed(rid)
+                    self._staged_callbacks.remove(rid)
+                self._owned.remove_region(rid)
+                self._mapper.release_region(rid)
+                if not self._rpc.return_alloc(instance_id, rid):
+                    raise RuntimeError(f"Server return failed for region {rid}")
+                del self._staged_handles[rid]
+            except Exception as error:
+                failures.append(error)
+        return failures
 
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.

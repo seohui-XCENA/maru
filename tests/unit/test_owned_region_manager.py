@@ -294,3 +294,59 @@ class TestOwnedRegionManagerCloseEdgeCases:
         assert mock_error.called
         # Check the format string pattern
         assert "Error closing owned region %d allocator" in mock_error.call_args[0][0]
+
+
+class TestStagedRegions:
+    def test_close_requires_staged_cleanup(self, mgr):
+        _add_region(mgr, 10)
+        mgr.stage_region(_make_handle(20))
+        with pytest.raises(RuntimeError, match="staged"):
+            mgr.close()
+        assert mgr.get_region_ids() == [10]
+        mgr.remove_region(20)
+        assert mgr.close() == [10]
+
+    def test_staged_capacity_hidden_until_commit(self, mgr):
+        mgr.stage_region(_make_handle(20))
+        mgr.stage_region(_make_handle(30))
+        assert mgr.get_region_ids() == []
+        assert mgr.allocate() is None
+        assert mgr.get_stats()["total_page_count"] == 0
+        mgr.commit_regions([30, 20])
+        assert mgr.get_region_ids() == [30, 20]
+        assert mgr.allocate() == (30, 0)
+
+    def test_commit_validation_is_atomic(self, mgr):
+        mgr.stage_region(_make_handle(20))
+        for ids in ([20, 999], [20, 20]):
+            with pytest.raises(ValueError):
+                mgr.commit_regions(ids)
+            assert mgr.get_region_ids() == []
+        mgr.commit_regions([20])
+        assert mgr.allocate() == (20, 0)
+
+    def test_duplicate_stage_preserves_existing_region(self, mgr):
+        _add_region(mgr, 10)
+        with pytest.raises(ValueError):
+            mgr.stage_region(_make_handle(10))
+        assert mgr.allocate() == (10, 0)
+
+    def test_remove_refuses_live_pages(self, mgr):
+        _add_region(mgr, 10)
+        _add_region(mgr, 20)
+        rid, pid = mgr.allocate()
+        with pytest.raises(RuntimeError, match="live allocations"):
+            mgr.remove_region(rid)
+        mgr.free(rid, pid)
+        assert mgr.remove_region(rid)
+        assert not mgr.remove_region(rid)
+        assert mgr.allocate() == (20, 0)
+
+    def test_remove_refuses_lease(self, mgr, mapper):
+        mgr.stage_region(_make_handle(20))
+        with mapper.hold_region(20):
+            with pytest.raises(RuntimeError, match="active users"):
+                mgr.remove_region(20)
+        assert mgr.remove_region(20)
+        assert mapper.get_mapping_status(20).is_mapped
+        assert mapper.release_region(20)

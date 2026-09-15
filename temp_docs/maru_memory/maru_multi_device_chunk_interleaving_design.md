@@ -4,13 +4,13 @@
 
 ## 현재 설정과 사용법 — C01 / Experimental
 
-**이 기능은 experimental이며 기본값은 OFF다. 현재 C01에서는 설정 모델·크기 파서·검증만 구현됐다. 실제 region 그룹 할당과 chunk 분산, 병렬 전송은 아직 사용할 수 없으며 ON 실행은 명확한 오류로 차단된다.** 아래 본문의 다중 Handler 흐름과 ON YAML 예시는 후속 구현 목표다.
+**이 기능은 experimental이며 기본값은 OFF다. C01의 설정 모델·크기 파서·검증과 C02의 region 준비·정리 및 mapping 상태 API가 구현됐다. 실제 region 그룹 할당과 chunk 분산, 병렬 전송은 아직 사용할 수 없으며 ON 실행은 명확한 오류로 차단된다.** 아래 본문의 다중 Handler 흐름과 ON YAML 예시는 후속 구현 목표다.
 
 ### 추가된 설정 한눈에 보기
 
 | 위치 | 설정 | 기본값 | 현재 의미 |
 |---|---|---|---|
-| MaruServer CLI | `--allocation-policy` | `fill_first` | OFF=`fill_first`, ON=`chunk_round_robin`; C01의 ON 실행은 미지원 |
+| MaruServer CLI | `--allocation-policy` | `fill_first` | OFF=`fill_first`, ON=`chunk_round_robin`; 현재 ON 실행은 미지원 |
 | Python `MaruServer(...)` | `allocation_policy` | `"fill_first"` | CLI와 같은 서버 정책 |
 | Python `MaruConfig(...)` | `placement_policy` | `"fill_first"` | Handler 정책; ON 설정은 `auto_expand=False` 필요, Handler 생성은 아직 미지원 |
 | MaruServer CLI | `--target-sizes` | 미지정 | 예: `256GiB,256GiB`. 단일 DAX의 연속 범위 크기 목록 |
@@ -66,11 +66,11 @@ Python에서는 ON 설정 객체를 만들 수 있지만 실제 Handler 생성�
 from maru import MaruConfig, MaruHandler
 
 config = MaruConfig(placement_policy="chunk_round_robin", auto_expand=False)
-# 현재 C01: 아래 호출은 NotImplementedError를 발생시킨다.
+# 현재: 아래 호출은 NotImplementedError를 발생시킨다.
 # handler = MaruHandler(config)
 ```
 
-현재 동작하는 기능은 주소 범위 설정을 파싱·검증하는 것이다. 다음 예시는 장치 접근이나 메모리 예약 없이 두 범위를 만든다.
+주소 범위 설정의 파싱·검증은 현재 사용할 수 있다. 다음 예시는 장치 접근이나 메모리 예약 없이 두 범위를 만든다.
 
 ```python
 from maru_common.allocation_target import parse_target_sizes
@@ -82,6 +82,10 @@ assert [(t.offset_bytes, t.length_bytes) for t in targets] == [
 ]
 ```
 
+### C02에서 추가된 준비·정리 API
+
+신규 config는 없다. `prepare_regions`로 여러 region을 할당 대상에 공개하지 않은 채 준비하고, `commit_regions`로 공개하거나 `rollback_regions`로 이번 준비만 정리할 수 있다. `get_mapping_status`로 실제 CUDA pin 성공 여부를 조회한다. 기존 OFF 연결·확장은 이 API를 자동 호출하지 않으며, ON 실행 차단도 유지한다. API와 실패 시 재시도 예시는 [구현 계획의 C02 구현 결과](maru_multi_device_chunk_interleaving_implementation_plan.md#c02-구현-결과와-api-계약)를 참고한다.
+
 ### OFF 호환성의 범위
 
 **기존 설정을 그대로 쓰거나 정책만 `fill_first`로 지정하면 기존 할당·전송 경로를 사용한다.** 첫 region의 크기와 요청 방식, DAX allowlist의 순서와 fallback, active-region 우선 page 할당, 자동 확장 기본값, GPU 전송 및 KV lookup/등록 경로를 이 기능으로 바꾸지 않는다. 추가된 target 정규화도 OFF의 기존 DAX 경로에 적용하지 않아 상대 경로·alias·중복 allowlist 순서를 그대로 전달한다.
@@ -90,7 +94,7 @@ OFF에 새 `allocation_targets`나 target 범위 옵션을 함께 지정하는 �
 
 검증은 기본값/명시적 OFF, 기존 DAX fallback, 상대 경로·alias 전달, 기존 client/server 회귀 테스트로 수행한다. 이는 코드 경로와 기능 호환성에 대한 검증이며, 모든 하드웨어에서 성능 차이가 정확히 0이라는 실측 보장은 아니다. 향후 커밋에서도 기본 OFF와 이 회귀 테스트를 유지하고 ON을 자동으로 활성화하지 않는다.
 
-> 상태: Experimental. C01 설정 모델·파서·검증 구현 완료. ON 실행 및 후속 할당·전송 기능은 아직 미지원.
+> 상태: Experimental. C01 설정과 C02 region 준비·정리 및 mapping 상태 API 구현 완료. ON 실행 및 후속 할당·전송 기능은 아직 미지원.
 > 설계 기준: 2026-09-15, Maru `b46d3bb` / LMCache `0d187365`. C01 구현: Maru `e60ef47`; OFF 호환성 후속 점검 반영.
 > 대상: Maru allocator와 LMCache MP 전송 경로를 수정하고 성능을 검증할 개발자.
 > 기반 문서: [Maru 메모리 모델](maru_memory_model.md).
