@@ -5,8 +5,16 @@
 import argparse
 import logging
 import signal
+from collections.abc import Sequence
 from threading import RLock
 
+from maru_common.allocation_target import (
+    AllocationPolicy,
+    AllocationTarget,
+    normalize_allocation_targets,
+    parse_byte_size,
+    parse_target_sizes,
+)
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -29,7 +37,33 @@ class MaruServer:
         self,
         rm_address: str | None = None,
         dax_paths: list[str] | None = None,
-    ):
+        *,
+        allocation_policy: AllocationPolicy | str = AllocationPolicy.FILL_FIRST,
+        allocation_targets: Sequence[AllocationTarget] | None = None,
+    ) -> None:
+        """Initialize metadata services with validated allocation configuration.
+
+        Args:
+            rm_address (str | None): RM TCP address, or the local default.
+            dax_paths (list[str] | None): Legacy DAX allowlist, or any pool.
+            allocation_policy (AllocationPolicy | str): Defaults to fill_first.
+            allocation_targets (Sequence[AllocationTarget] | None): Explicit
+                whole-device/range targets for the future round-robin policy.
+
+        Raises:
+            ValueError: If target or policy configuration is invalid.
+            NotImplementedError: If chunk_round_robin is requested; group
+                allocation is not yet implemented. No RM connection is made.
+        """
+        normalize_allocation_targets(
+            allocation_policy=allocation_policy,
+            dax_paths=dax_paths,
+            allocation_targets=allocation_targets,
+        )
+        if allocation_policy != AllocationPolicy.FILL_FIRST:
+            raise NotImplementedError(
+                "chunk_round_robin is not yet supported by MaruServer"
+            )
         self._rm_address = rm_address or "127.0.0.1:9850"
         self._dax_paths = dax_paths
         self._allocation_manager = AllocationManager(rm_address=rm_address)
@@ -417,12 +451,75 @@ def main() -> None:
             "If omitted, any available pool is used."
         ),
     )
+    parser.add_argument(
+        "--allocation-policy",
+        choices=[policy.value for policy in AllocationPolicy],
+        default=AllocationPolicy.FILL_FIRST.value,
+        help="Allocation policy (default: fill_first; chunk_round_robin is not yet supported)",
+    )
+    sizes_group = parser.add_mutually_exclusive_group()
+    sizes_group.add_argument(
+        "--target-sizes",
+        help="Consecutive target sizes in one DAX, e.g. 256GiB,256GiB (requires ON)",
+    )
+    sizes_group.add_argument(
+        "--target-size",
+        help="Size repeated --target-count times in one DAX (requires ON)",
+    )
+    parser.add_argument("--target-count", type=int, help="Count for --target-size")
+    parser.add_argument(
+        "--target-base-offset",
+        type=parse_byte_size,
+        default=None,
+        help="DAX file base offset in bytes or binary units; default 0 for range targets",
+    )
     args = parser.parse_args()
+
+    targets = None
+    dax_paths = args.dax_paths
+    range_requested = any(
+        value is not None
+        for value in (
+            args.target_sizes,
+            args.target_size,
+            args.target_count,
+            args.target_base_offset,
+        )
+    )
+    try:
+        if range_requested:
+            if dax_paths is None or len(dax_paths) != 1:
+                raise ValueError("Target size options require exactly one --dax-path")
+            targets = parse_target_sizes(
+                dax_paths[0],
+                target_sizes=args.target_sizes,
+                target_size=args.target_size,
+                target_count=args.target_count,
+                base_offset=args.target_base_offset or 0,
+            )
+            # Here --dax-path identifies the range backing, not a second allowlist.
+            dax_paths = None
+        normalize_allocation_targets(
+            allocation_policy=args.allocation_policy,
+            dax_paths=dax_paths,
+            allocation_targets=targets,
+        )
+        if args.allocation_policy != AllocationPolicy.FILL_FIRST:
+            raise NotImplementedError(
+                "chunk_round_robin is not yet supported by MaruServer"
+            )
+    except (ValueError, NotImplementedError) as exc:
+        parser.error(str(exc))
 
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer(rm_address=args.rm_address, dax_paths=args.dax_paths)
+    server = MaruServer(
+        rm_address=args.rm_address,
+        dax_paths=dax_paths,
+        allocation_policy=args.allocation_policy,
+        allocation_targets=targets,
+    )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

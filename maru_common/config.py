@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass
 
+from .allocation_target import AllocationPolicy
+
 
 def _parse_env_bool(name: str) -> bool | None:
     """Parse an optional boolean env var.
@@ -39,6 +41,9 @@ class MaruConfig:
         instance_id: Unique identifier for this client instance
         pool_size: Default pool size to request (in bytes)
         auto_connect: Whether to automatically connect on initialization
+        placement_policy: AllocationPolicy or str; fill_first by default.
+            chunk_round_robin validates the future policy but requires
+            auto_expand=False and is not yet supported by MaruHandler.
     """
 
     server_url: str = "tcp://localhost:5555"
@@ -55,8 +60,19 @@ class MaruConfig:
     rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
     enable_stats: bool = False  # Enable handler-side stats reporting to server
 
-    def __post_init__(self):
+    placement_policy: AllocationPolicy | str = AllocationPolicy.FILL_FIRST
+
+    def __post_init__(self) -> None:
         """Generate instance_id if not provided. Validate config."""
+        self.placement_policy = AllocationPolicy(self.placement_policy)
+        if (
+            self.placement_policy == AllocationPolicy.CHUNK_ROUND_ROBIN
+            and self.auto_expand
+        ):
+            raise ValueError(
+                "chunk_round_robin requires auto_expand=False until group expansion is supported"
+            )
+
         if self.instance_id is None:
             import uuid
 

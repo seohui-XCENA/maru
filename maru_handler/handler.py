@@ -68,13 +68,21 @@ class MaruHandler:
             └── _key_to_location (key -> (region_id, page_index))
     """
 
-    def __init__(self, config: MaruConfig | None = None):
+    def __init__(self, config: MaruConfig | None = None) -> None:
         """Initialize MaruHandler.
 
         Args:
             config: Configuration object. If None, uses defaults.
+
+        Raises:
+            NotImplementedError: If chunk_round_robin is requested before
+                group allocation support is implemented. No RPC is created.
         """
         self._config = config or MaruConfig()
+        if self._config.placement_policy != "fill_first":
+            raise NotImplementedError(
+                "chunk_round_robin is not yet supported by MaruHandler"
+            )
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
