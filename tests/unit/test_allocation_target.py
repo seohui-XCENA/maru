@@ -4,7 +4,7 @@
 
 # Standard
 from dataclasses import FrozenInstanceError
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 # Third Party
 import pytest
@@ -402,3 +402,37 @@ def test_size_expansion_limit_boundary() -> None:
     targets = parse_target_sizes("/dev/dax0.0", target_size="1MiB", target_count=1024)
     assert len(targets) == 1024
     assert targets[-1].offset_bytes == 1023 << 20
+
+
+@pytest.mark.parametrize("policy", [None, "fill_first"])
+def test_server_off_preserves_legacy_path_fallback(policy: str | None) -> None:
+    """OFF forwards relative and alias paths in their original fallback order."""
+    paths = ["./dax-link", "/dev/../dev/dax0.0", "./dax-link"]
+    with patch("maru_server.server.AllocationManager") as manager_cls:
+        manager = manager_cls.return_value
+        manager.allocate.side_effect = [None, None, None]
+        server = (
+            MaruServer(dax_paths=paths)
+            if policy is None
+            else MaruServer(dax_paths=paths, allocation_policy=policy)
+        )
+        try:
+            assert server.request_alloc("writer", 4096) is None
+            assert manager.allocate.call_args_list == [
+                call("writer", 4096, dax_path=path) for path in paths
+            ]
+        finally:
+            server.close()
+
+
+@pytest.mark.parametrize("policy_args", [[], ["--allocation-policy", "fill_first"]])
+def test_cli_off_preserves_relative_path(policy_args: list[str]) -> None:
+    """Omitted and explicit OFF accept the same legacy relative DAX paths."""
+    with (
+        patch("sys.argv", ["maru-server", "--dax-path", "./dax-link", *policy_args]),
+        patch("maru_server.server.MaruServer") as server,
+        patch("maru_server.rpc_server.RpcServer"),
+        patch("signal.signal"),
+    ):
+        main()
+        assert server.call_args.kwargs["dax_paths"] == ["./dax-link"]

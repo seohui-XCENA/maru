@@ -55,11 +55,17 @@ class MaruServer:
             NotImplementedError: If chunk_round_robin is requested; group
                 allocation is not yet implemented. No RM connection is made.
         """
-        normalize_allocation_targets(
-            allocation_policy=allocation_policy,
-            dax_paths=dax_paths,
-            allocation_targets=allocation_targets,
-        )
+        # OFF keeps legacy paths untouched, including relative paths and aliases.
+        # Explicit targets still require validation so ranges cannot be ignored.
+        if (
+            allocation_policy != AllocationPolicy.FILL_FIRST
+            or allocation_targets is not None
+        ):
+            normalize_allocation_targets(
+                allocation_policy=allocation_policy,
+                dax_paths=dax_paths,
+                allocation_targets=allocation_targets,
+            )
         if allocation_policy != AllocationPolicy.FILL_FIRST:
             raise NotImplementedError(
                 "chunk_round_robin is not yet supported by MaruServer"
@@ -499,11 +505,12 @@ def main() -> None:
             )
             # Here --dax-path identifies the range backing, not a second allowlist.
             dax_paths = None
-        normalize_allocation_targets(
-            allocation_policy=args.allocation_policy,
-            dax_paths=dax_paths,
-            allocation_targets=targets,
-        )
+        if args.allocation_policy != AllocationPolicy.FILL_FIRST or targets is not None:
+            normalize_allocation_targets(
+                allocation_policy=args.allocation_policy,
+                dax_paths=dax_paths,
+                allocation_targets=targets,
+            )
         if args.allocation_policy != AllocationPolicy.FILL_FIRST:
             raise NotImplementedError(
                 "chunk_round_robin is not yet supported by MaruServer"
