@@ -284,6 +284,21 @@ class MaruShmClient:
             raise RuntimeError(f"GetAccess failed with status {resp.status}")
         return resp
 
+    def get_access_info(self, handle: MaruHandle) -> GetAccessResp:
+        """Query RM-verified device UUID, path and extent without mapping memory.
+
+        Args:
+            handle: Allocation handle whose access token is checked by the RM.
+
+        Returns:
+            GetAccessResp containing the server-local path, UUID and extent.
+
+        Raises:
+            RuntimeError: If RM rejects access.
+            OSError: If transport fails after the existing RPC retry.
+        """
+        return self._request_access(handle)
+
     def mmap(self, handle: MaruHandle, prot: int) -> mmap_module.mmap:
         """Memory-map a handle into the calling process.
 

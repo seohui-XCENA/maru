@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """RpcHandlerMixin - Shared message dispatch and handler methods for RPC servers."""
 
 import logging
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from maru_common import MessageType
@@ -27,6 +29,8 @@ class RpcHandlerMixin:
         if self._handlers is None:
             self._handlers = {
                 MessageType.REQUEST_ALLOC.value: self._handle_request_alloc,
+                MessageType.REQUEST_ALLOC_GROUP.value: self._handle_request_alloc_group,
+                MessageType.RETURN_ALLOC_GROUP.value: self._handle_return_alloc_group,
                 MessageType.RETURN_ALLOC.value: self._handle_return_alloc,
                 MessageType.LIST_ALLOCATIONS.value: self._handle_list_allocations,
                 MessageType.REGISTER_KV.value: self._handle_register_kv,
@@ -81,6 +85,16 @@ class RpcHandlerMixin:
             handle.region_id,
         )
         return {"success": True, "handle": handle.to_dict()}
+
+    def _handle_request_alloc_group(self, req: Any) -> dict:
+        return asdict(
+            self._server.request_alloc_group(
+                req.instance_id, req.request_id, req.total_size, req.chunk_size_bytes
+            )
+        )
+
+    def _handle_return_alloc_group(self, req: Any) -> dict:
+        return asdict(self._server.return_alloc_group(req.instance_id, req.request_id))
 
     def _handle_return_alloc(self, req: Any) -> dict:
         success = self._server.return_alloc(
@@ -260,7 +274,8 @@ class RpcHandlerMixin:
         return {}
 
     def _handle_handshake(self, req: Any) -> dict:
-        return {
-            "success": True,
-            "rm_address": self._server.rm_address,
-        }
+        response = {"success": True, "rm_address": self._server.rm_address}
+        capabilities = self._server.get_capabilities()
+        if capabilities:
+            response["capabilities"] = capabilities
+        return response

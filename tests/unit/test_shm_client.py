@@ -832,3 +832,26 @@ class TestShmClientDeviceTable:
                     os.unlink(p)
                 except OSError:
                     pass
+
+
+def test_get_access_info_without_mapping() -> None:
+    """The public query returns verified backing metadata without mmap/open."""
+    expected = GetAccessResp(
+        dax_path="/dev/dax0.0", device_uuid="device-a", offset=2 << 20, length=8 << 20
+    )
+
+    def handler(sock: socket.socket) -> None:
+        hdr, _ = _recv_request(sock)
+        assert hdr.msg_type == MsgType.GET_ACCESS_REQ
+        _send_response(sock, MsgType.GET_ACCESS_RESP, expected)
+
+    server = MockResourceManagerServer(handler)
+    client = MaruShmClient(address=server.start())
+    try:
+        actual = client.get_access_info(
+            MaruHandle(1, expected.offset, expected.length, 123)
+        )
+        assert actual == expected
+    finally:
+        client.close()
+        server.stop()

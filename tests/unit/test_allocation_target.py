@@ -268,8 +268,8 @@ def test_handler_rejects_on_before_constructing_rpc() -> None:
         rpc.assert_not_called()
 
 
-def test_server_rejects_on_before_constructing_rm() -> None:
-    """Future target configuration cannot trigger an RM connection in C01."""
+def test_server_rejects_ranges_before_constructing_rm() -> None:
+    """Bounded targets remain unsupported until C08 and never contact RM."""
     with patch("maru_server.server.AllocationManager") as manager:
         with pytest.raises(NotImplementedError, match="not yet supported"):
             MaruServer(
@@ -306,10 +306,6 @@ def test_server_off_rejects_explicit_targets() -> None:
                 "--target-count",
                 "2",
             ],
-            "not yet supported",
-        ),
-        (
-            ["--allocation-policy", "chunk_round_robin", "--dax-path", "/dev/dax0.0"],
             "not yet supported",
         ),
         (["--target-sizes", "1GiB,1GiB"], "exactly one --dax-path"),

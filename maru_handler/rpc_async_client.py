@@ -38,7 +38,12 @@ from maru_common import (
     MessageType,
     Serializer,
 )
-from maru_common.protocol import HEADER_SIZE, MessageHeader
+from maru_common.protocol import (
+    HEADER_SIZE,
+    MessageHeader,
+    RequestAllocGroupResponse,
+    ReturnAllocGroupResponse,
+)
 
 from .rpc_client_base import RpcClientBase
 
@@ -304,6 +309,58 @@ class RpcAsyncClient(RpcClientBase):
             return self._parse_request_alloc(response)
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
+
+    def request_alloc_group_async(
+        self, instance_id: str, request_id: str, total_size: int, chunk_size_bytes: int
+    ) -> Future:
+        """Submit a group allocation and return a Future of its typed result.
+
+        Args:
+            instance_id: Owner ID.
+            request_id: Stable retry ID for the identical group payload.
+            total_size: Target-total requested bytes.
+            chunk_size_bytes: Slot size for this group.
+
+        Returns:
+            Future resolving to RequestAllocGroupResponse.
+        """
+
+        async def _do() -> RequestAllocGroupResponse:
+            response = await self._send_async(
+                MessageType.REQUEST_ALLOC_GROUP,
+                {
+                    "instance_id": instance_id,
+                    "request_id": request_id,
+                    "total_size": total_size,
+                    "chunk_size_bytes": chunk_size_bytes,
+                },
+            )
+            return self._parse_alloc_group(response)
+
+        return asyncio.run_coroutine_threadsafe(_do(), self._loop)
+
+    def return_alloc_group_async(self, instance_id: str, request_id: str) -> Future:
+        """Submit idempotent group release and return its typed-result Future.
+
+        Args:
+            instance_id: Original group owner.
+            request_id: Original allocation request ID.
+
+        Returns:
+            Future resolving to ReturnAllocGroupResponse.
+        """
+
+        async def _do() -> ReturnAllocGroupResponse:
+            response = await self._send_async(
+                MessageType.RETURN_ALLOC_GROUP,
+                {
+                    "instance_id": instance_id,
+                    "request_id": request_id,
+                },
+            )
+            return self._parse_return_group(response)
+
+        return asyncio.run_coroutine_threadsafe(_do(), self._loop)
 
     def list_allocations_async(self, exclude_instance_id: str | None = None) -> Future:
         """Non-blocking list_allocations. Returns Future[ListAllocationsResponse]."""

@@ -41,6 +41,8 @@ class MessageType(IntEnum):
     REQUEST_ALLOC = 0x01
     RETURN_ALLOC = 0x03
     LIST_ALLOCATIONS = 0x04
+    REQUEST_ALLOC_GROUP = 0x05
+    RETURN_ALLOC_GROUP = 0x06
 
     # KV Operations (0x10 - 0x1F)
     REGISTER_KV = 0x10
@@ -204,6 +206,68 @@ class ListAllocationsResponse:
 
     success: bool
     allocations: list[MaruHandle] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class AllocatedTargetRegion:
+    """Verified whole-device target and its allocation; paths are RM-reported."""
+
+    target_id: str
+    dax_path: str
+    device_uuid: str
+    alignment: int
+    handle: MaruHandle
+    page_count: int
+
+
+@dataclass
+class RequestAllocGroupRequest:
+    """Allocate one region per server target, deduplicated by instance/request ID."""
+
+    instance_id: str
+    request_id: str
+    total_size: int
+    chunk_size_bytes: int
+
+
+@dataclass
+class RequestAllocGroupResponse:
+    """Group snapshot; failed results never expose usable region handles.
+
+    pending_region_ids require cleanup; outcome_unknown means an RM allocation
+    may exist without a known handle. Neither condition is a successful group.
+    Request IDs and terminal results are retained until server shutdown.
+    """
+
+    success: bool
+    request_id: str = ""
+    state: str = "failed"
+    regions: list[AllocatedTargetRegion] = field(default_factory=list)
+    reserved_bytes: int = 0
+    usable_bytes: int = 0
+    pending_region_ids: list[int] = field(default_factory=list)
+    outcome_unknown: bool = False
+    error: str | None = None
+
+
+@dataclass
+class ReturnAllocGroupRequest:
+    """Release only the regions owned by this instance/request pair."""
+
+    instance_id: str
+    request_id: str
+
+
+@dataclass
+class ReturnAllocGroupResponse:
+    """Release acknowledgement; retained KV-backed regions are freed later."""
+
+    success: bool
+    request_id: str = ""
+    retained_region_ids: list[int] = field(default_factory=list)
+    pending_region_ids: list[int] = field(default_factory=list)
+    outcome_unknown: bool = False
     error: str | None = None
 
 
@@ -535,6 +599,7 @@ class HandshakeResponse:
     server_version: int = PROTOCOL_VERSION
     rm_address: str | None = None
     error: str | None = None
+    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -561,6 +626,11 @@ MESSAGE_CLASSES = {
     MessageType.REQUEST_ALLOC: (RequestAllocRequest, RequestAllocResponse),
     MessageType.RETURN_ALLOC: (ReturnAllocRequest, ReturnAllocResponse),
     MessageType.LIST_ALLOCATIONS: (ListAllocationsRequest, ListAllocationsResponse),
+    MessageType.REQUEST_ALLOC_GROUP: (
+        RequestAllocGroupRequest,
+        RequestAllocGroupResponse,
+    ),
+    MessageType.RETURN_ALLOC_GROUP: (ReturnAllocGroupRequest, ReturnAllocGroupResponse),
     # KV Operations
     MessageType.REGISTER_KV: (RegisterKVRequest, RegisterKVResponse),
     MessageType.LOOKUP_KV: (LookupKVRequest, LookupKVResponse),

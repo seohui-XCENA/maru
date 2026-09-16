@@ -15,6 +15,7 @@ from maru_common.allocation_target import (
     parse_byte_size,
     parse_target_sizes,
 )
+from maru_common.protocol import RequestAllocGroupResponse, ReturnAllocGroupResponse
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -48,31 +49,42 @@ class MaruServer:
             dax_paths (list[str] | None): Legacy DAX allowlist, or any pool.
             allocation_policy (AllocationPolicy | str): Defaults to fill_first.
             allocation_targets (Sequence[AllocationTarget] | None): Explicit
-                whole-device/range targets for the future round-robin policy.
+                whole-device targets for group allocation; ranges remain unsupported.
 
         Raises:
             ValueError: If target or policy configuration is invalid.
-            NotImplementedError: If chunk_round_robin is requested; group
-                allocation is not yet implemented. No RM connection is made.
+            NotImplementedError: If bounded targets are requested (C08).
+            RuntimeError: If ON targets cannot be verified against the RM.
         """
         # OFF keeps legacy paths untouched, including relative paths and aliases.
         # Explicit targets still require validation so ranges cannot be ignored.
+        targets: tuple[AllocationTarget, ...] = ()
         if (
             allocation_policy != AllocationPolicy.FILL_FIRST
             or allocation_targets is not None
         ):
-            normalize_allocation_targets(
+            targets = normalize_allocation_targets(
                 allocation_policy=allocation_policy,
                 dax_paths=dax_paths,
                 allocation_targets=allocation_targets,
             )
-        if allocation_policy != AllocationPolicy.FILL_FIRST:
+        if any(t.offset_bytes is not None for t in targets):
             raise NotImplementedError(
-                "chunk_round_robin is not yet supported by MaruServer"
+                "Bounded targets are not yet supported by MaruServer"
             )
+        self._allocation_policy = AllocationPolicy(allocation_policy)
+        self._allocation_targets = targets
         self._rm_address = rm_address or "127.0.0.1:9850"
         self._dax_paths = dax_paths
         self._allocation_manager = AllocationManager(rm_address=rm_address)
+        if self._allocation_policy == AllocationPolicy.CHUNK_ROUND_ROBIN:
+            try:
+                targets = self._allocation_manager.resolve_group_targets(targets)
+                self._allocation_targets = targets
+            except Exception:
+                self._allocation_manager.close()
+                raise
+            self._dax_paths = [target.dax_path for target in targets]
         self._kv_manager = KVManager()
         self._stats_manager = StatsManager()
         self._lock = RLock()  # Coordinates cross-manager operations
@@ -122,6 +134,8 @@ class MaruServer:
         When ``--dax-path`` is configured, iterates over the server's
         dax_path list (fill-first fallback). Otherwise uses any available pool.
         """
+        if self._allocation_policy != AllocationPolicy.FILL_FIRST:
+            raise ValueError("chunk_round_robin requires request_alloc_group")
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
@@ -144,6 +158,53 @@ class MaruServer:
 
         logger.error("Failed to allocate %d bytes for %s", size, instance_id)
         return None
+
+    def get_capabilities(self) -> list[str]:
+        """Return enabled RPC capabilities; OFF retains the legacy handshake."""
+        if self._allocation_policy == AllocationPolicy.CHUNK_ROUND_ROBIN:
+            return ["multi_pool_alloc_v1"]
+        return []
+
+    def request_alloc_group(
+        self, instance_id: str, request_id: str, total_size: int, chunk_size_bytes: int
+    ) -> RequestAllocGroupResponse:
+        """Allocate one whole-device region per configured target.
+
+        Args:
+            instance_id: Owner, which may have several independent groups.
+            request_id: Stable retry ID within this owner's namespace.
+            total_size: Target-total initial byte request.
+            chunk_size_bytes: Single slot size for this group.
+
+        Returns:
+            Group result with verified targets, capacity or tracked failure.
+            OFF rejects this endpoint without allocating.
+        """
+        if self._allocation_policy != AllocationPolicy.CHUNK_ROUND_ROBIN:
+            return RequestAllocGroupResponse(
+                False, error="Group allocation requires chunk_round_robin"
+            )
+        return self._allocation_manager.allocate_group(
+            instance_id,
+            request_id,
+            total_size,
+            chunk_size_bytes,
+            self._allocation_targets,
+        )
+
+    def return_alloc_group(
+        self, instance_id: str, request_id: str
+    ) -> ReturnAllocGroupResponse:
+        """Return a group's ownership; KV-referenced regions remain alive.
+
+        Args:
+            instance_id: Original group owner.
+            request_id: Original allocation request ID.
+
+        Returns:
+            Idempotent result, including retained regions and cleanup failures.
+        """
+        return self._allocation_manager.release_group(instance_id, request_id)
 
     def return_alloc(self, instance_id: str, region_id: int) -> bool:
         """Handle allocation return request from client."""
@@ -461,7 +522,7 @@ def main() -> None:
         "--allocation-policy",
         choices=[policy.value for policy in AllocationPolicy],
         default=AllocationPolicy.FILL_FIRST.value,
-        help="Allocation policy (default: fill_first; chunk_round_robin is not yet supported)",
+        help="Allocation policy (default: fill_first; experimental whole-device group RPC with chunk_round_robin)",
     )
     sizes_group = parser.add_mutually_exclusive_group()
     sizes_group.add_argument(
@@ -511,9 +572,9 @@ def main() -> None:
                 dax_paths=dax_paths,
                 allocation_targets=targets,
             )
-        if args.allocation_policy != AllocationPolicy.FILL_FIRST:
+        if targets is not None and any(t.offset_bytes is not None for t in targets):
             raise NotImplementedError(
-                "chunk_round_robin is not yet supported by MaruServer"
+                "Bounded targets are not yet supported by MaruServer"
             )
     except (ValueError, NotImplementedError) as exc:
         parser.error(str(exc))

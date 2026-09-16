@@ -30,6 +30,11 @@ from maru_common import (
     MessageType,
     RequestAllocResponse,
 )
+from maru_common.protocol import (
+    AllocatedTargetRegion,
+    RequestAllocGroupResponse,
+    ReturnAllocGroupResponse,
+)
 from maru_shm import MaruHandle
 
 
@@ -120,6 +125,52 @@ class RpcClientBase(abc.ABC):
             {"instance_id": instance_id, "size": size},
         )
         return self._parse_request_alloc(response)
+
+    def request_alloc_group(
+        self, instance_id: str, request_id: str, total_size: int, chunk_size_bytes: int
+    ) -> RequestAllocGroupResponse:
+        """Request a whole-device group using a stable retry ID.
+
+        Args:
+            instance_id: Owner ID, shared by any number of allocation groups.
+            request_id: Retry ID; reuse only with identical payload.
+            total_size: Requested bytes across all targets.
+            chunk_size_bytes: Slot size for this group.
+
+        Returns:
+            Typed result. Unknown/older servers fail without a legacy fallback.
+        """
+        response = self._send_request(
+            MessageType.REQUEST_ALLOC_GROUP,
+            {
+                "instance_id": instance_id,
+                "request_id": request_id,
+                "total_size": total_size,
+                "chunk_size_bytes": chunk_size_bytes,
+            },
+        )
+        return self._parse_alloc_group(response)
+
+    def return_alloc_group(
+        self, instance_id: str, request_id: str
+    ) -> ReturnAllocGroupResponse:
+        """Return one group by owner/request ID, preserving referenced KV data.
+
+        Args:
+            instance_id: Original group owner.
+            request_id: Original allocation request ID.
+
+        Returns:
+            Release status; retry the same ID if known cleanup remains pending.
+        """
+        response = self._send_request(
+            MessageType.RETURN_ALLOC_GROUP,
+            {
+                "instance_id": instance_id,
+                "request_id": request_id,
+            },
+        )
+        return self._parse_return_group(response)
 
     def list_allocations(
         self, exclude_instance_id: str | None = None
@@ -386,3 +437,39 @@ class RpcClientBase(abc.ABC):
     def handshake(self) -> dict:
         """Perform handshake with server. Returns server config (rm_address, etc.)."""
         return self._send_request(MessageType.HANDSHAKE, {})
+
+    @staticmethod
+    def _parse_alloc_group(response: dict) -> RequestAllocGroupResponse:
+        regions = [
+            AllocatedTargetRegion(
+                target_id=r["target_id"],
+                dax_path=r["dax_path"],
+                device_uuid=r["device_uuid"],
+                alignment=r["alignment"],
+                handle=MaruHandle.from_dict(r["handle"]),
+                page_count=r["page_count"],
+            )
+            for r in response.get("regions", [])
+        ]
+        return RequestAllocGroupResponse(
+            success=response.get("success", False),
+            request_id=response.get("request_id", ""),
+            state=response.get("state", "failed"),
+            regions=regions,
+            reserved_bytes=response.get("reserved_bytes", 0),
+            usable_bytes=response.get("usable_bytes", 0),
+            pending_region_ids=response.get("pending_region_ids", []),
+            outcome_unknown=response.get("outcome_unknown", False),
+            error=response.get("error"),
+        )
+
+    @staticmethod
+    def _parse_return_group(response: dict) -> ReturnAllocGroupResponse:
+        return ReturnAllocGroupResponse(
+            success=response.get("success", False),
+            request_id=response.get("request_id", ""),
+            retained_region_ids=response.get("retained_region_ids", []),
+            pending_region_ids=response.get("pending_region_ids", []),
+            outcome_unknown=response.get("outcome_unknown", False),
+            error=response.get("error"),
+        )

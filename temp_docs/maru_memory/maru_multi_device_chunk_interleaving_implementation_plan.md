@@ -2,11 +2,11 @@
 
 **필수 호환성 조건:** interleaving 설정을 명시적으로 켜지 않으면 기존 동작을 유지한다. 옵션 생략과 명시적 OFF는 동일하게 처리하며, 후속 커밋도 기존 할당·확장·전송·KV 접근 경로를 변경하지 않는다. 이 조건을 깨는 변경은 회귀 테스트로 차단한다.
 
-## 현재 설정 요약 — C01 / Experimental
+## 현재 설정 요약 — C01–C03 / Experimental
 
-**C01은 구현·커밋·푸시 완료(`e60ef47`)다. 현재는 설정/검증 단계이며, 실제 분산 할당과 병렬 전송은 아직 미구현이다. 기본값은 OFF이고 ON 실행은 차단된다.**
+**C01·C02에 이어 C03의 별도 DAX 그룹 할당 RPC를 구현했다. 서버의 ON 그룹 endpoint는 사용할 수 있지만 Handler의 ON 연결·chunk 분산은 C04, LMCache 연결과 병렬 read 실험은 C05·C06 대상이다. 기본값은 OFF이며 기존 Handler 경로는 유지한다.**
 
-| 설정 위치 | OFF — 기본값 | ON — 아직 실행 미지원 |
+| 설정 위치 | OFF — 기본값 | ON — 서버 그룹 RPC만 지원 |
 |---|---|---|
 | MaruServer CLI | `--allocation-policy fill_first` | `--allocation-policy chunk_round_robin` |
 | Python MaruServer | `allocation_policy="fill_first"` | `allocation_policy="chunk_round_robin"` |
@@ -21,9 +21,9 @@ maru-server --allocation-policy fill_first --dax-path /dev/dax0.0
 
 **OFF는 기존 region 요청, page 할당, 자동 확장 기본값, GPU 전송과 KV read/write 경로를 유지한다.** 기존 DAX 상대 경로·alias와 fallback 순서도 그대로 전달하도록 회귀 테스트한다. 새 범위 옵션의 충돌 검사는 별도이며, 전체 환경에서 성능 변화가 0이라고 단정하는 것은 아니다.
 
-실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. C02의 준비·정리 API도 구현됐으며, 아래 C03 이후 항목은 앞으로 진행할 계획이다.
+실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. C02의 준비·정리 API와 C03의 서버 그룹 RPC가 구현됐으며, C04 이후 항목은 앞으로 진행할 계획이다.
 
-> 상태: C01–C02 구현 완료. C03–C12는 구현 예정이며, ON 실행은 아직 미지원.
+> 상태: C01–C03 구현 완료. C04–C12는 구현 예정이며, Handler ON 실행과 실제 대역폭 검증은 아직 미지원.
 > 기반: [다중 CXL 장치 chunk 분산 디자인](maru_multi_device_chunk_interleaving_design.md).
 > 원칙: 기본 OFF, 기존 handle 및 KV 위치 형식 유지, 각 기능 커밋에 해당 테스트 포함, 본문 hard wrapping 금지.
 
@@ -73,7 +73,7 @@ flowchart LR
 이 단계는 코드 변경을 위한 확인 작업이다. 조사만으로 빈 git commit을 만들지 않는다. 확인한 사실은 관련 기능 커밋의 설명과 실험 manifest에 남긴다.
 
 1. 실제 실험 환경의 Maru/LMCache revision, import되는 Maru package 위치, vLLM→MP 서버→Handler→GPU 전송 호출 경로를 기록한다.
-2. 현재 확인한 LMCache 트리에서 직접적인 `MaruConfig` 생성은 `lmcache/v1/storage_backend/maru_backend.py`에 있다. MP의 별도 integration이 배포 branch나 외부 plugin에 있다면 C05의 정확한 수정 파일을 그 코드에서 확정한다. 디자인 문서의 과거 MP 파일 이름을 현재 구현으로 가정하지 않는다.
+2. 현재 로컬 MP 연동은 `lmcache/v1/distributed/maru_l1_manager.py`와 `memory_manager/maru_memory_allocator.py`에 있고 MP CLI는 `distributed/config.py`에서 `MaruL1Config`로 변환한다. C05는 이 경로와 비 MP `storage_backend/maru_backend.py`를 구분하여 수정한다. 실행 환경에서도 실제 import 경로와 revision을 다시 확인한다.
 3. MP에서 Maru 객체를 직접 전송하는 경로가 없는 경우, 기존의 실제 Maru connector로 먼저 검증할지 또는 MP 통합 선행 작업이 필요한지 기록한다. 전체 MP Maru 포팅을 C05의 설정 변경 안에 숨기지 말고 별도 선행 커밋으로 분리한다.
 4. `lmcache_driven_transfer.py`의 store `batch_size=1` 제약은 코드 이력과 descriptor/buffer 수명으로 근거를 확인한다. 이 조사는 C10 전에 완료하되 C01–C09를 막지 않는다.
 5. 실제 backing, 공유 upstream, GPU/NUMA 위치, DAX alignment와 header 예약 공간을 확인한다. 제품 용량이나 DAX 개수만으로 target 경계를 정하지 않는다.
@@ -131,7 +131,7 @@ LMCache 새 branch/PR은 저장소 지침에 따라 `dev`를 기준으로 한다
 
 #### C02 구현 결과와 API 계약
 
-**구현 완료. 신규 config는 없으며, 기존 OFF의 connect/확장/전송은 staged API를 호출하지 않는다.** 이 단계는 그룹 준비를 위한 기반 API만 제공한다. C03의 서버 그룹 RPC와 C04의 ON 연결·분산 할당은 아직 구현하지 않았다.
+**구현 완료. 신규 config는 없으며, 기존 OFF의 connect/확장/전송은 staged API를 호출하지 않는다.** 이 단계는 그룹 준비를 위한 기반 API만 제공한다. C03에서 서버 그룹 RPC를 추가했으며, C04의 ON 연결·분산 할당은 아직 구현하지 않았다.
 
 | Public API | 계약 |
 |---|---|
@@ -192,6 +192,21 @@ except Exception:
 
 **한계:** 이 커밋의 재시도 보장은 서버가 살아 있는 동안의 그룹 중복 억제다. 서버/RM 재시작과 할당 직후 crash의 완전한 회수는 C12 대상이다.
 
+#### C03 구현 결과와 재시도 계약
+
+- `REQUEST_ALLOC_GROUP=0x05`, `RETURN_ALLOC_GROUP=0x06`을 추가했다. `request_alloc_group(instance_id, request_id, total_size, chunk_size_bytes)`와 `return_alloc_group(instance_id, request_id)`를 sync/async transport 및 Future API에서 사용할 수 있다. 별도 DAX ON 서버만 handshake에 `multi_pool_alloc_v1`을 포함하며, OFF handshake payload와 기존 단일 region 요청은 유지한다.
+- 응답은 `target_id`, RM의 DAX 경로·device UUID·alignment, 기존 32-byte handle, page 수, 그룹 reserved/usable bytes를 제공한다. RM stats와 access 응답을 대조하여 같은 backing을 중복 target으로 사용하는 경우와 잘못된 extent를 거부한다. 범위 target은 C08까지 미지원이다.
+- Q 단위의 균등 분할은 §4.3의 LCM 규칙을 따른다. unsigned 64-bit 범위, 전체 chunk 배수, target당 최소 Q 단위, free capacity를 검증한다. 올림 초과량이 원래 요청량보다 큰 경우도 거부한다. 실제 연속 공간 부족은 RM 할당 실패로 처리한다.
+- 그룹은 **`(instance_id, request_id)`별**로 관리한다. 한 instance가 서로 다른 request ID로 여러 그룹을 가질 수 있으며 그룹마다 chunk 크기가 달라도 서버가 이를 한 값으로 덮어쓰지 않는다. 이것이 Handler의 여러 layout 지원을 의미하지는 않는다.
+- 성공 결과 재조회는 같은 handle들을 반환하며 추가 할당하지 않는다. 같은 ID의 다른 payload는 실패한다. 그룹 또는 개별 region을 반납하면 해당 그룹은 terminal 상태가 되어 이전 handle을 성공 결과로 재반환하지 않는다.
+- 실패 시 알려진 handle들을 역순으로 반납한다. 실패한 free는 `pending_region_ids`에 남고 같은 그룹 반납으로 재시도한다. `outcome_unknown=True`는 RM alloc 응답을 받지 못해 알려지지 않은 allocation이 있을 수 있다는 뜻이다. 알려진 handle을 모두 정리해도 이 플래그가 있으면 성공으로 보고하지 않으며 RM 대조·복구는 C12 대상이다.
+- 반납 성공은 소유자의 사용 종료를 뜻한다. KV 참조가 남은 region은 `retained_region_ids`로 보고하고 마지막 참조가 해제될 때 물리 반납한다. 타인의 그룹·region은 반납할 수 없다.
+- 활성·실패·반납 기록을 합해 프로세스당 최대 **4,096개 request ID**를 유지한다. 오래된 ID를 퇴출해서 재할당되는 일을 막기 위해 서버 수명 동안 tombstone을 보존하고, 한도에 도달하면 새 요청은 할당 전에 실패한다. 서버 재시작 후 replay 보장은 없다.
+
+**검증 결과:** CI와 같은 CPU 대상 `868 passed / 4 skipped`, 신규 ZMQ sync/async 및 OFF 호환성 integration `6 passed`. Ruff 0.16.5 lint와 git 추적 Python 파일 및 신규 테스트의 format 검사를 통과했다.
+
+**C03의 검증은 fake RM의 실패 주입과 실제 ZMQ sync/async transport 왕복 검증이다.** 실제 DAX의 mmap·CUDA pin·대역폭 검증은 아직 수행하지 않았다. C04는 그룹 준비 실패 시 로컬 view/mapping을 먼저 정리한 뒤 그룹 반납을 마무리해야 한다. C02의 개별 `return_alloc`으로 반납한 group region도 같은 owner의 반복 반납은 성공하므로 cleanup 재시도와 충돌하지 않는다.
+
 ### C04 — Handler 그룹 연결과 target별 round-robin
 
 **목적:** C03으로 확보한 region들을 한 Handler의 초기 영역으로 준비하고 chunk를 target별로 분산한다.
@@ -200,10 +215,11 @@ except Exception:
 
 - ON이면 capability 확인 후 그룹 요청, OFF이면 기존 단일 region 요청을 사용한다.
 - 전 region의 mmap/요구되는 pin/allocator 준비 후에만 연결 성공으로 전환한다. 오류 경로는 C02의 public 정리 API로 그룹 전체를 정리하고 C03으로 반납한다.
-- `regions_by_target`과 cursor를 유지한다. target에 region이 두 개 있다고 그 target을 두 번 선택하지 않는다.
+- `OwnedRegionManager`는 **슬롯 크기 하나**를 담당한다. `regions_by_target`과 target cursor는 이 클래스 안에 두며, target에 region이 두 개 있다고 그 target을 두 번 선택하지 않는다. 여러 size class를 관리하는 상위 계층은 별도 멀티 layout PR에서 추가한다.
 - allocator는 기존처럼 가용 target을 탐색할 수 있으나 target 고갈로 균등성이 깨진 경우를 public 상태에 표시한다. strict benchmark는 이를 감지해 run을 실패 처리한다. 자동 확장/성능 저하를 숨기지 않는다.
 - batch 할당 결과는 입력 chunk 순서로 반환한다. 중간 실패 시 page만 원래 region에 돌려주며 cursor를 과거로 복원할 필요는 없다.
-- shared lookup은 writer region handle을 사용한다. reader-owned region에 재복사하거나 reader cursor로 위치를 추측하지 않는다.
+- region 추가 callback과 초기 region replay에 `(region_id, page_count, slot_size)`를 전달한다. Adapter가 Handler 전역 chunk 크기를 다시 조회해서 region의 stride를 추측하지 않게 한다. 기존 OFF 동작과 callback 수신부 호환성을 회귀 검증한다.
+- shared lookup은 writer region handle과 **byte offset**을 사용한다. `MemoryInfo`에 `kv_offset`을 전달하고 Adapter는 `get_buffer_view(region_id, kv_offset, length)`로 읽기 view를 만든다. reader의 슬롯 크기로 peer offset을 나누거나 reader cursor로 위치를 추측하지 않는다. 기존 KV wire의 `(region_id, offset, length)`는 유지한다. layout 복원은 이번 PR의 단일 layout 계약을 사용한다.
 
 **테스트:** H1/H2 각각 총 512 MiB와 32 MiB page를 사용한 디자인 예제를 fixture로 구현한다. H1의 8개 chunk가 A/B에 4개씩 배치되고 H2가 같은 bytes를 읽으며, H2의 owned free page 수가 read 전후 동일해야 한다. GPU 없이 파일-backed mapping으로 데이터·소유권 계약을 먼저 검증한다.
 
@@ -215,7 +231,7 @@ except Exception:
 
 **수정 지점:** 확인된 `lmcache/v1/config.py`, `storage_backend/maru_backend.py` 및 실행 중인 MP Maru integration의 설정 생성 지점. MP 전송을 사용하는 경우 `multiprocess/modules/lmcache_driven_transfer.py`와 CUDA cache context의 batch 계약도 확인한다.
 
-- C01 정책을 MaruConfig까지 전달하고 실제 object layout에서 page 크기를 계산한다. MP의 object group별 크기가 다른 경우 현재 Maru 계약과의 호환성을 먼저 확인한다.
+- C01 정책을 MaruConfig까지 전달하고 실제 object layout에서 page 크기를 계산한다. 이번 실험은 **같은 모델·KV dtype·layout, object group 하나, `separate_object_groups=False`**로 제한한다. 현재 `num_object_groups > 1` 및 다른 layout의 재등록은 거부되며, 이 검사는 별도 멀티 layout PR 전까지 유지한다.
 - OFF에서는 기존 설정/실행 경로를 유지한다. ON인데 설치된 Maru가 지원하지 않으면 시작 단계에서 설명 가능한 오류를 낸다.
 - retrieve batch를 1/2/4로 선택하는 실험 경로를 제공한다. 현재 네이티브 한계 4를 넘는 값은 거부한다.
 - source pointer와 engine block 목적지를 원래 chunk 순서로 유지한다. chunk를 단순히 target별로 정렬하지 않는다.
@@ -235,7 +251,7 @@ except Exception:
 - writer store는 검증된 기존 batch=1을 사용한다. read 속도를 측정하기 위해 병렬 store를 먼저 만들지 않는다.
 - H1 store 완료·등록 성공 뒤 H2가 full hit를 확인하고 읽는다. mapping/pin warm-up과 정상상태 측정을 분리한다.
 - GPU 완료를 포함한 전송 시간, 실제 payload bytes, target별 chunk 수, cache hit, TTFT를 분리 기록한다.
-- topology, 실제 패키지와 양쪽 revision, policy, batch, UUID/target 범위, pin 성공을 manifest에 기록한다.
+- topology, 실제 패키지와 양쪽 revision, policy, batch, UUID/target 범위, pin 성공을 manifest에 기록한다. C05·C06의 manifest에는 모델 식별자, KV dtype/layout, 실제 `num_object_groups=1`, `separate_object_groups=False`도 포함하고 조건이 다르면 실행을 거부한다.
 - 최소 5회 반복하고 case 순서를 교차한다. target별 counter가 없으면 그 한계를 결과에 표시한다.
 
 **테스트:** runner의 dry-run/설정 검증 및 synthetic 결과 집계 테스트. 실제 CXL 2개와 GPU를 이용한 correctness+performance 실행은 별도 하드웨어 gate다.
@@ -386,7 +402,7 @@ GPU/네이티브 extension이 필요한 테스트는 해당 환경에서 실행�
 
 각 PR 설명에는 해결한 구체적 문제, 최종 동작, 해당 커밋의 테스트 결과, 필요한 상대 저장소 revision을 적는다. 신규 코드가 활성화되는 순간 관련 기능 테스트도 함께 있어야 하며, 테스트를 마지막 커밋에 몰지 않는다.
 
-## 7. 첫 구현에서 제외하고 후속 커밋으로 남길 항목
+## 7. 첫 구현에서 제외할 항목과 별도 PR
 
 | 후속 작업 | 제안 subject | 시작 조건 |
 |---|---|---|
@@ -397,6 +413,18 @@ GPU/네이티브 extension이 필요한 테스트는 해당 환경에서 실행�
 | 4개 초과 객체 batch | `feat(transfer): extend native object batch capacity` | 4개 장치/batch 한계를 넘어야 할 실험 근거 확보 |
 
 자동 확장은 `expand_size`를 그룹 전체 증가량으로 정의하고 기존 region을 유지한 채 새 그룹을 준비해야 한다. 가중치·multi-stream·batch 확대는 성능 측정 없이 첫 구현에 함께 넣지 않는다.
+
+### 멀티 layout·group 지원은 별도 PR
+
+**interleaving의 첫 목표인 C01–C06을 먼저 완료한다. 멀티 layout 지원은 이 interleaving PR에 커밋을 섞지 않고 별도 PR로 진행한다.** 아래는 별도 PR의 의존성 메모이며 이번 구현 범위가 아니다.
+
+| 별도 PR의 작업 | 내용 | 선행 조건 |
+| --- | --- | --- |
+| 읽기 layout 복원 | byte offset view에 모델/group/병렬화 context와 registry의 layout을 연결; 미등록·호환 불명확 layout은 miss 처리 | C04의 byte offset 읽기 |
+| Handler size class | `슬롯 크기 → OwnedRegionManager`, 명시적 슬롯 크기 선택, region별 사용량 집계와 Handler 전체 상한 | C04 및 interleaving C06 검증 |
+| LMCache 다중 group 등록 | group별 layout·fmt·world_size 전달, 등록 수명 처리, 준비된 할당·읽기 경로로 연결한 뒤 단일 group/layout 제한 제거 | 위 두 기능과 수명 검증 |
+
+`allocated_pages × get_chunk_size()`의 단일 크기 가정 수정은 size class 작업에, layout별 fmt 전달은 다중 group 등록 작업에 속한다. 위 세 항목은 최종 commit 경계를 확정한 것이 아니며 테스트 가능한 순서로 나눈다. 참고 로컬 문서: `temp_docs/maru_memory/maru_layout_support_scope_explained_ko.md`(별도 작업 문서이므로 이 커밋에 포함하지 않음).
 
 ## 8. 구현 완료 체크리스트
 
