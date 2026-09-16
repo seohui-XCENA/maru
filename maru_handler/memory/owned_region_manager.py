@@ -41,13 +41,22 @@ class OwnedRegionManager:
         3. Return None if all exhausted (caller handles expansion)
     """
 
-    def __init__(self, mapper: DaxMapper, chunk_size: int):
+    def __init__(
+        self, mapper: DaxMapper, chunk_size: int, placement_policy: str = "fill_first"
+    ) -> None:
         """Initialize the OwnedRegionManager.
 
         Args:
             mapper: DaxMapper for mmap/munmap operations
             chunk_size: Page/chunk size for PagedMemoryAllocator
+            placement_policy: fill_first (default) or chunk_round_robin.
         """
+        if placement_policy not in ("fill_first", "chunk_round_robin"):
+            raise ValueError(f"Unknown placement policy: {placement_policy}")
+        self._placement_policy = placement_policy
+        self._regions_by_target: dict[str, list[int]] = {}
+        self._target_cursor = 0
+        self._fallback_allocations = 0
         self._mapper = mapper
         self._chunk_size = chunk_size
         self._lock = threading.Lock()
@@ -77,6 +86,8 @@ class OwnedRegionManager:
             RuntimeError: If mmap fails
             ValueError: If allocator initialization fails
         """
+        if self._placement_policy == "chunk_round_robin":
+            raise ValueError("Use stage_region with a target ID, then commit_regions")
         self._mapper.map_region(handle)
 
         allocator = PagedMemoryAllocator(
@@ -104,22 +115,28 @@ class OwnedRegionManager:
         )
         return region
 
-    def stage_region(self, handle: MaruHandle) -> OwnedRegion:
+    def stage_region(
+        self, handle: MaruHandle, target_id: str | None = None
+    ) -> OwnedRegion:
         """Prepare handle without making it available to allocate or queries.
 
         Returns the staged allocator. The caller owns rollback of mapping failures.
+        target_id labels the physical allocation target, required in round-robin
+        mode. Multiple regions with the same target ID share one allocator turn.
 
         Raises:
             ValueError: If the region already exists or cannot hold a page.
             RuntimeError: If mapping fails.
         """
         with self._lock:
+            if self._placement_policy == "chunk_round_robin" and not target_id:
+                raise ValueError("Round-robin regions require a target ID")
             rid = handle.region_id
             if rid in self._regions or rid in self._staged:
                 raise ValueError(f"Region {rid} already exists")
             allocator = PagedMemoryAllocator(rid, handle.length, self._chunk_size)
             self._mapper.map_region(handle)
-            region = OwnedRegion(rid, allocator)
+            region = OwnedRegion(rid, allocator, target_id)
             self._staged[rid] = region
             return region
 
@@ -137,6 +154,9 @@ class OwnedRegionManager:
             for rid in region_ids:
                 self._regions[rid] = self._staged.pop(rid)
                 self._region_order.append(rid)
+                target = self._regions[rid].target_id
+                if target is not None:
+                    self._regions_by_target.setdefault(target, []).append(rid)
             if self._active_region_id is None and self._region_order:
                 self._active_region_id = self._region_order[0]
 
@@ -160,6 +180,10 @@ class OwnedRegionManager:
             region.allocator.close()
             self._staged.pop(region_id, None)
             self._regions.pop(region_id, None)
+            if region.target_id in self._regions_by_target:
+                ids = self._regions_by_target[region.target_id]
+                if region_id in ids:
+                    ids.remove(region_id)
             if region_id in self._region_order:
                 self._region_order.remove(region_id)
             if self._active_region_id == region_id:
@@ -200,6 +224,8 @@ class OwnedRegionManager:
 
             self._regions.clear()
             self._region_order.clear()
+            self._regions_by_target.clear()
+            self._target_cursor = 0
             self._active_region_id = None
 
             return region_ids
@@ -222,6 +248,8 @@ class OwnedRegionManager:
             (region_id, page_index) on success, None on failure.
         """
         with self._lock:
+            if self._placement_policy == "chunk_round_robin":
+                return self._allocate_round_robin()
             # 1. Fast path: try active region
             if self._active_region_id is not None:
                 active = self._regions.get(self._active_region_id)
@@ -330,3 +358,39 @@ class OwnedRegionManager:
             else 0.0,
             "regions": regions_stats,
         }
+
+    def get_placement_status(self) -> dict:
+        """Return a detached placement snapshot including sticky fallback count.
+
+        A fallback means the selected target was full and another supplied a
+        page. Strict benchmarks must reject runs with fallback_allocations > 0.
+        """
+        with self._lock:
+            return {
+                "policy": self._placement_policy,
+                "fallback_allocations": self._fallback_allocations,
+                "degraded": self._fallback_allocations > 0,
+                "targets": {
+                    target: {
+                        "region_ids": list(ids),
+                        "free_pages": sum(
+                            self._regions[rid].allocator.num_free_pages for rid in ids
+                        ),
+                    }
+                    for target, ids in self._regions_by_target.items()
+                },
+            }
+
+    def _allocate_round_robin(self) -> tuple[int, int] | None:
+        """Allocate under the manager lock; each target gets one turn."""
+        targets = list(self._regions_by_target)
+        for step in range(len(targets)):
+            index = (self._target_cursor + step) % len(targets)
+            for rid in self._regions_by_target[targets[index]]:
+                page = self._regions[rid].allocator.allocate()
+                if page is not None:
+                    self._target_cursor = (index + 1) % len(targets)
+                    if step:
+                        self._fallback_allocations += 1
+                    return rid, page
+        return None

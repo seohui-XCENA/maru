@@ -2,17 +2,17 @@
 
 **필수 호환성 조건:** interleaving 설정을 명시적으로 켜지 않으면 기존 동작을 유지한다. 옵션 생략과 명시적 OFF는 동일하게 처리하며, 후속 커밋도 기존 할당·확장·전송·KV 접근 경로를 변경하지 않는다. 이 조건을 깨는 변경은 회귀 테스트로 차단한다.
 
-## 현재 설정과 사용법 — C01–C03 / Experimental
+## 현재 설정과 사용법 — C01–C04 / Experimental
 
-**이 기능은 experimental이며 기본값은 OFF다. C01 설정, C02 region 준비·정리, C03 별도 DAX 그룹 할당 RPC가 구현됐다. 서버의 ON 그룹 endpoint는 사용할 수 있지만 Handler ON 연결·chunk 분산은 C04 전까지 차단되고, LMCache 연결과 병렬 read 실험은 C05·C06 대상이다.** 아래 본문의 다중 Handler 흐름과 ON YAML 예시는 후속 구현 목표다.
+**이 기능은 experimental이며 기본값은 OFF다. C04까지 구현되어 별도 DAX target에 대한 Handler 그룹 연결·chunk round-robin 배치·공유 byte offset 읽기를 사용할 수 있다. LMCache MP 경로의 정책 전달과 새 읽기 API 연결은 C05, 실제 병렬 read 대역폭 실험은 C06 대상이다.** 본문의 ON YAML은 아직 구현 예정 설정이다.
 
 ### 추가된 설정 한눈에 보기
 
 | 위치 | 설정 | 기본값 | 현재 의미 |
 |---|---|---|---|
-| MaruServer CLI | `--allocation-policy` | `fill_first` | OFF=`fill_first`, ON=`chunk_round_robin`; C03은 별도 DAX 그룹 RPC만 지원 |
+| MaruServer CLI | `--allocation-policy` | `fill_first` | OFF=`fill_first`, ON=`chunk_round_robin`; 별도 DAX 그룹 RPC 및 Handler 배치 지원 |
 | Python `MaruServer(...)` | `allocation_policy` | `"fill_first"` | CLI와 같은 서버 정책 |
-| Python `MaruConfig(...)` | `placement_policy` | `"fill_first"` | Handler 정책; ON 설정은 `auto_expand=False` 필요, Handler 생성은 아직 미지원 |
+| Python `MaruConfig(...)` | `placement_policy` | `"fill_first"` | Handler 정책; ON 설정은 `auto_expand=False` 필요 |
 | MaruServer CLI | `--target-sizes` | 미지정 | 예: `256GiB,256GiB`. 단일 DAX의 연속 범위 크기 목록 |
 | MaruServer CLI | `--target-size` + `--target-count` | 미지정 | 동일 크기 범위 반복. 예: `256GiB` × `2` |
 | MaruServer CLI | `--target-base-offset` | 범위 사용 시 `0` | DAX 파일 기준 시작 offset. 바이트 또는 `MiB`/`GiB` 등 |
@@ -45,9 +45,9 @@ explicit_off = MaruConfig(placement_policy="fill_first")
 
 이미 하드웨어 interleave된 DAX에서는 이 OFF 구성을 기본으로 사용한다. 소프트웨어 정책 스위치는 하드웨어 interleave/NUMA 설정을 변경하지 않는다.
 
-### ON 설정 형식 — 서버 그룹 RPC 지원, Handler 연결은 C04 대상
+### ON 설정 형식 — 별도 DAX의 서버·Handler 연결 지원
 
-별도 DAX 두 개를 사용하는 설정 형식은 다음과 같다. **C03부터 서버를 시작해 `multi_pool_alloc_v1` 그룹 RPC를 사용할 수 있다.** 시작 시 RM의 DEV_DAX allowlist를 검증하며, 실제 region은 그룹 요청을 받을 때 할당한다. 기존 단일 region 요청을 ON 서버에 보내면 그룹 RPC를 사용하라는 오류를 반환한다. Handler의 ON 연결은 C04 구현 전까지 차단된다.
+별도 DAX 두 개를 사용하는 설정 형식은 다음과 같다. **C03부터 서버를 시작해 `multi_pool_alloc_v1` 그룹 RPC를 사용할 수 있다.** 시작 시 RM의 DEV_DAX allowlist를 검증하며, 실제 region은 그룹 요청을 받을 때 할당한다. 기존 단일 region 요청을 ON 서버에 보내면 그룹 RPC를 사용하라는 오류를 반환한다. C04 Handler는 capability 확인 후 그룹 RPC를 사용하며 기존 단일 region 요청으로 fallback하지 않는다.
 
 ```bash
 maru-server --allocation-policy chunk_round_robin --dax-path /dev/dax1.0 --dax-path /dev/dax2.0
@@ -80,14 +80,28 @@ maru-server --allocation-policy chunk_round_robin --dax-path /dev/dax0.0 --targe
 maru-server --allocation-policy chunk_round_robin --dax-path /dev/dax0.0 --target-size 256GiB --target-count 2 --target-base-offset 0
 ```
 
-Python에서는 ON 설정 객체를 만들 수 있지만 실제 Handler 생성은 차단된다. OFF에서는 기존 `auto_expand=True` 기본값을 유지하며, 아래 `False`는 experimental ON 설정에만 필요한 제약이다.
+Python에서 다음과 같이 Handler를 연결한다. OFF에서는 기존 `auto_expand=True` 기본값을 유지하며, 아래 `False`는 experimental ON 설정에만 필요한 제약이다.
 
 ```python
 from maru import MaruConfig, MaruHandler
 
-config = MaruConfig(placement_policy="chunk_round_robin", auto_expand=False)
-# 현재: 아래 호출은 NotImplementedError를 발생시킨다.
-# handler = MaruHandler(config)
+config = MaruConfig(
+    server_url="tcp://127.0.0.1:5555",
+    placement_policy="chunk_round_robin",
+    auto_expand=False,
+    pool_size=512 * 1024**2,  # 장치별 크기가 아니라 이 Handler의 전체 초기 요청량
+    chunk_size_bytes=32 * 1024**2,
+)
+handler = MaruHandler(config)
+if not handler.connect(require_cuda_pin=True):  # GPU 실험에서는 pin 실패를 거부
+    handler.close()  # cleanup 실패는 예외; 원인 해소 후 같은 객체에서 재시도
+    raise RuntimeError("Maru group connection failed")
+try:
+    status = handler.get_placement_status()
+    assert not status["degraded"]
+    # alloc → store / retrieve; 모든 비동기 전송 완료 후 view를 해제한다.
+finally:
+    handler.close()
 ```
 
 주소 범위 설정의 파싱·검증은 현재 사용할 수 있다. 다음 예시는 장치 접근이나 메모리 예약 없이 두 범위를 만든다.
@@ -104,7 +118,20 @@ assert [(t.offset_bytes, t.length_bytes) for t in targets] == [
 
 ### C02에서 추가된 준비·정리 API
 
-신규 config는 없다. `prepare_regions`로 여러 region을 할당 대상에 공개하지 않은 채 준비하고, `commit_regions`로 공개하거나 `rollback_regions`로 이번 준비만 정리할 수 있다. `get_mapping_status`로 실제 CUDA pin 성공 여부를 조회한다. 기존 OFF 연결·확장은 이 API를 자동 호출하지 않으며, Handler의 ON 실행 차단도 유지한다. API와 실패 시 재시도 예시는 [구현 계획의 C02 구현 결과](maru_multi_device_chunk_interleaving_implementation_plan.md#c02-구현-결과와-api-계약)를 참고한다.
+신규 config는 없다. `prepare_regions`로 여러 region을 할당 대상에 공개하지 않은 채 준비하고, `commit_regions`로 공개하거나 `rollback_regions`로 이번 준비만 정리할 수 있다. `get_mapping_status`로 실제 CUDA pin 성공 여부를 조회한다. 기존 OFF 연결·확장은 이 API를 자동 호출하지 않으며, C04 ON 연결은 이 API로 그룹을 준비한다. API와 실패 시 재시도 예시는 [구현 계획의 C02 구현 결과](maru_multi_device_chunk_interleaving_implementation_plan.md#c02-구현-결과와-api-계약)를 참고한다.
+
+### C04의 Handler 단위와 읽기 계약
+
+1. 같은 노드에서 두 vLLM이 **하나의 MP server를 공유**하면 MaruL1Manager·MaruMemoryAllocator·Handler·Adapter도 각각 하나다. 첫 layout 등록 시 Handler/Adapter가 생성된다.
+2. interleaving ON에서 이 Handler 하나가 장치 A·B의 서로 다른 region을 확보하고, 두 vLLM의 할당 요청을 공유 allocator에서 처리한다. round-robin cursor도 공유하므로 동시에 들어온 여러 query 각각의 균등 배치까지 보장하지 않는다.
+3. 두 노드에 MP server가 하나씩 있으면 Handler도 두 개다. 각 Handler는 서로 겹치지 않는 소유 region을 확보한다. 동일 CXL 메모리가 양쪽에서 접근 가능하고 같은 MaruServer를 사용해야 한다.
+4. 다른 노드의 데이터를 읽을 때는 writer가 등록한 `(region_id, kv_offset, length)`로 공유 매핑을 읽는다. reader 소유 page를 할당하거나 데이터를 복제하지 않는다. C04의 두 Handler 테스트는 이 계약을 CPU 파일 매핑으로 검증한다.
+
+새 Adapter 읽기 API는 `get_by_offset(region_id, kv_offset, actual_size, single_token_size)`다. `MemoryInfo.kv_offset`을 그대로 전달하며 peer의 page 목록을 만들지 않는다. 반환값은 읽기용 borrowed view이고 `metadata.address=-1`이다. `free`와 `create_store_handle`에 넣으면 오류가 난다. 호출자가 key pin과 mapping 수명을 GPU 작업 완료까지 유지하고 view를 해제해야 한다. layout은 현재 Adapter의 단일 등록 layout을 사용한다. ON shared read의 `MemoryInfo.page_index`는 `-1`이며, OFF 및 기존 `get_by_location` 계약은 그대로 둔다. C05에서 LMCache 호출부를 새 API로 연결한다.
+
+`connect(require_cuda_pin=False)`가 기본이므로 CPU 테스트도 가능하다. GPU 실험에서는 `True`를 명시한다. 초기 region의 pin 실패는 연결 실패와 rollback으로 처리하고, shared read의 pin 실패는 miss로 반환한다. mapping 상태는 `get_mapping_status`로 확인한다. `get_placement_status()`의 `fallback_allocations`는 원래 선택할 target이 고갈되어 다른 target에서 할당한 횟수이며, 한 번이라도 발생하면 `degraded=True`가 유지된다. strict benchmark는 측정 후에도 이 값을 확인해야 한다.
+
+연결 중 그룹 RPC 응답이 유실되면 같은 Handler의 `connect()`를 재호출하여 동일 request ID로 재조회한다. `close()`도 필요하면 같은 ID를 재조회한 뒤 반납한다. 로컬 view·lease·CUDA unregister 또는 서버 반납이 실패하면 `cleanup_pending=True`가 남고 `close()`가 예외를 낸다. view/lease를 해제하고 오류 원인을 해결한 뒤 `close()`를 재시도하며, pending 상태에서는 새 연결을 만들지 않는다. ON 정상 종료도 local view/mapping 정리를 먼저 수행한다. 기존 KV가 참조하는 서버 region은 C03 계약에 따라 유지된다.
 
 ### OFF 호환성의 범위
 
@@ -114,7 +141,7 @@ OFF에 새 `allocation_targets`나 target 범위 옵션을 함께 지정하는 �
 
 검증은 기본값/명시적 OFF, 기존 DAX fallback, 상대 경로·alias 전달, 기존 client/server 회귀 테스트로 수행한다. 이는 코드 경로와 기능 호환성에 대한 검증이며, 모든 하드웨어에서 성능 차이가 정확히 0이라는 실측 보장은 아니다. 향후 커밋에서도 기본 OFF와 이 회귀 테스트를 유지하고 ON을 자동으로 활성화하지 않는다.
 
-> 상태: Experimental. C01–C03 구현 완료. 별도 DAX 서버 그룹 RPC 지원; Handler의 ON 연결과 실제 GPU/CXL 실험은 C04 이후 대상.
+> 상태: Experimental. C01–C04 구현 완료. 별도 DAX 그룹 연결·chunk 배치·공유 읽기의 CPU 정확성 검증 완료; 실제 두 노드의 DAX 접근·CUDA 전송·대역폭 검증은 미수행.
 > 설계 기준: 2026-09-15, Maru `b46d3bb` / LMCache `0d187365`. C01 구현: Maru `e60ef47`; OFF 호환성 후속 점검 반영.
 > 대상: Maru allocator와 LMCache MP 전송 경로를 수정하고 성능을 검증할 개발자.
 > 기반 문서: [Maru 메모리 모델](maru_memory_model.md).

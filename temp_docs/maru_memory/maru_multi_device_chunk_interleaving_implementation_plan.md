@@ -2,11 +2,11 @@
 
 **필수 호환성 조건:** interleaving 설정을 명시적으로 켜지 않으면 기존 동작을 유지한다. 옵션 생략과 명시적 OFF는 동일하게 처리하며, 후속 커밋도 기존 할당·확장·전송·KV 접근 경로를 변경하지 않는다. 이 조건을 깨는 변경은 회귀 테스트로 차단한다.
 
-## 현재 설정 요약 — C01–C03 / Experimental
+## 현재 설정 요약 — C01–C04 / Experimental
 
-**C01·C02에 이어 C03의 별도 DAX 그룹 할당 RPC를 구현했다. 서버의 ON 그룹 endpoint는 사용할 수 있지만 Handler의 ON 연결·chunk 분산은 C04, LMCache 연결과 병렬 read 실험은 C05·C06 대상이다. 기본값은 OFF이며 기존 Handler 경로는 유지한다.**
+**C04까지 별도 DAX 그룹 연결, 한 Handler 안의 target별 chunk 분산, 두 Handler 간 공유 byte offset 읽기를 구현했다. 기본값은 OFF이며 기존 할당·확장·전송 경로를 유지한다. LMCache MP 호출부 연결은 C05, 실제 병렬 read 실험은 C06 대상이다.**
 
-| 설정 위치 | OFF — 기본값 | ON — 서버 그룹 RPC만 지원 |
+| 설정 위치 | OFF — 기본값 | ON — 서버 그룹 RPC·Handler 배치 지원 |
 |---|---|---|
 | MaruServer CLI | `--allocation-policy fill_first` | `--allocation-policy chunk_round_robin` |
 | Python MaruServer | `allocation_policy="fill_first"` | `allocation_policy="chunk_round_robin"` |
@@ -21,9 +21,9 @@ maru-server --allocation-policy fill_first --dax-path /dev/dax0.0
 
 **OFF는 기존 region 요청, page 할당, 자동 확장 기본값, GPU 전송과 KV read/write 경로를 유지한다.** 기존 DAX 상대 경로·alias와 fallback 순서도 그대로 전달하도록 회귀 테스트한다. 새 범위 옵션의 충돌 검사는 별도이며, 전체 환경에서 성능 변화가 0이라고 단정하는 것은 아니다.
 
-실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. C02의 준비·정리 API와 C03의 서버 그룹 RPC가 구현됐으며, C04 이후 항목은 앞으로 진행할 계획이다.
+실제 추가된 설정 전체, Python 사용법, ON 오류의 의미와 범위 parser 예시는 [디자인 문서 맨 위의 설정 사용법](maru_multi_device_chunk_interleaving_design.md)을 참고한다. C04 Handler까지 구현됐으며, C05 이후 항목은 앞으로 진행할 계획이다.
 
-> 상태: C01–C03 구현 완료. C04–C12는 구현 예정이며, Handler ON 실행과 실제 대역폭 검증은 아직 미지원.
+> 상태: C01–C04 구현 완료. C05–C12 구현 예정. CPU 파일 매핑 정확성 검증 완료; 실제 GPU/CXL 대역폭 미측정.
 > 기반: [다중 CXL 장치 chunk 분산 디자인](maru_multi_device_chunk_interleaving_design.md).
 > 원칙: 기본 OFF, 기존 handle 및 KV 위치 형식 유지, 각 기능 커밋에 해당 테스트 포함, 본문 hard wrapping 금지.
 
@@ -36,7 +36,7 @@ maru-server --allocation-policy fill_first --dax-path /dev/dax0.0
 | C01 | Maru | `feat(config): define allocation targets and placement policies` | target 모델과 ON/OFF 설정 검증 |
 | C02 | Maru | `refactor(memory): add region cleanup and mapping status APIs` | 그룹 준비 실패를 안전하게 정리하고 pin 상태 관측 |
 | C03 | Maru | `feat(server): allocate region groups across DAX targets` | 서버가 별도 DAX별 region 그룹을 확보·반납 |
-| C04 | Maru | `feat(handler): allocate chunks round robin across targets` | 두 Handler가 분산 저장 및 공유 read 수행 |
+| C04 | Maru | `feat(handler): allocate chunks round robin across targets` | 한 Handler의 target별 배치 및 별도 Handler의 공유 read |
 | C05 | LMCache | `feat(maru): wire placement policy into cache allocation` | 실제 통합 경로에서 신규 Handler 정책과 retrieve batch 사용 |
 | C06 | LMCache | `bench(maru): compare single-target and striped query reads` | 별도 DAX 두 개의 읽기 대역폭 비교 |
 | C07 | Maru | `feat(rm): allocate extents within explicit DAX ranges` | RM 내부에서 단일 DAX 주소 범위 제한 할당 |
@@ -51,7 +51,7 @@ maru-server --allocation-policy fill_first --dax-path /dev/dax0.0
 ```mermaid
 flowchart LR
     C01["C01 target / 설정"] --> C03["C03 그룹 할당"]
-    C02["C02 정리 / 상태 API"] --> C04["C04 Handler 분산"]
+    C02["C02 정리 / 상태 API"] --> C04["C04 Handler 내 chunk 분산"]
     C03 --> C04
     C04 --> C05["C05 LMCache 연결"]
     C05 --> C06["C06 별도 DAX read 실험"]
@@ -224,6 +224,20 @@ except Exception:
 **테스트:** H1/H2 각각 총 512 MiB와 32 MiB page를 사용한 디자인 예제를 fixture로 구현한다. H1의 8개 chunk가 A/B에 4개씩 배치되고 H2가 같은 bytes를 읽으며, H2의 owned free page 수가 read 전후 동일해야 한다. GPU 없이 파일-backed mapping으로 데이터·소유권 계약을 먼저 검증한다.
 
 **완료 조건:** 기본 OFF 회귀 테스트와 두 Handler 공유 read가 통과한다. H2가 H1의 region을 shared로 매핑해도 RM 예약량과 저장 payload가 증가하지 않는다.
+
+#### C04 구현 결과와 범위
+
+**구현 완료.** 같은 MP server에 연결된 두 vLLM은 Handler 하나를 공유한다. C04의 분산은 이 Handler 안에서 chunk를 여러 target에 배치한다는 뜻이다. 두 Handler 공유 읽기는 두 MP server(예: 노드당 하나) 사이의 별도 검증이다. 각 Handler는 자신만의 region을 소유하고, read는 writer region을 공유 매핑한다.
+
+- ON 연결은 `multi_pool_alloc_v1`을 확인하고 하나의 안정적인 request ID로 그룹을 확보한다. 전 region 준비 완료 후 commit한다. 응답 유실 시 같은 객체에서 `connect()`를 재호출하면 동일 ID로 재조회한다.
+- `OwnedRegionManager`는 슬롯 크기 하나와 target별 region 목록·cursor를 갖는다. 같은 target에 region이 추가되어도 그 target에 추가 차례를 주지 않는다. 다른 target으로 우회한 할당 횟수는 `get_placement_status()`의 `fallback_allocations`와 sticky `degraded`로 공개한다. 그룹 자동 확장은 지원하지 않는다.
+- 세 인자 region callback을 지원하며 기존 두 인자 callback은 등록 시 signature를 확인하여 그대로 호출한다. Adapter 초기 replay는 모든 소유 region을 처리하고 슬롯 크기가 맞는지 검증한다.
+- `MemoryInfo.kv_offset`과 `CxlMemoryAdapter.get_by_offset(...)`을 추가했다. ON shared read는 reader page 크기로 위치를 계산하지 않으며 `page_index=-1`을 반환한다. 새 읽기 view는 `address=-1`인 borrowed 객체로, page free/store를 거부한다. 기존 OFF의 `page_index`와 `get_by_location`은 유지한다. 실제 LMCache MP 호출부 전환은 C05다.
+- `connect(require_cuda_pin=True)`는 초기 pin 실패를 거부하고 shared pin 실패를 miss로 처리한다. 기본 False는 CPU 검증을 위한 값이다. ON close는 로컬 mapping 해제 후 그룹을 반납하고, 실패 상태를 보존하여 재시도한다. OFF close는 기존 경로다.
+
+**검증 내용:** 두 Handler가 각각 총 512 MiB, 32 MiB page를 사용하고 writer의 8개 full chunk를 A/B에 4개씩 저장한 뒤 reader가 전체 bytes를 비교한다. reader의 free page 수와 RM 할당 횟수가 read 전후 동일하다. 추가로 target별 여러 region, 고갈 시 degraded, batch 중간 실패 복구, 두 번째 mmap/callback 실패 rollback, pin 거부, RPC 응답 유실 재조회, 미해제 view·서버 반납 실패 재시도, 실제 PyTorch borrowed view와 sync/async ZMQ 조합을 검증한다. 이는 두 물리 노드·실제 DAX·CUDA 전송 성능 검증을 대체하지 않는다.
+
+**검증 결과:** 기본 CPU CI 대상 880 passed / 5 skipped, 실제 PyTorch·LMCache를 import한 관련 테스트 236 passed, C03/C04 sync/async RPC integration 10 passed. Ruff lint와 tracked Python format 검사 통과. 두 Markdown의 table/fence 파싱 통과. Sphinx 엄격 빌드는 기존 문서의 경고 17개로 실패하며, C03 기준과 경고 내용·개수가 동일함을 확인했다.
 
 ### C05 — LMCache 정책 전달과 실제 read 연결
 
@@ -428,7 +442,7 @@ GPU/네이티브 extension이 필요한 테스트는 해당 환경에서 실행�
 
 ## 8. 구현 완료 체크리스트
 
-- [ ] C04: H1이 분산 저장한 8개 chunk를 H2가 같은 region에서 정확하게 읽는다.
+- [x] C04: writer Handler가 분산 저장한 8개 chunk를 reader Handler가 같은 region에서 정확하게 읽는다(CPU 파일 매핑).
 - [ ] C06: 별도 DAX에서 단일 target batch 최적화와 분산 효과를 분리 측정한다.
 - [ ] C08: 단일 DAX의 지정 범위를 벗어나거나 header를 덮는 할당이 없다.
 - [ ] C09: 실제 backing을 확인한 단일 DAX target에서도 공유 read와 성능 비교가 가능하다.

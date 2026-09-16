@@ -42,8 +42,8 @@ class MaruConfig:
         pool_size: Default pool size to request (in bytes)
         auto_connect: Whether to automatically connect on initialization
         placement_policy: AllocationPolicy or str; fill_first by default.
-            chunk_round_robin validates the future policy but requires
-            auto_expand=False and is not yet supported by MaruHandler.
+            chunk_round_robin requires
+            auto_expand=False and a server advertising multi_pool_alloc_v1.
     """
 
     server_url: str = "tcp://localhost:5555"

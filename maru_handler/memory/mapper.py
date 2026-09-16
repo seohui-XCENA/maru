@@ -340,6 +340,11 @@ class DaxMapper:
         """Get a mapped region by ID."""
         return self._regions.get(region_id)
 
+    def get_region_ids(self) -> list[int]:
+        """Return a snapshot of mapped region IDs, including shared regions."""
+        with self._lock:
+            return list(self._regions)
+
     def get_mapping_status(self, region_id: int) -> MappingStatus:
         """Return a snapshot for region_id; unknown regions are unmapped/unpinned."""
         with self._lock:

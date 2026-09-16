@@ -18,9 +18,11 @@ Example:
         result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
+import inspect
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
@@ -75,16 +77,13 @@ class MaruHandler:
 
         Args:
             config: Configuration object. If None, uses defaults.
-
-        Raises:
-            NotImplementedError: If chunk_round_robin is requested before
-                group allocation support is implemented. No RPC is created.
         """
         self._config = config or MaruConfig()
-        if self._config.placement_policy != "fill_first":
-            raise NotImplementedError(
-                "chunk_round_robin is not yet supported by MaruHandler"
-            )
+        self._group_request_id: str | None = None
+        self._group_reply_received = False
+        self._group_cleanup_started = False
+        self._require_cuda_pin = False
+        self._callback_slot_size = False
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
@@ -118,7 +117,7 @@ class MaruHandler:
         self._connected = False
 
         # Region-added callback (set by CxlMemoryAdapter)
-        self._on_region_added: Callable[[int, int], None] | None = None
+        self._on_region_added: Callable[..., None] | None = None
         self._on_region_removed: Callable[[int], None] | None = None
         self._staged_handles: dict[int, MaruHandle] = {}
         self._staged_ready: set[int] = set()
@@ -240,15 +239,28 @@ class MaruHandler:
         """
         return self._config.chunk_size_bytes
 
-    def set_on_region_added(self, callback: Callable[[int, int], None] | None) -> None:
-        """Register callback invoked with (region_id, page_count) after region added.
+    def set_on_region_added(self, callback: Callable[..., None] | None) -> None:
+        """Register a callback after a region is added.
+
+        New callbacks receive (region_id, page_count, slot_size_bytes). Legacy
+        callbacks accepting only two arguments retain their original contract.
 
         On registration, replays callback for all existing owned regions
         so the caller doesn't need separate init-time logic.
 
         Args:
-            callback: Called with (region_id, page_count), or None to unregister.
+            callback: Three- or two-argument callback, or None to unregister.
         """
+        # Inspect once; never mistake a TypeError inside the callback for arity.
+        accepts_slot = False
+        if callback is not None:
+            signature = inspect.signature(callback)
+            try:
+                signature.bind(0, 0, 0)
+                accepts_slot = True
+            except TypeError:
+                signature.bind(0, 0)
+        self._callback_slot_size = accepts_slot
         self._on_region_added = callback
         if callback is not None and self._owned is not None:
             for rid in self._owned.get_region_ids():
@@ -259,7 +271,7 @@ class MaruHandler:
                         rid,
                         region.allocator.page_count,
                     )
-                    callback(rid, region.allocator.page_count)
+                    self._notify_region_added(rid, region.allocator.page_count)
 
     def set_on_region_removed(self, callback: Callable[[int], None] | None) -> None:
         """Set the idempotent view-cleanup callback for staged rollback.
@@ -312,7 +324,11 @@ class MaruHandler:
         return region.allocator.num_allocated if region else 0
 
     def prepare_regions(
-        self, handles: list[MaruHandle], *, require_cuda_pin: bool = False
+        self,
+        handles: list[MaruHandle],
+        *,
+        require_cuda_pin: bool = False,
+        targets: dict[int, str] | None = None,
     ) -> list[int]:
         """Take ownership of newly allocated handles and stage them for commit.
 
@@ -326,6 +342,7 @@ class MaruHandler:
         Args:
             handles: Fresh server allocations belonging to this instance.
             require_cuda_pin: Reject unpinned mappings only for this preparation.
+            targets: Region ID to target ID; required by round-robin placement.
 
         Returns:
             Ordered IDs to pass to commit_regions or rollback_regions.
@@ -355,7 +372,9 @@ class MaruHandler:
             self._staged_handles.update((h.region_id, h) for h in handles)
             try:
                 for handle in handles:
-                    region = self._owned.stage_region(handle)
+                    region = self._owned.stage_region(
+                        handle, target_id=(targets or {}).get(handle.region_id)
+                    )
                     rid = handle.region_id
                     if (
                         require_cuda_pin
@@ -366,7 +385,7 @@ class MaruHandler:
                         )
                     if self._on_region_added is not None:
                         self._staged_callbacks.add(rid)
-                        self._on_region_added(rid, region.allocator.page_count)
+                        self._notify_region_added(rid, region.allocator.page_count)
                     self._staged_ready.add(rid)
             except Exception as error:
                 failures = self._rollback_regions_locked(ids)
@@ -423,14 +442,28 @@ class MaruHandler:
     # Connection Management
     # =========================================================================
 
-    def connect(self) -> bool:
+    def connect(self, *, require_cuda_pin: bool = False) -> bool:
         """Connect to the server and request a memory allocation.
+
+        Args:
+            require_cuda_pin: ON only: reject unpinned initial/shared regions.
+                Defaults to False for CPU correctness tests.
+
+        Raises:
+            ValueError: If strict pin validation is requested with OFF.
 
         Returns:
             True if successful
         """
+        if self._group_cleanup_started:
+            logger.error("Pending group cleanup: retry close() before connect()")
+            return False
         if self._connected:
             return True
+        if self._config.placement_policy == "chunk_round_robin":
+            return self._connect_group(require_cuda_pin=require_cuda_pin)
+        if require_cuda_pin:
+            raise ValueError("Strict pin validation is only supported in ON mode")
 
         try:
             # 1. Connect RPC client
@@ -582,9 +615,14 @@ class MaruHandler:
         ``_write_lock`` to wait for in-flight writes before teardown.
 
         Raises:
+            RuntimeError, BufferError: In ON mode, local mapping or server group
+                cleanup is incomplete. Release views/leases and retry close().
             ExceptionGroup: If pending staged rollback fails. The connection and
                 existing owned regions remain available so cleanup can be retried.
         """
+        if self._config.placement_policy == "chunk_round_robin":
+            self._close_group()
+            return
         if not self._connected and not self._staged_handles:
             return
 
@@ -892,6 +930,12 @@ class MaruHandler:
                     )
                     return None
 
+        if (
+            self._require_cuda_pin
+            and not self.get_mapping_status(region_id).cuda_pinned
+        ):
+            return None
+
         buf = self._mapper.get_buffer_view(
             region_id, result.kv_offset, result.kv_length
         )
@@ -900,22 +944,30 @@ class MaruHandler:
             return None
 
         logger.debug(
-            "retrieve: key=%s, region=%d, page=%d, offset=%d, size=%d, "
-            "readonly=%s, owned=%s",
+            "retrieve: key=%s, region=%d, offset=%d, size=%d, readonly=%s, owned=%s",
             key,
             region_id,
-            result.kv_offset // self._owned.get_chunk_size(),
             result.kv_offset,
             result.kv_length,
             buf.readonly,
             self._owned.is_owned(region_id),
         )
         chunk_size = self._owned.get_chunk_size()
-        page_index = result.kv_offset // chunk_size
+        page_index = (
+            -1
+            if self._config.placement_policy == "chunk_round_robin"
+            and not self._owned.is_owned(region_id)
+            else result.kv_offset // chunk_size
+        )
         self._record_stats(
             "retrieve", result.kv_length, (time.monotonic() - t0) * 1e6, result="hit"
         )
-        return MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
+        return MemoryInfo(
+            view=buf,
+            region_id=region_id,
+            page_index=page_index,
+            kv_offset=result.kv_offset,
+        )
 
     def exists(self, key: str) -> bool:
         """Check if a key exists.
@@ -1128,6 +1180,13 @@ class MaruHandler:
                         results.append(None)
                         continue
 
+            if (
+                self._require_cuda_pin
+                and not self.get_mapping_status(region_id).cuda_pinned
+            ):
+                results.append(None)
+                continue
+
             buf = self._mapper.get_buffer_view(
                 region_id, entry.kv_offset, entry.kv_length
             )
@@ -1137,19 +1196,27 @@ class MaruHandler:
                 continue
 
             logger.debug(
-                "batch_retrieve: key=%s, region=%d, page=%d, "
-                "offset=%d, size=%d, readonly=%s",
+                "batch_retrieve: key=%s, region=%d, offset=%d, size=%d, readonly=%s",
                 keys[i],
                 region_id,
-                entry.kv_offset // self._owned.get_chunk_size(),
                 entry.kv_offset,
                 entry.kv_length,
                 buf.readonly,
             )
             chunk_size = self._owned.get_chunk_size()
-            page_index = entry.kv_offset // chunk_size
+            page_index = (
+                -1
+                if self._config.placement_policy == "chunk_round_robin"
+                and not self._owned.is_owned(region_id)
+                else entry.kv_offset // chunk_size
+            )
             results.append(
-                MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
+                MemoryInfo(
+                    view=buf,
+                    region_id=region_id,
+                    page_index=page_index,
+                    kv_offset=entry.kv_offset,
+                )
             )
 
         hits = sum(1 for r in results if r is not None)
@@ -1401,6 +1468,193 @@ class MaruHandler:
     # Helpers
     # =========================================================================
 
+    def get_placement_status(self) -> dict:
+        """Return placement counters and pending group lifecycle state.
+
+        cleanup_pending requires close() retry before any new connection.
+        Group request IDs remain stable across lost replies and cleanup retries.
+        """
+        status = self._owned.get_placement_status() if self._owned else {}
+        return {
+            **status,
+            "request_id": self._group_request_id,
+            "cleanup_pending": self._group_cleanup_started,
+        }
+
+    def _notify_region_added(self, region_id: int, page_count: int) -> None:
+        if self._on_region_added is not None:
+            if self._callback_slot_size:
+                self._on_region_added(region_id, page_count, self.get_chunk_size())
+            else:
+                self._on_region_added(region_id, page_count)
+
+    def _connect_group(self, *, require_cuda_pin: bool) -> bool:
+        """Connect the opt-in path; never fall back to single-region allocation."""
+        from maru_shm.device_scanner import scan_dax_devices
+
+        if self._group_cleanup_started:
+            logger.error("Pending group cleanup: retry close() before connect()")
+            return False
+        self._closing.clear()
+        self._require_cuda_pin = require_cuda_pin
+        try:
+            self._rpc.connect()
+            handshake = self._rpc.handshake()
+            if not handshake.get(
+                "success"
+            ) or "multi_pool_alloc_v1" not in handshake.get("capabilities", []):
+                raise RuntimeError("Server lacks multi_pool_alloc_v1 capability")
+            if self._mapper is None:
+                self._mapper = DaxMapper(
+                    rm_address=handshake.get("rm_address") or self._config.rm_address,
+                    device_table=dict(scan_dax_devices()),
+                )
+                self._owned = OwnedRegionManager(
+                    self._mapper, self.get_chunk_size(), "chunk_round_robin"
+                )
+            if self._group_request_id is None:
+                self._group_request_id = str(uuid.uuid4())
+                self._group_reply_received = False
+            try:
+                response = self._rpc.request_alloc_group(
+                    self._config.instance_id,
+                    self._group_request_id,
+                    self._config.pool_size,
+                    self.get_chunk_size(),
+                )
+            except Exception:
+                # No handles received: replay this exact ID on connect() retry.
+                # close() can still return the same group once the server sees it.
+                logger.error(
+                    "Group reply unavailable; retry connect or close", exc_info=True
+                )
+                return False
+            self._group_reply_received = True
+            if (
+                not response.success
+                and response.state == "failed"
+                and not response.regions
+                and not response.pending_region_ids
+                and not response.outcome_unknown
+            ):
+                # Rejected before allocation, or all rollback already confirmed.
+                self._group_request_id = None
+            if not response.success or response.state != "active":
+                raise RuntimeError(f"Group allocation failed: {response.error}")
+            regions = response.regions
+            ids = [region.handle.region_id for region in regions]
+            if (
+                response.request_id != self._group_request_id
+                or not ids
+                or len(ids) != len(set(ids))
+                or any(
+                    not region.target_id
+                    or region.page_count
+                    != region.handle.length // self.get_chunk_size()
+                    for region in regions
+                )
+            ):
+                raise ValueError("Invalid allocation group response")
+            self.prepare_regions(
+                [region.handle for region in regions],
+                require_cuda_pin=require_cuda_pin,
+                targets={
+                    region.handle.region_id: region.target_id for region in regions
+                },
+            )
+            self.commit_regions(ids)
+            self._connected = True
+            if self._config.eager_map:
+                self._premap_shared_regions()
+            if self._config.enable_stats:
+                self._stats_rpc = RpcClient(
+                    server_url=self._config.server_url,
+                    timeout_ms=self._config.timeout_ms,
+                )
+                self._stats_rpc.connect()
+                self._stats_flusher = threading.Thread(
+                    target=self._stats_flush_loop, name="stats-flusher", daemon=True
+                )
+                self._stats_flusher.start()
+            return True
+        except Exception:
+            logger.error("Group connection failed", exc_info=True)
+        # Outside except: traceback references must not retain mapped buffers.
+        try:
+            self._close_group()
+        except Exception:
+            logger.error("Group cleanup pending; retry close()", exc_info=True)
+        return False
+
+    def _close_group(self) -> None:
+        """Strict local teardown before releasing the server allocation group."""
+        self._group_cleanup_started = True
+        self._closing.set()
+        if self._stats_rpc is not None:
+            self._stats_rpc.close()
+            self._stats_rpc = None
+        if self._stats_flusher is not None:
+            self._stats_flusher.join(timeout=2)
+            self._stats_flusher = None
+        with self._write_lock:
+            if self._staged_handles:
+                errors = self._rollback_regions_locked(list(self._staged_handles))
+                if errors:
+                    raise ExceptionGroup("Group preparation cleanup pending", errors)
+            # Preserve unmap failures for retries. Do not return any remaining
+            # server regions until all local mappings/views are gone.
+            if self._mapper is not None:
+                if self._plugins:
+                    self._dispatch_plugins("on_close", self)
+                for rid in self._mapper.get_region_ids():
+                    if self.get_mapping_status(rid).active_users:
+                        raise RuntimeError(f"Region {rid} has active users")
+                if self._owned is not None:
+                    self._owned.close()
+                for rid in self._mapper.get_region_ids():
+                    if self._on_region_removed is not None:
+                        self._on_region_removed(rid)
+                    self._mapper.release_region(rid)
+            if self._group_request_id is not None:
+                if not self._group_reply_received:
+                    # A lost request/reply is resolved with the SAME ID before
+                    # cancellation, including a request that never reached server.
+                    allocation = self._rpc.request_alloc_group(
+                        self._config.instance_id,
+                        self._group_request_id,
+                        self._config.pool_size,
+                        self.get_chunk_size(),
+                    )
+                    self._group_reply_received = True
+                    if (
+                        not allocation.success
+                        and allocation.state == "failed"
+                        and not allocation.regions
+                        and not allocation.pending_region_ids
+                        and not allocation.outcome_unknown
+                    ):
+                        self._group_request_id = None
+            if self._group_request_id is not None:
+                response = self._rpc.return_alloc_group(
+                    self._config.instance_id, self._group_request_id
+                )
+                if (
+                    not response.success
+                    or response.pending_region_ids
+                    or response.outcome_unknown
+                ):
+                    raise RuntimeError("Server allocation group cleanup pending")
+            if self._mapper is not None:
+                self._mapper.close()
+            self._rpc.close()
+            self._mapper = None
+            self._owned = None
+            self._connected = False
+            self._group_request_id = None
+            self._group_reply_received = False
+            self._group_cleanup_started = False
+            self._key_to_location.clear()
+
     def _rollback_regions_locked(self, region_ids: list[int]) -> list[Exception]:
         """Clean accepted staged handles while holding the lifecycle/write lock."""
         failures: list[Exception] = []
@@ -1438,6 +1692,8 @@ class MaruHandler:
         Returns:
             True if expansion succeeded.
         """
+        if self._config.placement_policy == "chunk_round_robin":
+            return False
         if not self._auto_expand:
             logger.warning(
                 "Pool exhausted but auto_expand is disabled. "
@@ -1471,7 +1727,7 @@ class MaruHandler:
                     handle.region_id,
                     region.allocator.page_count,
                 )
-                self._on_region_added(handle.region_id, region.allocator.page_count)
+                self._notify_region_added(handle.region_id, region.allocator.page_count)
             return True
         except Exception:
             logger.error("Failed to init expanded region", exc_info=True)

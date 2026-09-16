@@ -259,13 +259,17 @@ def test_client_policy_defaults_and_validation() -> None:
         MaruConfig(placement_policy="unknown")
 
 
-def test_handler_rejects_on_before_constructing_rpc() -> None:
-    """Unsupported ON execution cannot quietly allocate through the legacy path."""
-    config = MaruConfig(placement_policy="chunk_round_robin", auto_expand=False)
-    with patch("maru_handler.rpc_async_client.RpcAsyncClient") as rpc:
-        with pytest.raises(NotImplementedError, match="not yet supported"):
-            MaruHandler(config)
-        rpc.assert_not_called()
+def test_handler_on_requires_server_capability() -> None:
+    """ON cannot quietly allocate through a legacy server."""
+    config = MaruConfig(
+        placement_policy="chunk_round_robin", auto_expand=False, use_async_rpc=False
+    )
+    with patch("maru_handler.handler.RpcClient") as client:
+        client.return_value.handshake.return_value = {"success": True}
+        handler = MaruHandler(config)
+        assert not handler.connect()
+        client.return_value.request_alloc.assert_not_called()
+        client.return_value.request_alloc_group.assert_not_called()
 
 
 def test_server_rejects_ranges_before_constructing_rm() -> None:

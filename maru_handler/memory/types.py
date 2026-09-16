@@ -162,6 +162,7 @@ class OwnedRegion:
 
     region_id: int
     allocator: "PagedMemoryAllocator"
+    target_id: str | None = None
 
 
 @dataclass(eq=False)
@@ -213,9 +214,13 @@ class MemoryInfo:
     GET: handler returns MemoryInfo(view=memoryview_slice)
          connector creates tensor via torch.frombuffer(info.view)
 
-    Data size is available via len(view) or view.nbytes.
+    Data size is available via len(view) or view.nbytes. kv_offset is the
+    authoritative writer byte offset. page_index is legacy metadata assuming
+    equal reader/writer slot sizes; ON shared reads set it to -1. New readers
+    must use kv_offset.
     """
 
     view: memoryview
     region_id: int = 0
     page_index: int = 0
+    kv_offset: int = 0

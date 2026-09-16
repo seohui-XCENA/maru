@@ -86,7 +86,9 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
     # Pool Management
     # =========================================================================
 
-    def _on_region_added(self, region_id: int, page_count: int) -> None:
+    def _on_region_added(
+        self, region_id: int, page_count: int, slot_size: int | None = None
+    ) -> None:
         """Callback from MaruHandler when a region is added.
 
         Builds the MemoryObj pool for the region. Called both during
@@ -95,22 +97,28 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         Args:
             region_id: The region ID.
             page_count: Number of pages in the region.
+            slot_size: Explicit slot bytes; None keeps legacy callback support.
         """
         logger.debug("[Maru] on_region_added region=%d pages=%d", region_id, page_count)
-        self._build_region_pool(region_id, page_count)
+        self._build_region_pool(region_id, page_count, slot_size)
         if self._handler.is_region_staged(region_id) and not self.has_region_pool(
             region_id
         ):
             raise RuntimeError(f"Failed to prepare adapter pool for region {region_id}")
 
-    def _build_region_pool(self, region_id: int, page_count: int) -> None:
+    def _build_region_pool(
+        self, region_id: int, page_count: int, slot_size: int | None = None
+    ) -> None:
         """Pre-create MemoryObjs for all pages in a region.
 
         Args:
             region_id: The region ID.
             page_count: Number of pages in the region.
+            slot_size: Explicit slot bytes; None keeps legacy callback support.
         """
-        chunk_size = self._chunk_size
+        chunk_size = self._chunk_size if slot_size is None else slot_size
+        if chunk_size != self._chunk_size:
+            raise ValueError("Adapter supports one slot size")
         objs: list[TensorMemoryObj] = []
 
         buf = None
@@ -312,6 +320,8 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         For the normal store lifecycle, pages are freed via
         MaruBackend.remove() -> handler.delete().
         """
+        if memory_obj.metadata.address < 0:
+            raise ValueError("Borrowed read views cannot be freed or stored")
         rid, pid = self.decode_address(memory_obj.metadata.address)
         handle = AllocHandle(
             buf=memoryview(b""),
@@ -358,6 +368,8 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         Returns:
             AllocHandle for MaruHandler.store().
         """
+        if memory_obj.metadata.address < 0:
+            raise ValueError("Borrowed read views cannot be freed or stored")
         rid, pid = self.decode_address(memory_obj.metadata.address)
         return AllocHandle(
             buf=memoryview(b""),
@@ -365,6 +377,75 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
             _page_index=pid,
             _size=memory_obj.metadata.phy_size,
         )
+
+    def get_by_offset(
+        self,
+        region_id: int,
+        kv_offset: int,
+        actual_size: int,
+        single_token_size: int,
+    ) -> MemoryObj | None:
+        """Borrow a zero-copy view at the writer's byte offset.
+
+        Uses this adapter's single registered layout; it does not build a peer
+        page pool or allocate a page. The caller must keep the key pinned and
+        the mapping alive until all CPU/GPU reads finish, then drop the object.
+        The returned address is -1: free/create_store_handle reject read views.
+
+        Args:
+            region_id: Already mapped writer region from Handler.retrieve.
+            kv_offset: Exact byte offset from MemoryInfo.kv_offset.
+            actual_size: Stored payload bytes, at most the registered chunk size.
+            single_token_size: Bytes per token for partial-chunk layout recovery.
+
+        Returns:
+            TensorMemoryObj, or None if the range/layout is invalid or unmapped.
+        """
+        if (
+            kv_offset < 0
+            or actual_size <= 0
+            or actual_size > self._chunk_size
+            or single_token_size <= 0
+            or actual_size % single_token_size
+        ):
+            return None
+        shapes = self._shapes
+        if actual_size < self._chunk_size:
+            dim = self._fmt.token_dim()
+            if any(dim < 0 or dim >= len(shape) for shape in shapes):
+                return None
+            shapes = [
+                torch.Size(
+                    [
+                        actual_size // single_token_size if i == dim else size
+                        for i, size in enumerate(shape)
+                    ]
+                )
+                for shape in shapes
+            ]
+        if (
+            sum(
+                shape.numel() * dtype.itemsize
+                for shape, dtype in zip(shapes, self._dtypes, strict=True)
+            )
+            != actual_size
+        ):
+            return None
+        buf = self._handler.get_buffer_view(region_id, kv_offset, actual_size)
+        if buf is None:
+            return None
+        tensor = torch.frombuffer(buf, dtype=torch.uint8)
+        metadata = MemoryObjMetadata(
+            shape=shapes[0],
+            dtype=self._dtypes[0],
+            address=-1,
+            phy_size=actual_size,
+            ref_count=1,
+            fmt=self._fmt,
+            shapes=shapes,
+            dtypes=self._dtypes,
+        )
+        return TensorMemoryObj(tensor, metadata, parent_allocator=None)
 
     def get_by_location(
         self,
@@ -386,6 +467,9 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         Returns:
             MemoryObj from the pool, or None if not found.
         """
+        if page_index < 0:
+            return None
+
         with self._lock:
             region_pool = self._pool.get(region_id)
 
