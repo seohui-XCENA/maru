@@ -70,6 +70,8 @@ if(MARU_BUILD_TESTS)
         tests/test_device_header.cpp
         tests/test_pool_manager_uuid.cpp
         tests/test_dax_region_index.cpp
+        tests/test_wal_replay.cpp
+        tests/test_device_retry.cpp
         ${RM_LIB_SOURCES}
     )
 

@@ -51,9 +51,9 @@ int main(int argc, char **argv) {
         maru::logf(maru::LogLevel::Error, "loadPools failed (rc=%d)", rc);
     }
     // loadPools returns 0 even when no devices found (scanDevices succeeds
-    // with empty list). Check actual pool state for auto-rescan decision.
-    bool needsRescan = !pm.hasPools();
-    if (needsRescan) {
+    // with empty list). Report this, but keep rescanning even with live pools:
+    // other devices may appear later during boot or after hot-add.
+    if (!pm.hasPools()) {
         maru::logf(maru::LogLevel::Warn,
                     "no CXL/DAX devices found — starting with empty pool");
     }
@@ -90,21 +90,16 @@ int main(int argc, char **argv) {
             lastRescan = std::chrono::steady_clock::now();
         }
 
-        if (needsRescan) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - lastRescan > std::chrono::seconds(10)) {
-                maru::logf(maru::LogLevel::Info,
-                           "pools empty, rescanning for CXL/DAX devices...");
-                int ret = pm.rescanIfEmpty();
-                lastRescan = now;
-                if (ret > 0) {
-                    maru::logf(maru::LogLevel::Info,
-                               "CXL/DAX devices found, auto-rescan complete");
-                    needsRescan = false;
-                } else if (ret < 0) {
-                    maru::logf(maru::LogLevel::Warn,
-                               "auto-rescan failed (rc=%d), will retry", ret);
-                }
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastRescan >= std::chrono::seconds(10)) {
+            // rescanDevices skips existing pools, preserving live allocations.
+            maru::logf(maru::LogLevel::Debug,
+                       "rescanning for newly available CXL/DAX devices...");
+            int ret = pm.rescanDevices();
+            lastRescan = now;
+            if (ret < 0) {
+                maru::logf(maru::LogLevel::Warn,
+                           "auto-rescan failed (rc=%d), will retry", ret);
             }
         }
 

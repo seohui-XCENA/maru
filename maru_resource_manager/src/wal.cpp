@@ -192,15 +192,24 @@ int WalStore::replay(std::vector<PoolState> &pools,
       }
       Allocation al{};
       std::memcpy(&al, payload.data(), sizeof(al));
+      // Reserve IDs even for devices that have not appeared yet. Otherwise a
+      // live pool can reuse one before a later rescan replays this record.
+      if (al.handle.regionId >= nextRegionId) {
+        nextRegionId = al.handle.regionId + 1;
+      }
       PoolState *pool = findPool(pools, al.poolId);
       if (!pool) {
         continue;
       }
+      auto existing = allocations.find(al.handle.regionId);
+      if (existing != allocations.end() && existing->second.poolId != al.poolId) {
+        // Older writers may already have reused an ID across pools. Reject
+        // the replay so the caller rolls back instead of losing a live handle.
+        ::close(fd);
+        return -EEXIST;
+      }
       removeExtent(*pool, al.realOffset, al.allocLength);
       allocations[al.handle.regionId] = al;
-      if (al.handle.regionId >= nextRegionId) {
-        nextRegionId = al.handle.regionId + 1;
-      }
     } else if (hdr.type == static_cast<uint32_t>(WalRecordType::FREE)) {
       if (payload.size() != sizeof(WalFreeV3)) {
         continue;

@@ -364,6 +364,17 @@ uint32_t PoolManager::allocationCount() const {
     return static_cast<uint32_t>(allocations_.size());
 }
 
+bool isDeviceDaxBound(const std::string &sysfsDevicePath)
+{
+    char target[PATH_MAX];
+    ssize_t n = ::readlink((sysfsDevicePath + "/driver").c_str(), target, sizeof(target));
+    if (n <= 0 || n == static_cast<ssize_t>(sizeof(target)))
+    {
+        return false;
+    }
+    return baseName(std::string(target, n)) == "device_dax";
+}
+
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
     // Scan for DEV_DAX devices
@@ -381,6 +392,12 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
             }
             if (std::strncmp(name, "dax", 3) != 0)
             {
+                continue;
+            }
+            if (!isDeviceDaxBound(std::string(kSysBusDaxDevices) + "/" + name))
+            {
+                // kmem devices are system RAM and have no /dev/dax node.
+                // Unbound devices can be reconsidered on the next scan.
                 continue;
             }
             uint32_t regionId = 0;
@@ -459,6 +476,14 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
         outDevices.push_back(DeviceInfo{kv.first, kv.second, DaxType::FS_DAX});
     }
 
+    std::unordered_set<std::string> present;
+    for (const auto &dev : outDevices) present.insert(dev.devPath);
+    for (auto it = failedDevices_.begin(); it != failedDevices_.end();)
+    {
+        if (!present.count(it->first)) it = failedDevices_.erase(it);
+        else ++it;
+    }
+
     return 0;
 }
 
@@ -502,6 +527,19 @@ int PoolManager::getDeviceSize(const std::string &path, uint64_t &sizeOut)
     return -ENOTSUP;
 }
 
+int PoolManager::poolBuildFailed(const std::string &path, const char *stage, int error)
+{
+    auto failure = std::make_pair(std::string(stage), error);
+    auto previous = failedDevices_.find(path);
+    if (previous == failedDevices_.end() || previous->second != failure)
+    {
+        logf(LogLevel::Warn, "failed to load pool from %s (%s): %d (%s)",
+             path.c_str(), stage, error, std::strerror(-error));
+        failedDevices_[path] = std::move(failure);
+    }
+    return error;
+}
+
 int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
                                       DaxType type, PoolState &out)
 {
@@ -509,8 +547,7 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     int rc = getDeviceSize(path, size);
     if (rc != 0 || size == 0)
     {
-        logf(LogLevel::Error, "maru-resource-manager: failed to get size for %s (%d)", path.c_str(), rc);
-        return rc != 0 ? rc : -EINVAL;
+        return poolBuildFailed(path, "device size", rc != 0 ? rc : -EINVAL);
     }
 
     // Read device alignment first (needed for mmap-based header access)
@@ -538,10 +575,7 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
             hrc = writeDeviceHeader(path, hdr, devAlign);
             if (hrc != 0)
             {
-                logf(LogLevel::Error,
-                     "Failed to write device header to %s (%d)",
-                     path.c_str(), hrc);
-                return hrc;
+                return poolBuildFailed(path, "write device header", hrc);
             }
             logf(LogLevel::Info,
                  "Auto-initialized device header on %s: UUID=%s",
@@ -549,10 +583,7 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
         }
         else if (hrc != 0)
         {
-            logf(LogLevel::Error,
-                 "Failed to read device header from %s (%d)",
-                 path.c_str(), hrc);
-            return hrc;
+            return poolBuildFailed(path, "read device header", hrc);
         }
         else
         {
@@ -596,6 +627,10 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     }
 
     out = std::move(pool);
+    if (failedDevices_.erase(path))
+    {
+        logf(LogLevel::Info, "device recovered: %s", path.c_str());
+    }
     return 0;
 }
 
@@ -630,21 +665,6 @@ bool PoolManager::hasPools() const
     return !pools_.empty();
 }
 
-int PoolManager::rescanIfEmpty()
-{
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!pools_.empty())
-    {
-        return 1;
-    }
-    int rc = rescanDevicesLocked();
-    if (rc != 0)
-    {
-        return rc;
-    }
-    return pools_.empty() ? 0 : 1;
-}
-
 int PoolManager::loadPoolsLocked()
 {
     std::vector<DeviceInfo> devices;
@@ -665,9 +685,6 @@ int PoolManager::loadPoolsLocked()
         rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
         if (rc != 0)
         {
-            logf(LogLevel::Warn,
-                 "maru-resource-manager: failed to load pool %u from %s: %d",
-                 dev.poolId, dev.devPath.c_str(), rc);
             continue;
         }
         stagedPools.push_back(std::move(pool));
@@ -742,9 +759,6 @@ int PoolManager::rescanDevicesLocked()
         rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
         if (rc != 0)
         {
-            logf(LogLevel::Warn,
-                 "rescan: failed to load pool from %s: %d",
-                 dev.devPath.c_str(), rc);
             continue;
         }
         stagedPools.push_back(std::move(pool));
