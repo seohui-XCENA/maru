@@ -50,9 +50,11 @@ This will:
 4. Wait until both workers register and the frontend serves completions
 5. Run the cross-instance sharing test and clean everything up
 
-Expected output shape: worker A answers the long prompt with a cold prefill; worker B — which has never seen the prompt — retrieves A's KV chunks from the CXL pool instead of recomputing them (prefix caching is disabled on the workers, so Maru is the only cache source). The test prints both answers (identical), the per-request latency, and the definitive proof: worker B's `External prefix cache hit rate` counter goes nonzero. With the tiny default model the prefill is only a few ms, so the latency delta is visible only with larger models / longer prompts.
+Expected output shape: worker A answers the long prompt with a cold prefill; worker B — which has never seen the prompt — retrieves A's KV chunks from the CXL pool instead of recomputing them (prefix caching is disabled on the workers, so Maru is the only cache source). The test prints both answers and the per-request latency, and exits non-zero unless the two answers are identical and worker B's `External prefix cache hit rate` counter goes nonzero — the definitive proof that its prefill came from the pool. With the tiny default model the prefill is only a few ms, so the latency delta is visible only with larger models / longer prompts.
 
 ## Step-by-Step (Manual)
+
+Run each step in its own terminal from this directory. To use another model, `export MODEL=<model>` first so the workers and the test agree.
 
 ```bash
 source env.sh
@@ -64,11 +66,12 @@ maru-server --port $MARU_SERVER_PORT
 rm -rf $DYN_FILE_KV
 ./dynamo_launcher.sh frontend
 
-# 3. Workers (any order, after the frontend)
-./dynamo_launcher.sh worker w0
-./dynamo_launcher.sh worker w1
+# 3. Workers (any order, after the frontend). The test reads their logs
+#    from w0.log / w1.log to verify the cache hit.
+./dynamo_launcher.sh worker w0 2>&1 | tee w0.log
+./dynamo_launcher.sh worker w1 2>&1 | tee w1.log
 
-# 4. Test
+# 4. Test (fails on an HTTP error, differing answers, or no cache hit)
 ./run_simple_query.sh
 ```
 

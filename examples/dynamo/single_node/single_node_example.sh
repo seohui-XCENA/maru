@@ -28,10 +28,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env.sh"
 
-MODEL="${1:-${MODEL:-Qwen/Qwen2.5-0.5B}}"
+# Exported so run_simple_query.sh requests the model the workers serve.
+export MODEL="${1:-${MODEL:-Qwen/Qwen2.5-0.5B}}"
 LOG_DIR="$SCRIPT_DIR"
 
 cleanup() {
+    # Keep tearing down after a failed kill (a process that already
+    # exited); under errexit the first failure would leak the rest.
+    set +e
     echo ""
     echo "Cleaning up..."
     # LAST_WORKER_PID covers a worker whose start_worker attempt failed
@@ -163,10 +167,12 @@ print(ids[0])
 ")
 echo "Waiting for the frontend to serve completions (probe -> worker $PROBE_ID)..."
 for i in $(seq 1 120); do
+    # A transport error (timeout, reset) makes curl exit non-zero with
+    # code 000; keep it a retry instead of an errexit abort.
     CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
         -X POST "http://localhost:$DYN_HTTP_PORT/v1/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"model\": \"$MODEL\", \"prompt\": \"hi\", \"max_tokens\": 1, \"temperature\": 0, \"nvext\": {\"backend_instance_id\": $PROBE_ID}}")
+        -d "{\"model\": \"$MODEL\", \"prompt\": \"hi\", \"max_tokens\": 1, \"temperature\": 0, \"nvext\": {\"backend_instance_id\": $PROBE_ID}}") || true
     if [[ "$CODE" == "200" ]]; then
         echo "  Frontend serving completions (${i} probes)"
         break
