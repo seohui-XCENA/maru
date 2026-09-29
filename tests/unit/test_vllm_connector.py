@@ -34,6 +34,7 @@ from tests.unit.vllm_connector_helpers import (
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
+    make_vllm_scheduler,
     make_worker,
     store_metadata,
 )
@@ -4217,9 +4218,10 @@ class TestAbortDeferredWriteBehind:
     @pytest.mark.parametrize("overlap", [False, True])
     @pytest.mark.parametrize("write_behind", [False, True])
     @pytest.mark.parametrize("timing", ["pending", "ready", "in_transit", "received"])
-    def test_abort_frees_once(self, overlap, write_behind, timing):
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm.v1.request import RequestStatus
+    def test_abort_frees_once(self, tmp_path, overlap, write_behind, timing):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.outputs import KVConnectorOutput
+        from vllm.v1.request import Request, RequestStatus
 
         from maru_vllm.connector import MaruKVConnector
 
@@ -4228,54 +4230,27 @@ class TestAbortDeferredWriteBehind:
             "maru_async_store": write_behind,
             "maru_overlap_load_with_compute": overlap,
         }
-        sched = make_scheduler(4, 8, config)
+        # A real vLLM scheduler drives admission, abort and block release, so
+        # the test follows the installed vLLM's own retention rules.
+        engine = make_vllm_scheduler(tmp_path, 4, 8, config)
+        sched = engine.connector._scheduler
+        # One chunk of the 8-token prompt is in Maru, so vLLM parks the
+        # request in WAITING_FOR_REMOTE_KVS for a deferred load.
+        sched._count_matched_chunks = lambda token_ids: 1
         worker = make_worker(4, 8, config)
         facade = SimpleNamespace(_worker=worker, _scheduler=sched)
-        request = SimpleNamespace(
-            request_id="r1",
-            prompt_token_ids=list(range(8)),
-            status=RequestStatus.WAITING_FOR_REMOTE_KVS,
-            client_index=0,
-            num_computed_tokens=0,
-        )
-        request.is_finished = lambda: RequestStatus.is_finished(request.status)
-        blocks = MagicMock()
-        blocks.get_block_ids.return_value = ([0, 1],)
-        sched._last_match_result["r1"] = 1
-        sched.update_state_after_alloc(request, blocks, 8)
-        sched.build_connector_meta(fake_scheduler_output())
+        pool = engine.kv_cache_manager.block_pool
+        free_blocks = pool.get_num_free_blocks()
 
-        engine = Scheduler.__new__(Scheduler)
-        state = SimpleNamespace(
-            connector=SimpleNamespace(
-                update_connector_output=lambda output: (
-                    MaruKVConnector.update_connector_output(facade, output)
-                )
-            ),
-            requests={"r1": request},
-            finished_recving_kv_req_ids=set(),
-            failed_recving_kv_req_ids=set(),
-            finished_req_ids=set(),
-            finished_req_ids_dict=None,
-            running=[],
-            waiting=MagicMock(),
-            skipped_waiting=MagicMock(),
-            encoder_cache_manager=MagicMock(),
-            kv_cache_manager=MagicMock(),
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[object()]),
-        )
-
-        engine.__dict__.update(vars(state))
-        engine.connector.request_finished = lambda req, ids: (
-            MaruKVConnector.request_finished(facade, req, ids)
-        )
-        engine.kv_cache_manager.get_block_ids.return_value = ([0, 1],)
+        request = Request("r1", list(range(8)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
         def consume(result):
             sending, recving = result
-            Scheduler._update_from_kv_xfer_finished(
-                engine,
-                SimpleNamespace(finished_sending=sending, finished_recving=recving),
+            engine._update_from_kv_xfer_finished(
+                KVConnectorOutput(finished_sending=sending, finished_recving=recving)
             )
 
         early = (None, None)
@@ -4286,30 +4261,28 @@ class TestAbortDeferredWriteBehind:
         if timing == "received":
             consume(early)
 
-        # Use the actual cancellation/retention path, not a fixture that
-        # duplicates its delay_free_blocks decision.
         engine.finish_requests("r1", RequestStatus.FINISHED_ABORTED)
         assert request.status == RequestStatus.FINISHED_ABORTED
         if timing != "received" or write_behind:
-            engine.kv_cache_manager.free.assert_not_called()
+            assert pool.get_num_free_blocks() < free_blocks
             assert "r1" in engine.requests
         if timing == "in_transit":
             consume(early)
 
-        output = fake_scheduler_output()
-        output.finished_req_ids = set(engine.finished_req_ids)
-        metadata = sched.build_connector_meta(output)
-        worker.handle_preemptions(metadata)
-        result = MaruKVConnector.get_finished(facade, {"r1"})
+        output = engine.schedule()
+        worker.handle_preemptions(output.kv_connector_metadata)
+        result = MaruKVConnector.get_finished(facade, output.finished_req_ids)
         if timing == "pending":
             assert result == (None, None)  # No early send frees a live H2D target.
-            engine.kv_cache_manager.free.assert_not_called()
+            assert pool.get_num_free_blocks() < free_blocks
             worker._deferred_done.add("r1")
             result = MaruKVConnector.get_finished(facade, set())
+        # A second report for the same request would trip vLLM's own
+        # ``req_id in self.requests`` assertion inside consume().
         consume(result)
         consume(MaruKVConnector.get_finished(facade, set()))
-        engine.kv_cache_manager.free.assert_called_once_with(request)
         assert not engine.requests
+        assert pool.get_num_free_blocks() == free_blocks
         assert not worker._recv_only_finished_req_ids
         assert not sched._awaiting_deferred_recv
 
