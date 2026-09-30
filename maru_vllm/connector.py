@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -431,6 +432,26 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
     return req_meta._chunk_keys_memo
 
 
+def _validate_deferred_loading(enabled: bool) -> None:
+    """Require vLLM's receive-side block retention for cancelled loads."""
+    if not enabled:
+        return
+    import vllm
+    from packaging.version import InvalidVersion, Version
+
+    version = getattr(vllm, "__version__", "unknown")
+    try:
+        supported = Version(version) >= Version("0.16.0")
+    except InvalidVersion:
+        supported = False
+    if not supported:
+        raise ValueError(
+            f"maru_async_load requires vLLM >= 0.16.0 (found {version}); "
+            "upgrade vLLM or disable maru_async_load / "
+            "maru_enable_deferred_loading to keep cancelled KV loads safe."
+        )
+
+
 @dataclass
 class MaruConnectorMetadata(KVConnectorMetadata):
     """Metadata communicated from scheduler to worker each step."""
@@ -445,6 +466,9 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # the connector reports its load complete, so the worker must drain the
     # copies it queued for that request before that report goes out.
     finished_req_ids: set[str] = field(default_factory=set)
+    # Cancelled while the scheduler still awaited a receive completion. vLLM
+    # releases these through finished_recving, never finished_sending.
+    recv_only_finished_req_ids: set[str] = field(default_factory=set)
     # Deferred loads whose metadata RPC completed between steps. The resumed
     # forward consumes their CXL views layer-by-layer, so layer k+1 H2D can
     # overlap layer k compute regardless of the storage format.
@@ -702,6 +726,10 @@ class MaruKVConnector(KVConnectorBase_V1):
             self._worker.get_finished_loading(),
         )
 
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        assert self._scheduler is not None
+        self._scheduler.update_connector_output(connector_output)
+
     def request_finished(
         self,
         request: Request,
@@ -757,6 +785,7 @@ class MaruSchedulerConnector:
         # first forward pass. This is the mechanism vLLM itself calls async
         # loading — get_num_new_matched_tokens returns async_load=True.
         self._deferred_loading = bool(_get_knob(extra_config, "maru_async_load"))
+        _validate_deferred_loading(self._deferred_loading)
         self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
         overlap_requested = bool(
@@ -777,6 +806,10 @@ class MaruSchedulerConnector:
         # Keep the live set until finish/preemption so the layerwise overlap is
         # used only when the serving workload is actually singleton.
         self._active_deferred_req_ids: set[str] = set()
+        # Track scheduler-observed completion, not worker event readiness:
+        # an abort can race with a receive report travelling from the worker.
+        self._awaiting_deferred_recv: set[str] = set()
+        self._recv_only_finished_req_ids: set[str] = set()
         # Requests emitted for deferred packed loading remain here until vLLM's
         # second update_state_after_alloc call says they are ready to resume.
         # The next connector metadata then activates the worker's retained CXL
@@ -965,6 +998,7 @@ class MaruSchedulerConnector:
         num_chunks = self._last_match_result.pop(request.request_id, 0)
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
+            self._awaiting_deferred_recv.add(request.request_id)
             self._pending_deferred_loads[request.request_id] = (
                 request,
                 num_chunks,
@@ -980,7 +1014,9 @@ class MaruSchedulerConnector:
         meta = MaruConnectorMetadata(
             preempted_req_ids=set(scheduler_output.preempted_req_ids or ()),
             finished_req_ids=set(scheduler_output.finished_req_ids or ()),
+            recv_only_finished_req_ids=set(self._recv_only_finished_req_ids),
         )
+        self._recv_only_finished_req_ids.clear()
 
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
@@ -1134,11 +1170,17 @@ class MaruSchedulerConnector:
             self._requests_need_load.pop(rid, None)
             self._pending_deferred_loads.pop(rid, None)
             self._active_deferred_req_ids.discard(rid)
+            self._awaiting_deferred_recv.discard(rid)
             self._deferred_layerwise_waiting.discard(rid)
             self._deferred_layerwise_ready.discard(rid)
 
         self._requests_need_load.clear()
         return meta
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        self._awaiting_deferred_recv.difference_update(
+            connector_output.finished_recving or ()
+        )
 
     def request_finished(
         self,
@@ -1146,6 +1188,11 @@ class MaruSchedulerConnector:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Transfer block ownership to the worker for write-behind stores."""
+        if request.request_id in self._awaiting_deferred_recv:
+            # vLLM already retains a parked request's blocks until its receive
+            # completes. Claiming send ownership too produces a second free.
+            self._recv_only_finished_req_ids.add(request.request_id)
+            return False, None
         return self._write_behind, None
 
 
@@ -1165,6 +1212,7 @@ class MaruWorkerConnector:
         num_kv_heads: int | None = None,
         head_size: int | None = None,
     ):
+        _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
@@ -1210,6 +1258,7 @@ class MaruWorkerConnector:
         self._deferred_events: dict[str, torch.cuda.Event] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
+        self._recv_only_finished_req_ids: set[str] = set()
         self._failed_load_blocks: set[int] = set()
         # Loads the background thread has taken but not yet accounted for, and
         # those among them whose request was abandoned meanwhile. A request
@@ -2512,6 +2561,9 @@ class MaruWorkerConnector:
         release the request: they make that cache entry unavailable, but must
         never leak GPU blocks.
         """
+        recv_only = self._recv_only_finished_req_ids & finished_req_ids
+        self._recv_only_finished_req_ids.difference_update(recv_only)
+        finished_req_ids = finished_req_ids - recv_only
         if not self._write_behind:
             return None
         queued = self._queued_store_batches
@@ -2544,6 +2596,10 @@ class MaruWorkerConnector:
         longer reads the GPU cache. Only the store stream must be complete at
         this boundary.
         """
+        # Parked receives have no new store reads; stores from before a
+        # preemption were drained at that preemption. Do not synchronize the
+        # shared store stream for recv-only aborts (it may serve other requests).
+        self._recv_only_finished_req_ids.update(metadata.recv_only_finished_req_ids)
         if (
             self._write_behind
             and metadata.preempted_req_ids
@@ -3773,6 +3829,7 @@ class MaruWorkerConnector:
             self._deferred_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
+            self._recv_only_finished_req_ids.clear()
             self._inflight_deferred_req_ids.clear()
             self._abandoned_req_ids.clear()
         if self._handler is not None:

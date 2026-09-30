@@ -2,7 +2,9 @@
 
 ## Prerequisites
 
-**vLLM v0.14+** — required for `KVConnectorBase_V1` support:
+**vLLM v0.14+** — required for `KVConnectorBase_V1` support.
+
+**Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
 ```bash
 uv pip install vllm

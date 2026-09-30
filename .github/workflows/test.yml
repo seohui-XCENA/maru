@@ -4,13 +4,18 @@ on:
   pull_request:
 
 jobs:
-  unit-test:
+  unit-test-matrix:
+    name: unit-test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -34,7 +39,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          # Keep the baseline compatible with main and PRs predating the matrix.
+          name: ${{ matrix.python-version == '3.12' && 'coverage-report' || format('coverage-report-{0}', matrix.python-version) }}
           path: |
             coverage.xml
             pytest.xml
+
+  # Keep the required status-check context stable while the matrix expands.
+  unit-test:
+    name: unit-test
+    if: ${{ always() }}
+    needs: unit-test-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Python version to pass
+        env:
+          MATRIX_RESULT: ${{ needs.unit-test-matrix.result }}
+        run: test "$MATRIX_RESULT" = success

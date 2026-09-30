@@ -12,7 +12,9 @@ them, so importing this module never requires torch to be installed.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -91,6 +93,115 @@ def make_scheduler(
         block_size=block_size,
         kv_chunk_tokens=kv_chunk_tokens,
         extra_config={} if extra_config is None else extra_config,
+    )
+
+
+# A two-layer Llama config: enough for vLLM's ModelConfig to resolve the
+# architecture offline, without downloading weights or a tokenizer.
+_TINY_MODEL_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "num_hidden_layers": 2,
+    "vocab_size": 128,
+    "max_position_embeddings": 512,
+    "rms_norm_eps": 1e-5,
+    "torch_dtype": "float16",
+}
+
+
+def make_vllm_scheduler(
+    model_dir: Path,
+    block_size: int,
+    kv_chunk_tokens: int,
+    extra_config: dict[str, Any] | None = None,
+    num_blocks: int = 64,
+) -> Any:
+    """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
+
+    Going through vLLM's constructors keeps the scheduler's internal state
+    in step with the installed vLLM, so tests exercise its real abort,
+    free and completion paths instead of a hand-copied subset.
+
+    Args:
+        model_dir: Empty directory to hold the tiny model config.
+        block_size: vLLM KV block size in tokens.
+        kv_chunk_tokens: Maru chunk size in tokens.
+        extra_config: Extra ``kv_connector_extra_config`` entries.
+        num_blocks: GPU KV blocks the scheduler may allocate.
+
+    Returns:
+        The ``vllm.v1.core.sched.scheduler.Scheduler``; its
+        ``connector._scheduler`` is the MaruSchedulerConnector under test.
+    """
+    import torch
+    from vllm.config import (
+        CacheConfig,
+        KVTransferConfig,
+        ModelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    (model_dir / "config.json").write_text(json.dumps(_TINY_MODEL_CONFIG))
+    model_config = ModelConfig(
+        model=str(model_dir), dtype="float16", seed=0, skip_tokenizer_init=True
+    )
+    cache_config = CacheConfig(
+        block_size=block_size, cache_dtype="auto", enable_prefix_caching=False
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=512,
+            max_model_len=512,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+        cache_config=cache_config,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MaruKVConnector",
+            kv_connector_module_path="maru_vllm",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "maru_kv_chunk_tokens": kv_chunk_tokens,
+                **(extra_config or {}),
+            },
+        ),
+    )
+    cache_config.num_gpu_blocks = num_blocks
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        log_stats=False,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
     )
 
 
