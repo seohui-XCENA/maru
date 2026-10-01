@@ -19,6 +19,7 @@ class AllocationInfo:
     owner_instance_id: str
     kv_ref_count: int = 0
     owner_connected: bool = True
+    legacy_visible: bool = True
 
 
 class AllocationManager:
@@ -36,9 +37,18 @@ class AllocationManager:
         self._lock = RLock()
 
     def allocate(
-        self, instance_id: str, size: int, dax_path: str = ""
+        self,
+        instance_id: str,
+        size: int,
+        dax_path: str = "",
+        *,
+        legacy_visible: bool = True,
     ) -> MaruHandle | None:
-        """Allocate memory via ShmClient and track ownership."""
+        """Allocate memory via ShmClient and track ownership.
+
+        ``legacy_visible=False`` reserves a typed storage pool that must not be
+        returned by the legacy ``LIST_ALLOCATIONS`` discovery path.
+        """
         try:
             handle = self._client.alloc(size, dax_path=dax_path)
         except RuntimeError as e:
@@ -59,6 +69,7 @@ class AllocationManager:
                 owner_instance_id=instance_id,
                 kv_ref_count=0,
                 owner_connected=True,
+                legacy_visible=legacy_visible,
             )
         return handle
 
@@ -174,6 +185,8 @@ class AllocationManager:
         with self._lock:
             handles = []
             for info in self._allocations.values():
+                if not info.legacy_visible:
+                    continue
                 if (
                     exclude_instance_id
                     and info.owner_instance_id == exclude_instance_id

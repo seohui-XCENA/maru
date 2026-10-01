@@ -119,6 +119,7 @@ def make_vllm_scheduler(
     kv_chunk_tokens: int,
     extra_config: dict[str, Any] | None = None,
     num_blocks: int = 64,
+    enable_prefix_caching: bool = False,
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -132,6 +133,7 @@ def make_vllm_scheduler(
         kv_chunk_tokens: Maru chunk size in tokens.
         extra_config: Extra ``kv_connector_extra_config`` entries.
         num_blocks: GPU KV blocks the scheduler may allocate.
+        enable_prefix_caching: Exercise sharing of computed GPU blocks.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -155,10 +157,16 @@ def make_vllm_scheduler(
 
     (model_dir / "config.json").write_text(json.dumps(_TINY_MODEL_CONFIG))
     model_config = ModelConfig(
-        model=str(model_dir), dtype="float16", seed=0, skip_tokenizer_init=True
+        model=str(model_dir),
+        dtype="float16",
+        seed=0,
+        skip_tokenizer_init=True,
+        enforce_eager=True,
     )
     cache_config = CacheConfig(
-        block_size=block_size, cache_dtype="auto", enable_prefix_caching=False
+        block_size=block_size,
+        cache_dtype="auto",
+        enable_prefix_caching=enable_prefix_caching,
     )
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -174,6 +182,7 @@ def make_vllm_scheduler(
             kv_connector="MaruKVConnector",
             kv_connector_module_path="maru_vllm",
             kv_role="kv_both",
+            kv_load_failure_policy="recompute",
             kv_connector_extra_config={
                 "maru_kv_chunk_tokens": kv_chunk_tokens,
                 **(extra_config or {}),
