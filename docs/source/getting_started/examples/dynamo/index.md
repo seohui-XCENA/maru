@@ -5,8 +5,7 @@ The scripts live in `examples/dynamo/single_node/`.
 
 ## Prerequisites
 
-- A local CXL DEV_DAX pool and a running `maru-resource-manager`
-  (see {ref}`single-host quick start <quickstart-single-host>`).
+- A local CXL DEV_DAX pool and a running `maru-resource-manager` (see {ref}`single-host quick start <quickstart-single-host>`). The example starts its own MaruServer, so you do not need to start one.
 - Two GPUs by default, or enough memory on one GPU for two small-model workers.
 - Maru installed with its KV placement kernels (see {doc}`../../installation`).
 - Dynamo's vLLM backend installed in the **same Python environment** as Maru
@@ -18,8 +17,7 @@ One Dynamo frontend routes requests to two `dynamo.vllm` workers on a single
 host. The first worker stores KV cache in Maru; the second reuses it for the
 same prompt. The launcher disables vLLM's local prefix cache for this check.
 
-For Maru setup across hosts, see the
-{ref}`multi-host quick start <quickstart-multi-host>`.
+This example runs on a single host only. A multi-host Dynamo example is coming soon.
 
 ### Automated
 
@@ -90,11 +88,19 @@ Run each service in a separate terminal, in this order:
    ./dynamo_launcher.sh worker w1 2>&1 | tee w1.log
    ```
 
-4. After both workers register and become ready, run:
+4. Check that the frontend lists both workers. The response should contain two `instances` entries whose `endpoint` is `generate`:
+
+   ```bash
+   curl -s "http://localhost:${DYN_HTTP_PORT}/health"
+   ```
+
+   Then run:
 
    ```bash
    ./run_simple_query.sh
    ```
+
+   The frontend can return HTTP 503 for a short time after the workers register. If the query script fails with a 503, wait a few seconds and run it again.
 
 The query script sends the same prompt to each worker through the frontend
 and checks both the answers and the second worker's external cache hit rate.

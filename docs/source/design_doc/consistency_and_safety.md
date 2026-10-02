@@ -8,29 +8,12 @@ Maru publishes an object's location after the writer finishes writing its
 payload. Once `store()` returns successfully, other instances can look up that
 location through the metadata server.
 
-The payload-visibility guarantees below assume that writes reach the shared
-memory device and readers cannot consume stale host-cache copies. On a
-non-coherent multi-host CXL platform, metadata ordering alone does not establish
-those conditions. See {doc}`../getting_started/bios_setup` for platform setup.
+This relies on **write-then-register** ordering. Every store completes these steps in sequence:
 
-CPU access to a shared payload can leave cached copies that other hosts do not
-invalidate. Applications using that path need to handle write-back and
-invalidation explicitly. The CPU-based `examples/basic/producer.py` and
-`consumer.py` are single-host examples and do not implement that protocol.
-For multi-node use, validate the deployed transfer path across repeated updates
-and memory reuse, including any CPU access performed by the runtime or driver.
+1. **Write** — the caller writes the payload into a page from `alloc()`, by CPU through `handle.buf` or by GPU DMA.
+2. **Register** — `store()` records in the metadata registry that the key now maps to that page.
 
-This relies on **write-then-register** ordering. The handler always
-completes these steps in sequence:
-
-1. **Write** — copy data into the CXL memory region.
-2. **Register** — notify the metadata registry that the key now maps to that
-   location.
-
-For a handle-based store, the caller must finish its CPU/GPU write before
-registering the handle. Under the visibility conditions above, publishing only
-after the write completes prevents readers from discovering an in-progress
-object through the registry.
+The caller must finish its write before calling `store()`. Publishing only after the write completes prevents readers from discovering an in-progress object through the registry, provided the written data is visible to the reader (see {ref}`cross-host-visibility`).
 
 ```mermaid
 sequenceDiagram
@@ -39,20 +22,36 @@ sequenceDiagram
     participant Meta as Metadata Registry
     participant R as Reader (Instance B)
 
-    W->>CXL: 1. Write data to region
-    Note over CXL: Data fully committed
+    W->>CXL: 1. Write data to page (flush CPU writes)
+    Note over CXL: Payload reached the device
     W->>Meta: 2. Register key -> location
     Note over Meta: Key now globally visible
 
     R->>Meta: 3. Lookup key
     Meta-->>R: location (region, offset)
-    R->>CXL: 4. Read data (zero-copy)
-    Note over R: Complete, consistent data
+    R->>CXL: 4. Read data (zero-copy, invalidate before CPU reads)
+    Note over R: Complete data
 ```
 
 The visibility point is when `register_kv` RPC completes. The server holds the
 key in an in-memory registry protected by a lock, ensuring that concurrent
 lookups always see a fully committed entry or no entry at all.
+
+(cross-host-visibility)=
+### Cross-Host Visibility
+
+The ordering above assumes that writes reach the shared memory device and readers cannot consume stale host-cache copies. On a non-coherent multi-host CXL platform, metadata ordering alone does not establish those conditions. See {doc}`../getting_started/bios_setup` for the platform settings that GPU DMA writes depend on.
+
+On Intel GNR, the BIOS option `Allocating Write Flows` controls where device writes to CXL memory, such as GPU DMA writes, land. With the default `Allocating` policy, a write can stay in the writing host's cache, so other hosts read stale data. `Non-Allocating` stops these writes from allocating new lines in the host cache. It does not change lines the host already caches, for example after CPU access to the same memory, so CPU access still needs the explicit write-back and invalidation below.
+
+CPU access to a shared payload can leave cached copies that other hosts do not invalidate, so CPU writers and readers must write back and invalidate explicitly. `flush_range` from `maru_shm._cxl_flush` does both: it runs `clflush` over each cache line of the buffer, then `mfence`.
+
+1. **Writer:** write the payload to `handle.buf`, call `flush_range(handle.buf)`, then `store()`.
+2. **Reader:** `retrieve()`, call `flush_range(result.view)` to drop local cached copies, then read `result.view`.
+
+The {doc}`../getting_started/quick_start` producer and consumer follow this pattern. The CPU-based `examples/basic/producer.py` and `consumer.py` are single-host examples and do not flush.
+
+For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 
 > **See also:** [MaruHandler Architecture](maru_handler.md)
 

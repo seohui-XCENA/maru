@@ -28,7 +28,7 @@ On every participating host, inspect the CXL/DAX devices:
 
 ```bash
 # Install the inspection utilities if needed.
-sudo apt-get install -y cxl-cli daxctl
+sudo apt-get install -y cxl daxctl
 sudo cxl list -R -D
 sudo daxctl list
 ls -l /dev/dax*

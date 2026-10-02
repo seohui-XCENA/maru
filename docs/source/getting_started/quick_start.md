@@ -31,7 +31,7 @@ Alternatively, with the service stopped, run it in a dedicated terminal:
 sudo maru-resource-manager --host 127.0.0.1 --port 9850
 ```
 
-Wait for device discovery to finish, then start MaruServer in another terminal:
+Wait until the Resource Manager logs `ready — listening on 127.0.0.1:9850` (for the systemd service, check `journalctl -u maru-resource-manager`), then start MaruServer in another terminal:
 
 ```bash
 maru-server
@@ -79,15 +79,16 @@ matching device offsets**. Install Maru with `./install.sh` on Node A and
 Replace `192.0.2.10` with Node A's reachable IP. Node B must be able to reach
 Node A on TCP ports `5555` and `9850`.
 
-Run one Resource Manager for the shared pool on **Node A**. With the systemd
-service stopped, start it in a dedicated terminal:
+Run one Resource Manager for the shared pool on **Node A**. Stop the systemd service first: a service still bound to `127.0.0.1:9850` does not conflict with a second Resource Manager on `192.0.2.10:9850`, and the two would manage the same devices and state directory. Then start it in a dedicated terminal:
 
 ```bash
+sudo systemctl stop maru-resource-manager
 sudo maru-resource-manager --host 192.0.2.10 --port 9850
 ```
 
-Wait for device discovery to finish, then start MaruServer in another terminal
-on **Node A**:
+To run it as the systemd service instead, see the {ref}`multi-node configuration <installation-multi-node-config>`.
+
+Wait until it logs `ready — listening on 192.0.2.10:9850`, then start MaruServer in another terminal on **Node A**:
 
 ```bash
 maru-server --host 192.0.2.10 --port 5555 \
@@ -170,9 +171,7 @@ with MaruHandler(config) as handler:
 ```
 
 The consumer should print `Success: read the producer's data from shared CXL memory`.
-The `flush_range` calls support CPU data visibility across hosts and are used
-in both setups. They require Maru's x86 cache-flush extension, built during
-{doc}`installation`. See {doc}`../design_doc/consistency_and_safety` for details.
+The `flush_range` calls make CPU writes and reads visible across hosts and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
 
 ## 3. Stop the example
 
