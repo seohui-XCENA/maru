@@ -25,6 +25,9 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - CXL DAX device (`/dev/dax*`) or emulation environment
   - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
 
+See {doc}`bios_setup` for Intel GNR and AMD Turin firmware settings, DAX
+verification, and the cache-visibility requirements for cross-host sharing.
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y python3 python3-venv python3-pip git \
@@ -153,7 +156,8 @@ If you installed with the Resource Manager, verify the binary:
 which maru-resource-manager
 ```
 
-Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.
+Once installation is verified, choose the single-host or multi-host setup in
+{doc}`quick_start` to start services and verify KV sharing.
 
 <br/>
 
@@ -186,4 +190,5 @@ Multi-node requires changing default bind addresses from `127.0.0.1` to a networ
 
 > **Security:** When binding to a non-loopback address, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
 
-> Multi-node end-to-end examples and deployment guide are coming soon.
+Follow the {ref}`multi-host quickstart <quickstart-multi-host>` to start the
+services and share data between a Python producer and consumer on two hosts.

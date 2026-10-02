@@ -4,8 +4,21 @@
 
 ## 1. Data Visibility
 
-Maru provides **strong consistency** for store operations: once `store()` returns
-successfully, the stored data is immediately retrievable by any other instance.
+Maru publishes an object's location after the writer finishes writing its
+payload. Once `store()` returns successfully, other instances can look up that
+location through the metadata server.
+
+The payload-visibility guarantees below assume that writes reach the shared
+memory device and readers cannot consume stale host-cache copies. On a
+non-coherent multi-host CXL platform, metadata ordering alone does not establish
+those conditions. See {doc}`../getting_started/bios_setup` for platform setup.
+
+CPU access to a shared payload can leave cached copies that other hosts do not
+invalidate. Applications using that path need to handle write-back and
+invalidation explicitly. The CPU-based `examples/basic/producer.py` and
+`consumer.py` are single-host examples and do not implement that protocol.
+For multi-node use, validate the deployed transfer path across repeated updates
+and memory reuse, including any CPU access performed by the runtime or driver.
 
 This relies on **write-then-register** ordering. The handler always
 completes these steps in sequence:
@@ -14,9 +27,10 @@ completes these steps in sequence:
 2. **Register** — notify the metadata registry that the key now maps to that
    location.
 
-Because registration only occurs after the write is fully committed to shared
-memory, no reader can ever observe a partial or in-progress write. The key simply
-does not exist in the registry until the data is complete.
+For a handle-based store, the caller must finish its CPU/GPU write before
+registering the handle. Under the visibility conditions above, publishing only
+after the write completes prevents readers from discovering an in-progress
+object through the registry.
 
 ```mermaid
 sequenceDiagram
@@ -144,4 +158,3 @@ mismatch triggers reclamation.
 | Resource Manager crash | New region allocation blocked | WAL + checkpoint replay on restart | None |
 | Network partition (client-server) | Affected client cannot store/retrieve | Client reconnects when network recovers | None |
 | CXL device failure | All data on the device is lost | Not supported -- no cross-device replication | **Total** |
-
