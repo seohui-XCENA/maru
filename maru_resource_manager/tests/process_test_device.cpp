@@ -15,8 +15,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include "checkpoint_fault.h"
 
 namespace {
 std::string fixtureRoot;
@@ -46,6 +49,24 @@ extern "C" int __wrap_main(int, char **) {
         return 2;
     }
     fixtureRoot = std::filesystem::canonical(root).string();
+    if (const char *fault = std::getenv("MARU_TEST_CHECKPOINT_FAILURE")) {
+        std::istringstream fields(fault);
+        std::string file, operation, extra;
+        int error = 0;
+        size_t bytes = 0;
+        if (!(fields >> file >> operation >> error >> bytes) || (fields >> extra) ||
+            (file != "pool_0.meta.tmp" && file != "pool_1.meta.tmp" &&
+             file != "global.meta.tmp") ||
+            (operation != "write" && operation != "fsync") ||
+            (error != ENOSPC && error != EIO)) {
+            std::fprintf(stderr, "Invalid checkpoint fault specification\n");
+            return 2;
+        }
+        checkpoint_fault::arm(fixtureRoot + "/state/" + file,
+            operation == "write" ? checkpoint_fault::Operation::Write
+                                 : checkpoint_fault::Operation::Fsync,
+            error, bytes);
+    }
     // Do not accept caller-supplied state directories or listening addresses.
     std::vector<std::string> args{
         "maru_rm_process_test_daemon", "--state-dir", fixtureRoot + "/state",

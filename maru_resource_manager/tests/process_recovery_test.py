@@ -81,12 +81,15 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.process.kill()
             self.process.wait(timeout=10)
 
-    def start(self, expected_failure=False):
+    def start(self, expected_failure=False, checkpoint_fault=None):
         self.assertTrue(self.process is None or self.process.poll() is not None)
         self.starts += 1
         self.log = self.root / f"daemon-{self.starts}.log"
         (self.root / "port").unlink(missing_ok=True)
         env = dict(os.environ, MARU_TEST_DAX_ROOT=str(self.root))
+        env.pop("MARU_TEST_CHECKPOINT_FAILURE", None)
+        if checkpoint_fault is not None:
+            env["MARU_TEST_CHECKPOINT_FAILURE"] = checkpoint_fault
         with self.log.open("wb") as log:
             self.process = subprocess.Popen(
                 [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -109,9 +112,15 @@ class ProcessRecoveryTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"Daemon did not become ready: {self.log.read_text()}")
 
-    def stop(self, sig=signal.SIGTERM):
+    def stop(self, sig=signal.SIGTERM, expected_status=None):
         self.process.send_signal(sig)
-        expected = 0 if sig == signal.SIGTERM else -signal.SIGKILL
+        expected = (
+            expected_status
+            if expected_status is not None
+            else 0
+            if sig == signal.SIGTERM
+            else -signal.SIGKILL
+        )
         self.assertEqual(self.process.wait(timeout=10), expected, self.log.read_text())
         self.connection.close()
         self.connection = None
@@ -356,6 +365,59 @@ class ProcessRecoveryTest(unittest.TestCase):
             with (self.root / f"dev/dax{pool}.0").open("rb") as stream:
                 self.assertEqual(stream.read(len(header)), header)
         self.assertEqual((self.state / "secret").read_bytes(), before["secret"])
+
+    def checkpoint_failure_round_trip(self, filename, operation, error):
+        self.start()
+        old = self.allocate()
+        self.stop()
+        self.checkpoint(1, old[0] + 1)
+        before = (self.state / filename).read_bytes()
+        identity = self.identity()
+
+        # For write failures, successfully write the header and part of the
+        # payload before returning ENOSPC. fsync failures occur after all bytes.
+        fault = f"{filename}.tmp {operation} {error} 40"
+        self.start(checkpoint_fault=fault)
+        self.free(old)
+        live = [self.allocate(), self.allocate(), self.allocate(1)]
+        wal = (self.state / WAL_NAME).read_bytes()
+        self.stop(expected_status=1)
+        self.assertIn(f"Injected checkpoint {operation} failure", self.log.read_text())
+        self.assertIn(
+            f"shutdown checkpoint not written (rc={-error}); WAL retained",
+            self.log.read_text(),
+        )
+        self.assertEqual((self.state / WAL_NAME).read_bytes(), wal)
+        self.assertEqual((self.state / filename).read_bytes(), before)
+
+        # The following fresh process must replay the preserved log even when
+        # earlier pool files were already replaced before a later file failed.
+        self.start()
+        self.assertEqual(self.identity(), identity)
+        self.free(old, -errno.ENOENT)
+        self.check_stats({"/dev/dax0.0": 2, "/dev/dax1.0": 1})
+        for index, handle in enumerate(live):
+            self.access(handle, 1 if index == 2 else 0)
+        next_handle = self.allocate()
+        self.assertGreater(next_handle[0], max(h[0] for h in live))
+        self.assertGreaterEqual(next_handle[1], live[1][1] + live[1][2])
+        for handle in [*live, next_handle]:
+            self.free(handle)
+        self.stop()
+        self.checkpoint(0, next_handle[0] + 1)
+        self.assertFalse((self.state / f"{filename}.tmp").exists())
+
+    def test_shutdown_checkpoint_write_failure_retains_wal(self):
+        self.add_device(1)
+        for filename in ("pool_0.meta", "pool_1.meta", "global.meta"):
+            with self.subTest(file=filename):
+                self.checkpoint_failure_round_trip(filename, "write", errno.ENOSPC)
+
+    def test_shutdown_checkpoint_fsync_failure_retains_wal(self):
+        self.add_device(1)
+        for filename in ("pool_0.meta", "pool_1.meta", "global.meta"):
+            with self.subTest(file=filename):
+                self.checkpoint_failure_round_trip(filename, "fsync", errno.EIO)
 
 
 if __name__ == "__main__":

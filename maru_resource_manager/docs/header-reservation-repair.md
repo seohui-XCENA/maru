@@ -111,7 +111,7 @@ python3 -m unittest discover -s maru_resource_manager/tests \
   -p 'test_*.py'
 ```
 
-CTest includes five process tests in addition to the C++ regression suite. They
+CTest includes seven process tests in addition to the C++ regression suite. They
 launch a fresh test-only RM executable with production `main`, TCP handling,
 signals, secret loading, and checkpoint/WAL recovery. Linker wrappers redirect
 device discovery/access to temporary regular files and bind an ephemeral
@@ -131,13 +131,27 @@ The process tests cover:
   Python `prepare()` function against a temporary backup/sysfs, load the emitted
   pool files in the C++ daemon, allocate/free across restarts, and verify saved
   IDs, capacity, UUID headers, and secret preservation.
+- Checkpoint write/fsync failures during SIGTERM shutdown: inject ENOSPC after
+  a partial payload write or EIO at fsync, separately for the first pool, second
+  pool, and global metadata. Verify exit status 1, the failure log, unchanged WAL
+  bytes and failed destination file, then restart from an earlier complete
+  checkpoint plus the retained WAL and verify live/freed handles and capacity.
+
+The C++ suite also injects 18 checkpoint failures: each of those three metadata
+files, at header write, partial payload write, and fsync, with both ENOSPC and
+EIO. It checks the exact error returned by `PoolManager::checkpoint()`, verifies
+that the failpoint ran, and confirms WAL content is preserved. After removing
+the fault it appends another allocation, retries checkpoint successfully, and
+reloads the resulting state. The wrappers are linked only into test targets.
+Earlier pool files may have been replaced before a later file fails; these
+checks do not assert an atomic rollback of all checkpoint files.
 
 The GitHub `resource-manager` CI job runs CTest and all Python tool tests. Its
 result is included in the existing `unit-test` aggregate alongside the Python
 version matrix, so an RM test failure fails that check. These tests require no
-root access or real DAX devices. They do not simulate power loss, kernel DAX/GPU
-behavior, or checkpoint write/fsync failures; live deployment checks still
-belong to the maintenance procedure below.
+root access or real DAX devices. They do not simulate power loss or kernel
+DAX/GPU behavior; live deployment checks still belong to the maintenance
+procedure below.
 
 The following is an operator example after completing the preconditions. Use
 fresh backup/output paths. It is not an automatic stop/drain/repair script.

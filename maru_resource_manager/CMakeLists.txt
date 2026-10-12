@@ -88,11 +88,13 @@ if(MARU_BUILD_TESTS)
     include(GoogleTest)
     gtest_discover_tests(maru_rm_tests)
 
-    add_executable(maru_rm_recovery_tests tests/test_header_recovery.cpp ${RM_LIB_SOURCES})
+    add_executable(maru_rm_recovery_tests
+        tests/test_header_recovery.cpp tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
     target_include_directories(maru_rm_recovery_tests PRIVATE include src)
     target_compile_options(maru_rm_recovery_tests PRIVATE -Wall -Wextra -Wpedantic)
     target_link_options(maru_rm_recovery_tests PRIVATE
-        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink)
+        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink
+        -Wl,--wrap=write -Wl,--wrap=fsync)
     target_link_libraries(maru_rm_recovery_tests PRIVATE GTest::gtest_main pthread OpenSSL::Crypto)
     gtest_discover_tests(maru_rm_recovery_tests)
 
@@ -100,19 +102,22 @@ if(MARU_BUILD_TESTS)
     # temporary files. This fixture executable is not an install target.
     find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
     add_executable(maru_rm_process_test_daemon
-        src/main.cpp tests/process_test_device.cpp ${RM_LIB_SOURCES})
+        src/main.cpp tests/process_test_device.cpp tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
     target_include_directories(maru_rm_process_test_daemon PRIVATE include src)
     target_compile_options(maru_rm_process_test_daemon PRIVATE -Wall -Wextra -Wpedantic)
     target_link_options(maru_rm_process_test_daemon PRIVATE
         -Wl,--wrap=main -Wl,--wrap=bind
-        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink)
+        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink
+        -Wl,--wrap=write -Wl,--wrap=fsync)
     target_link_libraries(maru_rm_process_test_daemon PRIVATE pthread OpenSSL::Crypto)
     foreach(scenario IN ITEMS
         sigterm_preserves_live_handle
         sigkill_replays_live_and_freed_allocations
         sigkill_replays_checkpoint_and_wal
         missing_secret_rejects_live_recovery
-        prepared_legacy_checkpoint_round_trip)
+        prepared_legacy_checkpoint_round_trip
+        shutdown_checkpoint_write_failure_retains_wal
+        shutdown_checkpoint_fsync_failure_retains_wal)
         add_test(NAME ProcessRecovery.${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py
                 $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)

@@ -2,6 +2,7 @@
 // This target's linker wraps filesystem calls; it never opens real DAX devices.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <ostream>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -16,6 +18,7 @@
 #include <unistd.h>
 
 #include "device_header.h"
+#include "checkpoint_fault.h"
 #include "metadata.h"
 #include "pool_validation.h"
 #include "util.h"
@@ -473,3 +476,112 @@ TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
     EXPECT_EQ(stats[0].freeList[0].offset, H);
     EXPECT_EQ(stats[0].freeList[0].length, B - H);
 }
+
+namespace {
+struct CheckpointFaultCase {
+    std::string file;
+    std::string phase;
+    int error;
+};
+
+void PrintTo(const CheckpointFaultCase &fault, std::ostream *os) {
+    *os << fault.file << '/' << fault.phase << '/'
+        << (fault.error == ENOSPC ? "ENOSPC" : "EIO");
+}
+
+std::vector<CheckpointFaultCase> checkpointFaultCases() {
+    std::vector<CheckpointFaultCase> cases;
+    for (const auto *file : {"pool_0.meta", "pool_1.meta", "global.meta"})
+        for (const auto *phase : {"HeaderWrite", "PartialPayloadWrite", "Fsync"})
+            for (int error : {ENOSPC, EIO}) cases.push_back({file, phase, error});
+    return cases;
+}
+} // namespace
+
+class CheckpointFailureTest : public HeaderRecoveryTest,
+                              public ::testing::WithParamInterface<CheckpointFaultCase> {
+    void TearDown() override {
+        checkpoint_fault::clear();
+        HeaderRecoveryTest::TearDown();
+    }
+};
+
+TEST_P(CheckpointFailureTest, RetainsWalAndAllowsRetry) {
+    addDevice(0);
+    addDevice(1);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle old{};
+    ASSERT_EQ(allocate(pm, old), 0);
+    ASSERT_EQ(pm.checkpoint(), 0);
+    const auto oldPool0 = bytes(state + "/pool_0.meta");
+    const auto oldPool1 = bytes(state + "/pool_1.meta");
+    const auto oldGlobal = bytes(state + "/global.meta");
+
+    // Both pool checkpoints and the global ledger now differ from the baseline.
+    ASSERT_EQ(pm.verifyAndFree(old, "offline-test-owner"), 0);
+    Handle a{}, b{}, c{};
+    ASSERT_EQ(allocate(pm, a), 0);
+    ASSERT_EQ(allocate(pm, b), 0);
+    ASSERT_EQ(allocate(pm, c, 1), 0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    const auto walBefore = bytes(walPath);
+    ASSERT_FALSE(walBefore.empty());
+
+    const auto &fault = GetParam();
+    const auto path = state + "/" + fault.file;
+    const auto publishedBefore = bytes(path);
+    const bool partial = fault.phase == "PartialPayloadWrite";
+    checkpoint_fault::arm(path + ".tmp",
+        fault.phase == "Fsync" ? checkpoint_fault::Operation::Fsync
+                               : checkpoint_fault::Operation::Write,
+        fault.error, partial ? 40 : 0); // 32-byte header + 8 payload bytes.
+    const int rc = pm.checkpoint();
+    checkpoint_fault::clear();
+    ASSERT_EQ(checkpoint_fault::failures(), 1u); // Prove the failpoint was reached.
+    EXPECT_EQ(checkpoint_fault::shortWrites(), partial ? 1u : 0u);
+    EXPECT_EQ(rc, -fault.error);
+    EXPECT_EQ(bytes(path), publishedBefore); // Failed file was not renamed.
+    EXPECT_EQ(bytes(walPath), walBefore); // Not just present: byte-for-byte intact.
+    ASSERT_TRUE(fs::exists(path + ".tmp"));
+    if (fault.phase != "Fsync") {
+        EXPECT_EQ(fs::file_size(path + ".tmp"), partial ? 40u : 0u);
+    }
+    EXPECT_EQ(bytes(state + "/global.meta"), oldGlobal);
+    if (fault.file != "pool_0.meta") {
+        EXPECT_NE(bytes(state + "/pool_0.meta"), oldPool0);
+    }
+    if (fault.file == "global.meta") {
+        EXPECT_NE(bytes(state + "/pool_1.meta"), oldPool1);
+    }
+    EXPECT_EQ(pm.allocationCount(), 3u);
+
+    // A failed checkpoint must also leave the appendable WAL connected to its
+    // pathname. Continue allocating, then retry with the fault removed.
+    Handle later{};
+    ASSERT_EQ(allocate(pm, later, 1), 0);
+    const auto extendedWal = bytes(walPath);
+    EXPECT_GT(extendedWal.size(), walBefore.size());
+    EXPECT_EQ(extendedWal.substr(0, walBefore.size()), walBefore);
+    ASSERT_EQ(pm.checkpoint(), 0);
+    EXPECT_FALSE(fs::exists(walPath));
+    EXPECT_FALSE(fs::exists(path + ".tmp"));
+
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 4u);
+    EXPECT_EQ(restarted.verifyAndFree(old, "offline-test-owner"), -ENOENT);
+    for (const auto &handle : {a, b, c, later}) {
+        EXPECT_EQ(restarted.verifyAndFree(handle, "offline-test-owner"), 0);
+    }
+    EXPECT_EQ(restarted.checkpoint(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(CheckpointIo, CheckpointFailureTest,
+    ::testing::ValuesIn(checkpointFaultCases()),
+    [](const ::testing::TestParamInfo<CheckpointFaultCase> &info) {
+        auto file = info.param.file;
+        std::replace(file.begin(), file.end(), '.', '_');
+        return file + "_" + info.param.phase + "_" +
+               (info.param.error == ENOSPC ? "ENOSPC" : "EIO");
+    });
