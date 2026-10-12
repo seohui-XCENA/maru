@@ -56,58 +56,24 @@ through differently named device nodes. It scans threads as well as process
 leaders, and never opens the DAX devices themselves.
 
 ```bash
-sudo python3 - /dev/dax0.0 /dev/dax1.0 /dev/dax2.0 <<'PY'
-import os
-import stat
-import sys
-from pathlib import Path
-
-targets = {}
-for name in sys.argv[1:]:
-    info = os.stat(name)
-    if not stat.S_ISCHR(info.st_mode):
-        raise SystemExit(f"Not a character device: {name}")
-    targets[info.st_rdev] = name
-
-matches = set()
-errors = set()
-
-def entries(path):
-    try:
-        return list(path.iterdir())
-    except (FileNotFoundError, ProcessLookupError):
-        return []  # Process/thread exited during this snapshot.
-    except OSError as error:
-        errors.add(f"{path}: {error}")
-        return []
-
-for process in entries(Path("/proc")):
-    if not process.name.isdigit():
-        continue
-    for thread in entries(process / "task"):
-        # map_files is exposed at /proc/<tid>, not /proc/<pid>/task/<tid>.
-        task = Path("/proc") / thread.name
-        for kind in ("fd", "map_files"):
-            for link in entries(task / kind):
-                try:
-                    info = link.stat()
-                except (FileNotFoundError, ProcessLookupError):
-                    continue  # FD/mapping closed, or thread exited.
-                except OSError as error:
-                    errors.add(f"{link}: {error}")
-                    continue
-                if stat.S_ISCHR(info.st_mode) and info.st_rdev in targets:
-                    matches.add((int(process.name), kind, link.name,
-                                 targets[info.st_rdev]))
-
-for pid, kind, entry, device in sorted(matches):
-    print(f"PID={pid} {kind}/{entry} -> {device}")
-for error in sorted(errors):
-    print(f"INCOMPLETE: {error}", file=sys.stderr)
-print(f"Found {len(matches)} distinct process references; {len(errors)} scan errors.")
-raise SystemExit(2 if errors else 1 if matches else 0)
-PY
+# From the repository root. The report file is written by your regular user.
+set -o pipefail
+sudo python3 maru_resource_manager/tools/inspect_dax_users.py \
+  /dev/dax0.0 /dev/dax1.0 /dev/dax2.0 2>&1 | tee /tmp/maru-dax-usage.txt
 ```
+
+The report includes the host/time, device numbers, matching PID/TID and process
+names, and mapping offsets/permissions when available. It does not print process
+command-line arguments or environment variables. Exit status/result meanings:
+
+- `0 / NO_REFERENCES_OBSERVED`: no references were observed in this local scan.
+- `1 / IN_USE`: open descriptors or mappings were found.
+- `2 / INCOMPLETE`: a device could not be inspected, root privileges were
+  missing, or some process references could not be read.
+
+You can run this inventory while RM is running; it does not stop services,
+release mappings, modify metadata, or open the DAX devices. For a maintenance
+clearance, drain clients/prevent new work and repeat it.
 
 `map_files/<start>-<end>` identifies a virtual address range; inspect the
 corresponding `/proc/<pid>/maps` entry for its device offset and permissions.
@@ -142,7 +108,7 @@ cmake -S maru_resource_manager -B /tmp/maru-rm-header-fix-build \
 cmake --build /tmp/maru-rm-header-fix-build -j 4
 ctest --test-dir /tmp/maru-rm-header-fix-build --output-on-failure
 python3 -m unittest discover -s maru_resource_manager/tests \
-  -p test_prepare_empty_pool_repair.py
+  -p 'test_*.py'
 ```
 
 The following is an operator example after completing the preconditions. Use
