@@ -3,7 +3,8 @@
 
 Writes only to a new output directory. Never updates the source state, opens a
 DAX device, changes global.meta/secret, or removes WAL. Stop/drain the RM and
-take a backup first; see docs/header-reservation-repair.md.
+take a backup first. Verify device UUID headers and review the output manifest
+before replacing any pool checkpoint files.
 """
 
 import argparse
