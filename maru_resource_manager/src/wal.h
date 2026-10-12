@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <set>
 
 #include "pool_manager.h"
 
@@ -19,6 +20,8 @@ public:
 
   int appendAlloc(const Allocation &alloc);
   int appendFree(uint64_t regionId);
+  // Read/validate the log without opening any device or changing recovery state.
+  int referencedPools(std::set<uint32_t> &pools) const;
 
   int replay(std::vector<PoolState> &pools,
              std::map<uint64_t, Allocation> &allocations,

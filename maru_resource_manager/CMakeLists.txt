@@ -15,6 +15,7 @@ add_executable(maru_resource_manager
     src/server_config.cpp
     src/log.cpp
     src/pool_manager.cpp
+    src/pool_validation.cpp
     src/metadata.cpp
     src/wal.cpp
     src/reaper.cpp
@@ -59,6 +60,7 @@ if(MARU_BUILD_TESTS)
         src/server_config.cpp
         src/log.cpp
         src/pool_manager.cpp
+        src/pool_validation.cpp
         src/metadata.cpp
         src/wal.cpp
         src/reaper.cpp
@@ -85,4 +87,12 @@ if(MARU_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(maru_rm_tests)
+
+    add_executable(maru_rm_recovery_tests tests/test_header_recovery.cpp ${RM_LIB_SOURCES})
+    target_include_directories(maru_rm_recovery_tests PRIVATE include src)
+    target_compile_options(maru_rm_recovery_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(maru_rm_recovery_tests PRIVATE
+        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink)
+    target_link_libraries(maru_rm_recovery_tests PRIVATE GTest::gtest_main pthread OpenSSL::Crypto)
+    gtest_discover_tests(maru_rm_recovery_tests)
 endif()

@@ -1,0 +1,475 @@
+// Exercise production discovery/recovery using a private fake /dev and sysfs.
+// This target's linker wraps filesystem calls; it never opens real DAX devices.
+#include <gtest/gtest.h>
+
+#include <cerrno>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <dirent.h>
+#include <unistd.h>
+
+#include "device_header.h"
+#include "metadata.h"
+#include "pool_validation.h"
+#include "util.h"
+#include "wal.h"
+
+namespace fs = std::filesystem;
+using namespace maru;
+
+namespace {
+std::string fakeRoot;
+std::string redirected(const char *path) {
+    std::string p(path);
+    if (p.rfind("/dev/", 0) == 0 || p.rfind("/sys/", 0) == 0) {
+        if (fakeRoot.empty()) std::abort();
+        return fakeRoot + p;
+    }
+    return p;
+}
+} // namespace
+
+extern "C" int __real_stat(const char *, struct stat *);
+extern "C" int __real_open(const char *, int, ...);
+extern "C" DIR *__real_opendir(const char *);
+extern "C" ssize_t __real_readlink(const char *, char *, size_t);
+
+extern "C" int __wrap_stat(const char *path, struct stat *st) {
+    const int rc = __real_stat(redirected(path).c_str(), st);
+    if (rc == 0 && std::string(path).rfind("/dev/dax", 0) == 0) {
+        st->st_mode = (st->st_mode & ~S_IFMT) | S_IFCHR;
+        st->st_rdev = makedev(240, 0);
+    }
+    return rc;
+}
+extern "C" int __wrap_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, unsigned int);
+        va_end(args);
+    }
+    return __real_open(redirected(path).c_str(), flags, mode);
+}
+extern "C" DIR *__wrap_opendir(const char *path) {
+    return __real_opendir(redirected(path).c_str());
+}
+extern "C" ssize_t __wrap_readlink(const char *path, char *buf, size_t size) {
+    return __real_readlink(redirected(path).c_str(), buf, size);
+}
+
+namespace maru {
+class PoolManagerTestPeer {
+public:
+    static void inject(PoolManager &pm, PoolState pool, const Allocation &a) {
+        pm.pools_.push_back(std::move(pool));
+        if (a.allocLength) pm.allocations_[a.handle.regionId] = a;
+    }
+};
+} // namespace maru
+
+class HeaderRecoveryTest : public ::testing::Test {
+protected:
+    static constexpr uint64_t H = 2ULL << 20;
+    static constexpr uint64_t B = 16ULL << 20;
+    std::string state;
+    void SetUp() override {
+        char path[] = "/tmp/maru-header-recovery-XXXXXX";
+        ASSERT_NE(::mkdtemp(path), nullptr);
+        fakeRoot = path;
+        state = fakeRoot + "/state";
+        fs::create_directories(state);
+        fs::create_directories(fakeRoot + "/dev");
+        fs::create_directories(fakeRoot + "/sys/bus/dax/devices");
+        fs::create_directories(fakeRoot + "/sys/class/block");
+        ASSERT_EQ(initSecret(state, false), 0);
+    }
+    void TearDown() override {
+        fs::remove_all(fakeRoot);
+        fakeRoot.clear();
+    }
+    std::string dev(uint32_t id) { return "/dev/dax" + std::to_string(id) + ".0"; }
+    void addDevice(uint32_t id, bool header = true) {
+        const auto name = "dax" + std::to_string(id) + ".0";
+        const auto sys = fakeRoot + "/sys/bus/dax/devices/" + name;
+        fs::create_directories(sys);
+        fs::create_directories(fakeRoot + "/sys/class/dax/" + name);
+        fs::create_symlink("/sys/bus/dax/drivers/device_dax", sys + "/driver");
+        std::ofstream(sys + "/align") << H;
+        std::ofstream(fakeRoot + "/sys/class/dax/" + name + "/size") << B;
+        int fd = ::open(dev(id).c_str(), O_CREAT | O_RDWR, 0600);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::ftruncate(fd, B), 0);
+        ::close(fd);
+        if (header) {
+            DeviceHeader hdr{};
+            initDeviceHeader(hdr);
+            ASSERT_EQ(writeDeviceHeader(dev(id), hdr, H), 0);
+        }
+    }
+    PoolState pool(uint32_t id = 0) {
+        PoolState p{};
+        p.poolId = id;
+        p.devPath = dev(id);
+        p.type = DaxType::DEV_DAX;
+        p.alignBytes = p.dataBegin = H;
+        p.dataEnd = B;
+        p.totalSize = p.freeSize = B - H;
+        p.freeList = {{H, B - H}};
+        return p;
+    }
+    Allocation allocation(uint32_t id = 0, uint64_t offset = H) {
+        Allocation a{};
+        a.poolId = id;
+        a.handle.regionId = 42;
+        a.handle.offset = a.realOffset = offset;
+        a.handle.length = a.allocLength = a.requestedSize = H;
+        a.nonce = 17;
+        std::strcpy(a.clientId, "offline-test-owner");
+        a.handle.authToken = computeAuthToken(a.handle, a.nonce, a.clientId);
+        return a;
+    }
+    void save(PoolState p, const std::map<uint64_t, Allocation> &a = {}) {
+        MetadataStore m(state);
+        ASSERT_EQ(m.save(p), 0);
+        ASSERT_EQ(m.saveGlobal(a, 43), 0);
+    }
+    std::string bytes(const std::string &path) {
+        std::ifstream in(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    }
+    int allocate(PoolManager &pm, Handle &h, uint32_t id = 0) {
+        std::string path, uuid;
+        uint64_t requested;
+        return pm.alloc(H, "offline-test-owner", h, path, uuid, dev(id), requested);
+    }
+};
+
+TEST_F(HeaderRecoveryTest, FreshPoolInitializesHeaderAfterValidation) {
+    addDevice(0, false);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(0), header, H), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    EXPECT_EQ(h.offset, H);
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    EXPECT_EQ(pm.checkpoint(), 0);
+    EXPECT_FALSE(fs::exists(state + "/maru-resource-manager.wal"));
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    ASSERT_EQ(allocate(restarted, h), 0);
+    EXPECT_EQ(h.offset, H);
+}
+
+TEST_F(HeaderRecoveryTest, LegacyAndRewrittenTotalAreRejectedWithoutDeviceWrites) {
+    addDevice(0, false);
+    for (bool rewritten : {false, true}) {
+        auto p = pool();
+        p.totalSize = rewritten ? B - H : B;
+        p.freeSize = B;
+        p.freeList = {{0, B}};
+        save(p);
+        const auto before = bytes(state + "/pool_0.meta");
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        EXPECT_FALSE(pm.hasPools());
+        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
+        DeviceHeader header{};
+        EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
+    addDevice(0);
+    save(pool());
+    auto original = bytes(state + "/pool_0.meta");
+    for (size_t field : {size_t(12), size_t(24)}) {
+        auto corrupt = original;
+        corrupt[field] ^= 0x7f;
+        std::ofstream(state + "/pool_0.meta", std::ios::binary) << corrupt;
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), corrupt);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, BadGlobalMetadataDoesNotInitializeFreshHeader) {
+    addDevice(0, false);
+    std::ofstream(state + "/global.meta") << "broken";
+    PoolManager pm(state);
+    EXPECT_NE(pm.loadPools(), 0);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+}
+
+TEST_F(HeaderRecoveryTest, MissingGlobalCheckpointIsNotAnEmptyLedger) {
+    addDevice(0);
+    ASSERT_EQ(MetadataStore(state).save(pool()), 0);
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+}
+
+TEST_F(HeaderRecoveryTest, MissingPoolCheckpointWithLiveAllocationIsRejected) {
+    addDevice(0);
+    const auto a = allocation();
+    ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+}
+
+TEST_F(HeaderRecoveryTest, MissingHeaderWithHistoryIsNotReinitialized) {
+    addDevice(0, false);
+    save(pool());
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+}
+
+TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRejected) {
+    addDevice(0);
+    auto a = allocation(0, 0);
+    save(pool(), {{42, a}});
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+}
+
+TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
+    addDevice(0);
+    save(pool());
+    WalStore wal(state);
+    ASSERT_EQ(wal.appendAlloc(allocation(0, 0)), 0);
+    ASSERT_EQ(wal.appendFree(42), 0);
+    const auto before = bytes(state + "/maru-resource-manager.wal");
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), before);
+}
+
+TEST_F(HeaderRecoveryTest, TruncatedWalDoesNotInitializeAnyDevice) {
+    addDevice(0, false);
+    std::ofstream(state + "/maru-resource-manager.wal") << "torn";
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EPROTO);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+}
+
+TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
+    addDevice(0);
+    const auto a = allocation();
+    ASSERT_EQ(WalStore(state).appendAlloc(a), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    Handle next{};
+    ASSERT_EQ(allocate(pm, next), 0);
+    EXPECT_EQ(next.regionId, 43u);
+    EXPECT_EQ(next.offset, 2 * H);
+    EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
+    ASSERT_EQ(pm.checkpoint(), 0);
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 1u);
+    EXPECT_EQ(restarted.verifyAndFree(next, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, CheckpointPlusWalFreeDoesNotResurrectAllocation) {
+    addDevice(0);
+    const auto a = allocation();
+    auto p = pool();
+    p.freeList = {{2 * H, B - 2 * H}};
+    p.freeSize = B - 2 * H;
+    save(p, {{42, a}});
+    ASSERT_EQ(WalStore(state).appendFree(42), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    EXPECT_EQ(h.offset, H);
+    EXPECT_GE(h.regionId, 43u);
+}
+
+TEST_F(HeaderRecoveryTest, MissingDeviceKeepsWalUntilLateDiscovery) {
+    addDevice(0);
+    const auto a = allocation(1);
+    ASSERT_EQ(WalStore(state).appendAlloc(a), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_TRUE(fs::exists(state + "/maru-resource-manager.wal"));
+    addDevice(1);
+    ASSERT_EQ(pm.rescanDevices(), 0);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
+    EXPECT_EQ(pm.checkpoint(), 0);
+}
+
+TEST_F(HeaderRecoveryTest, FailedRescanPreservesLivePoolAndWal) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    addDevice(1, false);
+    auto p = pool(1);
+    p.freeList = {{0, B}};
+    p.freeSize = B;
+    ASSERT_EQ(MetadataStore(state).save(p), 0);
+    const auto walBefore = bytes(state + "/maru-resource-manager.wal");
+    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), walBefore);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, BoundsOverflowOverlapAndLiveFreeIntersectionAreRejected) {
+    addDevice(0);
+    for (auto extents : std::vector<std::vector<Extent>>{
+             {{H, B}}, {{UINT64_MAX - H + 1, H}}, {{H, H}, {H, H}}}) {
+        auto p = pool();
+        p.freeList = extents;
+        ASSERT_EQ(MetadataStore(state).save(p), 0);
+        ASSERT_EQ(MetadataStore(state).saveGlobal({}, 43), 0);
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    }
+    save(pool(), {{42, allocation()}}); // Valid ranges, but free/live overlap.
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+}
+
+TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
+    PoolManager pm(state);
+    auto p = pool();
+    p.freeList = {{0, B}};
+    p.freeSize = B;
+    PoolManagerTestPeer::inject(pm, p, {});
+    Handle h{};
+    EXPECT_EQ(allocate(pm, h), -EUCLEAN);
+
+    PoolManager other(state);
+    const auto invalid = allocation(0, 0);
+    PoolManagerTestPeer::inject(other, pool(), invalid);
+    EXPECT_EQ(other.verifyAndFree(invalid.handle, invalid.clientId), -EUCLEAN);
+    // A local dead PID makes the reaper attempt the same deallocation path.
+    PoolManager reaper(state);
+    auto dead = invalid;
+    char host[256]{};
+    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
+    std::snprintf(dead.clientId, sizeof(dead.clientId), "%.80s:2147483647", host);
+    PoolManagerTestPeer::inject(reaper, pool(), dead);
+    uint64_t reaped = 99;
+    reaper.reapExpired(reaped);
+    EXPECT_EQ(reaped, 0u);
+    EXPECT_EQ(reaper.allocationCount(), 1u);
+}
+
+TEST_F(HeaderRecoveryTest, FsDaxStillAllowsFileOffsetZero) {
+    auto p = pool();
+    p.type = DaxType::FS_DAX;
+    p.dataBegin = 0;
+    p.totalSize = p.freeSize = B;
+    p.freeList = {{0, B}};
+    p.devPath = fakeRoot + "/files";
+    fs::create_directory(p.devPath);
+    PoolManager pm(state);
+    PoolManagerTestPeer::inject(pm, p, {});
+    Handle h{};
+    std::string path, uuid;
+    uint64_t size;
+    ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
+    EXPECT_EQ(h.offset, 0u);
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST_F(HeaderRecoveryTest, FailedWalReplayIsTransactional) {
+    WalStore wal(state);
+    const auto good = allocation();
+    auto bad = allocation(0, 0);
+    bad.handle.regionId = 99;
+    ASSERT_EQ(wal.appendAlloc(good), 0);
+    ASSERT_EQ(wal.appendAlloc(bad), 0);
+    std::vector<PoolState> pools{pool()};
+    std::map<uint64_t, Allocation> allocations;
+    uint64_t next = 1;
+    EXPECT_EQ(wal.replay(pools, allocations, next), -EUCLEAN);
+    EXPECT_EQ(next, 1u);
+    EXPECT_TRUE(allocations.empty());
+    ASSERT_EQ(pools[0].freeList.size(), 1u);
+    EXPECT_EQ(pools[0].freeList[0].offset, H);
+    EXPECT_EQ(pools[0].freeList[0].length, B - H);
+}
+
+TEST_F(HeaderRecoveryTest, InvalidSecondPoolCannotInitializeFirstPoolHeader) {
+    addDevice(0, false);
+    addDevice(1, false);
+    auto bad = pool(1);
+    bad.freeList = {{0, B}};
+    bad.freeSize = B;
+    save(bad);
+    PoolManager pm(state);
+    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    DeviceHeader h{};
+    EXPECT_EQ(readDeviceHeader(dev(0), h, H), -ENODATA);
+    EXPECT_EQ(readDeviceHeader(dev(1), h, H), -ENODATA);
+}
+
+TEST_F(HeaderRecoveryTest, LateHeaderAllocationFailsWithoutLosingExistingAllocations) {
+    addDevice(0);
+    const auto bad = allocation(1, 0);
+    ASSERT_EQ(WalStore(state).appendAlloc(bad), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    EXPECT_EQ(h.regionId, 43u);
+    addDevice(1);
+    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
+    auto a = allocation();
+    char host[256]{};
+    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
+    std::snprintf(a.clientId, sizeof(a.clientId), "%.80s:2147483647", host);
+    auto p = pool();
+    p.freeList = {{2 * H, B - 2 * H}};
+    p.freeSize = B - 2 * H;
+    PoolManager pm(state);
+    PoolManagerTestPeer::inject(pm, p, a);
+    uint64_t reaped = 0;
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 1u);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    std::vector<PoolState> stats;
+    pm.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].freeSize, B - H);
+    ASSERT_EQ(stats[0].freeList.size(), 1u);
+    EXPECT_EQ(stats[0].freeList[0].offset, H);
+    EXPECT_EQ(stats[0].freeList[0].length, B - H);
+}

@@ -45,6 +45,11 @@ struct PoolState
     uint64_t alignBytes;
     DaxType type;
     std::vector<Extent> freeList;
+    // Runtime bounds from the device, never trusted from checkpoint metadata.
+    uint64_t dataBegin{0};
+    uint64_t dataEnd{0};
+    bool hasCheckpoint{false};
+    bool needsHeaderInit{false};
 };
 
 class MetadataStore;
@@ -92,7 +97,7 @@ public:
     std::string getDeviceUuidForRegion(uint64_t regionId);
 
     void reapExpired(uint64_t &reapedCount);
-    void checkpoint();
+    int checkpoint();
 
     /// Notify that a client has disconnected. Starts the grace period timer.
     void clientDisconnected(const std::string &clientId);
@@ -109,19 +114,19 @@ private:
     };
 
     int scanDevices(std::vector<DeviceInfo> &outDevices);
-    // Pure builder: constructs a PoolState from device without touching pools_.
-    // Caller decides when to commit. Disk side effects (UUID header init) may
-    // still happen and are idempotent.
+    // Read-only builder. Header initialization is deferred until recovery passes.
     int buildPoolFromDevice(uint32_t poolId, const std::string &path,
                             DaxType type, PoolState &out);
     int poolBuildFailed(const std::string &path, const char *stage, int error);
     // Suppress only identical failures; every scan still retries the device.
     std::map<std::string, std::pair<std::string, int>> failedDevices_;
-    int loadPoolFromDevice(uint32_t poolId, const std::string &path,
-                           DaxType type);
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);
     int loadPoolsLocked();
     int rescanDevicesLocked();
+    int recoverPools(std::vector<PoolState> &pools,
+                     std::map<uint64_t, Allocation> &allocations,
+                     uint64_t &nextRegionId);
+    int checkpointLocked();
     void recomputeFreeSize(PoolState &pool);
 
     void coalesceFreeList(PoolState &pool);
@@ -142,6 +147,10 @@ private:
     std::vector<PoolState> pools_;
     uint64_t opCount_{0};
     uint64_t checkpointInterval_{100};
+    // Keep WAL records for unavailable/rejected pools; never checkpoint a
+    // partial recovery or discard the evidence needed for a later retry.
+    bool checkpointBlocked_{true};
+    bool hasGlobalCheckpoint_{false};
 
     std::unique_ptr<MetadataStore> metadata_;
     std::unique_ptr<WalStore> wal_;

@@ -22,6 +22,7 @@
 
 #include "device_header.h"
 #include "metadata.h"
+#include "pool_validation.h"
 #include "util.h"
 #include "wal.h"
 
@@ -561,44 +562,15 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
         }
     }
 
-    // DEV_DAX: read or auto-initialize device UUID header via mmap
-    uint64_t dataOffset = 0;
-    std::string deviceUuid;
-    if (type == DaxType::DEV_DAX)
-    {
-        DeviceHeader hdr{};
-        int hrc = readDeviceHeader(path, hdr, devAlign);
-        if (hrc == -ENODATA)
-        {
-            // No valid header — auto-initialize
-            initDeviceHeader(hdr);
-            hrc = writeDeviceHeader(path, hdr, devAlign);
-            if (hrc != 0)
-            {
-                return poolBuildFailed(path, "write device header", hrc);
-            }
-            logf(LogLevel::Info,
-                 "Auto-initialized device header on %s: UUID=%s",
-                 path.c_str(), uuidToString(hdr.uuid).c_str());
-        }
-        else if (hrc != 0)
-        {
-            return poolBuildFailed(path, "read device header", hrc);
-        }
-        else
-        {
-            logf(LogLevel::Info,
-                 "Device %s: UUID=%s",
-                 path.c_str(), uuidToString(hdr.uuid).c_str());
-        }
-        deviceUuid = uuidToString(hdr.uuid);
-        dataOffset = devAlign;
-    }
+    const uint64_t dataOffset = type == DaxType::DEV_DAX ? devAlign : 0;
+    if (devAlign == 0 || size <= dataOffset)
+        return poolBuildFailed(path, "device layout", -EUCLEAN);
 
     PoolState pool{};
     pool.poolId = poolId;
     pool.devPath = path;
-    pool.deviceUuid = deviceUuid;
+    pool.dataBegin = dataOffset;
+    pool.dataEnd = size;
     pool.totalSize = size - dataOffset;
     pool.freeSize = size - dataOffset;
     pool.type = type;
@@ -620,10 +592,35 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     rc = metadata_->load(poolId, loaded);
     if (rc == 0)
     {
-        loaded.devPath = path;
-        loaded.totalSize = size - dataOffset;
-        loaded.alignBytes = pool.alignBytes;
+        loaded.hasCheckpoint = true;
         pool = loaded;
+    }
+    else if (rc != -ENOENT)
+    {
+        poolBuildFailed(path, "checkpoint read", rc);
+        return -EUCLEAN;
+    }
+    if (validateFreeList(pool) != 0)
+        return poolBuildFailed(path, "checkpoint data range (offline repair required)", -EUCLEAN);
+
+    if (type == DaxType::DEV_DAX)
+    {
+        DeviceHeader hdr{};
+        const int hrc = readDeviceHeader(path, hdr, devAlign);
+        if (hrc == -ENODATA)
+        {
+            pool.needsHeaderInit = true;
+        }
+        else if (hrc != 0)
+        {
+            return poolBuildFailed(path, "read device header", hrc);
+        }
+        else
+        {
+            if (hdr.version != kDeviceHeaderVersion)
+                return poolBuildFailed(path, "device header version", -EUCLEAN);
+            pool.deviceUuid = uuidToString(hdr.uuid);
+        }
     }
 
     out = std::move(pool);
@@ -631,19 +628,6 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     {
         logf(LogLevel::Info, "device recovered: %s", path.c_str());
     }
-    return 0;
-}
-
-int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
-                                    DaxType type)
-{
-    PoolState pool;
-    int rc = buildPoolFromDevice(poolId, path, type, pool);
-    if (rc != 0)
-    {
-        return rc;
-    }
-    pools_.push_back(std::move(pool));
     return 0;
 }
 
@@ -665,64 +649,110 @@ bool PoolManager::hasPools() const
     return !pools_.empty();
 }
 
-int PoolManager::loadPoolsLocked()
+int PoolManager::recoverPools(std::vector<PoolState> &pools,
+                              std::map<uint64_t, Allocation> &allocations,
+                              uint64_t &nextRegionId)
 {
-    std::vector<DeviceInfo> devices;
-    int rc = scanDevices(devices);
-    if (rc != 0)
+    std::set<uint32_t> referenced;
+    int rc = wal_->referencedPools(referenced);
+    if (rc != 0 && rc != -ENOENT) return rc;
+
+    // Validate saved allocations before replay, even if a later FREE could
+    // hide them. Never initialize a header over any existing pool history.
+    for (const auto &pool : pools)
     {
-        logf(LogLevel::Error, "loadPools: device scan failed: %d", rc);
-        return rc;
+        bool hasAllocations = false;
+        for (const auto &[id, a] : allocations)
+        {
+            if (a.poolId != pool.poolId) continue;
+            hasAllocations = true;
+            if (id != a.handle.regionId || !validAllocation(pool, a))
+                return poolBuildFailed(pool.devPath, "checkpoint allocation range", -EUCLEAN);
+        }
+        if (!pool.hasCheckpoint && hasAllocations)
+            return poolBuildFailed(pool.devPath, "missing pool checkpoint", -EUCLEAN);
+        if (pool.needsHeaderInit &&
+            (pool.hasCheckpoint || hasAllocations || referenced.count(pool.poolId)))
+            return poolBuildFailed(pool.devPath, "missing header with saved pool history", -EUCLEAN);
     }
 
-    // Stage everything in scratch state. Commit only after WAL replay succeeds
-    // so a partial replay cannot leave pools_/allocations_ in an inconsistent
-    // state visible to clients.
+    rc = wal_->replay(pools, allocations, nextRegionId);
+    if (rc != 0 && rc != -ENOENT) return rc;
+    for (auto &pool : pools)
+    {
+        coalesceFreeList(pool);
+        recomputeFreeSize(pool);
+        if (validatePoolState(pool, allocations) != 0)
+            return poolBuildFailed(pool.devPath, "recovered allocation/free-list consistency", -EUCLEAN);
+    }
+
+    // No device writes until every staged pool and the entire WAL pass.
+    for (auto &pool : pools)
+    {
+        if (!pool.needsHeaderInit) continue;
+        DeviceHeader hdr{};
+        initDeviceHeader(hdr);
+        rc = writeDeviceHeader(pool.devPath, hdr, pool.alignBytes);
+        if (rc != 0) return poolBuildFailed(pool.devPath, "write device header", rc);
+        pool.deviceUuid = uuidToString(hdr.uuid);
+        pool.needsHeaderInit = false;
+        logf(LogLevel::Info, "Auto-initialized device header on %s: UUID=%s",
+             pool.devPath.c_str(), pool.deviceUuid.c_str());
+    }
+
+    // Missing devices must retain their WAL, including records not imported
+    // into allocations yet. Keep current pools in the coverage check on rescan.
+    std::set<uint32_t> available;
+    for (const auto &p : pools_) available.insert(p.poolId);
+    for (const auto &p : pools) available.insert(p.poolId);
+    checkpointBlocked_ = false;
+    for (uint32_t id : referenced)
+        if (!available.count(id)) checkpointBlocked_ = true;
+    for (const auto &[id, a] : allocations)
+        if (!available.count(a.poolId)) checkpointBlocked_ = true;
+    return 0;
+}
+
+int PoolManager::loadPoolsLocked()
+{
+    checkpointBlocked_ = true;
+    std::map<uint64_t, Allocation> stagedAllocations;
+    uint64_t stagedNextRegionId = 1;
+    const int globalRc = metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
+    hasGlobalCheckpoint_ = globalRc == 0;
+    if (globalRc != 0 && globalRc != -ENOENT)
+    {
+        logf(LogLevel::Error, "cannot restore global metadata: %d", globalRc);
+        return globalRc;
+    }
+
+    std::vector<DeviceInfo> devices;
+    int rc = scanDevices(devices);
+    if (rc != 0) return rc;
     std::vector<PoolState> stagedPools;
     for (const auto &dev : devices)
     {
         PoolState pool;
         rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
-        if (rc != 0)
-        {
-            continue;
-        }
+        if (rc == -EUCLEAN) return rc;
+        if (rc != 0) continue; // Transient device errors remain retryable.
+        if (pool.hasCheckpoint && globalRc == -ENOENT)
+            return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
         stagedPools.push_back(std::move(pool));
     }
+    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId);
+    if (rc != 0) return rc;
 
-    std::map<uint64_t, Allocation> stagedAllocations;
-    uint64_t stagedNextRegionId = 1;
-    metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
-
-    int walRc = wal_->replay(stagedPools, stagedAllocations, stagedNextRegionId);
-    if (walRc != 0 && walRc != -ENOENT)
-    {
-        logf(LogLevel::Error, "loadPools: WAL replay failed: %d", walRc);
-        return walRc;
-    }
-
-    // Recompute auth tokens for all restored allocations.
-    // Tokens now include client_id in the HMAC input; legacy tokens
-    // (computed without client_id) would fail verification after this change.
+    // Initialize the persisted secret before recomputing restored tokens.
+    rc = initSecret(stateDir_, !stagedAllocations.empty());
+    if (rc != 0) { checkpointBlocked_ = true; return rc; }
+    clientAllocCounts_.clear();
     for (auto &[regionId, alloc] : stagedAllocations)
     {
         alloc.handle.authToken = computeAuthToken(
             alloc.handle, alloc.nonce, std::string(alloc.clientId));
+        ++clientAllocCounts_[alloc.clientId];
     }
-
-    for (auto &pool : stagedPools)
-    {
-        // WAL replay returns freed extents via addExtent() (plain push_back,
-        // no merge), so the reconstructed free list is left uncoalesced:
-        // adjacent free regions remain as separate extents. That caps the
-        // largest single allocation at the biggest individual extent, far
-        // below the actual free capacity, even when nothing is allocated.
-        // Coalesce once after replay to restore contiguity (the live free
-        // path already merges inline via insertExtentSorted()).
-        coalesceFreeList(pool);
-        recomputeFreeSize(pool);
-    }
-
     pools_ = std::move(stagedPools);
     allocations_ = std::move(stagedAllocations);
     nextRegionId_ = stagedNextRegionId;
@@ -731,68 +761,40 @@ int PoolManager::loadPoolsLocked()
 
 int PoolManager::rescanDevicesLocked()
 {
+    checkpointBlocked_ = true;
     std::vector<DeviceInfo> devices;
     int rc = scanDevices(devices);
-    if (rc != 0)
-    {
-        return rc;
-    }
+    if (rc != 0) return rc;
 
-    // Build new pools in scratch space without touching pools_.
     std::vector<PoolState> stagedPools;
     for (const auto &dev : devices)
     {
         bool exists = false;
         for (const auto &pool : pools_)
-        {
-            if (pool.poolId == dev.poolId || pool.devPath == dev.devPath)
-            {
-                exists = true;
-                break;
-            }
-        }
-        if (exists)
-        {
-            continue;
-        }
+            if (pool.poolId == dev.poolId || pool.devPath == dev.devPath) exists = true;
+        if (exists) continue;
         PoolState pool;
         rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
-        if (rc != 0)
-        {
-            continue;
-        }
+        if (rc == -EUCLEAN) return rc;
+        if (rc != 0) continue;
+        if (pool.hasCheckpoint && !hasGlobalCheckpoint_)
+            return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
         stagedPools.push_back(std::move(pool));
     }
 
-    if (stagedPools.empty())
+    auto stagedAllocations = allocations_;
+    uint64_t stagedNextRegionId = nextRegionId_;
+    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId);
+    if (rc != 0) return rc;
+    for (auto &pool : stagedPools) pools_.push_back(std::move(pool));
+    allocations_ = std::move(stagedAllocations);
+    nextRegionId_ = stagedNextRegionId;
+    clientAllocCounts_.clear();
+    for (auto &[id, a] : allocations_)
     {
-        return 0;
+        a.handle.authToken = computeAuthToken(a.handle, a.nonce, std::string(a.clientId));
+        ++clientAllocCounts_[a.clientId];
     }
-
-    // Snapshot global mutable state. WAL replay mutates allocations_ and
-    // nextRegionId_ by reference and may fail mid-stream, so we need rollback.
-    auto allocSnapshot = allocations_;
-    uint64_t nextRegionIdSnapshot = nextRegionId_;
-
-    int walRc = wal_->replay(stagedPools, allocations_, nextRegionId_);
-    if (walRc != 0 && walRc != -ENOENT)
-    {
-        allocations_ = std::move(allocSnapshot);
-        nextRegionId_ = nextRegionIdSnapshot;
-        logf(LogLevel::Error,
-             "rescan: WAL replay failed: %d, rolled back", walRc);
-        return walRc;
-    }
-
-    // Commit only after replay succeeds.
-    for (auto &pool : stagedPools)
-    {
-        // Coalesce the WAL-reconstructed free list (addExtent does not merge).
-        coalesceFreeList(pool);
-        recomputeFreeSize(pool);
-        pools_.push_back(std::move(pool));
-    }
-
     return 0;
 }
 
@@ -898,11 +900,15 @@ PoolState *PoolManager::findPoolById(uint32_t poolId)
 bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
                                    Allocation &outAlloc)
 {
+    if (nextRegionId_ == UINT64_MAX || !validPoolLayout(pool)) return false;
     uint64_t alignedSize = alignUp(size, pool.alignBytes);
+    if (alignedSize == UINT64_MAX || alignedSize > pool.freeSize) return false;
     for (size_t i = 0; i < pool.freeList.size(); ++i)
     {
         Extent ex = pool.freeList[i];
+        if (!validExtent(pool, ex.offset, ex.length)) return false;
         uint64_t aligned = alignUp(ex.offset, pool.alignBytes);
+        if (!validExtent(pool, aligned, alignedSize)) continue;
         uint64_t end = aligned + alignedSize;
         if (end > ex.offset + ex.length)
         {
@@ -1027,6 +1033,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         {
             return -ENOENT;
         }
+        if (validateFreeList(*selectedPool) != 0) return -EUCLEAN;
         if (!allocateFromPool(*selectedPool, size, alloc))
         {
             return -ENOMEM;
@@ -1038,6 +1045,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     {
         for (auto &pool : pools_)
         {
+            if (validateFreeList(pool) != 0) return -EUCLEAN;
             if (allocateFromPool(pool, size, alloc))
             {
                 setClientId(alloc.clientId, kMaxClientIdLen, clientId);
@@ -1089,7 +1097,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     wal_->appendAlloc(alloc);
     if (++opCount_ % checkpointInterval_ == 0)
     {
-        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+        checkpointLocked();
     }
     return 0;
 }
@@ -1240,10 +1248,19 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     }
 }
 
-void PoolManager::checkpoint()
+int PoolManager::checkpointLocked()
+{
+    if (checkpointBlocked_) return -EAGAIN;
+    const int rc = wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+    if (rc == 0) hasGlobalCheckpoint_ = true;
+    else logf(LogLevel::Error, "checkpoint failed; keeping WAL: %d", rc);
+    return rc;
+}
+
+int PoolManager::checkpoint()
 {
     std::lock_guard<std::mutex> lock(mu_);
-    wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+    return checkpointLocked();
 }
 
 void PoolManager::clientDisconnected(const std::string &clientId)
@@ -1321,6 +1338,13 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
         return -ENOENT;
     }
 
+    if (!validAllocation(*targetPool, alloc) || validateFreeList(*targetPool) != 0 ||
+        alloc.allocLength > targetPool->totalSize - targetPool->freeSize)
+        return -EUCLEAN;
+    for (const auto &e : targetPool->freeList)
+        if (alloc.realOffset < e.offset + e.length &&
+            e.offset < alloc.realOffset + alloc.allocLength) return -EUCLEAN;
+
     if (targetPool->type == DaxType::FS_DAX)
     {
         deleteFsDaxFile(targetPool->devPath, regionId);
@@ -1352,7 +1376,7 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
     wal_->appendFree(regionId);
     if (++opCount_ % checkpointInterval_ == 0)
     {
-        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+        checkpointLocked();
     }
     return 0;
 }

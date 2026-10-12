@@ -6,10 +6,12 @@
 
 #include <cerrno>
 #include <cstring>
+#include <functional>
 
 #include "log.h"
 #include "metadata.h"
 #include "util.h"
+#include "pool_validation.h"
 
 namespace maru {
 
@@ -95,9 +97,8 @@ int WalStore::appendRecord(WalRecordType type, const void *payload,
   hdr.payloadLen = len;
   hdr.ts = nowSec();
 
-  // Assemble header + payload into a single buffer so that the write is
-  // atomic for small records (< PIPE_BUF).  This prevents a partial WAL
-  // entry if the process crashes between two separate write() calls.
+  // One buffer avoids a separate header write. Regular-file writes are not
+  // guaranteed crash-atomic; the reader rejects incomplete records.
   std::vector<uint8_t> buf(sizeof(hdr) + len);
   std::memcpy(buf.data(), &hdr, sizeof(hdr));
   if (len > 0) {
@@ -108,8 +109,7 @@ int WalStore::appendRecord(WalRecordType type, const void *payload,
   if (rc != 0) {
     return rc;
   }
-  ::fdatasync(walFd_);
-  return 0;
+  return ::fdatasync(walFd_) == 0 ? 0 : -errno;
 }
 
 int WalStore::appendAlloc(const Allocation &alloc) {
@@ -154,83 +154,114 @@ static void addExtent(PoolState &pool, uint64_t off, uint64_t len) {
   pool.freeList.push_back(Extent{off, len});
 }
 
+static int visitRecords(const std::string &path,
+                        const std::function<int(uint32_t, const std::vector<uint8_t> &)> &visit) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return -errno;
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) {
+    int rc = -errno;
+    ::close(fd);
+    return rc;
+  }
+  uint64_t remaining = st.st_size;
+  int rc = 0;
+  while (remaining != 0) {
+    if (remaining < sizeof(WalHeader)) { rc = -EPROTO; break; }
+    WalHeader hdr{};
+    if ((rc = readFull(fd, &hdr, sizeof(hdr))) != 0) break;
+    remaining -= sizeof(hdr);
+    const bool alloc = hdr.type == static_cast<uint32_t>(WalRecordType::ALLOC);
+    const bool free = hdr.type == static_cast<uint32_t>(WalRecordType::FREE);
+    if (hdr.magic != kWalMagic || hdr.version != kWalVersion ||
+        (!alloc && !free) ||
+        hdr.payloadLen != (alloc ? sizeof(Allocation) : sizeof(WalFreeV3)) ||
+        hdr.payloadLen > remaining) { rc = -EPROTO; break; }
+    std::vector<uint8_t> payload(hdr.payloadLen);
+    if ((rc = readFull(fd, payload.data(), payload.size())) != 0) break;
+    remaining -= payload.size();
+    if (alloc) {
+      Allocation a{};
+      std::memcpy(&a, payload.data(), sizeof(a));
+      if (!validAllocationRecord(a)) { rc = -EUCLEAN; break; }
+    }
+    if ((rc = visit(hdr.type, payload)) != 0) break;
+  }
+  ::close(fd);
+  return rc;
+}
+
+int WalStore::referencedPools(std::set<uint32_t> &pools) const {
+  std::set<uint32_t> staged;
+  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
+    if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
+      Allocation a{};
+      std::memcpy(&a, payload.data(), sizeof(a));
+      staged.insert(a.poolId);
+    }
+    return 0;
+  });
+  if (rc == 0 || rc == -ENOENT) pools = std::move(staged);
+  return rc;
+}
+
 int WalStore::replay(std::vector<PoolState> &pools,
                      std::map<uint64_t, Allocation> &allocations,
                      uint64_t &nextRegionId) {
-  std::string path = walPath();
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    return -errno;
+  for (const auto &p : pools) {
+    if (validateFreeList(p) != 0) return -EUCLEAN;
+    for (const auto &[id, a] : allocations) {
+      if (a.poolId == p.poolId && (id != a.handle.regionId || !validAllocation(p, a)))
+        return -EUCLEAN;
+    }
   }
-
-  while (true) {
-    WalHeader hdr{};
-    int rc = readFull(fd, &hdr, sizeof(hdr));
-    if (rc != 0) {
-      if (rc == -EPIPE) {
-        break;
-      }
-      ::close(fd);
-      return rc;
-    }
-    if (hdr.magic != kWalMagic || hdr.version != kWalVersion) {
-      ::close(fd);
-      return -EPROTO;
-    }
-    std::vector<uint8_t> payload(hdr.payloadLen);
-    if (hdr.payloadLen > 0) {
-      rc = readFull(fd, payload.data(), hdr.payloadLen);
-      if (rc != 0) {
-        ::close(fd);
-        return rc;
-      }
-    }
-
-    if (hdr.type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
-      if (payload.size() != sizeof(Allocation)) {
-        continue;
-      }
+  auto stagedPools = pools;
+  auto stagedAllocations = allocations;
+  uint64_t stagedNext = nextRegionId;
+  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
+    if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
       Allocation al{};
       std::memcpy(&al, payload.data(), sizeof(al));
       // Reserve IDs even for devices that have not appeared yet. Otherwise a
       // live pool can reuse one before a later rescan replays this record.
-      if (al.handle.regionId >= nextRegionId) {
-        nextRegionId = al.handle.regionId + 1;
+      if (al.handle.regionId >= stagedNext) {
+        stagedNext = al.handle.regionId + 1;
       }
-      PoolState *pool = findPool(pools, al.poolId);
+      PoolState *pool = findPool(stagedPools, al.poolId);
       if (!pool) {
-        continue;
+        return 0;
       }
-      auto existing = allocations.find(al.handle.regionId);
-      if (existing != allocations.end() && existing->second.poolId != al.poolId) {
+      if (!validAllocation(*pool, al)) return -EUCLEAN;
+      auto existing = stagedAllocations.find(al.handle.regionId);
+      if (existing != stagedAllocations.end() && existing->second.poolId != al.poolId) {
         // Older writers may already have reused an ID across pools. Reject
         // the replay so the caller rolls back instead of losing a live handle.
-        ::close(fd);
         return -EEXIST;
       }
       removeExtent(*pool, al.realOffset, al.allocLength);
-      allocations[al.handle.regionId] = al;
-    } else if (hdr.type == static_cast<uint32_t>(WalRecordType::FREE)) {
-      if (payload.size() != sizeof(WalFreeV3)) {
-        continue;
-      }
+      stagedAllocations[al.handle.regionId] = al;
+    } else {
       WalFreeV3 fr{};
       std::memcpy(&fr, payload.data(), sizeof(fr));
-      auto globalIt = allocations.find(fr.regionId);
-      if (globalIt == allocations.end()) {
-        continue;
+      auto globalIt = stagedAllocations.find(fr.regionId);
+      if (globalIt == stagedAllocations.end()) {
+        return 0;
       }
       const Allocation &al = globalIt->second;
-      PoolState *pool = findPool(pools, al.poolId);
+      PoolState *pool = findPool(stagedPools, al.poolId);
       if (!pool) {
-        continue;
+        return 0;
       }
+      if (!validAllocation(*pool, al)) return -EUCLEAN;
       addExtent(*pool, al.realOffset, al.allocLength);
-      allocations.erase(globalIt);
+      stagedAllocations.erase(globalIt);
     }
-  }
-
-  ::close(fd);
+    return 0;
+  });
+  if (rc != 0) return rc;
+  pools = std::move(stagedPools);
+  allocations = std::move(stagedAllocations);
+  nextRegionId = stagedNext;
   return 0;
 }
 
@@ -238,6 +269,15 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
                          MetadataStore &metadata,
                          const std::map<uint64_t, Allocation> &allocations,
                          uint64_t nextRegionId) {
+  for (const auto &pool : pools) {
+    if (validatePoolState(pool, allocations) != 0) return -EUCLEAN;
+  }
+  for (const auto &[id, a] : allocations) {
+    bool found = false;
+    for (const auto &p : pools) if (p.poolId == a.poolId) found = true;
+    if (!found) return -EAGAIN;
+    if (id >= nextRegionId) return -EUCLEAN;
+  }
   for (const auto &pool : pools) {
     int rc = metadata.save(pool);
     if (rc != 0) {
@@ -254,7 +294,7 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
     ::close(walFd_);
     walFd_ = -1;
   }
-  ::unlink(walPath().c_str());
+  if (::unlink(walPath().c_str()) != 0 && errno != ENOENT) return -errno;
   return 0;
 }
 
