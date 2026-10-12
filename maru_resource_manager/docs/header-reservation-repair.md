@@ -111,6 +111,34 @@ python3 -m unittest discover -s maru_resource_manager/tests \
   -p 'test_*.py'
 ```
 
+CTest includes five process tests in addition to the C++ regression suite. They
+launch a fresh test-only RM executable with production `main`, TCP handling,
+signals, secret loading, and checkpoint/WAL recovery. Linker wrappers redirect
+device discovery/access to temporary regular files and bind an ephemeral
+loopback port. The executable is never installed and refuses to run without a
+private fixture. Python clients use only the test daemon's published port.
+
+The process tests cover:
+
+- SIGTERM shutdown and restart with live handles, persisted authentication,
+  nonoverlapping subsequent allocations, and a further empty restart.
+- SIGKILL after acknowledged ALLOC/FREE operations, both with WAL-only state
+  and with an existing checkpoint plus newer WAL. Freed handles remain absent,
+  live handles remain usable, and region IDs continue to increase.
+- Missing secret with a live allocation: startup fails before binding, without
+  replacing the secret or discarding WAL.
+- Legacy empty checkpoints for three pools: reject before repair, run the real
+  Python `prepare()` function against a temporary backup/sysfs, load the emitted
+  pool files in the C++ daemon, allocate/free across restarts, and verify saved
+  IDs, capacity, UUID headers, and secret preservation.
+
+The GitHub `resource-manager` CI job runs CTest and all Python tool tests. Its
+result is included in the existing `unit-test` aggregate alongside the Python
+version matrix, so an RM test failure fails that check. These tests require no
+root access or real DAX devices. They do not simulate power loss, kernel DAX/GPU
+behavior, or checkpoint write/fsync failures; live deployment checks still
+belong to the maintenance procedure below.
+
 The following is an operator example after completing the preconditions. Use
 fresh backup/output paths. It is not an automatic stop/drain/repair script.
 

@@ -95,4 +95,27 @@ if(MARU_BUILD_TESTS)
         -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink)
     target_link_libraries(maru_rm_recovery_tests PRIVATE GTest::gtest_main pthread OpenSSL::Crypto)
     gtest_discover_tests(maru_rm_recovery_tests)
+
+    # Real main, signals, TCP and persistence, with device paths redirected to
+    # temporary files. This fixture executable is not an install target.
+    find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+    add_executable(maru_rm_process_test_daemon
+        src/main.cpp tests/process_test_device.cpp ${RM_LIB_SOURCES})
+    target_include_directories(maru_rm_process_test_daemon PRIVATE include src)
+    target_compile_options(maru_rm_process_test_daemon PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(maru_rm_process_test_daemon PRIVATE
+        -Wl,--wrap=main -Wl,--wrap=bind
+        -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink)
+    target_link_libraries(maru_rm_process_test_daemon PRIVATE pthread OpenSSL::Crypto)
+    foreach(scenario IN ITEMS
+        sigterm_preserves_live_handle
+        sigkill_replays_live_and_freed_allocations
+        sigkill_replays_checkpoint_and_wal
+        missing_secret_rejects_live_recovery
+        prepared_legacy_checkpoint_round_trip)
+        add_test(NAME ProcessRecovery.${scenario}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py
+                $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)
+        set_tests_properties(ProcessRecovery.${scenario} PROPERTIES TIMEOUT 60)
+    endforeach()
 endif()
