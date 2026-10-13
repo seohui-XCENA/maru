@@ -129,6 +129,7 @@ private:
                      uint64_t &nextRegionId, std::string &unavailablePools);
     int checkpointLocked();
     void setCheckpointBlock(std::string reason);
+    void removeOrphanFsDaxFiles(const PoolState &pool);
     void recomputeFreeSize(PoolState &pool);
 
     void coalesceFreeList(PoolState &pool);

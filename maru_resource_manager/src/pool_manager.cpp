@@ -719,6 +719,60 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
     return 0;
 }
 
+// Remove backing files of freed regions: a crash between logging a FREE and
+// the unlink leaves one behind. Only this RM creates maru_<id>.dat in the
+// mount. An FS_DAX pool ID comes from sysfs numbering, not from the mount, so
+// a file is kept if any pool owns its region ID.
+void PoolManager::removeOrphanFsDaxFiles(const PoolState &pool)
+{
+    if (pool.type != DaxType::FS_DAX) return;
+    // A missing pool may own files here, including WAL-only allocations that
+    // replay did not import.
+    if (!unavailablePools_.empty())
+    {
+        logf(LogLevel::Info, "keeping unowned files in %s: %s",
+             pool.devPath.c_str(), unavailablePools_.c_str());
+        return;
+    }
+    DIR *dir = ::opendir(pool.devPath.c_str());
+    if (!dir)
+    {
+        logf(LogLevel::Warn, "cannot scan %s for orphan files: %s",
+             pool.devPath.c_str(), std::strerror(errno));
+        return;
+    }
+    std::vector<std::string> orphans;
+    while (const struct dirent *ent = ::readdir(dir))
+    {
+        const char *name = ent->d_name;
+        if (std::strncmp(name, "maru_", 5) != 0 ||
+            !std::isdigit(static_cast<unsigned char>(name[5])))
+            continue;
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long id = std::strtoull(name + 5, &end, 10);
+        const std::string path = makeFsDaxFilePath(pool.devPath, id);
+        // Only the exact name allocation would create, e.g. not maru_007.dat.
+        if (errno != 0 || std::strcmp(end, ".dat") != 0 || path != pool.devPath + "/" + name)
+            continue;
+        // Leave IDs this state never issued: a fresh or wrong state directory
+        // must not delete another instance's files. A crash before an ALLOC
+        // was logged therefore leaves its file, and the first allocation
+        // that draws that ID fails once and moves past it.
+        if (id >= nextRegionId_ || allocations_.count(id)) continue;
+        orphans.push_back(path);
+    }
+    ::closedir(dir);
+    for (const auto &path : orphans)
+    {
+        if (::unlink(path.c_str()) == 0)
+            logf(LogLevel::Info, "removed orphan FS_DAX file %s", path.c_str());
+        else
+            logf(LogLevel::Warn, "cannot remove orphan FS_DAX file %s: %s",
+                 path.c_str(), std::strerror(errno));
+    }
+}
+
 void PoolManager::setCheckpointBlock(std::string reason)
 {
     if (reason == checkpointBlock_) return;
@@ -781,6 +835,7 @@ int PoolManager::loadPoolsLocked()
     allocations_ = std::move(stagedAllocations);
     nextRegionId_ = stagedNextRegionId;
     unavailablePools_ = std::move(unavailable);
+    for (const auto &pool : pools_) removeOrphanFsDaxFiles(pool);
     setCheckpointBlock(unavailablePools_);
     return 0;
 }
@@ -834,6 +889,7 @@ int PoolManager::rescanDevicesLocked()
         setCheckpointBlock("rescan recovery failed (rc=" + std::to_string(rc) + ")");
         return rc;
     }
+    const size_t firstNew = pools_.size();
     for (auto &pool : stagedPools) pools_.push_back(std::move(pool));
     allocations_ = std::move(stagedAllocations);
     nextRegionId_ = stagedNextRegionId;
@@ -844,6 +900,7 @@ int PoolManager::rescanDevicesLocked()
         ++clientAllocCounts_[a.clientId];
     }
     unavailablePools_ = std::move(unavailable);
+    for (size_t i = firstNew; i < pools_.size(); ++i) removeOrphanFsDaxFiles(pools_[i]);
     setCheckpointBlock(unavailablePools_);
     return 0;
 }

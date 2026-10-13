@@ -79,6 +79,13 @@ public:
     static std::string checkpointBlock(const PoolManager &pm) {
         return pm.checkpointBlock_;
     }
+    // FS_DAX discovery reads /proc/mounts, so tests drive the sweep directly.
+    static void removeOrphanFsDaxFiles(PoolManager &pm, uint64_t nextRegionId,
+                                       std::string unavailable = "") {
+        pm.nextRegionId_ = nextRegionId;
+        pm.unavailablePools_ = std::move(unavailable);
+        for (const auto &pool : pm.pools_) pm.removeOrphanFsDaxFiles(pool);
+    }
 };
 } // namespace maru
 
@@ -617,6 +624,38 @@ TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
     ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
     EXPECT_EQ(h.regionId, 2u);
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
+    auto p = pool(5);
+    p.type = DaxType::FS_DAX;
+    p.dataBegin = 0;
+    p.totalSize = p.freeSize = B;
+    p.freeList = {{0, B}};
+    p.devPath = fakeRoot + "/files";
+    fs::create_directory(p.devPath);
+    PoolManager pm(state);
+    PoolManagerTestPeer::inject(pm, p, allocation(5, 0)); // Owns maru_42.dat.
+    // FS_DAX pool IDs follow sysfs numbering and can change across boots, so
+    // a file whose region another pool owns is kept as well.
+    auto elsewhere = allocation();
+    elsewhere.handle.regionId = 43;
+    PoolManagerTestPeer::inject(pm, pool(), elsewhere);
+    // maru_50.dat: an ID this state has not issued yet.
+    const std::vector<std::string> kept{"maru_42.dat", "maru_43.dat", "maru_50.dat",
+                                        "maru_007.dat", "maru_7.dat.bak", "maru_x.dat",
+                                        "notes.txt"};
+    for (const auto &name : kept) std::ofstream(p.devPath + "/" + name) << "x";
+    std::ofstream(p.devPath + "/maru_7.dat") << "x";
+    // Fresh (or wrong) state issued no IDs, so it owns nothing to remove.
+    PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 1);
+    EXPECT_TRUE(fs::exists(p.devPath + "/maru_7.dat"));
+    // A missing pool may own it through a WAL-only allocation.
+    PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50, "no device for pool(s) 9");
+    EXPECT_TRUE(fs::exists(p.devPath + "/maru_7.dat"));
+    PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50);
+    EXPECT_FALSE(fs::exists(p.devPath + "/maru_7.dat"));
+    for (const auto &name : kept) EXPECT_TRUE(fs::exists(p.devPath + "/" + name)) << name;
 }
 
 TEST_F(HeaderRecoveryTest, FailedWalReplayIsTransactional) {
