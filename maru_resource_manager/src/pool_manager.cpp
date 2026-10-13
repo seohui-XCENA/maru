@@ -651,7 +651,7 @@ bool PoolManager::hasPools() const
 
 int PoolManager::recoverPools(std::vector<PoolState> &pools,
                               std::map<uint64_t, Allocation> &allocations,
-                              uint64_t &nextRegionId)
+                              uint64_t &nextRegionId, std::string &unavailablePools)
 {
     std::set<uint32_t> referenced;
     int rc = wal_->referencedPools(referenced);
@@ -705,17 +705,33 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
     std::set<uint32_t> available;
     for (const auto &p : pools_) available.insert(p.poolId);
     for (const auto &p : pools) available.insert(p.poolId);
-    checkpointBlocked_ = false;
+    std::set<uint32_t> missing;
     for (uint32_t id : referenced)
-        if (!available.count(id)) checkpointBlocked_ = true;
+        if (!available.count(id)) missing.insert(id);
     for (const auto &[id, a] : allocations)
-        if (!available.count(a.poolId)) checkpointBlocked_ = true;
+        if (!available.count(a.poolId)) missing.insert(a.poolId);
+    unavailablePools.clear();
+    for (uint32_t id : missing)
+        unavailablePools += (unavailablePools.empty() ? "" : ",") + std::to_string(id);
+    if (!unavailablePools.empty())
+        unavailablePools = "no device for pool(s) " + unavailablePools +
+                           " referenced by WAL/checkpoint";
     return 0;
+}
+
+void PoolManager::setCheckpointBlock(std::string reason)
+{
+    if (reason == checkpointBlock_) return;
+    if (reason.empty())
+        logf(LogLevel::Info, "checkpoints enabled");
+    else
+        logf(LogLevel::Warn, "checkpoints paused, WAL retained: %s", reason.c_str());
+    checkpointBlock_ = std::move(reason);
 }
 
 int PoolManager::loadPoolsLocked()
 {
-    checkpointBlocked_ = true;
+    setCheckpointBlock("recovery has not completed");
     std::map<uint64_t, Allocation> stagedAllocations;
     uint64_t stagedNextRegionId = 1;
     const int globalRc = metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
@@ -740,12 +756,20 @@ int PoolManager::loadPoolsLocked()
             return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
         stagedPools.push_back(std::move(pool));
     }
-    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId);
+    std::string unavailable;
+    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId, unavailable);
     if (rc != 0) return rc;
+    // Every complete record passed; never append after an incomplete one.
+    rc = wal_->discardTornTail();
+    if (rc != 0)
+    {
+        logf(LogLevel::Error, "cannot discard incomplete WAL tail: %d", rc);
+        return rc;
+    }
 
     // Initialize the persisted secret before recomputing restored tokens.
     rc = initSecret(stateDir_, !stagedAllocations.empty());
-    if (rc != 0) { checkpointBlocked_ = true; return rc; }
+    if (rc != 0) return rc;
     clientAllocCounts_.clear();
     for (auto &[regionId, alloc] : stagedAllocations)
     {
@@ -756,15 +780,20 @@ int PoolManager::loadPoolsLocked()
     pools_ = std::move(stagedPools);
     allocations_ = std::move(stagedAllocations);
     nextRegionId_ = stagedNextRegionId;
+    unavailablePools_ = std::move(unavailable);
+    setCheckpointBlock(unavailablePools_);
     return 0;
 }
 
 int PoolManager::rescanDevicesLocked()
 {
-    checkpointBlocked_ = true;
     std::vector<DeviceInfo> devices;
     int rc = scanDevices(devices);
-    if (rc != 0) return rc;
+    if (rc != 0)
+    {
+        setCheckpointBlock("device rescan failed (rc=" + std::to_string(rc) + ")");
+        return rc;
+    }
 
     std::vector<PoolState> stagedPools;
     for (const auto &dev : devices)
@@ -775,17 +804,36 @@ int PoolManager::rescanDevicesLocked()
         if (exists) continue;
         PoolState pool;
         rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
-        if (rc == -EUCLEAN) return rc;
+        if (rc == -EUCLEAN)
+        {
+            setCheckpointBlock("device " + dev.devPath + " failed recovery validation");
+            return rc;
+        }
         if (rc != 0) continue;
         if (pool.hasCheckpoint && !hasGlobalCheckpoint_)
+        {
+            setCheckpointBlock("device " + dev.devPath + " has no global checkpoint");
             return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
+        }
         stagedPools.push_back(std::move(pool));
+    }
+
+    // Without a new pool there is nothing to import from the WAL or ledger.
+    if (stagedPools.empty())
+    {
+        setCheckpointBlock(unavailablePools_);
+        return 0;
     }
 
     auto stagedAllocations = allocations_;
     uint64_t stagedNextRegionId = nextRegionId_;
-    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId);
-    if (rc != 0) return rc;
+    std::string unavailable;
+    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId, unavailable);
+    if (rc != 0)
+    {
+        setCheckpointBlock("rescan recovery failed (rc=" + std::to_string(rc) + ")");
+        return rc;
+    }
     for (auto &pool : stagedPools) pools_.push_back(std::move(pool));
     allocations_ = std::move(stagedAllocations);
     nextRegionId_ = stagedNextRegionId;
@@ -795,6 +843,8 @@ int PoolManager::rescanDevicesLocked()
         a.handle.authToken = computeAuthToken(a.handle, a.nonce, std::string(a.clientId));
         ++clientAllocCounts_[a.clientId];
     }
+    unavailablePools_ = std::move(unavailable);
+    setCheckpointBlock(unavailablePools_);
     return 0;
 }
 
@@ -915,6 +965,17 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
             continue;
         }
 
+        // Consume the ID even on failure: a file left by a crash before the
+        // WAL append must not make every retry collide with it.
+        uint64_t regionId = nextRegionId_++;
+        // Create the file before splitting the extent so a failure leaves the
+        // free list consistent with freeSize.
+        if (pool.type == DaxType::FS_DAX &&
+            createFsDaxFile(pool.devPath, regionId, alignedSize) != 0)
+        {
+            return false;
+        }
+
         bool hasFront = (aligned > ex.offset);
         bool hasBack = (end < ex.offset + ex.length);
 
@@ -941,16 +1002,6 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
             // Exact fit: remove
             pool.freeList.erase(pool.freeList.begin() +
                                 static_cast<std::ptrdiff_t>(i));
-        }
-
-        uint64_t regionId = nextRegionId_++;
-
-        if (pool.type == DaxType::FS_DAX)
-        {
-            if (createFsDaxFile(pool.devPath, regionId, alignedSize) != 0)
-            {
-                return false;
-            }
         }
 
         Handle h{};
@@ -1022,6 +1073,12 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     {
         return -ENODEV;
     }
+    // Replace a log holding a record that could not be removed; this must
+    // run before any tentative change to the pools.
+    if (wal_->appendsDisabled())
+    {
+        checkpointLocked();
+    }
 
     Allocation alloc{};
     PoolState *selectedPool = nullptr;
@@ -1062,6 +1119,21 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
 
     alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce, clientId);
 
+    // Acknowledge only a durable record: otherwise recovery could hand this
+    // range to another client after a restart.
+    const int walRc = wal_->appendAlloc(alloc);
+    if (walRc != 0)
+    {
+        insertExtentSorted(*selectedPool, alloc.realOffset, alloc.allocLength);
+        selectedPool->freeSize += alloc.allocLength;
+        if (selectedPool->type == DaxType::FS_DAX)
+        {
+            deleteFsDaxFile(selectedPool->devPath, alloc.handle.regionId);
+        }
+        logWalAppendFailure("allocation", walRc);
+        return walRc;
+    }
+
     // Cache owner PID start time for reaper PID-reuse detection (local only)
     if (!clientId.empty())
     {
@@ -1094,7 +1166,6 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     deviceUuid = selectedPool->deviceUuid;
     requestedSizeOut = alloc.requestedSize;
     out = alloc.handle;
-    wal_->appendAlloc(alloc);
     if (++opCount_ % checkpointInterval_ == 0)
     {
         checkpointLocked();
@@ -1174,7 +1245,8 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 
     // Collect client_ids whose grace period has expired
     auto now = SteadyClock::now();
-    std::unordered_set<std::string> expiredClients;
+    std::unordered_set<std::string> expiredClients(reapRetries_.begin(), reapRetries_.end());
+    reapRetries_.clear();
     for (auto it = disconnectedClients_.begin(); it != disconnectedClients_.end(); )
     {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1241,16 +1313,44 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 
     for (uint64_t regionId : toFree)
     {
-        if (doFreeAllocation(regionId) == 0)
+        const auto allocIt = allocations_.find(regionId);
+        const std::string cid = allocIt != allocations_.end() ? allocIt->second.clientId : "";
+        const int rc = doFreeAllocation(regionId);
+        if (rc == 0)
         {
             ++reapedCount;
+        }
+        else if (rc != -ENOENT && rc != -EUCLEAN && expiredClients.count(cid))
+        {
+            // The free was not logged (e.g. WAL append failed); retry this
+            // expired client next pass. Local dead PIDs are found again anyway.
+            reapRetries_.insert(cid);
         }
     }
 }
 
+void PoolManager::logWalAppendFailure(const char *operation, int error)
+{
+    const auto now = SteadyClock::now();
+    if (now < nextWalFailureLog_) return;
+    logf(LogLevel::Error, "WAL append failed, %s rejected: %d (repeats muted for 1 min)",
+         operation, error);
+    nextWalFailureLog_ = now + std::chrono::minutes(1);
+}
+
 int PoolManager::checkpointLocked()
 {
-    if (checkpointBlocked_) return -EAGAIN;
+    if (!checkpointBlock_.empty())
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextSkippedCheckpointLog_)
+        {
+            logf(LogLevel::Warn, "checkpoint skipped, WAL retained: %s",
+                 checkpointBlock_.c_str());
+            nextSkippedCheckpointLog_ = now + std::chrono::minutes(1);
+        }
+        return -EAGAIN;
+    }
     const int rc = wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
     if (rc == 0) hasGlobalCheckpoint_ = true;
     else logf(LogLevel::Error, "checkpoint failed; keeping WAL: %d", rc);
@@ -1280,6 +1380,7 @@ void PoolManager::clientReconnected(const std::string &clientId)
 {
     if (clientId.empty()) return;
     std::lock_guard<std::mutex> lock(mu_);
+    reapRetries_.erase(clientId);
     auto it = disconnectedClients_.find(clientId);
     if (it != disconnectedClients_.end())
     {
@@ -1345,6 +1446,19 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
         if (alloc.realOffset < e.offset + e.length &&
             e.offset < alloc.realOffset + alloc.allocLength) return -EUCLEAN;
 
+    // Log the free before releasing anything: a failed append leaves the
+    // allocation intact so the caller (or the reaper) can retry.
+    if (wal_->appendsDisabled())
+    {
+        checkpointLocked();
+    }
+    const int walRc = wal_->appendFree(regionId);
+    if (walRc != 0)
+    {
+        logWalAppendFailure("free", walRc);
+        return walRc;
+    }
+
     if (targetPool->type == DaxType::FS_DAX)
     {
         deleteFsDaxFile(targetPool->devPath, regionId);
@@ -1373,7 +1487,6 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
 
     allocations_.erase(globalIt);
 
-    wal_->appendFree(regionId);
     if (++opCount_ % checkpointInterval_ == 0)
     {
         checkpointLocked();

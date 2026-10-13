@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -125,8 +126,9 @@ private:
     int rescanDevicesLocked();
     int recoverPools(std::vector<PoolState> &pools,
                      std::map<uint64_t, Allocation> &allocations,
-                     uint64_t &nextRegionId);
+                     uint64_t &nextRegionId, std::string &unavailablePools);
     int checkpointLocked();
+    void setCheckpointBlock(std::string reason);
     void recomputeFreeSize(PoolState &pool);
 
     void coalesceFreeList(PoolState &pool);
@@ -149,7 +151,12 @@ private:
     uint64_t checkpointInterval_{100};
     // Keep WAL records for unavailable/rejected pools; never checkpoint a
     // partial recovery or discard the evidence needed for a later retry.
-    bool checkpointBlocked_{true};
+    // Empty when checkpoints are allowed, otherwise why they are paused.
+    std::string checkpointBlock_{"recovery has not completed"};
+    // From the last successful recovery; only a rescan that adds pools can
+    // change it, because new WAL records and allocations use live pools.
+    std::string unavailablePools_;
+    std::chrono::steady_clock::time_point nextSkippedCheckpointLog_{};
     bool hasGlobalCheckpoint_{false};
 
     std::unique_ptr<MetadataStore> metadata_;
@@ -170,6 +177,12 @@ private:
     // Maps client_id -> time of disconnection.
     using SteadyClock = std::chrono::steady_clock;
     std::map<std::string, SteadyClock::time_point> disconnectedClients_;
+    // Expired clients whose free could not be logged; retried every pass.
+    std::set<std::string> reapRetries_;
+
+    // Rate-limited: the reaper retries failed frees every second.
+    void logWalAppendFailure(const char *operation, int error);
+    SteadyClock::time_point nextWalFailureLog_{};
 
 };
 

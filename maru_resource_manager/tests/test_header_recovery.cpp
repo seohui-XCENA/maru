@@ -76,6 +76,9 @@ public:
         pm.pools_.push_back(std::move(pool));
         if (a.allocLength) pm.allocations_[a.handle.regionId] = a;
     }
+    static std::string checkpointBlock(const PoolManager &pm) {
+        return pm.checkpointBlock_;
+    }
 };
 } // namespace maru
 
@@ -315,12 +318,158 @@ TEST_F(HeaderRecoveryTest, MissingDeviceKeepsWalUntilLateDiscovery) {
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_NE(PoolManagerTestPeer::checkpointBlock(pm).find("pool(s) 1 "), std::string::npos);
     EXPECT_TRUE(fs::exists(state + "/maru-resource-manager.wal"));
+    ASSERT_EQ(pm.rescanDevices(), 0); // No new device: still paused.
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
     addDevice(1);
     ASSERT_EQ(pm.rescanDevices(), 0);
+    EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
     EXPECT_EQ(pm.allocationCount(), 1u);
     EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
     EXPECT_EQ(pm.checkpoint(), 0);
+}
+
+TEST_F(HeaderRecoveryTest, RescanWithoutNewDevicesDoesNotReadWal) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    // Any replay would reject these bytes; a rescan with no new pool must not
+    // re-read the log under the manager lock.
+    std::ofstream(state + "/maru-resource-manager.wal", std::ios::app) << "junk";
+    EXPECT_EQ(pm.rescanDevices(), 0);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
+}
+
+TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
+    addDevice(0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    auto second = allocation(0, 2 * H);
+    second.handle.regionId = 43;
+    // A crash during the second append can leave part of its header, or the
+    // whole header and part of its payload.
+    for (size_t kept : {size_t{10}, size_t{40}}) {
+        fs::remove(walPath);
+        ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
+        const auto complete = bytes(walPath);
+        ASSERT_EQ(WalStore(state).appendAlloc(second), 0);
+        fs::resize_file(walPath, complete.size() + kept);
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(bytes(walPath), complete);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0);
+        EXPECT_EQ(h.regionId, 43u);
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 2u);
+    }
+    // Not a prefix of the final record: zero fill, a header prefix with an
+    // unknown type, or a torn record followed by another. WAL left untouched.
+    fs::remove(walPath);
+    ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
+    const auto one = bytes(walPath);
+    for (const auto &tail : {std::string(16, '\0'), one.substr(0, 8) + std::string("\7\0\0\0", 4),
+                             one.substr(0, 10) + one}) {
+        std::ofstream(walPath, std::ios::binary | std::ios::trunc) << one + tail;
+        const auto corrupt = bytes(walPath);
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EPROTO);
+        EXPECT_EQ(bytes(walPath), corrupt);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, FailedWalAppendIsNotAcknowledged) {
+    using checkpoint_fault::Operation;
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle kept{};
+    ASSERT_EQ(allocate(pm, kept), 0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    const auto walBefore = bytes(walPath);
+    std::vector<PoolState> before;
+    pm.getStats(before);
+    // A short write followed by ENOSPC, and a whole record whose fdatasync fails.
+    for (const auto &[op, error] : std::vector<std::pair<Operation, int>>{
+             {Operation::Write, ENOSPC}, {Operation::Fdatasync, EIO}}) {
+        checkpoint_fault::arm(walPath, op, error, 10);
+        Handle h{};
+        EXPECT_EQ(allocate(pm, h), -error);
+        EXPECT_EQ(checkpoint_fault::failures(), 1u);
+        checkpoint_fault::arm(walPath, op, error, 10);
+        EXPECT_EQ(pm.verifyAndFree(kept, "offline-test-owner"), -error);
+        EXPECT_EQ(checkpoint_fault::failures(), 1u);
+        checkpoint_fault::clear();
+        EXPECT_EQ(bytes(walPath), walBefore);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        std::vector<PoolState> after;
+        pm.getStats(after);
+        ASSERT_EQ(after.size(), 1u);
+        EXPECT_EQ(after[0].freeSize, before[0].freeSize);
+        ASSERT_EQ(after[0].freeList.size(), before[0].freeList.size());
+        EXPECT_EQ(after[0].freeList[0].offset, before[0].freeList[0].offset);
+    }
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 1u);
+    EXPECT_EQ(restarted.verifyAndFree(kept, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle kept{};
+    ASSERT_EQ(allocate(pm, kept), 0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    const auto walBefore = bytes(walPath);
+    checkpoint_fault::arm(walPath, checkpoint_fault::Operation::Write, ENOSPC, 10);
+    checkpoint_fault::armTruncate(walPath, EIO);
+    Handle h{};
+    EXPECT_EQ(allocate(pm, h), -ENOSPC);
+    EXPECT_EQ(checkpoint_fault::failures(), 2u); // The write, then its rollback.
+    checkpoint_fault::clear();
+    ASSERT_EQ(bytes(walPath).size(), walBefore.size() + 10);
+
+    // A crash now leaves a torn record that nobody was told about.
+    const std::string crashed = fakeRoot + "/crashed";
+    fs::copy(state, crashed, fs::copy_options::recursive);
+    {
+        PoolManager restarted(crashed);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 1u);
+        EXPECT_EQ(bytes(crashed + "/maru-resource-manager.wal"), walBefore);
+    }
+
+    // Otherwise the next request checkpoints first, replacing the log.
+    ASSERT_EQ(allocate(pm, h), 0);
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 2u);
+}
+
+TEST_F(HeaderRecoveryTest, ReaperRetriesFreeAfterWalFailure) {
+    addDevice(0);
+    PoolManager pm(state, 0);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    pm.clientDisconnected("offline-test-owner");
+    checkpoint_fault::arm(state + "/maru-resource-manager.wal",
+                          checkpoint_fault::Operation::Write, ENOSPC);
+    uint64_t reaped = 0;
+    pm.reapExpired(reaped);
+    checkpoint_fault::clear();
+    EXPECT_EQ(reaped, 0u);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 1u);
+    EXPECT_EQ(pm.allocationCount(), 0u);
 }
 
 TEST_F(HeaderRecoveryTest, FailedRescanPreservesLivePoolAndWal) {
@@ -338,6 +487,7 @@ TEST_F(HeaderRecoveryTest, FailedRescanPreservesLivePoolAndWal) {
     EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
     EXPECT_EQ(pm.allocationCount(), 1u);
     EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_NE(PoolManagerTestPeer::checkpointBlock(pm).find(dev(1)), std::string::npos);
     EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), walBefore);
     DeviceHeader header{};
     EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
@@ -404,6 +554,32 @@ TEST_F(HeaderRecoveryTest, FsDaxStillAllowsFileOffsetZero) {
     EXPECT_TRUE(fs::exists(path));
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
     EXPECT_FALSE(fs::exists(path));
+}
+
+TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
+    auto p = pool();
+    p.type = DaxType::FS_DAX;
+    p.dataBegin = 0;
+    p.totalSize = p.freeSize = B;
+    p.freeList = {{0, B}};
+    p.devPath = fakeRoot + "/files";
+    fs::create_directory(p.devPath);
+    PoolManager pm(state);
+    PoolManagerTestPeer::inject(pm, p, {});
+    // Left by a crash between file creation and the WAL append.
+    std::ofstream(p.devPath + "/maru_1.dat") << "stale";
+    Handle h{};
+    std::string path, uuid;
+    uint64_t size;
+    EXPECT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), -ENOMEM);
+    std::vector<PoolState> stats;
+    pm.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(validateFreeList(stats[0]), 0);
+    EXPECT_EQ(stats[0].freeSize, B);
+    ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
+    EXPECT_EQ(h.regionId, 2u);
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
 }
 
 TEST_F(HeaderRecoveryTest, FailedWalReplayIsTransactional) {

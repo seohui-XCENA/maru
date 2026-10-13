@@ -94,7 +94,7 @@ if(MARU_BUILD_TESTS)
     target_compile_options(maru_rm_recovery_tests PRIVATE -Wall -Wextra -Wpedantic)
     target_link_options(maru_rm_recovery_tests PRIVATE
         -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink
-        -Wl,--wrap=write -Wl,--wrap=fsync)
+        -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=fdatasync -Wl,--wrap=ftruncate)
     target_link_libraries(maru_rm_recovery_tests PRIVATE GTest::gtest_main pthread OpenSSL::Crypto)
     gtest_discover_tests(maru_rm_recovery_tests)
 
@@ -108,7 +108,7 @@ if(MARU_BUILD_TESTS)
     target_link_options(maru_rm_process_test_daemon PRIVATE
         -Wl,--wrap=main -Wl,--wrap=bind
         -Wl,--wrap=stat -Wl,--wrap=open -Wl,--wrap=opendir -Wl,--wrap=readlink
-        -Wl,--wrap=write -Wl,--wrap=fsync)
+        -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=fdatasync -Wl,--wrap=ftruncate)
     target_link_libraries(maru_rm_process_test_daemon PRIVATE pthread OpenSSL::Crypto)
     foreach(scenario IN ITEMS
         sigterm_preserves_live_handle

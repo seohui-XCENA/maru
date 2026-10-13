@@ -382,7 +382,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         live = [self.allocate(), self.allocate(), self.allocate(1)]
         wal = (self.state / WAL_NAME).read_bytes()
         self.stop(expected_status=1)
-        self.assertIn(f"Injected checkpoint {operation} failure", self.log.read_text())
+        self.assertIn(f"Injected {operation} failure", self.log.read_text())
         self.assertIn(
             f"shutdown checkpoint not written (rc={-error}); WAL retained",
             self.log.read_text(),

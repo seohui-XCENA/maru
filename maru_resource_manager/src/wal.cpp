@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <functional>
 
@@ -84,9 +86,16 @@ int WalStore::ensureOpen() {
 
 int WalStore::appendRecord(WalRecordType type, const void *payload,
                            uint32_t len) {
+  if (appendError_ != 0) {
+    return appendError_;
+  }
   int rc = ensureOpen();
   if (rc != 0) {
     return rc;
+  }
+  struct stat st{};
+  if (::fstat(walFd_, &st) != 0) {
+    return -errno;
   }
 
   WalHeader hdr{};
@@ -98,7 +107,7 @@ int WalStore::appendRecord(WalRecordType type, const void *payload,
   hdr.ts = nowSec();
 
   // One buffer avoids a separate header write. Regular-file writes are not
-  // guaranteed crash-atomic; the reader rejects incomplete records.
+  // guaranteed crash-atomic; recovery discards an incomplete final record.
   std::vector<uint8_t> buf(sizeof(hdr) + len);
   std::memcpy(buf.data(), &hdr, sizeof(hdr));
   if (len > 0) {
@@ -106,10 +115,20 @@ int WalStore::appendRecord(WalRecordType type, const void *payload,
   }
 
   rc = writeFull(walFd_, buf.data(), buf.size());
-  if (rc != 0) {
-    return rc;
+  if (rc == 0 && ::fdatasync(walFd_) != 0) {
+    rc = -errno;
   }
-  return ::fdatasync(walFd_) == 0 ? 0 : -errno;
+  // Callers report failure and keep their old state, so remove the record:
+  // recovery may then discard only a torn tail that nobody was told about.
+  if (rc != 0 && ::ftruncate(walFd_, st.st_size) != 0) {
+    // Later records would follow these bytes; refuse them until a checkpoint
+    // replaces the log.
+    appendError_ = rc;
+    logf(LogLevel::Error,
+         "cannot remove failed WAL record: %s; appends disabled until checkpoint",
+         std::strerror(errno));
+  }
+  return rc;
 }
 
 int WalStore::appendAlloc(const Allocation &alloc) {
@@ -154,8 +173,36 @@ static void addExtent(PoolState &pool, uint64_t off, uint64_t len) {
   pool.freeList.push_back(Extent{off, len});
 }
 
+// True if the bytes can start a header this version appends. ts and the
+// padding before it are not compared.
+static bool headerPrefix(const uint8_t *bytes, size_t len) {
+  const size_t known =
+      std::min(len, offsetof(WalHeader, payloadLen) + sizeof(WalHeader::payloadLen));
+  for (auto type : {WalRecordType::ALLOC, WalRecordType::FREE}) {
+    WalHeader expected;
+    std::memset(&expected, 0, sizeof(expected));
+    expected.magic = kWalMagic;
+    expected.version = kWalVersion;
+    expected.type = static_cast<uint32_t>(type);
+    expected.payloadLen = type == WalRecordType::ALLOC ? sizeof(Allocation) : sizeof(WalFreeV3);
+    if (std::memcmp(bytes, &expected, known) == 0) return true;
+  }
+  return false;
+}
+
+// Incomplete final record: [offset, offset + length) ends the file.
+struct TornTail {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
+// Callers acknowledge a record only after fdatasync, and a failed append is
+// removed (or blocks later appends), so an incomplete final record was cut
+// short by a crash and never acknowledged: it ends the log. Any other bytes
+// that do not parse are rejected.
 static int visitRecords(const std::string &path,
-                        const std::function<int(uint32_t, const std::vector<uint8_t> &)> &visit) {
+                        const std::function<int(uint32_t, const std::vector<uint8_t> &)> &visit,
+                        TornTail *torn = nullptr) {
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return -errno;
   struct stat st{};
@@ -165,9 +212,17 @@ static int visitRecords(const std::string &path,
     return rc;
   }
   uint64_t remaining = st.st_size;
+  TornTail tail;
   int rc = 0;
   while (remaining != 0) {
-    if (remaining < sizeof(WalHeader)) { rc = -EPROTO; break; }
+    const uint64_t offset = static_cast<uint64_t>(st.st_size) - remaining;
+    if (remaining < sizeof(WalHeader)) {
+      uint8_t partial[sizeof(WalHeader)]{};
+      if ((rc = readFull(fd, partial, remaining)) != 0) break;
+      if (!headerPrefix(partial, remaining)) { rc = -EPROTO; break; }
+      tail = {offset, remaining};
+      break;
+    }
     WalHeader hdr{};
     if ((rc = readFull(fd, &hdr, sizeof(hdr))) != 0) break;
     remaining -= sizeof(hdr);
@@ -175,8 +230,14 @@ static int visitRecords(const std::string &path,
     const bool free = hdr.type == static_cast<uint32_t>(WalRecordType::FREE);
     if (hdr.magic != kWalMagic || hdr.version != kWalVersion ||
         (!alloc && !free) ||
-        hdr.payloadLen != (alloc ? sizeof(Allocation) : sizeof(WalFreeV3)) ||
-        hdr.payloadLen > remaining) { rc = -EPROTO; break; }
+        hdr.payloadLen != (alloc ? sizeof(Allocation) : sizeof(WalFreeV3))) {
+      rc = -EPROTO;
+      break;
+    }
+    if (hdr.payloadLen > remaining) {
+      tail = {offset, sizeof(hdr) + remaining};
+      break;
+    }
     std::vector<uint8_t> payload(hdr.payloadLen);
     if ((rc = readFull(fd, payload.data(), payload.size())) != 0) break;
     remaining -= payload.size();
@@ -188,6 +249,26 @@ static int visitRecords(const std::string &path,
     if ((rc = visit(hdr.type, payload)) != 0) break;
   }
   ::close(fd);
+  if (rc == 0 && torn) *torn = tail;
+  return rc;
+}
+
+int WalStore::discardTornTail() {
+  TornTail tail;
+  int rc = visitRecords(walPath(), [](uint32_t, const auto &) { return 0; }, &tail);
+  if (rc == -ENOENT) return 0;
+  if (rc != 0 || tail.length == 0) return rc;
+  const int fd = ::open(walPath().c_str(), O_WRONLY);
+  if (fd < 0) return -errno;
+  rc = ::ftruncate(fd, static_cast<off_t>(tail.offset)) == 0 && ::fsync(fd) == 0
+           ? 0 : -errno;
+  ::close(fd);
+  if (rc == 0) {
+    logf(LogLevel::Warn,
+         "discarded incomplete final WAL record (%llu bytes at offset %llu)",
+         static_cast<unsigned long long>(tail.length),
+         static_cast<unsigned long long>(tail.offset));
+  }
   return rc;
 }
 
@@ -295,6 +376,7 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
     walFd_ = -1;
   }
   if (::unlink(walPath().c_str()) != 0 && errno != ENOENT) return -errno;
+  appendError_ = 0;
   return 0;
 }
 
