@@ -12,10 +12,16 @@ own user only):
                                its pool metadata and writes a fresh header,
                                discarding whatever the device holds
   release REGION --confirm     return one allocation whose owner has exited
+  wipe daxN.M --confirm        zero all of an excluded device, header included
+                               (e.g. before handing it over, or to reset it for
+                               tests); waits until done, which can take minutes
 
 Exit codes: 0 = done, 1 = refused by the RM, 2 = RM unreachable,
 3 = sent but no reply in time (the command may still complete; run status).
+Interrupting a wipe (Ctrl-C) stops it, leaving the device partly zeroed.
 """
+
+from __future__ import annotations  # System python3 may be 3.9.
 
 import argparse
 import re
@@ -49,6 +55,8 @@ def request_line(args: argparse.Namespace) -> str:
         return f"exclude {args.device}"
     if args.command == "include":
         return f"include {args.device}" + (" --reinit" if args.reinit else "")
+    if args.command == "wipe":
+        return f"wipe {args.device}" + (" --confirm" if args.confirm else "")
     return f"release {args.region}" + (" --confirm" if args.confirm else "")
 
 
@@ -56,7 +64,7 @@ class NoReplyError(Exception):
     """The request was sent, but the RM did not answer in time."""
 
 
-def send(path: Path, line: str, timeout: float = 120.0) -> tuple[str, str]:
+def send(path: Path, line: str, timeout: float | None = 120.0) -> tuple[str, str]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
         conn.connect(str(path))
@@ -101,6 +109,13 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="the owner has exited and unmapped the region",
     )
+    wipe = commands.add_parser("wipe", help="zero all of an excluded device")
+    wipe.add_argument("device", type=device_name)
+    wipe.add_argument(
+        "--confirm",
+        action="store_true",
+        help="no host maps the device and its contents may be destroyed",
+    )
     return root
 
 
@@ -108,7 +123,13 @@ def main(argv=None) -> int:
     args = parser().parse_args(argv)
     path = Path(args.socket) if args.socket else Path(args.state_dir) / "admin.sock"
     try:
-        status, body = send(path, request_line(args))
+        # A wipe of a large device takes minutes; wait for it.
+        timeout = None if args.command == "wipe" else 120.0
+        status, body = send(path, request_line(args), timeout)
+    except KeyboardInterrupt:
+        # Closing the connection stops a running wipe; nothing else is undone.
+        print("interrupted; check the result with 'status'", file=sys.stderr)
+        return 130
     except NoReplyError:
         print(
             "no reply from maru-resource-manager in time; the command may still "

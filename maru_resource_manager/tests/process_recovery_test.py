@@ -483,6 +483,25 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.free(handle)
         self.stop()
 
+    def test_admin_wipe_resets_an_excluded_device(self):
+        self.add_device(1)
+        self.start()
+        self.free(self.allocate(1))
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 1, output)  # Still used by the RM.
+        code, output = self.ctl("exclude", "dax1.0")
+        self.assertEqual(code, 0, output)
+        code, output = self.ctl("wipe", "dax1.0")
+        self.assertEqual(code, 1, output)  # Needs --confirm.
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.root / "dev/dax1.0").read_bytes(), bytes(SIZE))
+        code, output = self.ctl("include", "dax1.0")
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.root / "dev/dax1.0").read_bytes()[:8], b"MARUDEV\0")
+        self.access(self.allocate(1), 1)
+        self.stop()
+
 
 if __name__ == "__main__":
     DAEMON = Path(sys.argv.pop(1)).resolve(strict=True)

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -118,6 +120,10 @@ public:
     int adminInclude(const std::string &device, bool reinit, std::string &out);
     /// Return one allocation whose owner the caller verified has exited.
     int adminRelease(uint64_t regionId, bool confirmed, std::string &out);
+    /// Zero all of an excluded device, header included. Runs without holding
+    /// the pool lock; stops between chunks once `cancel` is set.
+    int adminWipe(const std::string &device, bool confirmed, std::string &out,
+                  const std::function<bool()> &cancelled = {});
 
 private:
     friend class PoolManagerTestPeer;

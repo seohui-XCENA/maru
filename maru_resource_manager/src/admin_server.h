@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -24,7 +26,9 @@ public:
     void stop();
 
     /// Run one request line and return the reply ("OK" or "ERR <errno> ...").
-    static std::string handleLine(PoolManager &pm, const std::string &line);
+    /// Long commands (wipe) stop early once `cancelled` returns true.
+    static std::string handleLine(PoolManager &pm, const std::string &line,
+                                  const std::function<bool()> &cancelled = {});
 
 private:
     void loop();
@@ -36,6 +40,7 @@ private:
     bool bound_{false}; // Only then is the path ours to unlink.
     int stopPipe_[2]{-1, -1};
     std::thread thread_;
+    std::atomic<bool> stopping_{false};
 };
 
 } // namespace maru

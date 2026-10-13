@@ -21,7 +21,7 @@ namespace maru {
 static constexpr size_t kMaxRequestBytes = 4096;
 static constexpr const char *kUsage =
     "usage: status | allocations [daxN.M] | exclude daxN.M | "
-    "include daxN.M [--reinit] | release REGION [--confirm]\n";
+    "include daxN.M [--reinit] | release REGION [--confirm] | wipe daxN.M [--confirm]\n";
 
 AdminServer::AdminServer(PoolManager &pm, std::string socketPath)
     : pm_(pm), path_(std::move(socketPath)) {}
@@ -67,6 +67,7 @@ int AdminServer::start() {
 }
 
 void AdminServer::stop() {
+    stopping_ = true; // Interrupts a running wipe between chunks.
     if (thread_.joinable()) {
         const char wake = 0;
         (void)!::write(stopPipe_[1], &wake, 1);
@@ -112,6 +113,13 @@ void AdminServer::loop() {
     }
 }
 
+// The client closed its connection (gave up waiting, or was interrupted). A
+// half-close after sending the request still counts as present.
+static bool peerGone(int fd) {
+    pollfd p{fd, 0, 0};
+    return ::poll(&p, 1, 0) == 1 && (p.revents & (POLLHUP | POLLERR)) != 0;
+}
+
 void AdminServer::serve(int fd) {
     const timeval timeout{5, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -136,7 +144,13 @@ void AdminServer::serve(int fd) {
             reply = "ERR " + std::to_string(EINVAL) + " malformed request\n" + kUsage;
         } else {
             line.resize(end);
-            reply = handleLine(pm_, line);
+            // Requests queued behind a long command must not run for a
+            // client that already left (it may have reported a timeout).
+            if (peerGone(fd)) {
+                logf(LogLevel::Warn, "admin: client left before '%s' ran; skipped", line.c_str());
+                return;
+            }
+            reply = handleLine(pm_, line, [this, fd] { return stopping_.load() || peerGone(fd); });
             logf(LogLevel::Info, "admin: '%s' -> %.*s", line.c_str(),
                  static_cast<int>(reply.find('\n')), reply.c_str());
         }
@@ -160,7 +174,8 @@ static bool parseRegion(const std::string &text, uint64_t &out) {
     return true;
 }
 
-std::string AdminServer::handleLine(PoolManager &pm, const std::string &line) {
+std::string AdminServer::handleLine(PoolManager &pm, const std::string &line,
+                                    const std::function<bool()> &cancelled) {
     std::istringstream words(line);
     std::vector<std::string> args;
     for (std::string word; words >> word;) args.push_back(word);
@@ -182,6 +197,9 @@ std::string AdminServer::handleLine(PoolManager &pm, const std::string &line) {
                (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm")) &&
                parseRegion(args[1], region)) {
         rc = pm.adminRelease(region, args.size() == 3, out);
+    } else if (command == "wipe" &&
+               (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm"))) {
+        rc = pm.adminWipe(args[1], args.size() == 3, out, cancelled);
     } else {
         out = kUsage;
     }

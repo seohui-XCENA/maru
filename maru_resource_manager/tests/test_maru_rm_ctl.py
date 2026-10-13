@@ -72,6 +72,8 @@ class MaruRmCtlTest(unittest.TestCase):
             (["include", "dax2.0", "--reinit"], "include dax2.0 --reinit\n"),
             (["release", "42"], "release 42\n"),
             (["release", "42", "--confirm"], "release 42 --confirm\n"),
+            (["wipe", "/dev/dax2.0"], "wipe dax2.0\n"),
+            (["wipe", "dax2.0", "--confirm"], "wipe dax2.0 --confirm\n"),
         ]
         for argv, expected in cases:
             code, request, out, _ = self.run_ctl("OK\nbody\n", *argv)
@@ -102,7 +104,7 @@ class MaruRmCtlTest(unittest.TestCase):
         self.addCleanup(server.close)
         err = io.StringIO()
         original = ctl.send
-        ctl.send = lambda path, line: original(path, line, timeout=0.2)
+        ctl.send = lambda path, line, timeout: original(path, line, 0.2)
         self.addCleanup(setattr, ctl, "send", original)
         with contextlib.redirect_stderr(err):
             code = ctl.main(["--state-dir", str(self.state), "include", "dax2.0"])
@@ -110,7 +112,7 @@ class MaruRmCtlTest(unittest.TestCase):
         self.assertIn("may still complete", err.getvalue())
 
     def test_bad_arguments_never_reach_the_rm(self):
-        for argv in (["exclude", "sda"], ["release", "-1"], ["include"]):
+        for argv in (["exclude", "sda"], ["release", "-1"], ["include"], ["wipe"]):
             with (
                 self.assertRaises(SystemExit),
                 contextlib.redirect_stderr(io.StringIO()),

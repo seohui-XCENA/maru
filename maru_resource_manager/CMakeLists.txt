@@ -12,6 +12,7 @@ add_executable(maru_resource_manager
     src/admin_server.cpp
     src/device_exclusion.cpp
     src/device_header.cpp
+    src/device_wipe.cpp
     src/util.cpp
     src/main.cpp
     src/server_config.cpp
@@ -64,6 +65,7 @@ if(MARU_BUILD_TESTS)
         src/admin_server.cpp
         src/device_exclusion.cpp
         src/device_header.cpp
+        src/device_wipe.cpp
         src/util.cpp
         src/server_config.cpp
         src/log.cpp
@@ -128,7 +130,8 @@ if(MARU_BUILD_TESTS)
         shutdown_checkpoint_write_failure_retains_wal
         shutdown_checkpoint_fsync_failure_retains_wal
         admin_exclude_and_include
-        second_instance_is_refused)
+        second_instance_is_refused
+        admin_wipe_resets_an_excluded_device)
         add_test(NAME ProcessRecovery.${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py
                 $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)

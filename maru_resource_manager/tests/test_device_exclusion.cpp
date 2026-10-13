@@ -10,6 +10,7 @@
 #include "admin_server.h"
 #include "checkpoint_fault.h"
 #include "device_exclusion.h"
+#include "device_wipe.h"
 
 namespace {
 constexpr auto npos = std::string::npos;
@@ -489,4 +490,102 @@ TEST_F(DeviceExclusionTest, ArchivesAreNeverOverwritten) {
     for (const auto &entry : fs::directory_iterator(state))
         archives += entry.path().filename().string().rfind("pool_1.meta.include-", 0) == 0;
     EXPECT_EQ(archives, 3u);
+}
+
+TEST_F(DeviceExclusionTest, WipeZeroesOnlyExcludedDevicesWhenConfirmed) {
+    addDevice(0);
+    addDevice(1);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h, 1), 0);
+    {   // A client's data in the allocated range.
+        std::fstream f(fakeRoot + dev(1), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(static_cast<std::streamoff>(h.offset));
+        f << std::string(4096, 'k');
+    }
+    std::string out;
+    EXPECT_EQ(pm.adminWipe("dax1.0", true, out), -EINVAL); // Still in use by the RM.
+    ASSERT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    out.clear();
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    const auto before = bytes(fakeRoot + dev(1));
+    out.clear();
+    EXPECT_EQ(pm.adminWipe("/dev/dax1.0", false, out), -EPERM);
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), before);
+    out.clear();
+    ASSERT_EQ(pm.adminWipe("/dev/dax1.0", true, out), 0) << out;
+    EXPECT_NE(out.find("wiped /dev/dax1.0 bytes=" + std::to_string(B)), npos) << out;
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0')); // Header included.
+
+    // Reset for reuse: a wiped device comes back with a fresh header.
+    out.clear();
+    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(1), header, H), 0);
+    ASSERT_EQ(allocate(pm, h, 1), 0);
+
+    // Absent devices cannot be wiped.
+    out.clear();
+    ASSERT_EQ(pm.adminExclude("dax3.0", out), 0) << out;
+    out.clear();
+    EXPECT_NE(pm.adminWipe("dax3.0", true, out), 0);
+}
+
+TEST_F(DeviceExclusionTest, WipeStopsBetweenChunksWhenCancelled) {
+    addDevice(1);
+    const std::string pattern(B, 'k');
+    std::ofstream(fakeRoot + dev(1), std::ios::binary | std::ios::trunc) << pattern;
+    std::atomic<bool> cancel{true};
+    EXPECT_EQ(wipeDevice(dev(1), B, H, &cancel), -ECANCELED);
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), pattern);
+    cancel = false;
+    ASSERT_EQ(wipeDevice(dev(1), B, H, &cancel), 0); // Eight 2 MiB chunks.
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+    EXPECT_EQ(wipeDevice(dev(1), B, 1000), -EINVAL); // Not page-aligned.
+}
+
+TEST_F(DeviceExclusionTest, IsolatedWipeSurvivesFaultsAndStopsOnCancel) {
+    addDevice(1);
+    // Mapping past the end of a file faults like an unbound device-dax mapping:
+    // SIGBUS kills the child only.
+    EXPECT_EQ(wipeDeviceIsolated(dev(1), 2 * B, H), -EIO);
+    EXPECT_EQ(wipeDeviceIsolated(dev(1), B, H, [] { return true; }), -ECANCELED);
+    EXPECT_EQ(wipeDeviceIsolated("/dev/dax9.0", B, H), -ENOENT);
+    ASSERT_EQ(wipeDeviceIsolated(dev(1), B, H), 0);
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+}
+
+TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    const std::string path = state + "/admin.sock";
+    AdminServer admin(pm, path);
+    ASSERT_EQ(admin.start(), 0);
+    auto connectTo = [&] {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+        EXPECT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+        return fd;
+    };
+    const int busy = connectTo(); // Holds the admin thread until it sends a line.
+    ::usleep(100 * 1000);
+    const int gone = connectTo(); // Queued behind it; gives up before its turn.
+    const std::string request = "exclude dax0.0\n";
+    ASSERT_EQ(::send(gone, request.data(), request.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(request.size()));
+    ::close(gone);
+    const std::string status = "status\n";
+    ASSERT_EQ(::send(busy, status.data(), status.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(status.size()));
+    char buf[256];
+    EXPECT_GT(::recv(busy, buf, sizeof(buf), 0), 0);
+    ::close(busy);
+    // Both connections are served by now once a later request gets through.
+    EXPECT_EQ(ask(path, "status\n").rfind("OK\n", 0), 0u);
+    EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
+    EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
 }

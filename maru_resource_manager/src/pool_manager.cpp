@@ -24,6 +24,7 @@
 
 #include "device_exclusion.h"
 #include "device_header.h"
+#include "device_wipe.h"
 #include "metadata.h"
 #include "pool_validation.h"
 #include "util.h"
@@ -2085,6 +2086,68 @@ int PoolManager::adminRelease(uint64_t regionId, bool confirmed, std::string &ou
     appendf(out, "released region=%llu size=%llu client=%s\n",
             static_cast<unsigned long long>(regionId),
             static_cast<unsigned long long>(a.allocLength), a.clientId);
+    return 0;
+}
+
+int PoolManager::adminWipe(const std::string &device, bool confirmed, std::string &out,
+                           const std::function<bool()> &cancelled)
+{
+    std::string name;
+    if (!normalizeDaxName(device, name))
+    {
+        out = "invalid device name: " + device + "\n";
+        return -EINVAL;
+    }
+    const std::string path = "/dev/" + name;
+    uint64_t size = 0;
+    uint64_t align = alignBytes_;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        int rc = checkExcludedFileLocked(out);
+        if (rc != 0) return rc;
+        if (!excluded_.count(name))
+        {
+            out = path + " is not excluded; exclude it first\n";
+            return -EINVAL;
+        }
+        if (!confirmed)
+        {
+            out = "this zeroes all of " + path +
+                  ", header included; verify that no host maps it, then pass --confirm\n";
+            return -EPERM;
+        }
+        rc = getDeviceSize(path, size);
+        if (rc != 0 || size == 0)
+        {
+            rc = rc != 0 ? rc : -ENODEV;
+            out = "cannot read the size of " + path + " (is it bound to device_dax?): " +
+                  std::strerror(-rc) + "\n";
+            return rc;
+        }
+        uint64_t devAlign = 0;
+        if (readDaxAlignBytes(name, devAlign) && devAlign != 0) align = devAlign;
+    }
+
+    // Outside the lock: an excluded device is unused by the RM, and admin
+    // commands run one at a time, so it cannot be included meanwhile.
+    logf(LogLevel::Warn, "admin: wiping %s (%llu bytes)", path.c_str(),
+         static_cast<unsigned long long>(size));
+    const auto started = SteadyClock::now();
+    const uint64_t chunk = std::max<uint64_t>(align, (1ULL << 30) / align * align);
+    const int rc = wipeDeviceIsolated(path, size, chunk, cancelled);
+    const double seconds =
+        std::chrono::duration<double>(SteadyClock::now() - started).count();
+    if (rc != 0)
+    {
+        logf(LogLevel::Error, "admin: wipe of %s stopped after %.1fs: %s", path.c_str(),
+             seconds, std::strerror(-rc));
+        out = "wipe of " + path + " stopped: " + std::strerror(-rc) +
+              "; the device may be partly zeroed\n";
+        return rc;
+    }
+    logf(LogLevel::Warn, "admin: wiped %s in %.1fs", path.c_str(), seconds);
+    appendf(out, "wiped %s bytes=%llu seconds=%.1f\n", path.c_str(),
+            static_cast<unsigned long long>(size), seconds);
     return 0;
 }
 
