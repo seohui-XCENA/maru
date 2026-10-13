@@ -349,9 +349,9 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
     const std::string walPath = state + "/maru-resource-manager.wal";
     auto second = allocation(0, 2 * H);
     second.handle.regionId = 43;
-    // A crash during the second append can leave part of its header, or the
-    // whole header and part of its payload.
-    for (size_t kept : {size_t{10}, size_t{40}}) {
+    // A crash during the second append can leave part of its header (even
+    // just magic bytes), or the whole header and part of its payload.
+    for (size_t kept : {size_t{3}, size_t{10}, size_t{40}}) {
         fs::remove(walPath);
         ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
         const auto complete = bytes(walPath);
@@ -381,6 +381,43 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         EXPECT_EQ(pm.loadPools(), -EPROTO);
         EXPECT_EQ(bytes(walPath), corrupt);
     }
+}
+
+TEST_F(HeaderRecoveryTest, LegacyWalReplaysButItsTornTailIsRejected) {
+    addDevice(0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    const auto record = [&](const Allocation &a) {
+        fs::remove(walPath);
+        EXPECT_EQ(WalStore(state).appendAlloc(a), 0);
+        auto r = bytes(walPath);
+        r[4] = 6; // WalHeader::version, as written before v7.
+        return r;
+    };
+    auto second = allocation(0, 2 * H);
+    second.handle.regionId = 43;
+    const auto v6 = record(allocation());
+    const auto v6Second = record(second);
+    // A v6 writer acknowledged even failed appends, so its torn tail may be
+    // an allocation a client still holds.
+    for (const auto &tail : {v6Second.substr(0, 40), v6Second.substr(0, 10),
+                             v6Second.substr(0, 3)}) {
+        std::ofstream(walPath, std::ios::binary | std::ios::trunc) << v6 + tail;
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EPROTO);
+        EXPECT_EQ(bytes(walPath), v6 + tail);
+    }
+    // Complete v6 records still replay, and v7 records are appended after them.
+    std::ofstream(walPath, std::ios::binary | std::ios::trunc) << v6;
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0);
+    }
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 2u);
 }
 
 TEST_F(HeaderRecoveryTest, FailedWalAppendIsNotAcknowledged) {

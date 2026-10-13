@@ -21,7 +21,10 @@ static constexpr const char *kLegacyWalName = "maru_resourced.wal";
 static constexpr const char *kCurrentWalName = "maru-resource-manager.wal";
 
 static constexpr uint32_t kWalMagic = 0x57414C21; // 'WAL!'
-static constexpr uint32_t kWalVersion = 6;
+static constexpr uint32_t kWalVersion = 7;
+// Same record layout, but v6 writers acknowledged records whose append had
+// failed, so a torn v6 record may have been acknowledged. Replay only.
+static constexpr uint32_t kLegacyWalVersion = 6;
 
 struct WalHeader {
   uint32_t magic;
@@ -196,10 +199,10 @@ struct TornTail {
   uint64_t length = 0;
 };
 
-// Callers acknowledge a record only after fdatasync, and a failed append is
-// removed (or blocks later appends), so an incomplete final record was cut
-// short by a crash and never acknowledged: it ends the log. Any other bytes
-// that do not parse are rejected.
+// Since v7, callers acknowledge a record only after fdatasync, and a failed
+// append is removed (or blocks later appends), so an incomplete final v7
+// record was cut short by a crash and never acknowledged: it ends the log.
+// Any other bytes that do not parse, including a torn v6 record, are rejected.
 static int visitRecords(const std::string &path,
                         const std::function<int(uint32_t, const std::vector<uint8_t> &)> &visit,
                         TornTail *torn = nullptr) {
@@ -213,13 +216,20 @@ static int visitRecords(const std::string &path,
   }
   uint64_t remaining = st.st_size;
   TornTail tail;
+  uint32_t lastVersion = 0;
   int rc = 0;
   while (remaining != 0) {
     const uint64_t offset = static_cast<uint64_t>(st.st_size) - remaining;
     if (remaining < sizeof(WalHeader)) {
       uint8_t partial[sizeof(WalHeader)]{};
       if ((rc = readFull(fd, partial, remaining)) != 0) break;
-      if (!headerPrefix(partial, remaining)) { rc = -EPROTO; break; }
+      // Magic alone cannot tell v7 from v6; then the previous record decides.
+      const bool versionKnown = remaining > offsetof(WalHeader, version);
+      if (!headerPrefix(partial, remaining) ||
+          (!versionKnown && lastVersion != kWalVersion)) {
+        rc = -EPROTO;
+        break;
+      }
       tail = {offset, remaining};
       break;
     }
@@ -228,16 +238,19 @@ static int visitRecords(const std::string &path,
     remaining -= sizeof(hdr);
     const bool alloc = hdr.type == static_cast<uint32_t>(WalRecordType::ALLOC);
     const bool free = hdr.type == static_cast<uint32_t>(WalRecordType::FREE);
-    if (hdr.magic != kWalMagic || hdr.version != kWalVersion ||
+    if (hdr.magic != kWalMagic ||
+        (hdr.version != kWalVersion && hdr.version != kLegacyWalVersion) ||
         (!alloc && !free) ||
         hdr.payloadLen != (alloc ? sizeof(Allocation) : sizeof(WalFreeV3))) {
       rc = -EPROTO;
       break;
     }
     if (hdr.payloadLen > remaining) {
+      if (hdr.version != kWalVersion) { rc = -EPROTO; break; }
       tail = {offset, sizeof(hdr) + remaining};
       break;
     }
+    lastVersion = hdr.version;
     std::vector<uint8_t> payload(hdr.payloadLen);
     if ((rc = readFull(fd, payload.data(), payload.size())) != 0) break;
     remaining -= payload.size();
