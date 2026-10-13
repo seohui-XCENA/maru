@@ -9,6 +9,8 @@ include(GNUInstallDirs)
 find_package(OpenSSL REQUIRED)
 
 add_executable(maru_resource_manager
+    src/admin_server.cpp
+    src/device_exclusion.cpp
     src/device_header.cpp
     src/util.cpp
     src/main.cpp
@@ -34,6 +36,10 @@ set_target_properties(maru_resource_manager PROPERTIES OUTPUT_NAME "maru-resourc
 install(TARGETS maru_resource_manager
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+install(PROGRAMS tools/maru_rm_ctl.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME maru-rm-ctl
+)
 
 # Test client tool (not installed by default)
 option(MARU_BUILD_TOOLS "Build test/debug tools" ON)
@@ -55,6 +61,8 @@ if(MARU_BUILD_TESTS)
 
     # Sources needed by tests (everything except main.cpp)
     set(RM_LIB_SOURCES
+        src/admin_server.cpp
+        src/device_exclusion.cpp
         src/device_header.cpp
         src/util.cpp
         src/server_config.cpp
@@ -89,7 +97,8 @@ if(MARU_BUILD_TESTS)
     gtest_discover_tests(maru_rm_tests)
 
     add_executable(maru_rm_recovery_tests
-        tests/test_header_recovery.cpp tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
+        tests/test_header_recovery.cpp tests/test_device_exclusion.cpp
+        tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
     target_include_directories(maru_rm_recovery_tests PRIVATE include src)
     target_compile_options(maru_rm_recovery_tests PRIVATE -Wall -Wextra -Wpedantic)
     target_link_options(maru_rm_recovery_tests PRIVATE
@@ -117,7 +126,9 @@ if(MARU_BUILD_TESTS)
         missing_secret_rejects_live_recovery
         prepared_legacy_checkpoint_round_trip
         shutdown_checkpoint_write_failure_retains_wal
-        shutdown_checkpoint_fsync_failure_retains_wal)
+        shutdown_checkpoint_fsync_failure_retains_wal
+        admin_exclude_and_include
+        second_instance_is_refused)
         add_test(NAME ProcessRecovery.${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py
                 $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)

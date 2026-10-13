@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -107,6 +108,11 @@ extern "C" ssize_t __wrap_readlink(const char *path, char *buf, size_t size) {
 }
 
 extern "C" int __wrap_bind(int fd, const struct sockaddr *address, socklen_t size) {
+    // The admin socket lives in the fixture's state directory.
+    if (!fixtureRoot.empty() && address->sa_family == AF_UNIX &&
+        std::string(reinterpret_cast<const sockaddr_un *>(address)->sun_path)
+                .rfind(fixtureRoot + "/", 0) == 0)
+        return __real_bind(fd, address, size);
     if (fixtureRoot.empty() || size != sizeof(sockaddr_in) ||
         address->sa_family != AF_INET) {
         errno = EINVAL;

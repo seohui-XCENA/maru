@@ -299,6 +299,28 @@ int WalStore::referencedPools(std::set<uint32_t> &pools) const {
   return rc;
 }
 
+int WalStore::liveAllocations(const std::set<uint32_t> &pools,
+                              std::map<uint64_t, Allocation> &live) const {
+  std::map<uint64_t, Allocation> staged;
+  for (const auto &[id, a] : live)
+    if (pools.count(a.poolId)) staged.emplace(id, a);
+  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
+    if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
+      Allocation a{};
+      std::memcpy(&a, payload.data(), sizeof(a));
+      if (pools.count(a.poolId)) staged[a.handle.regionId] = a;
+    } else {
+      WalFreeV3 fr{};
+      std::memcpy(&fr, payload.data(), sizeof(fr));
+      staged.erase(fr.regionId); // Region IDs are never reused across pools.
+    }
+    return 0;
+  });
+  if (rc != 0 && rc != -ENOENT) return rc;
+  live = std::move(staged);
+  return 0;
+}
+
 int WalStore::replay(std::vector<PoolState> &pools,
                      std::map<uint64_t, Allocation> &allocations,
                      uint64_t &nextRegionId) {

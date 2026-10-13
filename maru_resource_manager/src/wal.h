@@ -24,6 +24,10 @@ public:
   bool appendsDisabled() const { return appendError_ != 0; }
   // Read/validate the log without opening any device or changing recovery state.
   int referencedPools(std::set<uint32_t> &pools) const;
+  // Keep only `pools` in `live` (seeded from the global checkpoint) and apply
+  // the log's ALLOC/FREE records for them, without opening any device.
+  int liveAllocations(const std::set<uint32_t> &pools,
+                      std::map<uint64_t, Allocation> &live) const;
 
   int replay(std::vector<PoolState> &pools,
              std::map<uint64_t, Allocation> &allocations,
