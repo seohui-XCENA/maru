@@ -3,6 +3,7 @@
 #include "recovery_fixture.h"
 
 #include <sys/file.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/un.h>
@@ -645,6 +646,10 @@ TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
 }
 
 TEST_F(DeviceExclusionTest, WipeChildDiesWithTheRmAndHoldsNoDescriptors) {
+    // Orphans reparent to this process, so the test reaps the wipe child
+    // itself: PID 1 of a CI container (tail -f /dev/null) never reaps them,
+    // and an unreaped zombie still answers kill(pid, 0).
+    ASSERT_EQ(::prctl(PR_SET_CHILD_SUBREAPER, 1), 0);
     const std::string lockPath = state + "/maru-resource-manager.lock";
     const pid_t rm = ::fork();
     if (rm == 0) {
@@ -653,24 +658,32 @@ TEST_F(DeviceExclusionTest, WipeChildDiesWithTheRmAndHoldsNoDescriptors) {
         wipeDeviceIsolated("/dev/dax-hang", B, H); // The child stalls in open().
         ::_exit(0);
     }
-    ASSERT_GT(rm, 0);
     pid_t wipe = 0;
-    for (int i = 0; i < 250 && wipe == 0; ++i) {
+    for (int i = 0; rm > 0 && i < 250 && wipe == 0; ++i) {
         std::ifstream children("/proc/" + std::to_string(rm) + "/task/" +
                                std::to_string(rm) + "/children");
         children >> wipe;
         if (wipe == 0) ::usleep(20 * 1000);
     }
-    ASSERT_GT(wipe, 0) << "wipe child never started";
-    ::kill(rm, SIGKILL); // The RM dies mid-wipe.
-    ::waitpid(rm, nullptr, 0);
-    bool gone = false;
-    for (int i = 0; i < 250 && !gone; ++i) {
-        gone = ::kill(wipe, 0) != 0 && errno == ESRCH;
-        if (!gone) ::usleep(20 * 1000);
+    if (rm > 0) {
+        ::kill(rm, SIGKILL); // The RM dies mid-wipe.
+        ::waitpid(rm, nullptr, 0);
     }
-    if (!gone) ::kill(wipe, SIGKILL); // Never leave a runaway wipe behind.
-    EXPECT_TRUE(gone);
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; wipe > 0 && i < 250 && !reaped; ++i) {
+        reaped = ::waitpid(wipe, &status, WNOHANG) == wipe;
+        if (!reaped) ::usleep(20 * 1000);
+    }
+    if (wipe > 0 && !reaped) { // Never leave a runaway wipe behind.
+        ::kill(wipe, SIGKILL);
+        ::waitpid(wipe, nullptr, 0);
+    }
+    ::prctl(PR_SET_CHILD_SUBREAPER, 0);
+    ASSERT_GT(rm, 0);
+    ASSERT_GT(wipe, 0) << "wipe child never started";
+    ASSERT_TRUE(reaped) << "wipe child outlived the RM";
+    EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) << status;
     const int fd = ::open(lockPath.c_str(), O_RDWR | O_CLOEXEC);
     ASSERT_GE(fd, 0);
     EXPECT_EQ(::flock(fd, LOCK_EX | LOCK_NB), 0); // A new RM can take the lock.
