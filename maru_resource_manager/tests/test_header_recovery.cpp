@@ -308,8 +308,7 @@ TEST_F(HeaderRecoveryTest, LegacyWalReplaysButItsTornTailIsRejected) {
     EXPECT_EQ(restarted.allocationCount(), 2u);
 }
 
-TEST_F(HeaderRecoveryTest, FailedWalAppendIsNotAcknowledged) {
-    using checkpoint_fault::Operation;
+TEST_F(HeaderRecoveryTest, PartialWalAppendIsNotAcknowledged) {
     addDevice(0);
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
@@ -319,30 +318,101 @@ TEST_F(HeaderRecoveryTest, FailedWalAppendIsNotAcknowledged) {
     const auto walBefore = bytes(walPath);
     std::vector<PoolState> before;
     pm.getStats(before);
-    // A short write followed by ENOSPC, and a whole record whose fdatasync fails.
-    for (const auto &[op, error] : std::vector<std::pair<Operation, int>>{
-             {Operation::Write, ENOSPC}, {Operation::Fdatasync, EIO}}) {
-        checkpoint_fault::arm(walPath, op, error, 10);
-        Handle h{};
-        EXPECT_EQ(allocate(pm, h), -error);
-        EXPECT_EQ(checkpoint_fault::failures(), 1u);
-        checkpoint_fault::arm(walPath, op, error, 10);
-        EXPECT_EQ(pm.verifyAndFree(kept, "offline-test-owner"), -error);
-        EXPECT_EQ(checkpoint_fault::failures(), 1u);
-        checkpoint_fault::clear();
-        EXPECT_EQ(bytes(walPath), walBefore);
-        EXPECT_EQ(pm.allocationCount(), 1u);
-        std::vector<PoolState> after;
-        pm.getStats(after);
-        ASSERT_EQ(after.size(), 1u);
-        EXPECT_EQ(after[0].freeSize, before[0].freeSize);
-        ASSERT_EQ(after[0].freeList.size(), before[0].freeList.size());
-        EXPECT_EQ(after[0].freeList[0].offset, before[0].freeList[0].offset);
-    }
+    // A short write followed by ENOSPC: neither operation takes effect.
+    checkpoint_fault::arm(walPath, checkpoint_fault::Operation::Write, ENOSPC, 10);
+    Handle h{};
+    EXPECT_EQ(allocate(pm, h), -ENOSPC);
+    EXPECT_EQ(checkpoint_fault::failures(), 1u);
+    checkpoint_fault::arm(walPath, checkpoint_fault::Operation::Write, ENOSPC, 10);
+    EXPECT_EQ(pm.verifyAndFree(kept, "offline-test-owner"), -ENOSPC);
+    EXPECT_EQ(checkpoint_fault::failures(), 1u);
+    checkpoint_fault::clear();
+    EXPECT_EQ(bytes(walPath), walBefore);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    std::vector<PoolState> after;
+    pm.getStats(after);
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].freeSize, before[0].freeSize);
+    ASSERT_EQ(after[0].freeList.size(), before[0].freeList.size());
+    EXPECT_EQ(after[0].freeList[0].offset, before[0].freeList[0].offset);
     PoolManager restarted(state);
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_EQ(restarted.allocationCount(), 1u);
     EXPECT_EQ(restarted.verifyAndFree(kept, "offline-test-owner"), 0);
+}
+
+// A whole record is in the WAL but fdatasync fails (and so does the rollback
+// truncate), then the RM restarts before any checkpoint: recovery may apply
+// the record, so the reply must match what recovery would do or be harmless.
+TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
+    using checkpoint_fault::Operation;
+    addDevice(0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    char host[256]{};
+    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
+    const std::string exitedOwner = std::string(host) + ":2147483647";
+    auto failSync = [&] {
+        checkpoint_fault::arm(walPath, Operation::Fdatasync, EIO);
+        checkpoint_fault::armTruncate(walPath, EIO);
+    };
+
+    // FREE: completed despite the failed sync, since recovery may apply it.
+    // The client is told it succeeded and drops its mapping.
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0);
+        failSync();
+        EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+        checkpoint_fault::clear();
+        EXPECT_EQ(pm.allocationCount(), 0u);
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 0u);
+        EXPECT_EQ(restarted.verifyAndFree(h, "offline-test-owner"), -ENOENT);
+    }
+
+    // ALLOC: rejected. If the record still survives, recovery restores an
+    // allocation its client never got: a leak the reaper reclaims with that
+    // client, never a range handed to two clients.
+    fs::remove(walPath);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        failSync();
+        Handle h{};
+        std::string path, uuid;
+        uint64_t requested;
+        EXPECT_EQ(pm.alloc(H, exitedOwner, h, path, uuid, dev(0), requested), -EIO);
+        checkpoint_fault::clear();
+        EXPECT_EQ(pm.allocationCount(), 0u);
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 1u);
+        uint64_t reaped = 0;
+        restarted.reapExpired(reaped);
+        EXPECT_EQ(reaped, 1u);
+        EXPECT_EQ(restarted.allocationCount(), 0u);
+    }
+
+    // After any failed sync the next operation first replaces the log, so a
+    // later restart cannot replay the uncertain record.
+    fs::remove(walPath);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        checkpoint_fault::arm(walPath, Operation::Fdatasync, EIO);
+        Handle rejected{};
+        EXPECT_EQ(allocate(pm, rejected), -EIO);
+        checkpoint_fault::clear();
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0); // Checkpoints first, then logs this ALLOC.
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 1u);
+        EXPECT_EQ(restarted.verifyAndFree(h, "offline-test-owner"), 0);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) {

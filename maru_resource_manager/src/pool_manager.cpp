@@ -1638,11 +1638,21 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
     {
         checkpointLocked();
     }
-    const int walRc = wal_->appendFree(regionId);
-    if (walRc != 0)
+    bool written = false;
+    const int walRc = wal_->appendFree(regionId, &written);
+    if (walRc != 0 && !written)
     {
         logWalAppendFailure("free", walRc);
         return walRc;
+    }
+    if (walRc != 0)
+    {
+        // The FREE is in the log but not known to be on disk. Rejecting it
+        // would keep the client's mapping while recovery may still free the
+        // range for someone else; completing it risks only a leak.
+        logf(LogLevel::Error,
+             "WAL FREE for region %llu written but not synced (%d); completing the free",
+             static_cast<unsigned long long>(regionId), walRc);
     }
 
     if (targetPool->type == DaxType::FS_DAX)
