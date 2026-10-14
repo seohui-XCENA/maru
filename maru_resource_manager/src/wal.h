@@ -30,6 +30,10 @@ public:
   bool appendsDisabled() const { return appendError_ != 0; }
   // Read/validate the log without opening any device or changing recovery state.
   int referencedPools(std::set<uint32_t> &pools) const;
+  // Keep only `pools` in `live` (seeded from the global checkpoint) and apply
+  // the log's ALLOC/FREE records for them, without opening any device.
+  int liveAllocations(const std::set<uint32_t> &pools,
+                      std::map<uint64_t, Allocation> &live) const;
 
   int replay(std::vector<PoolState> &pools,
              std::map<uint64_t, Allocation> &allocations,
@@ -46,6 +50,9 @@ public:
 private:
   std::string stateDir_;
   int walFd_{-1};
+  // Whether the WAL's directory entry is known to survive a power loss. A
+  // record's fdatasync does not cover the entry of a newly created file.
+  bool entrySynced_{false};
   // Set when an append's outcome on disk is unknown (sync failed, or a
   // partial record could not be removed); cleared by a checkpoint.
   int appendError_{0};

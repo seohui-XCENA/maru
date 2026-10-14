@@ -29,6 +29,7 @@ HANDLE = struct.Struct("<QQQQ")
 META_HEADER = struct.Struct("<IIIIQQ")
 EXTENT = struct.Struct("<QQ")
 WAL_NAME = "maru-resource-manager.wal"
+CTL = Path(__file__).resolve().parents[1] / "tools/maru_rm_ctl.py"
 
 spec = importlib.util.spec_from_file_location(
     "repair", Path(__file__).resolve().parents[1] / "tools/prepare_empty_pool_repair.py"
@@ -418,6 +419,88 @@ class ProcessRecoveryTest(unittest.TestCase):
         for filename in ("pool_0.meta", "pool_1.meta", "global.meta"):
             with self.subTest(file=filename):
                 self.checkpoint_failure_round_trip(filename, "fsync", errno.EIO)
+
+    def ctl(self, *argv):
+        result = subprocess.run(
+            [sys.executable, str(CTL), "--state-dir", str(self.state), *argv],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    def pool_paths(self):
+        response = self.request(5)
+        offset, paths = 4, set()
+        for _ in range(struct.unpack_from("<I", response)[0]):
+            length = struct.unpack_from("<I", response, offset)[0]
+            offset += 32
+            paths.add(response[offset : offset + length].decode())
+            offset += length
+        return paths
+
+    def test_admin_exclude_and_include(self):
+        self.add_device(1)
+        self.start()
+        handle = self.allocate(1)
+        code, output = self.ctl("exclude", "/dev/dax1.0")
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"region={handle[0]}", output)
+        self.free(handle)
+        code, output = self.ctl("exclude", "dax1.0")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.pool_paths(), {"/dev/dax0.0"})
+        header = (self.root / "dev/dax1.0").read_bytes()[:64]
+
+        # The decision survives a restart; the device is never touched.
+        self.stop()
+        self.start()
+        self.assertEqual(self.pool_paths(), {"/dev/dax0.0"})
+        self.assertEqual((self.root / "dev/dax1.0").read_bytes()[:64], header)
+        code, output = self.ctl("status")
+        self.assertEqual(code, 0, output)
+        self.assertIn("device=/dev/dax1.0 state=excluded", output)
+
+        code, output = self.ctl("include", "dax1.0")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.pool_paths(), {"/dev/dax0.0", "/dev/dax1.0"})
+        self.access(self.allocate(1), 1)
+        self.stop()
+        self.assertFalse((self.state / "admin.sock").exists())
+
+    def test_second_instance_is_refused(self):
+        self.start()
+        handle = self.allocate()
+        env = dict(os.environ, MARU_TEST_DAX_ROOT=str(self.root))
+        second = subprocess.run(
+            [str(DAEMON)], env=env, capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+        self.assertIn("cannot lock", second.stdout + second.stderr)
+        code, output = self.ctl("status")  # The first RM keeps its admin socket.
+        self.assertEqual(code, 0, output)
+        self.access(handle)
+        self.free(handle)
+        self.stop()
+
+    def test_admin_wipe_resets_an_excluded_device(self):
+        self.add_device(1)
+        self.start()
+        self.free(self.allocate(1))
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 1, output)  # Still used by the RM.
+        code, output = self.ctl("exclude", "dax1.0")
+        self.assertEqual(code, 0, output)
+        code, output = self.ctl("wipe", "dax1.0")
+        self.assertEqual(code, 1, output)  # Needs --confirm.
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.root / "dev/dax1.0").read_bytes(), bytes(SIZE))
+        code, output = self.ctl("include", "dax1.0")
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.root / "dev/dax1.0").read_bytes()[:8], b"MARUDEV\0")
+        self.access(self.allocate(1), 1)
+        self.stop()
 
 
 if __name__ == "__main__":

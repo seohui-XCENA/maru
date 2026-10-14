@@ -84,6 +84,17 @@ int WalStore::ensureOpen() {
   if (walFd_ < 0) {
     return -errno;
   }
+  // Before the first record is acknowledged, make sure the file itself is
+  // found after a power loss (it is new after every checkpoint).
+  if (!entrySynced_) {
+    const int rc = syncDirectory(stateDir_);
+    if (rc != 0) {
+      ::close(walFd_);
+      walFd_ = -1;
+      return rc;
+    }
+    entrySynced_ = true;
+  }
   return 0;
 }
 
@@ -313,6 +324,28 @@ int WalStore::referencedPools(std::set<uint32_t> &pools) const {
   return rc;
 }
 
+int WalStore::liveAllocations(const std::set<uint32_t> &pools,
+                              std::map<uint64_t, Allocation> &live) const {
+  std::map<uint64_t, Allocation> staged;
+  for (const auto &[id, a] : live)
+    if (pools.count(a.poolId)) staged.emplace(id, a);
+  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
+    if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
+      Allocation a{};
+      std::memcpy(&a, payload.data(), sizeof(a));
+      if (pools.count(a.poolId)) staged[a.handle.regionId] = a;
+    } else {
+      WalFreeV3 fr{};
+      std::memcpy(&fr, payload.data(), sizeof(fr));
+      staged.erase(fr.regionId); // Region IDs are never reused across pools.
+    }
+    return 0;
+  });
+  if (rc != 0 && rc != -ENOENT) return rc;
+  live = std::move(staged);
+  return 0;
+}
+
 int WalStore::replay(std::vector<PoolState> &pools,
                      std::map<uint64_t, Allocation> &allocations,
                      uint64_t &nextRegionId) {
@@ -396,6 +429,12 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
   if (rc != 0) {
     return rc;
   }
+  // The renames must be on disk before the WAL they replace is removed: a
+  // power loss could otherwise keep the unlink and lose the checkpoint.
+  rc = syncDirectory(stateDir_);
+  if (rc != 0) {
+    return rc;
+  }
 
   // Close the WAL fd before unlinking so the next append reopens a fresh file
   if (walFd_ >= 0) {
@@ -403,6 +442,7 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
     walFd_ = -1;
   }
   if (::unlink(walPath().c_str()) != 0 && errno != ENOENT) return -errno;
+  entrySynced_ = false;
   appendError_ = 0;
   return 0;
 }
