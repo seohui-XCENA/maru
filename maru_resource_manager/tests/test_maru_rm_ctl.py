@@ -90,6 +90,17 @@ class MaruRmCtlTest(unittest.TestCase):
         self.assertIn("refused: Device or resource busy", err)
         self.assertIn("region=7", err)
 
+    def test_unfinished_exclusion_is_neither_success_nor_refusal(self):
+        code, _, out, err = self.run_ctl(
+            "INCOMPLETE\nexcluded /dev/dax2.0 (pool 2)\nnot durable yet\n",
+            "exclude",
+            "dax2.0",
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(out, "excluded /dev/dax2.0 (pool 2)\nnot durable yet\n")
+        self.assertIn("not finished", err)
+        self.assertNotIn("refused", err)
+
     def test_unreachable_rm_is_distinct_from_refusal(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

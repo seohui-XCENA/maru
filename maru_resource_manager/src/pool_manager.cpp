@@ -886,6 +886,13 @@ int PoolManager::loadPoolsLocked()
     for (const auto &name : excluded_)
         logf(LogLevel::Info, "device /dev/%s is excluded (maru-rm-ctl include to use it)",
              name.c_str());
+    // A previous RM may have renamed the list into place without syncing it,
+    // and that state lived only in its memory. Confirm it again so no
+    // excluded device is handed over while a power loss could still undo it.
+    excludedSyncRc_ = excluded_.empty() ? 0 : syncExcludedDevices(stateDir_);
+    if (excludedSyncRc_ != 0)
+        logf(LogLevel::Warn, "the excluded device list in %s is not durable yet: %s",
+             stateDir_.c_str(), std::strerror(-excludedSyncRc_));
     std::map<uint64_t, Allocation> stagedAllocations;
     uint64_t stagedNextRegionId = 1;
     const int globalRc = metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
@@ -1763,6 +1770,9 @@ int PoolManager::adminStatus(std::string &out)
                 static_cast<unsigned long long>(p.freeSize), counts[p.poolId]);
     for (const auto &name : excluded_)
         appendf(out, "device=/dev/%s state=excluded\n", name.c_str());
+    if (excludedSyncRc_ != 0)
+        out += "excluded_list=not-durable reason=" + std::string(std::strerror(-excludedSyncRc_)) +
+               "\n";
     if (checkpointBlock_.empty())
         out += "checkpoints=enabled\n";
     else
@@ -1781,9 +1791,42 @@ int PoolManager::adminAllocations(const std::string &device, std::string &out)
         return -EINVAL;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    for (const auto &[id, a] : allocations_)
+    // A loaded pool's allocations are current. A pool without a device only
+    // has its checkpoint entries here and the WAL holds the rest, so list it
+    // from both, as adminExclude does.
+    std::set<uint32_t> absent;
+    if (device.empty())
     {
-        if (!device.empty() && a.poolId != poolFilter) continue;
+        const int rc = wal_->referencedPools(absent);
+        if (rc != 0 && rc != -ENOENT)
+        {
+            out = "cannot read WAL: " + std::string(std::strerror(-rc)) + "\n";
+            return rc;
+        }
+        for (const auto &[id, a] : allocations_) absent.insert(a.poolId);
+    }
+    else
+    {
+        absent.insert(poolFilter);
+    }
+    for (const auto &p : pools_) absent.erase(p.poolId);
+    std::map<uint64_t, Allocation> live;
+    for (const auto &[id, a] : allocations_)
+        if (absent.count(a.poolId)) live.emplace(id, a);
+    if (!absent.empty())
+    {
+        const int rc = wal_->liveAllocations(absent, live);
+        if (rc != 0)
+        {
+            out = "cannot read WAL: " + std::string(std::strerror(-rc)) + "\n";
+            return rc;
+        }
+    }
+    for (const auto &[id, a] : allocations_)
+        if (!absent.count(a.poolId) && (device.empty() || a.poolId == poolFilter))
+            live.emplace(id, a);
+    for (const auto &[id, a] : live)
+    {
         const PoolState *pool = findPoolById(a.poolId);
         appendf(out, "region=%llu pool=%u device=%s size=%llu offset=%llu client=%s owner=%s\n",
                 static_cast<unsigned long long>(id), a.poolId,
@@ -1815,6 +1858,17 @@ int PoolManager::checkExcludedFileLocked(std::string &out)
     return 0;
 }
 
+// The exclusion is in effect, but a power loss could undo it: say so, and how
+// to confirm it, before anyone hands the device over.
+static std::string unsyncedExclusionNote(const std::string &stateDir, int syncRc,
+                                         const std::string &name)
+{
+    return "the excluded device list is not durable yet: syncing " + stateDir + " failed (" +
+           std::strerror(-syncRc) + "). A power loss could return /dev/" + name +
+           " to the RM, so do not hand it over; rerun 'maru-rm-ctl exclude " + name +
+           "' until it succeeds\n";
+}
+
 int PoolManager::adminExclude(const std::string &device, std::string &out)
 {
     std::string name;
@@ -1830,6 +1884,15 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
     if (fileRc != 0) return fileRc;
     if (excluded_.count(name))
     {
+        // An earlier save may have renamed the list into place without
+        // syncing it: a retry confirms durability before reporting success.
+        if (excludedSyncRc_ != 0) excludedSyncRc_ = syncExcludedDevices(stateDir_);
+        if (excludedSyncRc_ != 0)
+        {
+            out = path + " is excluded, but " +
+                  unsyncedExclusionNote(stateDir_, excludedSyncRc_, name);
+            return kAdminIncomplete;
+        }
         out = path + " is already excluded\n";
         return 0;
     }
@@ -1885,12 +1948,16 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
 
     auto next = excluded_;
     next.insert(name);
-    const int rc = saveExcludedDevices(stateDir_, next);
+    int syncRc = 0;
+    const int rc = saveExcludedDevices(stateDir_, next, syncRc);
     if (rc != 0)
     {
         out = "cannot save excluded device list: " + std::string(std::strerror(-rc)) + "\n";
         return rc;
     }
+    // Renamed into place: memory must follow the file even if it is not
+    // durable yet; that is reported below instead of a plain success.
+    excludedSyncRc_ = syncRc;
     excluded_ = std::move(next);
     if (loaded != pools_.end()) pools_.erase(loaded);
     // Checkpoint entries the WAL already freed would otherwise look like
@@ -1918,6 +1985,11 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
     else
         out += "checkpoint=deferred reason=" +
                (checkpointBlock_.empty() ? std::string("write failed") : checkpointBlock_) + "\n";
+    if (excludedSyncRc_ != 0)
+    {
+        out += unsyncedExclusionNote(stateDir_, excludedSyncRc_, name);
+        return kAdminIncomplete;
+    }
     return 0;
 }
 
@@ -1992,11 +2064,18 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
         if (wasExcluded)
         {
             excluded_.insert(name);
-            const int saveRc = listSaved ? saveExcludedDevices(stateDir_, excluded_) : 0;
+            int syncRc = 0;
+            const int saveRc =
+                listSaved ? saveExcludedDevices(stateDir_, excluded_, syncRc) : 0;
             if (saveRc != 0)
                 out += "WARNING: could not record the exclusion again (" +
                        std::string(std::strerror(-saveRc)) +
                        "); the RM may register this device when it restarts\n";
+            else if (listSaved)
+            {
+                excludedSyncRc_ = syncRc;
+                if (syncRc != 0) out += unsyncedExclusionNote(stateDir_, syncRc, name);
+            }
         }
         if (headerWritten)
         {
@@ -2050,9 +2129,11 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
     }
     if (wasExcluded)
     {
-        if ((rc = saveExcludedDevices(stateDir_, excluded_)) != 0)
+        int syncRc = 0;
+        if ((rc = saveExcludedDevices(stateDir_, excluded_, syncRc)) != 0)
             return rollback(rc, "cannot save excluded device list");
         listSaved = true;
+        excludedSyncRc_ = syncRc;
     }
     publishPoolsLocked(recovery);
     reinit_.erase(name);
@@ -2068,6 +2149,12 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
     else
         out += "checkpoint=deferred reason=" +
                (checkpointBlock_.empty() ? std::string("write failed") : checkpointBlock_) + "\n";
+    // Losing this list only keeps the device excluded after a power loss, so
+    // the include stands; still say so.
+    if (wasExcluded && excludedSyncRc_ != 0)
+        out += "WARNING: the excluded device list is not durable yet (syncing " + stateDir_ +
+               " failed: " + std::strerror(-excludedSyncRc_) + "); after a power loss the RM " +
+               "may find " + path + " excluded again\n";
     return 0;
 }
 
@@ -2133,6 +2220,15 @@ int PoolManager::adminWipe(const std::string &device, bool confirmed, std::strin
         {
             out = path + " is not excluded; exclude it first\n";
             return -EINVAL;
+        }
+        // Wiping prepares a handover, which must not start while a power loss
+        // could still return the device to the RM.
+        if (excludedSyncRc_ != 0) excludedSyncRc_ = syncExcludedDevices(stateDir_);
+        if (excludedSyncRc_ != 0)
+        {
+            out = path + " is excluded, but " +
+                  unsyncedExclusionNote(stateDir_, excludedSyncRc_, name);
+            return excludedSyncRc_;
         }
         if (!confirmed)
         {

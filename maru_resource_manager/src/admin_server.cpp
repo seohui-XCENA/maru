@@ -204,6 +204,8 @@ std::string AdminServer::handleLine(PoolManager &pm, const std::string &line,
         out = kUsage;
     }
     if (rc == 0) return "OK\n" + out;
+    // Done, but not safe to build on yet (e.g. hand the device over).
+    if (rc == PoolManager::kAdminIncomplete) return "INCOMPLETE\n" + out;
     return "ERR " + std::to_string(-rc) + " " + std::strerror(-rc) + "\n" + out;
 }
 

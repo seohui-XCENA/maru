@@ -421,6 +421,41 @@ TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
     }
 }
 
+TEST_F(HeaderRecoveryTest, CheckpointKeepsTheWalUntilItsRenamesAreDurable) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    const std::string wal = state + "/maru-resource-manager.wal";
+    ASSERT_TRUE(fs::exists(wal));
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    EXPECT_EQ(pm.checkpoint(), -EIO);
+    checkpoint_fault::clear();
+    EXPECT_EQ(checkpoint_fault::failures(), 1u);
+    EXPECT_TRUE(fs::exists(wal)); // It still covers the allocation.
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
+TEST_F(HeaderRecoveryTest, NewWalEntryIsSyncedBeforeItsFirstRecordIsAcknowledged) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    ASSERT_EQ(pm.checkpoint(), 0); // The next append creates the WAL.
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    Handle h{};
+    EXPECT_EQ(allocate(pm, h), -EIO);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    checkpoint_fault::clear();
+    EXPECT_EQ(checkpoint_fault::failures(), 1u);
+    ASSERT_EQ(allocate(pm, h), 0); // The retry syncs the entry first.
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
 TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) {
     addDevice(0);
     PoolManager pm(state);

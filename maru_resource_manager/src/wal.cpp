@@ -84,6 +84,17 @@ int WalStore::ensureOpen() {
   if (walFd_ < 0) {
     return -errno;
   }
+  // Before the first record is acknowledged, make sure the file itself is
+  // found after a power loss (it is new after every checkpoint).
+  if (!entrySynced_) {
+    const int rc = syncDirectory(stateDir_);
+    if (rc != 0) {
+      ::close(walFd_);
+      walFd_ = -1;
+      return rc;
+    }
+    entrySynced_ = true;
+  }
   return 0;
 }
 
@@ -418,6 +429,12 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
   if (rc != 0) {
     return rc;
   }
+  // The renames must be on disk before the WAL they replace is removed: a
+  // power loss could otherwise keep the unlink and lose the checkpoint.
+  rc = syncDirectory(stateDir_);
+  if (rc != 0) {
+    return rc;
+  }
 
   // Close the WAL fd before unlinking so the next append reopens a fresh file
   if (walFd_ >= 0) {
@@ -425,6 +442,7 @@ int WalStore::checkpoint(const std::vector<PoolState> &pools,
     walFd_ = -1;
   }
   if (::unlink(walPath().c_str()) != 0 && errno != ENOENT) return -errno;
+  entrySynced_ = false;
   appendError_ = 0;
   return 0;
 }

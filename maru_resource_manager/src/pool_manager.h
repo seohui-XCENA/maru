@@ -111,8 +111,12 @@ public:
     /// key=value lines, or with the reason on failure.
     int adminStatus(std::string &out);
     int adminAllocations(const std::string &device, std::string &out);
+    /// Returned by adminExclude when the device is excluded (the RM no longer
+    /// uses it) but the list is not on disk yet, so a power loss could undo it.
+    static constexpr int kAdminIncomplete = 1;
     /// Stop using a device for good (e.g. to hand it to ROOF). Refused while
-    /// any allocation on it is live.
+    /// any allocation on it is live. kAdminIncomplete until the list is on
+    /// disk; calling it again retries the sync.
     int adminExclude(const std::string &device, std::string &out);
     /// Register an excluded (or skipped) device again as an empty pool, keeping
     /// its old metadata aside. `reinit` also writes a fresh header, even over a
@@ -200,6 +204,10 @@ private:
     bool hasGlobalCheckpoint_{false};
     // Devices handed to another owner (daxN.M): never opened or registered.
     std::set<std::string> excluded_;
+    // -errno while the last list renamed into place has not been synced: a
+    // power loss could bring the previous list back, so no excluded device
+    // may be handed over yet. 0 once the list is durable.
+    int excludedSyncRc_{0};
     // Devices `include --reinit` may give a fresh header despite pool
     // history or a foreign signature.
     std::set<std::string> reinit_;

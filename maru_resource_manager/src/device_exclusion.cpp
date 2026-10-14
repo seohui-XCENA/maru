@@ -72,8 +72,11 @@ int loadExcludedDevices(const std::string &stateDir, std::set<std::string> &out)
     return 0;
 }
 
+int syncExcludedDevices(const std::string &stateDir) { return syncDirectory(stateDir); }
+
 int saveExcludedDevices(const std::string &stateDir,
-                        const std::set<std::string> &names) {
+                        const std::set<std::string> &names, int &syncRc) {
+    syncRc = 0;
     const std::string path = stateDir + "/" + kExcludedDevicesFile;
     const std::string tmp = path + ".tmp";
     std::string text =
@@ -91,12 +94,12 @@ int saveExcludedDevices(const std::string &stateDir,
         return rc;
     }
     // The rename is the commit point: callers must treat the new list as in
-    // effect. Syncing the directory only makes it survive a power loss.
-    const int dir = ::open(stateDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir < 0 || ::fsync(dir) != 0)
+    // effect. Syncing the directory only makes it survive a power loss, which
+    // callers must confirm before a device is handed to another owner.
+    syncRc = syncExcludedDevices(stateDir);
+    if (syncRc != 0)
         logf(LogLevel::Warn, "%s saved but its directory was not synced: %s", path.c_str(),
-             std::strerror(errno));
-    if (dir >= 0) ::close(dir);
+             std::strerror(-syncRc));
     return 0;
 }
 

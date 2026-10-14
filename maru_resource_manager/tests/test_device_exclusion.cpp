@@ -378,19 +378,129 @@ TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
     ASSERT_EQ(pm.adminInclude("dax1.0", true, out), 0) << out; // Retry works.
 }
 
-TEST_F(DeviceExclusionTest, UnsyncedDirectoryStillCommitsTheList) {
+TEST_F(DeviceExclusionTest, UnsyncedListIsNotReportedAsReadyForHandover) {
     addDevice(0);
     addDevice(1);
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
     std::string out;
-    const int rc = pm.adminExclude("dax1.0", out);
-    checkpoint_fault::clear();
-    EXPECT_EQ(checkpoint_fault::failures(), 1u);
-    ASSERT_EQ(rc, 0) << out; // Renamed into place: memory must agree with the file.
+    EXPECT_EQ(pm.adminExclude("dax1.0", out), PoolManager::kAdminIncomplete);
+    EXPECT_NE(out.find("excluded /dev/dax1.0"), npos) << out;
+    EXPECT_NE(out.find("do not hand it over"), npos) << out;
+    // Renamed into place: memory must agree with the file.
     EXPECT_EQ(excludedOnDisk(), std::set<std::string>{"dax1.0"});
     EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
+    out.clear();
+    ASSERT_EQ(pm.adminStatus(out), 0);
+    EXPECT_NE(out.find("excluded_list=not-durable"), npos) << out;
+    // Neither a retry nor a wipe may take the already-excluded shortcut. The
+    // retry is neither a success nor a refusal on the admin socket.
+    {
+        const std::string sock = state + "/admin.sock";
+        AdminServer admin(pm, sock);
+        ASSERT_EQ(admin.start(), 0);
+        const std::string reply = ask(sock, "exclude dax1.0\n");
+        admin.stop();
+        EXPECT_EQ(reply.rfind("INCOMPLETE\n/dev/dax1.0 is excluded, but", 0), 0u) << reply;
+        EXPECT_NE(reply.find("not durable yet"), npos) << reply;
+    }
+    out.clear();
+    EXPECT_EQ(pm.adminWipe("dax1.0", true, out), -EIO);
+    EXPECT_NE(out.find("do not hand it over"), npos) << out;
+    checkpoint_fault::clear();
+    // The list, the exclusion's checkpoint, the retry and the wipe.
+    EXPECT_EQ(checkpoint_fault::failures(), 4u);
+
+    out.clear();
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out; // The retry syncs.
+    out.clear();
+    ASSERT_EQ(pm.adminStatus(out), 0);
+    EXPECT_EQ(out.find("not-durable"), npos) << out;
+    out.clear();
+    EXPECT_EQ(pm.adminWipe("dax1.0", false, out), -EPERM); // Only --confirm is missing.
+}
+
+TEST_F(DeviceExclusionTest, RestartRechecksThatTheListIsOnDisk) {
+    addDevice(0);
+    addDevice(1);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        std::string out;
+        ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    }
+    // Whether the previous RM synced the list died with it: check again.
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    std::string out;
+    ASSERT_EQ(restarted.adminStatus(out), 0);
+    EXPECT_NE(out.find("excluded_list=not-durable"), npos) << out;
+    out.clear();
+    EXPECT_EQ(restarted.adminWipe("dax1.0", true, out), -EIO);
+    checkpoint_fault::clear();
+    out.clear();
+    ASSERT_EQ(restarted.adminExclude("dax1.0", out), 0) << out;
+    out.clear();
+    ASSERT_EQ(restarted.adminStatus(out), 0);
+    EXPECT_EQ(out.find("not-durable"), npos) << out;
+}
+
+TEST_F(DeviceExclusionTest, UnsyncedIncludeStandsButIsReported) {
+    addDevice(0);
+    addDevice(1);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    std::string out;
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    out.clear();
+    const int rc = pm.adminInclude("dax1.0", false, out);
+    checkpoint_fault::clear();
+    // Losing this list would only keep the device excluded.
+    ASSERT_EQ(rc, 0) << out;
+    EXPECT_NE(out.find("WARNING: the excluded device list is not durable yet"), npos) << out;
+    EXPECT_EQ(poolPaths(pm), (std::set<std::string>{dev(0), dev(1)}));
+    out.clear();
+    ASSERT_EQ(pm.adminStatus(out), 0);
+    EXPECT_NE(out.find("excluded_list=not-durable"), npos) << out;
+}
+
+TEST_F(DeviceExclusionTest, AllocationsOfAbsentDeviceIncludeTheWal) {
+    addDevice(0);
+    auto p = pool(1);
+    p.freeList = {{2 * H, B - 2 * H}};
+    p.freeSize = B - 2 * H;
+    save(p, {{42, allocation(1)}});
+    {
+        WalStore wal(state);
+        ASSERT_EQ(wal.appendFree(42), 0); // Freed after the checkpoint.
+        auto later = allocation(1, 3 * H);
+        later.handle.regionId = 43;
+        ASSERT_EQ(wal.appendAlloc(later), 0); // Allocated after it.
+    }
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    for (const std::string filter : {"dax1.0", ""}) {
+        std::string out;
+        ASSERT_EQ(pm.adminAllocations(filter, out), 0) << out;
+        EXPECT_EQ(out.find("region=42 "), npos) << filter << ": " << out;
+        EXPECT_NE(out.find("region=43 pool=1 device=(not present)"), npos)
+            << filter << ": " << out;
+    }
+    std::string out;
+    ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
+    EXPECT_EQ(out, "");
+
+    // An unreadable WAL is an error, never an empty listing.
+    std::ofstream(state + "/maru-resource-manager.wal", std::ios::binary | std::ios::trunc)
+        << std::string(64, '\xff');
+    for (const std::string filter : {"dax1.0", ""}) {
+        out.clear();
+        EXPECT_EQ(pm.adminAllocations(filter, out), -EPROTO) << filter;
+        EXPECT_NE(out.find("cannot read WAL"), npos) << filter << ": " << out;
+    }
 }
 
 TEST_F(DeviceExclusionTest, IncludeIgnoresUnrelatedRejectedDevice) {

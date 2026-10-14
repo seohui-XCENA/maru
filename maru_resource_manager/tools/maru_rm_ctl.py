@@ -7,7 +7,10 @@ own user only):
   status                       pools, excluded devices, checkpoint state
   allocations [daxN.M]         live allocations and whether their owner runs
   exclude daxN.M               stop using a device for good (e.g. for ROOF);
-                               refused while any allocation on it is live
+                               refused while any allocation on it is live.
+                               Hand the device over only once this exits 0:
+                               until the list is synced to disk it exits 4,
+                               and running it again retries the sync
   include daxN.M [--reinit]    use an excluded device again; --reinit archives
                                its pool metadata and writes a fresh header,
                                discarding whatever the device holds
@@ -17,7 +20,8 @@ own user only):
                                tests); waits until done, which can take minutes
 
 Exit codes: 0 = done, 1 = refused by the RM, 2 = RM unreachable,
-3 = sent but no reply in time (the command may still complete; run status).
+3 = sent but no reply in time (the command may still complete; run status),
+4 = done but not on disk yet (a power loss could undo it; run it again).
 Interrupting a wipe (Ctrl-C) stops it, leaving the device partly zeroed.
 """
 
@@ -143,6 +147,14 @@ def main(argv=None) -> int:
     if status == "OK":
         sys.stdout.write(body)
         return 0
+    if status == "INCOMPLETE":
+        sys.stdout.write(body)
+        print(
+            "not finished: a power loss could still undo this; run the same "
+            "command again until it exits 0",
+            file=sys.stderr,
+        )
+        return 4
     parts = status.split(" ", 2)
     message = parts[2] if len(parts) == 3 and parts[0] == "ERR" else status
     print(f"refused: {message}", file=sys.stderr)

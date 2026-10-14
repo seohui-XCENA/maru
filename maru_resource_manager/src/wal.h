@@ -50,6 +50,9 @@ public:
 private:
   std::string stateDir_;
   int walFd_{-1};
+  // Whether the WAL's directory entry is known to survive a power loss. A
+  // record's fdatasync does not cover the entry of a newly created file.
+  bool entrySynced_{false};
   // Set when an append's outcome on disk is unknown (sync failed, or a
   // partial record could not be removed); cleared by a checkpoint.
   int appendError_{0};
