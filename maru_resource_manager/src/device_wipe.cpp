@@ -2,6 +2,9 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -61,12 +64,31 @@ int wipeDevice(const std::string &devPath, uint64_t size, uint64_t chunk,
     return rc;
 }
 
+// Close every descriptor from 3 up. The child must not keep the RM's state
+// directory lock, listening sockets or WAL open once the RM is gone.
+static void closeInheritedFds() {
+#ifdef SYS_close_range
+    if (::syscall(SYS_close_range, 3U, ~0U, 0U) == 0) return;
+#endif
+    rlimit limit{};
+    const int max = ::getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY
+                        ? static_cast<int>(limit.rlim_cur)
+                        : 65536;
+    for (int fd = 3; fd < max; ++fd) ::close(fd);
+}
+
 int wipeDeviceIsolated(const std::string &devPath, uint64_t size, uint64_t chunk,
                        const std::function<bool()> &cancelled) {
+    const pid_t parent = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) return -errno;
     if (pid == 0) {
         // Child of a multithreaded process: only system calls from here on.
+        // Die with the RM (the forking thread lives until the wipe ends), and
+        // do not outlive a parent that died before the request took effect.
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (::getppid() != parent) ::_exit(ECANCELED);
+        closeInheritedFds();
         const int rc = wipeDevice(devPath, size, chunk, nullptr);
         ::_exit(rc == 0 ? 0 : std::min(-rc, 255));
     }

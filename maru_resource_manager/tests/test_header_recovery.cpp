@@ -38,6 +38,12 @@ extern "C" int __wrap_open(const char *path, int flags, ...) {
         va_end(args);
     }
     openedPaths.emplace_back(path);
+    // Holds a caller in open(), e.g. a wipe child (test_device_exclusion.cpp).
+    if (std::string(path) == "/dev/dax-hang") {
+        ::sleep(30);
+        errno = EIO;
+        return -1;
+    }
     return __real_open(redirected(path).c_str(), flags, mode);
 }
 extern "C" DIR *__wrap_opendir(const char *path) {

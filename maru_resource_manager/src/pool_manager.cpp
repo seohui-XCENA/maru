@@ -1833,6 +1833,17 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
         out = path + " is already excluded\n";
         return 0;
     }
+    // After a failed sync the WAL may hold an ALLOC that is not in memory,
+    // e.g. on this device. Replace the log first, or refuse.
+    if (wal_->appendsDisabled() && checkpointBlock_.empty()) checkpointLocked();
+    if (wal_->appendsDisabled())
+    {
+        out = "the WAL holds a record whose outcome is unknown (a sync failed) and no "
+              "checkpoint could replace it" +
+              (checkpointBlock_.empty() ? std::string() : ": " + checkpointBlock_) +
+              "; retry once a checkpoint succeeds\n";
+        return -EAGAIN;
+    }
 
     auto loaded = pools_.end();
     for (auto it = pools_.begin(); it != pools_.end(); ++it)
@@ -2028,7 +2039,10 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
         return rc;
     }
     headerWritten = writesHeader;
-    if (wasExcluded || reinit)
+    // Fresh metadata reconciles a global checkpoint that may still list
+    // regions the WAL freed. Without one there is nothing to reconcile, and
+    // pool metadata without a global checkpoint would make startup refuse.
+    if ((wasExcluded || reinit) && hasGlobalCheckpoint_)
     {
         if ((rc = metadata_->save(recovery.pools.front())) != 0)
             return rollback(rc, "cannot write pool metadata");

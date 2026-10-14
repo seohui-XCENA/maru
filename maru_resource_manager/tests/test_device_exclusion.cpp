@@ -2,7 +2,9 @@
 // of the recovery fixture. Nothing here opens a real DAX device.
 #include "recovery_fixture.h"
 
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <sys/un.h>
 
 #include <set>
@@ -588,4 +590,89 @@ TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {
     EXPECT_EQ(ask(path, "status\n").rfind("OK\n", 0), 0u);
     EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
     EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
+}
+
+TEST_F(DeviceExclusionTest, IncludeBeforeAnyGlobalCheckpointStaysRestartable) {
+    addDevice(0);
+    addDevice(1);
+    auto absent = allocation(2);
+    absent.handle.regionId = 500;
+    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0); // Keeps checkpoints paused.
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    std::string out;
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    out.clear();
+    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    EXPECT_FALSE(fs::exists(state + "/global.meta"));
+    EXPECT_FALSE(fs::exists(state + "/pool_1.meta")); // No pool metadata without it.
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h, 1), 0);
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.verifyAndFree(h, "offline-test-owner"), 0);
+}
+
+TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
+    addDevice(0);
+    addDevice(1);
+    auto absent = allocation(2);
+    absent.handle.regionId = 500;
+    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0); // Keeps checkpoints paused.
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    checkpoint_fault::arm(walPath, checkpoint_fault::Operation::Fdatasync, EIO);
+    checkpoint_fault::armTruncate(walPath, EIO);
+    Handle h{};
+    EXPECT_EQ(allocate(pm, h, 1), -EIO); // Rejected, but its ALLOC stays in the WAL.
+    checkpoint_fault::clear();
+    std::string out;
+    EXPECT_EQ(pm.adminExclude("dax1.0", out), -EAGAIN);
+    EXPECT_NE(out.find("outcome is unknown"), npos) << out;
+    EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
+    {
+        PoolManager restarted(state); // Nothing was excluded: still restartable.
+        EXPECT_EQ(restarted.loadPools(), 0);
+    }
+    // Once a checkpoint is possible it replaces the log, and exclude proceeds.
+    addDevice(2);
+    ASSERT_EQ(pm.rescanDevices(), 0);
+    out.clear();
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+}
+
+TEST_F(DeviceExclusionTest, WipeChildDiesWithTheRmAndHoldsNoDescriptors) {
+    const std::string lockPath = state + "/maru-resource-manager.lock";
+    const pid_t rm = ::fork();
+    if (rm == 0) {
+        const int lockFd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (lockFd < 0 || ::flock(lockFd, LOCK_EX) != 0) ::_exit(1);
+        wipeDeviceIsolated("/dev/dax-hang", B, H); // The child stalls in open().
+        ::_exit(0);
+    }
+    ASSERT_GT(rm, 0);
+    pid_t wipe = 0;
+    for (int i = 0; i < 250 && wipe == 0; ++i) {
+        std::ifstream children("/proc/" + std::to_string(rm) + "/task/" +
+                               std::to_string(rm) + "/children");
+        children >> wipe;
+        if (wipe == 0) ::usleep(20 * 1000);
+    }
+    ASSERT_GT(wipe, 0) << "wipe child never started";
+    ::kill(rm, SIGKILL); // The RM dies mid-wipe.
+    ::waitpid(rm, nullptr, 0);
+    bool gone = false;
+    for (int i = 0; i < 250 && !gone; ++i) {
+        gone = ::kill(wipe, 0) != 0 && errno == ESRCH;
+        if (!gone) ::usleep(20 * 1000);
+    }
+    if (!gone) ::kill(wipe, SIGKILL); // Never leave a runaway wipe behind.
+    EXPECT_TRUE(gone);
+    const int fd = ::open(lockPath.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(::flock(fd, LOCK_EX | LOCK_NB), 0); // A new RM can take the lock.
+    ::close(fd);
 }
