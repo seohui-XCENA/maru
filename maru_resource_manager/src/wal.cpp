@@ -87,8 +87,9 @@ int WalStore::ensureOpen() {
   return 0;
 }
 
-int WalStore::appendRecord(WalRecordType type, const void *payload,
-                           uint32_t len) {
+int WalStore::appendRecord(WalRecordType type, const void *payload, uint32_t len,
+                           bool keepUnsynced, bool *written) {
+  if (written) *written = false;
   if (appendError_ != 0) {
     return appendError_;
   }
@@ -118,30 +119,43 @@ int WalStore::appendRecord(WalRecordType type, const void *payload,
   }
 
   rc = writeFull(walFd_, buf.data(), buf.size());
-  if (rc == 0 && ::fdatasync(walFd_) != 0) {
+  if (rc != 0) {
+    // Only part of the record: the caller keeps its old state, so remove the
+    // bytes. If that fails they stay a torn tail, which recovery discards as
+    // long as nothing is appended after it.
+    if (::ftruncate(walFd_, st.st_size) != 0) {
+      appendError_ = rc;
+      logf(LogLevel::Error,
+           "cannot remove failed WAL record: %s; appends disabled until checkpoint",
+           std::strerror(errno));
+    }
+    return rc;
+  }
+  if (::fdatasync(walFd_) != 0) {
+    // The whole record is in the file but may or may not survive a crash, and
+    // after a failed sync nothing in this file is known to be on disk. Replace
+    // the log with a checkpoint before appending anything else.
     rc = -errno;
-  }
-  // Callers report failure and keep their old state, so remove the record:
-  // recovery may then discard only a torn tail that nobody was told about.
-  if (rc != 0 && ::ftruncate(walFd_, st.st_size) != 0) {
-    // Later records would follow these bytes; refuse them until a checkpoint
-    // replaces the log.
+    if (written) *written = true;
     appendError_ = rc;
-    logf(LogLevel::Error,
-         "cannot remove failed WAL record: %s; appends disabled until checkpoint",
-         std::strerror(errno));
+    // A caller that rejects the operation drops the record (best effort: it
+    // may already be durable, which callers must tolerate).
+    if (!keepUnsynced) (void)::ftruncate(walFd_, st.st_size);
+    logf(LogLevel::Error, "WAL sync failed: %s; appends disabled until checkpoint",
+         std::strerror(-rc));
+    return rc;
   }
-  return rc;
+  return 0;
 }
 
 int WalStore::appendAlloc(const Allocation &alloc) {
-  return appendRecord(WalRecordType::ALLOC, &alloc, sizeof(alloc));
+  return appendRecord(WalRecordType::ALLOC, &alloc, sizeof(alloc), false, nullptr);
 }
 
-int WalStore::appendFree(uint64_t regionId) {
+int WalStore::appendFree(uint64_t regionId, bool *written) {
   WalFreeV3 fr{};
   fr.regionId = regionId;
-  return appendRecord(WalRecordType::FREE, &fr, sizeof(fr));
+  return appendRecord(WalRecordType::FREE, &fr, sizeof(fr), true, written);
 }
 
 static PoolState *findPool(std::vector<PoolState> &pools, uint32_t poolId) {

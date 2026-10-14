@@ -18,9 +18,15 @@ public:
   WalStore(const WalStore &) = delete;
   WalStore &operator=(const WalStore &) = delete;
 
+  // A failed ALLOC is removed (best effort) and must be rejected: if it still
+  // survives a crash, recovery restores an allocation its client never got,
+  // which is only a leak.
   int appendAlloc(const Allocation &alloc);
-  int appendFree(uint64_t regionId);
-  // A failed record could not be removed; a checkpoint must replace the log.
+  // A FREE whose record reached the file but whose sync failed is kept and
+  // sets `written`: the caller must complete the free, because recovery may
+  // apply it. Losing it instead only brings the allocation back (a leak).
+  int appendFree(uint64_t regionId, bool *written = nullptr);
+  // An append's outcome on disk is unknown; a checkpoint must replace the log.
   bool appendsDisabled() const { return appendError_ != 0; }
   // Read/validate the log without opening any device or changing recovery state.
   int referencedPools(std::set<uint32_t> &pools) const;
@@ -40,12 +46,14 @@ public:
 private:
   std::string stateDir_;
   int walFd_{-1};
-  // Set when a failed record could not be removed; cleared by a checkpoint.
+  // Set when an append's outcome on disk is unknown (sync failed, or a
+  // partial record could not be removed); cleared by a checkpoint.
   int appendError_{0};
 
   std::string walPath() const;
   int ensureOpen();
-  int appendRecord(WalRecordType type, const void *payload, uint32_t len);
+  int appendRecord(WalRecordType type, const void *payload, uint32_t len,
+                   bool keepUnsynced, bool *written);
 };
 
 } // namespace maru
