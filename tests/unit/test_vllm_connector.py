@@ -1563,15 +1563,16 @@ class TestPackedKernelRoundtripGPU:
                 deferred_load=deferred,
             ),
         )
-        # On CUDA a deferred packed load always goes to the background loader
-        # thread, so the request is reported on a later call, not this one.
-        deadline = time.monotonic() + 30.0
-        finished = None
-        while deferred and finished is None and time.monotonic() < deadline:
-            finished = reader.get_finished_loading()
-            if finished is None:
-                time.sleep(0.01)
-        assert finished == ({"r1"} if deferred else None)
+        if deferred:
+            # On CUDA a deferred packed load always goes to the background
+            # loader thread, so the request is reported on a later call.
+            deadline = time.monotonic() + 30.0
+            finished = None
+            while finished is None and time.monotonic() < deadline:
+                finished = reader.get_finished_loading()
+                if finished is None:
+                    time.sleep(0.01)
+            assert finished == {"r1"}
         assert reader.take_failed_load_blocks() == set()
         reader.shutdown()
         return dst
@@ -1580,11 +1581,20 @@ class TestPackedKernelRoundtripGPU:
         keys = _chunk_keys(token_ids, self.CHUNK)
         return [bytes(pool.objects[key].buf) for key in keys]
 
+    @pytest.mark.parametrize(
+        "pinning",
+        [(True,), (False,), (True, False)],
+        ids=["pinned", "pageable", "mixed"],
+    )
     @pytest.mark.parametrize("write_behind", [False, True], ids=["direct", "staging"])
-    def test_roundtrip_restores_every_layer(self, write_behind):
-        """Either store variant round-trips every layer of every chunk exactly."""
+    def test_roundtrip_restores_every_layer(self, write_behind, pinning):
+        """Either store variant round-trips every layer of every chunk exactly.
+
+        The deferred load reads back slabs whose region may have failed CUDA
+        registration, so every pin state must survive it too.
+        """
         src = self._source_caches()
-        pool, token_ids = self._store(src, write_behind=write_behind)
+        pool, token_ids = self._store(src, write_behind=write_behind, pinning=pinning)
         dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK)
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name])
@@ -1641,26 +1651,24 @@ class TestPackedKernelRoundtripGPU:
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
 
-        # Pinned pages still go straight to/from the kernel. Pageable stores
-        # share one device slab, so staging does not grow with the request.
+        # Pinned pages still go straight to/from the kernel. Pageable pages
+        # reach it through a device copy, one launch per chunk either way.
+        # Pageable stores share one device slab, so staging does not grow
+        # with the request.
         store_calls = [c for c in calls if c[0] == maru_kv_ops.TransferDirection.D2H]
         load_calls = [c for c in calls if c[0] == maru_kv_ops.TransferDirection.H2D]
-        pinned_ptrs = []
         staging_ptrs = set()
         keys = _chunk_keys(token_ids, self.CHUNK)
-        assert len(store_calls) == len(keys)
-        for key, (_, device, ptr) in zip(keys, store_calls, strict=True):
+        assert len(store_calls) == len(load_calls) == len(keys)
+        for key, store, load in zip(keys, store_calls, load_calls, strict=True):
             backing = pool.objects[key].backing
             if backing.is_pinned():
-                assert device == "cpu" and ptr == backing.data_ptr()
-                pinned_ptrs.append(ptr)
+                assert store[1:] == ("cpu", backing.data_ptr())
+                assert load[1:] == ("cpu", backing.data_ptr())
             else:
-                assert device == "cuda"
-                staging_ptrs.add(ptr)
+                assert store[1] == "cuda" and load[1] == "cuda"
+                staging_ptrs.add(store[2])
         assert len(staging_ptrs) <= 1
-        assert [(device, ptr) for _, device, ptr in load_calls] == [
-            ("cpu", ptr) for ptr in pinned_ptrs
-        ]
 
     def test_inline_load_from_pageable_write_behind_store(self):
         """Exercise inline load independently of the direct store fallback."""
@@ -1678,9 +1686,40 @@ class TestPackedKernelRoundtripGPU:
             torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
         # Some GPUs can access pageable DRAM directly; even there, verify the
         # dispatch contract needed on GPUs/mappings that require registration.
+        assert transfer.call_count == self.PROMPT // self.CHUNK
         for call in transfer.call_args_list:
-            slab = call.args[0]
-            assert slab.is_cuda or slab.is_pinned()
+            assert call.args[0].is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA registration")
+def test_registered_mapping_reports_pinned():
+    """``is_pinned()`` must see a mapping registered the way DaxMapper does it.
+
+    Packed transfers pick the direct kernel path from ``is_pinned()`` on a
+    tensor aliasing the CXL mapping. The pools above are cudaHostAlloc memory,
+    but production maps are registered with ``cudaHostRegister``. If torch
+    stopped reporting those as pinned, every slab would silently take the
+    staged path.
+    """
+    import ctypes
+    import mmap
+
+    from maru_handler.memory.mapper import _cuda_rc
+
+    torch.cuda.init()
+    nbytes = 1 << 20
+    view = memoryview(mmap.mmap(-1, nbytes))
+    slab = torch.frombuffer(view[4096 : 2 * 4096], dtype=torch.uint8)
+    assert not slab.is_pinned()
+
+    cudart = torch.cuda.cudart()
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(view))
+    assert _cuda_rc(cudart.cudaHostRegister(addr, nbytes, 0)) == 0
+    try:
+        assert slab.is_pinned()
+    finally:
+        assert _cuda_rc(cudart.cudaHostUnregister(addr)) == 0
+    assert not slab.is_pinned()
 
 
 # =============================================================================

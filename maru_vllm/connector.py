@@ -682,7 +682,9 @@ class MaruKVConnector(KVConnectorBase_V1):
             the multi_layer_kv_transfer kernel directly on the pinned
             CXL slab (no staging) when available — load scatters a whole slab
             into the paged cache per chunk, store gathers one D2H per chunk —
-            falling back to per-layer copies otherwise. See design note P6.
+            falling back to per-layer copies otherwise. A slab whose region
+            failed CUDA registration is staged through one chunk of GPU
+            memory and still placed by the kernel. See design note P6.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_load_admission_window: int - With maru_async_load, cap how many
@@ -2976,9 +2978,11 @@ class MaruWorkerConnector:
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
         ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
-        per-(layer, chunk) copies and the reverted GPU-staging OOM. Unpinned
-        slabs, non-Flash layouts, CPU, or an unbuilt ``maru_kv_ops`` fall back
-        to copying one slab at a time and injecting its per-layer slices.
+        per-(layer, chunk) copies and the reverted GPU-staging OOM. A slab
+        whose region failed CUDA registration is first copied to the device,
+        one chunk at a time, and then placed by the same kernel. Non-Flash
+        layouts, CPU, or an unbuilt ``maru_kv_ops`` fall back to copying one
+        slab at a time and injecting its per-layer slices.
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
@@ -3009,6 +3013,7 @@ class MaruWorkerConnector:
             stream_ctx = contextlib.nullcontext()
 
         dtype = layers[0][1].dtype
+        staged_chunks: dict[str, int] = {}
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3036,13 +3041,21 @@ class MaruWorkerConnector:
                             hi = min(end - chunk_index * ct, ct)
                             chunk_slots = chunk_slots[lo:hi]
                             slab_host = slab_host[:, :, lo:hi]
-                        # Registration can fail independently for each region;
-                        # kernel availability alone does not make a host slab
-                        # accessible to the GPU.
-                        if kernel is not None and slab_host.is_pinned():
+                        if kernel is not None:
                             ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                            # Registration can fail independently for each
+                            # region; kernel availability alone does not make
+                            # a host slab accessible to the GPU. Stage such a
+                            # slab like the deferred path does, keeping one
+                            # placement launch per chunk.
+                            slab_src = slab_host
+                            if not slab_host.is_pinned():
+                                slab_src = slab_host.to(dev, non_blocking=True)
+                                staged_chunks[req_meta.req_id] = (
+                                    staged_chunks.get(req_meta.req_id, 0) + 1
+                                )
                             ops.multi_layer_kv_transfer(
-                                slab_host,
+                                slab_src,
                                 ptrs,
                                 chunk_slots,
                                 dev,
@@ -3077,7 +3090,13 @@ class MaruWorkerConnector:
             self._load_stream.synchronize()
 
         for req_meta, num_chunks, _, _ in prepared_requests:
-            mode = "kernel" if kernel is not None else "fallback"
+            staged = staged_chunks.get(req_meta.req_id, 0)
+            if kernel is None:
+                mode = "fallback"
+            elif staged:
+                mode = f"kernel, {staged} unpinned chunks staged"
+            else:
+                mode = "kernel"
             logger.info(
                 "Maru: packed-loaded %d layers x %d chunks (%d tokens) for req %s (%s)",
                 num_layers,
@@ -3637,6 +3656,7 @@ class MaruWorkerConnector:
         ready_keys: list[str] = []
         ready_handles: list = []
         staging: torch.Tensor | None = None
+        staged_chunks = 0
         # Requests sharing a prefix can yield the same base_key within one
         # step; the single deferred batch_store no longer dedupes them the way
         # the per-request fallback's eager _stored_keys updates did.
@@ -3707,6 +3727,7 @@ class MaruWorkerConnector:
                         )
                         if target is not slab_host:
                             slab_host.copy_(target)
+                            staged_chunks += 1
                     except Exception as e:
                         logger.error("Maru packed save error: %s: %s", base_key, e)
                         if handle is not None:
@@ -3738,8 +3759,11 @@ class MaruWorkerConnector:
             else:
                 logger.warning("Maru packed store failed: %s", base_key)
         if self._timing:
+            mode = "kernel"
+            if staged_chunks:
+                mode += f", {staged_chunks} unpinned chunks staged"
             _emit_timing(
-                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c"
+                f"packed-store {mode} {self._num_layers}L x {len(ready_keys)}c"
             )
 
     def _store_packed_slabs_write_behind(
