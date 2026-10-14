@@ -113,6 +113,8 @@ Every allocation and free operation is first appended to the **WAL** before modi
 
 On startup, the **recovery sequence** proceeds as: (1) scan for current hardware, (2) initialize pools with device sizes, (3) restore state from the last checkpoint, (4) replay any WAL records written since that checkpoint, and (5) recompute free sizes from the reconstituted free lists.
 
+If a DAX device grew since its pool was checkpointed, step (3) keeps the checkpointed layout and adds the new range to the free list. Recovery refuses any other size or layout mismatch, including a device that shrank, so it can be repaired offline.
+
 ---
 
 ## 5. Reaper

@@ -528,17 +528,61 @@ int PoolManager::getDeviceSize(const std::string &path, uint64_t &sizeOut)
     return -ENOTSUP;
 }
 
-int PoolManager::poolBuildFailed(const std::string &path, const char *stage, int error)
+int PoolManager::poolBuildFailed(const std::string &path, const std::string &stage, int error)
 {
-    auto failure = std::make_pair(std::string(stage), error);
+    auto failure = std::make_pair(stage, error);
     auto previous = failedDevices_.find(path);
     if (previous == failedDevices_.end() || previous->second != failure)
     {
         logf(LogLevel::Warn, "failed to load pool from %s (%s): %d (%s)",
-             path.c_str(), stage, error, std::strerror(-error));
+             path.c_str(), stage.c_str(), error, std::strerror(-error));
         failedDevices_[path] = std::move(failure);
     }
     return error;
+}
+
+// A device that grew since its checkpoint keeps the checkpointed layout, and
+// the bytes past the old end are unallocated. Extend only a free list that is
+// valid for the old size, so any other layout (legacy offset 0, a changed
+// alignment) still fails validation. Recovery then requires free + allocated
+// to equal the new total, which holds only if they covered the old one.
+static bool extendGrownPool(PoolState &pool)
+{
+    PoolState old = pool;
+    old.dataEnd = old.dataBegin + old.totalSize;
+    if (old.dataEnd >= pool.dataEnd || validateFreeList(old) != 0) return false;
+    const uint64_t added = pool.dataEnd - old.dataEnd;
+    pool.freeList.push_back(Extent{old.dataEnd, added});
+    pool.freeSize += added;
+    pool.totalSize += added;
+    return true;
+}
+
+// A device that grew under a resource manager without extendGrownPool kept
+// its old free list but checkpointed the new total. Nothing covers the bytes
+// in between and the checkpoint cannot say why, so name the gap and, for a
+// pool nobody holds memory in, the way to rebuild it.
+static std::string describeUncovered(const PoolState &pool,
+                                     const std::map<uint64_t, Allocation> &allocations,
+                                     const std::string &metaPath)
+{
+    uint64_t covered = 0;
+    bool allocated = false;
+    for (const auto &ex : pool.freeList)
+        if (__builtin_add_overflow(covered, ex.length, &covered)) return "";
+    for (const auto &[id, a] : allocations)
+    {
+        if (a.poolId != pool.poolId) continue;
+        allocated = true;
+        if (__builtin_add_overflow(covered, a.allocLength, &covered)) return "";
+    }
+    if (covered >= pool.totalSize) return "";
+    std::string out = "; free list and allocations cover " + std::to_string(covered) +
+                      " of " + std::to_string(pool.totalSize) + " data bytes";
+    if (!allocated)
+        out += ". No allocation uses this pool: with the resource manager stopped, move " +
+               metaPath + " aside to rebuild it from the device";
+    return out;
 }
 
 int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
@@ -600,8 +644,23 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
         poolBuildFailed(path, "checkpoint read", rc);
         return -EUCLEAN;
     }
+    const uint64_t deviceTotal = size - dataOffset;
+    if (pool.hasCheckpoint && pool.totalSize < deviceTotal)
+    {
+        const uint64_t checkpointTotal = pool.totalSize;
+        if (extendGrownPool(pool))
+            logf(LogLevel::Warn, "%s grew since pool %u was checkpointed: %llu -> %llu data bytes; "
+                 "the added range is free", path.c_str(), poolId,
+                 (unsigned long long)checkpointTotal, (unsigned long long)deviceTotal);
+    }
     if (validateFreeList(pool) != 0)
-        return poolBuildFailed(path, "checkpoint data range (offline repair required)", -EUCLEAN);
+    {
+        std::string stage = "checkpoint data range (offline repair required)";
+        if (pool.totalSize != deviceTotal)
+            stage += "; checkpoint covers " + std::to_string(pool.totalSize) +
+                     " data bytes, device has " + std::to_string(deviceTotal);
+        return poolBuildFailed(path, stage, -EUCLEAN);
+    }
 
     if (type == DaxType::DEV_DAX)
     {
@@ -683,7 +742,13 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
         coalesceFreeList(pool);
         recomputeFreeSize(pool);
         if (validatePoolState(pool, allocations) != 0)
-            return poolBuildFailed(pool.devPath, "recovered allocation/free-list consistency", -EUCLEAN);
+        {
+            const std::string meta = stateDir_ + "/pool_" + std::to_string(pool.poolId) + ".meta";
+            return poolBuildFailed(pool.devPath,
+                                   "recovered allocation/free-list consistency" +
+                                       describeUncovered(pool, allocations, meta),
+                                   -EUCLEAN);
+        }
     }
 
     // No device writes until every staged pool and the entire WAL pass.

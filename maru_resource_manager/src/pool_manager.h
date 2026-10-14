@@ -118,7 +118,7 @@ private:
     // Read-only builder. Header initialization is deferred until recovery passes.
     int buildPoolFromDevice(uint32_t poolId, const std::string &path,
                             DaxType type, PoolState &out);
-    int poolBuildFailed(const std::string &path, const char *stage, int error);
+    int poolBuildFailed(const std::string &path, const std::string &stage, int error);
     // Suppress only identical failures; every scan still retries the device.
     std::map<std::string, std::pair<std::string, int>> failedDevices_;
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);

@@ -79,6 +79,10 @@ public:
     static std::string checkpointBlock(const PoolManager &pm) {
         return pm.checkpointBlock_;
     }
+    static std::string failure(const PoolManager &pm, const std::string &path) {
+        auto it = pm.failedDevices_.find(path);
+        return it == pm.failedDevices_.end() ? "" : it->second.first;
+    }
     // FS_DAX discovery reads /proc/mounts, so tests drive the sweep directly.
     static void removeOrphanFsDaxFiles(PoolManager &pm, uint64_t nextRegionId,
                                        std::string unavailable = "") {
@@ -201,6 +205,104 @@ TEST_F(HeaderRecoveryTest, LegacyAndRewrittenTotalAreRejectedWithoutDeviceWrites
         DeviceHeader header{};
         EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
     }
+}
+
+TEST_F(HeaderRecoveryTest, GrownDeviceAddsItsNewRangeAndKeepsAllocations) {
+    constexpr uint64_t old = B / 2;
+    addDevice(0);
+    auto p = pool();
+    p.totalSize = old - H;
+    p.freeSize = old - 2 * H;
+    p.freeList = {{2 * H, old - 2 * H}};
+    const auto a = allocation();
+    save(p, {{a.handle.regionId, a}});
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    std::vector<PoolState> stats;
+    pm.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].totalSize, B - H);
+    EXPECT_EQ(stats[0].freeSize, B - 2 * H);
+    EXPECT_EQ(pm.verifyAndFree(a.handle, "offline-test-owner"), 0);
+    ASSERT_EQ(pm.checkpoint(), 0);
+
+    // The checkpoint now records the grown size, so a restart sees one free
+    // extent over the whole data range.
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    Handle h{};
+    std::string path, uuid;
+    uint64_t requested = 0;
+    ASSERT_EQ(restarted.alloc(B - H, "offline-test-owner", h, path, uuid, dev(0), requested), 0);
+    EXPECT_EQ(h.offset, H);
+}
+
+TEST_F(HeaderRecoveryTest, SizeChangesThatCannotBeReconciledAreRejected) {
+    constexpr uint64_t old = B / 2;
+    addDevice(0);
+    struct Case {
+        uint64_t total;
+        Extent free;
+        uint64_t align;
+    };
+    const Case cases[] = {
+        {2 * B - H, {H, 2 * B - H}, H},  // the device shrank
+        {old, {0, old}, H},              // legacy layout on a grown device
+        {old - H, {H, old - H}, 2 * H},  // the alignment changed as it grew
+    };
+    for (const auto &c : cases) {
+        std::ofstream(fakeRoot + "/sys/bus/dax/devices/dax0.0/align") << c.align;
+        auto p = pool();
+        p.totalSize = c.total;
+        p.freeSize = c.free.length;
+        p.freeList = {c.free};
+        save(p);
+        const auto before = bytes(state + "/pool_0.meta");
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN) << c.total;
+        EXPECT_FALSE(pm.hasPools());
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, UncoveredBytesAreNamedAndAnEmptyPoolCanBeRebuilt) {
+    // An older RM checkpointed a grown device's total over its old free list.
+    constexpr uint64_t old = B / 2;
+    addDevice(0);
+    auto p = pool();
+    p.freeSize = old - 2 * H;
+    p.freeList = {{2 * H, old - 2 * H}};
+    const auto a = allocation();
+    save(p, {{a.handle.regionId, a}});
+    const std::string gap =
+        "cover " + std::to_string(old - H) + " of " + std::to_string(B - H) + " data bytes";
+    const std::string rebuild = state + "/pool_0.meta aside";
+    {
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        const auto why = PoolManagerTestPeer::failure(pm, dev(0));
+        EXPECT_NE(why.find(gap), std::string::npos) << why;
+        EXPECT_EQ(why.find(rebuild), std::string::npos) << why;
+    }
+
+    p.freeSize = old - H;
+    p.freeList = {{H, old - H}};
+    save(p);
+    {
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        const auto why = PoolManagerTestPeer::failure(pm, dev(0));
+        EXPECT_NE(why.find(gap), std::string::npos) << why;
+        EXPECT_NE(why.find(rebuild), std::string::npos) << why;
+    }
+
+    fs::rename(state + "/pool_0.meta", state + "/pool_0.meta.old");
+    PoolManager rebuilt(state);
+    ASSERT_EQ(rebuilt.loadPools(), 0);
+    std::vector<PoolState> stats;
+    rebuilt.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].freeSize, B - H);
 }
 
 TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
