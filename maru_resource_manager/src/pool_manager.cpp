@@ -601,6 +601,19 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     rc = metadata_->load(poolId, loaded);
     if (rc == 0)
     {
+        // The data range comes from the device. RMs before recovery validation
+        // (#99) replaced the saved total with the device size on load but kept
+        // the saved free list, so a checkpoint can hold a total that does not
+        // match its own extents. The extents and allocations are still checked
+        // against the device range below and after WAL replay.
+        if (loaded.totalSize != pool.totalSize)
+        {
+            logf(LogLevel::Warn,
+                 "%s: ignoring checkpoint total size %llu; the device data size is %llu",
+                 path.c_str(), static_cast<unsigned long long>(loaded.totalSize),
+                 static_cast<unsigned long long>(pool.totalSize));
+            loaded.totalSize = pool.totalSize;
+        }
         loaded.hasCheckpoint = true;
         pool = loaded;
     }
@@ -668,6 +681,15 @@ bool PoolManager::hasPools() const
     return !pools_.empty();
 }
 
+static std::string describeAllocations(const std::map<uint64_t, Allocation> &live)
+{
+    std::string text;
+    for (const auto &[id, a] : live)
+        text += "region=" + std::to_string(id) + " pool=" + std::to_string(a.poolId) +
+                " size=" + std::to_string(a.allocLength) + " client=" + a.clientId + "\n";
+    return text;
+}
+
 int PoolManager::recoverPools(std::vector<PoolState> &pools,
                               std::map<uint64_t, Allocation> &allocations,
                               uint64_t &nextRegionId, std::string &unavailablePools)
@@ -677,7 +699,8 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
     if (rc != 0 && rc != -ENOENT) return rc;
 
     // Validate saved allocations before replay, even if a later FREE could
-    // hide them. Never initialize a header over any existing pool history.
+    // hide them.
+    std::set<uint32_t> headerLost;
     for (const auto &pool : pools)
     {
         bool hasAllocations = false;
@@ -692,11 +715,26 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
             return poolBuildFailed(pool.devPath, "missing pool checkpoint", -EUCLEAN);
         if (pool.needsHeaderInit && !reinit_.count(baseName(pool.devPath)) &&
             (pool.hasCheckpoint || hasAllocations || referenced.count(pool.poolId)))
-            return poolBuildFailed(pool.devPath, "missing header with saved pool history", -EUCLEAN);
+            headerLost.insert(pool.poolId);
     }
 
     rc = wal_->replay(pools, allocations, nextRegionId);
     if (rc != 0 && rc != -ENOENT) return rc;
+    // A device that lost its header (volatile CXL memory comes back cleared
+    // after a power cycle) lost what its allocations held. Its history is
+    // replayed and validated like any other, and it starts over with a fresh
+    // header only if none of its allocations is live.
+    for (const auto &pool : pools)
+    {
+        if (!headerLost.count(pool.poolId)) continue;
+        std::map<uint64_t, Allocation> live;
+        for (const auto &[id, a] : allocations)
+            if (a.poolId == pool.poolId) live.emplace(id, a);
+        if (live.empty()) continue;
+        logf(LogLevel::Error, "%s lost its device header but holds live allocations:\n%s",
+             pool.devPath.c_str(), describeAllocations(live).c_str());
+        return poolBuildFailed(pool.devPath, "missing header with live allocations", -EUCLEAN);
+    }
     for (auto &pool : pools)
     {
         coalesceFreeList(pool);
@@ -715,8 +753,14 @@ int PoolManager::recoverPools(std::vector<PoolState> &pools,
         if (rc != 0) return poolBuildFailed(pool.devPath, "write device header", rc);
         pool.deviceUuid = uuidToString(hdr.uuid);
         pool.needsHeaderInit = false;
-        logf(LogLevel::Info, "Auto-initialized device header on %s: UUID=%s",
-             pool.devPath.c_str(), pool.deviceUuid.c_str());
+        if (headerLost.count(pool.poolId))
+            logf(LogLevel::Warn,
+                 "%s lost its device header with no live allocations; wrote a fresh one: "
+                 "UUID=%s",
+                 pool.devPath.c_str(), pool.deviceUuid.c_str());
+        else
+            logf(LogLevel::Info, "Auto-initialized device header on %s: UUID=%s",
+                 pool.devPath.c_str(), pool.deviceUuid.c_str());
     }
 
     unavailablePools = describeUnavailable(referenced, allocations, pools);
@@ -771,15 +815,6 @@ std::set<uint32_t> PoolManager::excludedPoolIds() const
         if (parseRegionIndexFromDaxName(name, id)) ids.insert(id);
     }
     return ids;
-}
-
-static std::string describeAllocations(const std::map<uint64_t, Allocation> &live)
-{
-    std::string text;
-    for (const auto &[id, a] : live)
-        text += "region=" + std::to_string(id) + " pool=" + std::to_string(a.poolId) +
-                " size=" + std::to_string(a.allocLength) + " client=" + a.clientId + "\n";
-    return text;
 }
 
 // Drop checkpoint entries of excluded pools that the WAL freed, so they do

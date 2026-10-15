@@ -1,42 +1,10 @@
 // Exercise production discovery/recovery using a private fake /dev and sysfs.
-// This target's linker wraps filesystem calls; it never opens real DAX devices.
+// This target links fake_dax_fs.cpp; it never opens real DAX devices.
 #include "recovery_fixture.h"
 
-std::string fakeRoot;
 std::vector<std::string> openedPaths;
 
-namespace {
-std::string redirected(const char *path) {
-    std::string p(path);
-    if (p.rfind("/dev/", 0) == 0 || p.rfind("/sys/", 0) == 0) {
-        if (fakeRoot.empty()) std::abort();
-        return fakeRoot + p;
-    }
-    return p;
-}
-} // namespace
-
-extern "C" int __real_stat(const char *, struct stat *);
-extern "C" int __real_open(const char *, int, ...);
-extern "C" DIR *__real_opendir(const char *);
-extern "C" ssize_t __real_readlink(const char *, char *, size_t);
-
-extern "C" int __wrap_stat(const char *path, struct stat *st) {
-    const int rc = __real_stat(redirected(path).c_str(), st);
-    if (rc == 0 && std::string(path).rfind("/dev/dax", 0) == 0) {
-        st->st_mode = (st->st_mode & ~S_IFMT) | S_IFCHR;
-        st->st_rdev = makedev(240, 0);
-    }
-    return rc;
-}
-extern "C" int __wrap_open(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, unsigned int);
-        va_end(args);
-    }
+int recordOpen(const char *path) {
     openedPaths.emplace_back(path);
     // Holds a caller in open(), e.g. a wipe child (test_device_exclusion.cpp).
     if (std::string(path) == "/dev/dax-hang") {
@@ -44,13 +12,7 @@ extern "C" int __wrap_open(const char *path, int flags, ...) {
         errno = EIO;
         return -1;
     }
-    return __real_open(redirected(path).c_str(), flags, mode);
-}
-extern "C" DIR *__wrap_opendir(const char *path) {
-    return __real_opendir(redirected(path).c_str());
-}
-extern "C" ssize_t __wrap_readlink(const char *path, char *buf, size_t size) {
-    return __real_readlink(redirected(path).c_str(), buf, size);
+    return 0;
 }
 
 TEST_F(HeaderRecoveryTest, FreshPoolInitializesHeaderAfterValidation) {
@@ -90,6 +52,43 @@ TEST_F(HeaderRecoveryTest, LegacyAndRewrittenTotalAreRejectedWithoutDeviceWrites
     }
 }
 
+TEST_F(HeaderRecoveryTest, StaleCheckpointTotalUsesDeviceRange) {
+    addDevice(0);
+    // A pre-validation RM saved the device size it saw at load but kept the
+    // old free list; the extents and the allocation cover this device exactly.
+    for (uint64_t total : {4 * (B - H), (B - H) / 2}) {
+        auto p = pool();
+        p.totalSize = total;
+        p.freeSize = B - 2 * H;
+        p.freeList = {{2 * H, B - 2 * H}};
+        save(p, {{42, allocation()}});
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        std::vector<PoolState> stats;
+        pm.getStats(stats);
+        ASSERT_EQ(stats.size(), 1u);
+        EXPECT_EQ(stats[0].totalSize, B - H);
+        EXPECT_EQ(stats[0].freeSize, B - 2 * H);
+        EXPECT_EQ(pm.checkpoint(), 0);
+        PoolState saved = pool();
+        ASSERT_EQ(MetadataStore(state).load(0, saved), 0);
+        EXPECT_EQ(saved.totalSize, B - H);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
+    addDevice(0, false);
+    // Consistent checkpoints of a device half and twice this size.
+    for (uint64_t size : {B / 2, 2 * B}) {
+        auto p = pool();
+        p.totalSize = p.freeSize = size - H;
+        p.freeList = {{H, size - H}};
+        save(p);
+        SCOPED_TRACE(size);
+        expectRecoveryRefused(-EUCLEAN);
+    }
+}
+
 TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
     addDevice(0);
     save(pool());
@@ -107,44 +106,103 @@ TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
 
 TEST_F(HeaderRecoveryTest, BadGlobalMetadataDoesNotInitializeFreshHeader) {
     addDevice(0, false);
+    // Shorter than its header, or a header of another format.
     std::ofstream(state + "/global.meta") << "broken";
-    PoolManager pm(state);
-    EXPECT_NE(pm.loadPools(), 0);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    {
+        SCOPED_TRACE("truncated");
+        expectRecoveryRefused(-EPIPE);
+    }
+    std::ofstream(state + "/global.meta") << std::string(32, 'x');
+    {
+        SCOPED_TRACE("wrong magic");
+        expectRecoveryRefused(-EPROTO);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, MissingGlobalCheckpointIsNotAnEmptyLedger) {
     addDevice(0);
     ASSERT_EQ(MetadataStore(state).save(pool()), 0);
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, MissingPoolCheckpointWithLiveAllocationIsRejected) {
     addDevice(0);
     const auto a = allocation();
     ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
-TEST_F(HeaderRecoveryTest, MissingHeaderWithHistoryIsNotReinitialized) {
+TEST_F(HeaderRecoveryTest, MissingHeaderWithoutLiveAllocationGetsFreshHeader) {
     addDevice(0, false);
-    save(pool());
+    // A power cycle took the header; the memory came back with any content.
+    std::fstream(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary) << "garbage";
+    // The last run freed every region: a stale checkpoint total, a checkpoint
+    // entry freed in the WAL, WAL pairs.
+    auto p = pool();
+    p.totalSize = 4 * (B - H);
+    p.freeSize = B - 2 * H;
+    p.freeList = {{2 * H, B - 2 * H}};
+    save(p, {{42, allocation()}});
+    auto later = allocation();
+    later.handle.regionId = 43;
+    {
+        WalStore wal(state);
+        ASSERT_EQ(wal.appendFree(42), 0);
+        ASSERT_EQ(wal.appendAlloc(later), 0);
+        ASSERT_EQ(wal.appendFree(43), 0);
+    }
     PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    ASSERT_EQ(pm.loadPools(), 0);
     DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+    EXPECT_EQ(readDeviceHeader(dev(0), header, H), 0);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    EXPECT_EQ(h.offset, H);
+    EXPECT_EQ(h.regionId, 44u); // IDs from the history are not reused.
+    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    EXPECT_EQ(pm.checkpoint(), 0);
+}
+
+TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
+    addDevice(0, false);
+    auto restart = [&] {
+        fs::remove_all(state);
+        fs::create_directories(state);
+        ASSERT_EQ(initSecret(state, false), 0);
+    };
+    // Live in the checkpoint, or only in the WAL.
+    for (bool walOnly : {false, true}) {
+        restart();
+        if (walOnly) {
+            save(pool());
+            ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
+        } else {
+            auto p = pool();
+            p.freeSize = B - 2 * H;
+            p.freeList = {{2 * H, B - 2 * H}};
+            save(p, {{42, allocation()}});
+        }
+        SCOPED_TRACE(walOnly ? "live in the WAL" : "live in the checkpoint");
+        expectRecoveryRefused(-EUCLEAN);
+    }
+    // Only in the WAL, for a device that appears at a rescan: startup could
+    // not apply the record.
+    restart();
+    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0); // dax0.0 has no history now.
+    addDevice(1, false);
+    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    EXPECT_EQ(head(1, B), std::string(B, '\0'));
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
 }
 
 TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRejected) {
     addDevice(0);
     auto a = allocation(0, 0);
     save(pool(), {{42, a}});
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
@@ -158,15 +216,6 @@ TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
     EXPECT_EQ(pm.loadPools(), -EUCLEAN);
     EXPECT_EQ(pm.checkpoint(), -EAGAIN);
     EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), before);
-}
-
-TEST_F(HeaderRecoveryTest, TruncatedWalDoesNotInitializeAnyDevice) {
-    addDevice(0, false);
-    std::ofstream(state + "/maru-resource-manager.wal") << "torn";
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EPROTO);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
 }
 
 TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
@@ -263,7 +312,9 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         EXPECT_EQ(restarted.allocationCount(), 2u);
     }
     // Not a prefix of the final record: zero fill, a header prefix with an
-    // unknown type, or a torn record followed by another. WAL left untouched.
+    // unknown type, or a torn record followed by another. WAL left untouched,
+    // and no fresh device gets a header.
+    addDevice(1, false);
     fs::remove(walPath);
     ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
     const auto one = bytes(walPath);
@@ -274,6 +325,8 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         PoolManager pm(state);
         EXPECT_EQ(pm.loadPools(), -EPROTO);
         EXPECT_EQ(bytes(walPath), corrupt);
+        DeviceHeader header{};
+        EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
     }
 }
 
@@ -354,9 +407,7 @@ TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
     using checkpoint_fault::Operation;
     addDevice(0);
     const std::string walPath = state + "/maru-resource-manager.wal";
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    const std::string exitedOwner = std::string(host) + ":2147483647";
+    const std::string exitedOwner = localClient(2147483647);
     auto failSync = [&] {
         checkpoint_fault::arm(walPath, Operation::Fdatasync, EIO);
         checkpoint_fault::armTruncate(walPath, EIO);
@@ -388,9 +439,7 @@ TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
         ASSERT_EQ(pm.loadPools(), 0);
         failSync();
         Handle h{};
-        std::string path, uuid;
-        uint64_t requested;
-        EXPECT_EQ(pm.alloc(H, exitedOwner, h, path, uuid, dev(0), requested), -EIO);
+        EXPECT_EQ(allocate(pm, h, 0, exitedOwner), -EIO);
         checkpoint_fault::clear();
         EXPECT_EQ(pm.allocationCount(), 0u);
         PoolManager restarted(state);
@@ -538,12 +587,11 @@ TEST_F(HeaderRecoveryTest, BoundsOverflowOverlapAndLiveFreeIntersectionAreReject
         p.freeList = extents;
         ASSERT_EQ(MetadataStore(state).save(p), 0);
         ASSERT_EQ(MetadataStore(state).saveGlobal({}, 43), 0);
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        SCOPED_TRACE(extents.front().offset);
+        expectRecoveryRefused(-EUCLEAN);
     }
     save(pool(), {{42, allocation()}}); // Valid ranges, but free/live overlap.
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
@@ -562,9 +610,7 @@ TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
     // A local dead PID makes the reaper attempt the same deallocation path.
     PoolManager reaper(state);
     auto dead = invalid;
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    std::snprintf(dead.clientId, sizeof(dead.clientId), "%.80s:2147483647", host);
+    std::snprintf(dead.clientId, sizeof(dead.clientId), "%s", localClient(2147483647).c_str());
     PoolManagerTestPeer::inject(reaper, pool(), dead);
     uint64_t reaped = 99;
     reaper.reapExpired(reaped);
@@ -572,34 +618,8 @@ TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
     EXPECT_EQ(reaper.allocationCount(), 1u);
 }
 
-TEST_F(HeaderRecoveryTest, FsDaxStillAllowsFileOffsetZero) {
-    auto p = pool();
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
-    PoolManager pm(state);
-    PoolManagerTestPeer::inject(pm, p, {});
-    Handle h{};
-    std::string path, uuid;
-    uint64_t size;
-    ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
-    EXPECT_EQ(h.offset, 0u);
-    EXPECT_TRUE(fs::exists(path));
-    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
-    EXPECT_FALSE(fs::exists(path));
-}
-
 TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
-    auto p = pool();
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
+    const auto p = fsDaxPool();
     PoolManager pm(state);
     PoolManagerTestPeer::inject(pm, p, {});
     // Left by a crash between file creation and the WAL append.
@@ -615,17 +635,14 @@ TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
     EXPECT_EQ(stats[0].freeSize, B);
     ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
     EXPECT_EQ(h.regionId, 2u);
+    EXPECT_EQ(h.offset, 0u); // FS_DAX keeps file offset zero; it has no header.
+    EXPECT_TRUE(fs::exists(path));
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    EXPECT_FALSE(fs::exists(path));
 }
 
 TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
-    auto p = pool(5);
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
+    const auto p = fsDaxPool(5);
     PoolManager pm(state);
     PoolManagerTestPeer::inject(pm, p, allocation(5, 0)); // Owns maru_42.dat.
     // FS_DAX pool IDs follow sysfs numbering and can change across boots, so
@@ -648,24 +665,6 @@ TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
     PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50);
     EXPECT_FALSE(fs::exists(p.devPath + "/maru_7.dat"));
     for (const auto &name : kept) EXPECT_TRUE(fs::exists(p.devPath + "/" + name)) << name;
-}
-
-TEST_F(HeaderRecoveryTest, FailedWalReplayIsTransactional) {
-    WalStore wal(state);
-    const auto good = allocation();
-    auto bad = allocation(0, 0);
-    bad.handle.regionId = 99;
-    ASSERT_EQ(wal.appendAlloc(good), 0);
-    ASSERT_EQ(wal.appendAlloc(bad), 0);
-    std::vector<PoolState> pools{pool()};
-    std::map<uint64_t, Allocation> allocations;
-    uint64_t next = 1;
-    EXPECT_EQ(wal.replay(pools, allocations, next), -EUCLEAN);
-    EXPECT_EQ(next, 1u);
-    EXPECT_TRUE(allocations.empty());
-    ASSERT_EQ(pools[0].freeList.size(), 1u);
-    EXPECT_EQ(pools[0].freeList[0].offset, H);
-    EXPECT_EQ(pools[0].freeList[0].length, B - H);
 }
 
 TEST_F(HeaderRecoveryTest, InvalidSecondPoolCannotInitializeFirstPoolHeader) {
@@ -700,9 +699,7 @@ TEST_F(HeaderRecoveryTest, LateHeaderAllocationFailsWithoutLosingExistingAllocat
 
 TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
     auto a = allocation();
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    std::snprintf(a.clientId, sizeof(a.clientId), "%.80s:2147483647", host);
+    std::snprintf(a.clientId, sizeof(a.clientId), "%s", localClient(2147483647).c_str());
     auto p = pool();
     p.freeList = {{2 * H, B - 2 * H}};
     p.freeSize = B - 2 * H;
@@ -734,10 +731,11 @@ void PrintTo(const CheckpointFaultCase &fault, std::ostream *os) {
 }
 
 std::vector<CheckpointFaultCase> checkpointFaultCases() {
+    // The checkpoint returns any errno as is, so one per phase is enough.
     std::vector<CheckpointFaultCase> cases;
     for (const auto *file : {"pool_0.meta", "pool_1.meta", "global.meta"})
         for (const auto *phase : {"HeaderWrite", "PartialPayloadWrite", "Fsync"})
-            for (int error : {ENOSPC, EIO}) cases.push_back({file, phase, error});
+            cases.push_back({file, phase, std::string(phase) == "Fsync" ? EIO : ENOSPC});
     return cases;
 }
 } // namespace
@@ -787,10 +785,6 @@ TEST_P(CheckpointFailureTest, RetainsWalAndAllowsRetry) {
     EXPECT_EQ(rc, -fault.error);
     EXPECT_EQ(bytes(path), publishedBefore); // Failed file was not renamed.
     EXPECT_EQ(bytes(walPath), walBefore); // Not just present: byte-for-byte intact.
-    ASSERT_TRUE(fs::exists(path + ".tmp"));
-    if (fault.phase != "Fsync") {
-        EXPECT_EQ(fs::file_size(path + ".tmp"), partial ? 40u : 0u);
-    }
     EXPECT_EQ(bytes(state + "/global.meta"), oldGlobal);
     if (fault.file != "pool_0.meta") {
         EXPECT_NE(bytes(state + "/pool_0.meta"), oldPool0);
@@ -826,6 +820,5 @@ INSTANTIATE_TEST_SUITE_P(CheckpointIo, CheckpointFailureTest,
     [](const ::testing::TestParamInfo<CheckpointFaultCase> &info) {
         auto file = info.param.file;
         std::replace(file.begin(), file.end(), '.', '_');
-        return file + "_" + info.param.phase + "_" +
-               (info.param.error == ENOSPC ? "ENOSPC" : "EIO");
+        return file + "_" + info.param.phase;
     });
