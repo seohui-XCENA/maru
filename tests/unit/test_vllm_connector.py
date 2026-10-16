@@ -4326,6 +4326,418 @@ class TestKvOpsResolution:
         )
 
 
+class TestDeferredAdmissionFitsCache:
+    """Parked loads must leave room for the oldest one to resume.
+
+    A request parked for a deferred load holds blocks for its loaded prefix
+    only, yet resumes only when its whole prompt fits. vLLM checks that fit
+    for each request against the blocks free at that moment, so several
+    parked requests can together hold the pool while the oldest still needs
+    more. With nothing running, nothing frees a block and the engine stops.
+    """
+
+    # 200 tokens with 12 cached chunks: 24 blocks held, 50 needed in all.
+    # 100 tokens with 12 cached chunks: 24 held, 25 needed.
+    # 60 tokens with 7 cached chunks: 14 held, 15 needed.
+    PROMPTS = {"big": (200, 12), "mid": (100, 12), "small": (60, 7)}
+
+    def _engine(self, tmp_path):
+        engine = make_vllm_scheduler(tmp_path, 4, 8, {"maru_async_load": True})
+        chunks = dict(self.PROMPTS.values())
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        return engine
+
+    def _add(self, engine, name):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request
+
+        request = Request(
+            name,
+            list(range(self.PROMPTS[name][0])),
+            SamplingParams(max_tokens=1),
+            None,
+        )
+        engine.add_request(request)
+        return request
+
+    @staticmethod
+    def _finish_loads(engine, req_ids):
+        from vllm.v1.outputs import KVConnectorOutput
+
+        engine._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending=None, finished_recving=set(req_ids))
+        )
+
+    def test_oldest_parked_request_resumes(self, tmp_path):
+        from vllm.v1.request import RequestStatus
+
+        engine = self._engine(tmp_path)
+        requests = [self._add(engine, name) for name in self.PROMPTS]
+        engine.schedule()
+        parked = [
+            r.request_id
+            for r in requests
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        assert "big" in parked
+
+        self._finish_loads(engine, parked)
+        output = engine.schedule()
+        assert output.num_scheduled_tokens.get("big", 0) > 0
+
+    def test_request_refused_blocks_keeps_its_place(self, tmp_path):
+        # A request can fit the budget yet get no blocks from vLLM while
+        # running requests hold them. It must stay ahead of later requests.
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = self._engine(tmp_path)
+        chunks = dict(self.PROMPTS.values())
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks.get(
+            len(ids), 0
+        )
+        running = Request(
+            "running", list(range(64)), SamplingParams(max_tokens=1), None
+        )
+        engine.add_request(running)  # 16 blocks, nothing in Maru
+        engine.schedule()
+        self._add(engine, "mid")
+        engine.schedule()  # mid parks
+        big, small = self._add(engine, "big"), self._add(engine, "small")
+        engine.schedule()  # both wait for the budget, big first
+        self._finish_loads(engine, ["mid"])
+        for _ in range(3):
+            # mid runs; big fits the budget but only 22 blocks are free
+            # (63 usable: running holds 16, mid 25; big needs 50).
+            engine.schedule()
+            assert big.status == RequestStatus.WAITING
+            assert small.status == RequestStatus.WAITING
+        engine.finish_requests(["running", "mid"], RequestStatus.FINISHED_STOPPED)
+        engine.schedule()
+        assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert small.status == RequestStatus.WAITING  # big 50 + small 15 > 63
+
+    def test_requests_parked_alone_still_resume(self, tmp_path):
+        from vllm.v1.request import RequestStatus
+
+        engine = self._engine(tmp_path)
+        big = self._add(engine, "big")
+        engine.schedule()
+        assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        self._finish_loads(engine, ["big"])
+        assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
+
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    @pytest.mark.parametrize("prompt_tokens", [200, 201])
+    @pytest.mark.parametrize("small_chunks", [4, 5])
+    def test_speculative_requests_resume(
+        self, tmp_path, method, prompt_tokens, small_chunks
+    ):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path, 4, 8, {"maru_async_load": True}, speculative_method=method
+        )
+        # Prompt-only reservations fit in 63 blocks (50+13 or 51+12),
+        # but the oldest needs four more blocks for its draft tokens.
+        small_tokens = 52 if prompt_tokens == 200 else 48
+        chunks = {prompt_tokens: 12, small_tokens: small_chunks}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = []
+        for name, count in (("big", prompt_tokens), ("small", small_tokens)):
+            request = Request(
+                name, list(range(count)), SamplingParams(max_tokens=1), None
+            )
+            engine.add_request(request)
+            requests.append(request)
+        engine.schedule()
+        parked = [
+            r.request_id
+            for r in requests
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        assert "big" in parked
+        self._finish_loads(engine, parked)
+        assert any(
+            engine.schedule().num_scheduled_tokens.get("big", 0) > 0 for _ in range(4)
+        )
+
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    def test_single_speculative_request_at_model_limit(self, tmp_path, method):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {"maru_async_load": True},
+            speculative_method=method,
+            max_model_len=252,
+        )
+        engine.connector._scheduler._count_matched_chunks = lambda ids: 12
+        request = Request("big", list(range(251)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        self._finish_loads(engine, ["big"])
+        assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
+
+    def test_ngram_does_not_reserve_draft_model_slots(self, tmp_path):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path, 4, 8, {"maru_async_load": True}, speculative_method="ngram"
+        )
+        chunks = {200: 12, 52: 6}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = [
+            Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
+            for name, count in (("big", 200), ("small", 52))
+        ]
+        for request in requests:
+            engine.add_request(request)
+        engine.schedule()
+        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
+
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    def test_model_limit_does_not_overreserve_speculative_loads(self, tmp_path, method):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {"maru_async_load": True},
+            num_blocks=68,
+            speculative_method=method,
+            max_model_len=200,
+        )
+        chunks = {199: 12, 52: 4}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = [
+            Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
+            for name, count in (("big", 199), ("small", 52))
+        ]
+        for request in requests:
+            engine.add_request(request)
+        engine.schedule()
+        # The model's 200-token limit caps big at 50 blocks. With small's
+        # 17 blocks including lookahead, both fit the 67 usable blocks.
+        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
+        self._finish_loads(engine, [r.request_id for r in requests])
+        assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
+
+    def test_upstream_reservation_allows_overlapping_loads(self, tmp_path):
+        import vllm
+        from packaging.version import Version
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        if Version(vllm.__version__) < Version("0.23.0"):
+            pytest.skip("upstream async-load reservation requires vLLM >= 0.23")
+        engine = self._engine(tmp_path)
+        engine.connector._scheduler._count_matched_chunks = lambda ids: {
+            200: 12,
+            60: 6,
+        }[len(ids)]
+        big = self._add(engine, "big")
+        engine.schedule()
+        request = Request("next", list(range(60)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    def _sched(self, num_gpu_blocks=64):
+        sched = make_scheduler(4, 8, {"maru_async_load": True})
+        sched._num_gpu_blocks = num_gpu_blocks
+        chunks = dict(self.PROMPTS.values())
+        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
+        return sched
+
+    def _request(self, name):
+        n = self.PROMPTS[name][0]
+        return SimpleNamespace(
+            request_id=name, prompt_token_ids=list(range(n)), num_tokens=n
+        )
+
+    def _park(self, sched, request):
+        matched, load_async = sched.get_num_new_matched_tokens(request, 0)
+        assert matched and load_async
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([0],)
+        sched.update_state_after_alloc(request, blocks, matched)
+
+    def test_load_that_would_overfill_the_cache_waits(self):
+        sched = self._sched()
+        self._park(sched, self._request("big"))
+        mid = self._request("mid")
+        assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
+        assert "mid" not in sched._last_match_result
+
+    def test_waiting_request_keeps_its_place(self):
+        sched = self._sched()
+        big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        # 50 + 15 fits 64 only without mid; mid asked first, so small waits.
+        sched._num_gpu_blocks = 66
+        assert sched.get_num_new_matched_tokens(small, 0)[0] is None
+        sched.update_state_after_alloc(big, MagicMock(), 0)  # big resumed
+        assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
+        assert sched.get_num_new_matched_tokens(small, 0)[1] is True
+
+    def test_let_through_request_waits_until_it_gets_blocks(self):
+        sched = self._sched()
+        big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
+        self._park(sched, mid)
+        assert sched.get_num_new_matched_tokens(big, 0)[0] is None
+        assert sched.get_num_new_matched_tokens(small, 0)[0] is None
+        sched.update_state_after_alloc(mid, MagicMock(), 0)  # mid resumed
+        # big fits the budget, but vLLM has no blocks for it yet.
+        assert sched.get_num_new_matched_tokens(big, 0)[1] is True
+        assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
+        assert sched.get_num_new_matched_tokens(big, 0)[1] is True  # asked again
+        assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
+        self._park(sched, big)  # vLLM gave big its blocks
+        assert "big" not in sched._admission_waiters
+
+    def test_finished_requests_release_their_room(self):
+        sched = self._sched()
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        sched.build_connector_meta(self._finished("big"))
+        assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
+
+    def test_abandoned_waiter_stops_blocking(self):
+        sched = self._sched(num_gpu_blocks=66)  # big 50 + small 15 fits
+        big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        assert sched.get_num_new_matched_tokens(small, 0)[0] is None
+        sched.build_connector_meta(self._finished("mid"))
+        assert sched.get_num_new_matched_tokens(small, 0)[1] is True
+
+    def test_abort_after_match_before_allocation_clears_lookup(self, tmp_path):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = self._engine(tmp_path)
+        chunks = dict(self.PROMPTS.values())
+        sched = engine.connector._scheduler
+        sched._count_matched_chunks = lambda ids: chunks.get(len(ids), 0)
+        engine.add_request(
+            Request("running", list(range(64)), SamplingParams(max_tokens=1), None)
+        )
+        engine.schedule()  # 16 of the 63 usable blocks are occupied.
+        big = self._add(engine, "big")
+        engine.schedule()  # lookup succeeds, but its 50 blocks do not fit.
+        assert big.status == RequestStatus.WAITING
+        assert "big" in sched._last_match_result
+
+        engine.finish_requests(["big"], RequestStatus.FINISHED_ABORTED)
+        engine.schedule()
+        assert "big" not in sched._last_match_result
+        assert "big" not in sched._admission_waiters
+        assert "big" not in sched._parked_blocks
+
+    def test_failed_load_asked_again_drops_its_old_room(self):
+        # A failed load that invalidates the first block sends the request
+        # back to WAITING with its blocks freed, and vLLM asks again. Its old
+        # reservation must not count against the waiter it shares room with.
+        sched = self._sched(num_gpu_blocks=70)
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        assert sched.get_num_new_matched_tokens(big, 0)[0] is None  # mid first
+        assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
+
+    def test_waiter_is_not_looked_up_again_until_it_fits(self):
+        sched = self._sched()
+        chunks = dict(self.PROMPTS.values())
+        lookups = []
+
+        def count(ids):
+            lookups.append(len(ids))
+            return chunks[len(ids)]
+
+        sched._count_matched_chunks = count
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        lookups.clear()
+        for _ in range(3):  # vLLM asks again every step
+            assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
+        assert lookups == []
+        sched.build_connector_meta(self._finished("big"))
+        assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
+        assert lookups == [100]
+
+    def test_waiter_whose_prefix_is_gone_computes_once_it_fits(self):
+        sched = self._sched()
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        sched._count_matched_chunks = lambda ids: 0  # evicted while it waited
+        # The budget still has no room: mid keeps waiting without a lookup.
+        assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
+        sched.build_connector_meta(self._finished("big"))
+        assert sched.get_num_new_matched_tokens(mid, 0) == (0, False)
+        assert "mid" not in sched._admission_waiters
+
+    @staticmethod
+    def _finished(req_id):
+        output = fake_scheduler_output()
+        output.finished_req_ids = {req_id}
+        return output
+
+    def test_budget_uses_installed_vllm_version(self, tmp_path):
+        import vllm
+        from packaging.version import Version
+
+        engine = self._engine(tmp_path)  # 64 blocks, one kept aside by vLLM
+        expected = 63 if Version(vllm.__version__) < Version("0.23.0") else None
+        assert engine.connector._scheduler._num_gpu_blocks == expected
+
+    @pytest.mark.parametrize(
+        "version,lookahead,expected",
+        [
+            ("0.22.1", 0, 63),
+            ("0.23.0rc1", 0, 63),
+            ("0.23.0.dev1", 0, 63),
+            ("0.23.0", 0, None),
+            ("0.23.0+local", 0, None),
+            ("0.23.0.post1", 0, None),
+            ("0.28.0", 0, None),
+            ("0.23.0", 16, 63),
+            ("0.28.0", 16, 63),
+            ("unknown", 0, 63),
+        ],
+    )
+    def test_budget_version_boundary(self, monkeypatch, version, lookahead, expected):
+        import vllm
+
+        from maru_vllm.connector import _async_load_budget
+
+        monkeypatch.setattr(vllm, "__version__", version)
+        config = SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks=64))
+        assert _async_load_budget(None, config, lookahead) == expected
+        assert (
+            _async_load_budget(SimpleNamespace(num_blocks=64), config, lookahead)
+            == expected
+        )
+
+    def test_no_limit_without_block_count(self):
+        sched = self._sched(num_gpu_blocks=None)
+        self._park(sched, self._request("big"))
+        assert sched.get_num_new_matched_tokens(self._request("mid"), 0)[1] is True
+
+
 class TestAbortDeferredWriteBehind:
     """Exercise both completion channels against vLLM's scheduler consumer."""
 
