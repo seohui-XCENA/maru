@@ -41,10 +41,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 from maru_common.storage_types import StorageError
 from maru_vllm.kv_groups import (
+    GroupCache,
     KVGroup,
     blocks_for_tokens,
     check_multi_group_support,
     describe_kv_groups,
+    group_caches,
     group_object_key,
     hit_chunks,
 )
@@ -858,6 +860,7 @@ class MaruKVConnector(KVConnectorBase_V1):
                 extra_config=extra,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
+                kv_groups=self._kv_groups,
             )
 
     # ==================================
@@ -1690,11 +1693,17 @@ class MaruWorkerConnector:
         extra_config: dict[str, Any],
         num_kv_heads: int | None = None,
         head_size: int | None = None,
+        kv_groups: list[KVGroup] | None = None,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        self._kv_groups = list(kv_groups or ())
+        self._multi_group = len(self._kv_groups) > 1
+        # With several groups, register_kv_caches fills this instead of the
+        # single-group fields (_num_layers, _kv_layout), which stay unset.
+        self._group_caches: list[GroupCache] = []
         self._cpu_mode = _validate_storage_config(extra_config)
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
@@ -1902,6 +1911,10 @@ class MaruWorkerConnector:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
+        if self._multi_group:
+            self._register_group_caches(kv_caches)
+            self._connect_eagerly(kv_caches)
+            return
         self._num_layers = len(kv_caches)
         self._kv_layout = self._resolve_kv_layout(kv_caches)
         if self._cpu_mode:
@@ -1971,6 +1984,44 @@ class MaruWorkerConnector:
             len(kv_caches),
             self._page_size_bytes if self._page_size_bytes is not None else "default",
         )
+        self._connect_eagerly(kv_caches)
+
+    def _register_group_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Map registered tensors onto the KV cache groups and size the page.
+
+        Every (chunk, group) object fits one CXL page: the page is the
+        largest group object, so a group with fewer layers leaves the rest
+        of its page empty, as vLLM leaves its padding layers on the GPU.
+        """
+        self._group_caches = group_caches(
+            self._kv_groups,
+            kv_caches,
+            kv_layout=_vllm_kv_cache_layout(),
+            num_kv_heads=self._num_kv_heads,
+            head_size=self._head_size,
+        )
+        self._page_size_bytes = max(
+            g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
+        )
+        configured = self._extra_config.get("maru_chunk_size")
+        if configured is not None and _parse_size(configured) < self._page_size_bytes:
+            raise ValueError(
+                f"maru_chunk_size {configured} cannot hold one (chunk, group) "
+                f"object of {self._page_size_bytes} bytes"
+            )
+        logger.info(
+            "MaruWorkerConnector: registered %d KV cache groups (%s); "
+            "CXL page size %d bytes",
+            len(self._group_caches),
+            ", ".join(
+                f"g{c.group.group_id} {c.group.kind} x{len(c.tensors)}"
+                for c in self._group_caches
+            ),
+            self._page_size_bytes,
+        )
+
+    def _connect_eagerly(self, kv_caches: dict[str, Any]) -> None:
+        """Connect to Maru now that the page size is known."""
         # Connecting the worker eagerly is a performance requirement, not just
         # an initialization preference.  For a large CXL pool connect() maps,
         # prefaults, and CUDA-registers the owned region; a 200 GiB pool takes

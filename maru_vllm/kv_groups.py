@@ -5,9 +5,10 @@ A hybrid model (Qwen3.5: Gated DeltaNet + full attention; gpt-oss: sliding
 window + full attention) reaches the connector as several KV cache groups.
 Each group has its own block table and spec. This module turns
 ``kv_cache_config.kv_cache_groups`` into plain :class:`KVGroup` records,
-checks which group combinations the connector supports, and decides how much
-of a prompt the stored objects of every group can resume. It holds no
-connector state and imports no vLLM class, so it is testable without a GPU.
+checks which group combinations the connector supports, decides how much
+of a prompt the stored objects of every group can resume, and maps the
+worker's registered tensors onto the groups. It holds no connector state and
+imports no vLLM class, so it is testable without a GPU.
 
 Storage unit: one Maru object per (chunk, group). vLLM gives every layer the
 same bytes per block slot in every group (Mamba state is padded up to it), so
@@ -20,9 +21,14 @@ one group keeps the bare chunk key; with several, each object is keyed
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+import torch
+
+from maru_vllm.kv_layout import KVLayout, _detect_kv_layout
 
 GROUP_FULL = "full"
 GROUP_SLIDING_WINDOW = "sliding_window"
@@ -50,6 +56,9 @@ class KVGroup:
         state_blocks: For a Mamba group, blocks one request holds at most:
             the state being written, the previous one until vLLM frees it,
             and any speculative or prefill-checkpoint blocks. 0 otherwise.
+        state_bytes: For a Mamba group, bytes of one layer's state in one
+            block (its state shapes times dtypes), which vLLM pads up to
+            ``slot_bytes``. 0 otherwise.
     """
 
     group_id: int
@@ -61,6 +70,7 @@ class KVGroup:
     sliding_window: int | None = None
     mamba_cache_mode: str | None = None
     state_blocks: int = 0
+    state_bytes: int = 0
 
     def object_bytes(self, chunk_tokens: int) -> int:
         """Bytes of this group's object for one chunk.
@@ -125,6 +135,14 @@ def describe_kv_groups(
                     2
                     + getattr(spec, "num_speculative_blocks", 0)
                     + getattr(spec, "num_prefill_checkpoint_blocks", 0)
+                    if kind == GROUP_MAMBA
+                    else 0
+                ),
+                state_bytes=(
+                    sum(
+                        math.prod(shape) * dtype.itemsize
+                        for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+                    )
                     if kind == GROUP_MAMBA
                     else 0
                 ),
@@ -289,3 +307,189 @@ def check_multi_group_support(
             "MaruKVConnector needs every KV cache group to use the block size "
             f"{block_size} (got {group_block_sizes})"
         )
+
+
+@dataclass(frozen=True, eq=False)
+class GroupCache:
+    """One group's registered GPU tensors, in the group's layer order.
+
+    A layer's index in ``tensors`` is its position in the group's Maru
+    object, and the same index in ``group.layer_names`` names it.
+
+    Attributes:
+        group: The group.
+        tensors: For an attention group, each layer's paged KV tensor; all
+            share one shape, dtype and strides. For a Mamba group, each
+            layer's state as a ``uint8`` view of shape ``[num_blocks,
+            state_bytes]``: row ``b`` is block ``b``'s state.
+        layout: Paged KV layout of an attention group; None for Mamba.
+    """
+
+    group: KVGroup
+    tensors: tuple[torch.Tensor, ...]
+    layout: KVLayout | None = None
+
+
+def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.Tensor:
+    """A Mamba layer's per-block state as ``uint8 [num_blocks, state_bytes]``.
+
+    vLLM lays one layer's state for one block out contiguously at the start
+    of that block's slot, and registers it either as a list of state tensors
+    (``[conv_state, ssm_state]``, vLLM 0.23) or as one int8 tensor of the
+    whole state (0.30). Both become the same byte view, which aliases vLLM's
+    memory: writing a row writes that block's state.
+
+    Args:
+        name: Layer name, for errors.
+        kv: The layer's registered value.
+        slot_bytes: Bytes between consecutive blocks.
+        state_bytes: Bytes of one block's state, from the group's spec.
+
+    Raises:
+        ValueError: The tensors are not one contiguous state per block slot,
+            or not the whole state the spec describes.
+    """
+    tensors = list(kv) if isinstance(kv, (list, tuple)) else [kv]
+    first = tensors[0]
+    base = first.data_ptr()
+    registered = 0
+    for t in tensors:
+        if (
+            t.stride(0) * t.element_size() != slot_bytes
+            or t.data_ptr() != base + registered
+            or not t[0].is_contiguous()
+        ):
+            raise ValueError(
+                f"MaruKVConnector cannot read the Mamba state of {name}: "
+                f"expected one contiguous state per {slot_bytes}-byte block "
+                f"slot (got shape {tuple(t.shape)}, stride {t.stride()})"
+            )
+        registered += t[0].numel() * t.element_size()
+    if registered != state_bytes:
+        raise ValueError(
+            f"MaruKVConnector: {name} registers {registered} B of Mamba state "
+            f"per block, but its spec describes {state_bytes} B"
+        )
+    storage = first.untyped_storage()
+    view = torch.empty(0, dtype=torch.uint8, device=first.device)
+    view.set_(
+        storage,
+        base - storage.data_ptr(),
+        (first.shape[0], state_bytes),
+        (slot_bytes, 1),
+    )
+    return view
+
+
+def _kernel_block_size(
+    shape: tuple[int, ...],
+    block_size: int,
+    kv_layout: str,
+    num_kv_heads: int,
+    head_size: int | None,
+) -> int | None:
+    """Kernel block size, when vLLM split each block for the attention kernel.
+
+    A backend that cannot take the group's block size whole (FlashInfer, or
+    FlashAttention 4 with head size 256) gets each block as several
+    consecutive kernel blocks, so the tensor's token axis is a divisor of the
+    block size.
+    """
+    for kernel in range(block_size // 2, 0, -1):
+        if block_size % kernel == 0 and _detect_kv_layout(
+            shape, kernel, kv_layout, num_kv_heads, head_size
+        ):
+            return kernel
+    return None
+
+
+def group_caches(
+    groups: list[KVGroup],
+    kv_caches: dict[str, Any],
+    *,
+    kv_layout: str,
+    num_kv_heads: int | None,
+    head_size: int | None,
+) -> list[GroupCache]:
+    """Map the worker's registered tensors onto the KV cache groups.
+
+    Every layer a group lists must be registered. Layers that no group lists
+    (none for the supported models) are left alone. An attention group's
+    layout comes from its first layer, and every layer of the group must
+    share its shape, dtype and strides. A block of KV may not exceed the
+    group's ``slot_bytes``, which the object sizes are computed from; it is
+    smaller when vLLM pads the page.
+
+    Args:
+        groups: The model's KV cache groups.
+        kv_caches: ``register_kv_caches``' argument.
+        kv_layout: vLLM's cache layout, "NHD" or "HND".
+        num_kv_heads: KV heads per rank. Required for attention groups: a
+            fused layout read without it can take the head axis for K/V.
+        head_size: Width of one head, when known.
+
+    Raises:
+        ValueError: A layer is missing, its tensor does not match the
+            group's spec, or the attention kernel split the blocks.
+    """
+    caches = []
+    for g in groups:
+        missing = [n for n in g.layer_names if n not in kv_caches]
+        if missing:
+            raise ValueError(
+                f"MaruKVConnector: KV cache group {g.group_id} lists layers "
+                f"with no registered tensor: {missing}"
+            )
+        if g.kind == GROUP_MAMBA:
+            views = tuple(
+                state_view(n, kv_caches[n], g.slot_bytes, g.state_bytes)
+                for n in g.layer_names
+            )
+            caches.append(GroupCache(g, views))
+            continue
+        if num_kv_heads is None:
+            raise ValueError(
+                "MaruKVConnector needs the model's KV head count to read the "
+                f"KV layout of group {g.group_id}"
+            )
+        tensors = tuple(kv_caches[n] for n in g.layer_names)
+        first = tensors[0]
+        shape = tuple(first.shape)
+        if any(
+            t.shape != first.shape
+            or t.dtype != first.dtype
+            or t.stride() != first.stride()
+            for t in tensors
+        ):
+            raise ValueError(
+                f"MaruKVConnector: layers of KV cache group {g.group_id} differ "
+                "in shape, dtype or strides"
+            )
+        layout = _detect_kv_layout(
+            shape, g.block_size, kv_layout, num_kv_heads, head_size
+        )
+        if layout is None:
+            kernel = _kernel_block_size(
+                shape, g.block_size, kv_layout, num_kv_heads, head_size
+            )
+            if kernel is not None:
+                raise ValueError(
+                    "MaruKVConnector does not support attention kernels that "
+                    f"split blocks: group {g.group_id} uses {g.block_size}-token "
+                    f"blocks, laid out as {kernel}-token kernel blocks. Pick an "
+                    "attention backend that keeps whole blocks, such as "
+                    "TRITON_ATTN, or FLASH_ATTN except FlashAttention 4 with "
+                    "head size 256 (compute capability 10.x/11.x)."
+                )
+            raise ValueError(
+                f"MaruKVConnector cannot read the KV layout {shape} of group "
+                f"{g.group_id}"
+            )
+        block_bytes = first.numel() * first.element_size() // layout.num_blocks
+        if block_bytes > g.slot_bytes:
+            raise ValueError(
+                f"MaruKVConnector: a block of group {g.group_id} holds "
+                f"{block_bytes} B on the GPU, more than its spec's {g.slot_bytes} B"
+            )
+        caches.append(GroupCache(g, tensors, layout))
+    return caches

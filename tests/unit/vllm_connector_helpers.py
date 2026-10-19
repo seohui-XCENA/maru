@@ -41,8 +41,12 @@ def make_worker(
     extra_config: dict[str, Any] | None = None,
     num_kv_heads: int | None = None,
     head_size: int | None = None,
+    **kwargs: Any,
 ) -> MaruWorkerConnector:
-    """Construct a MaruWorkerConnector (no CXL hardware or GPU required)."""
+    """Construct a MaruWorkerConnector (no CXL hardware or GPU required).
+
+    kwargs go to its constructor.
+    """
     from maru_vllm.connector import MaruWorkerConnector
 
     return MaruWorkerConnector(
@@ -51,6 +55,7 @@ def make_worker(
         extra_config={} if extra_config is None else extra_config,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        **kwargs,
     )
 
 

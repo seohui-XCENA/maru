@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache groups: description, support checks, hits and per-group block ids.
+"""KV cache groups: description, support checks, hits, per-group block ids
+and worker registration.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
@@ -38,12 +39,14 @@ from maru_vllm.kv_groups import (
     describe_kv_groups,
     group_object_key,
     hit_chunks,
+    state_view,
     window_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
     fake_cached_reqs,
     fake_scheduler_output,
     make_scheduler,
+    make_worker,
 )
 
 QWEN35_BLOCK = 544
@@ -547,3 +550,297 @@ def test_lookup_failure_is_a_miss():
     sched = _qwen35_scheduler(())
     sched._handler.batch_exists = MagicMock(side_effect=RuntimeError("down"))
     assert _hit(sched, list(range(1200))) == 0
+
+
+# =============================================================================
+# Worker registration
+# =============================================================================
+
+# A small Qwen3.5: layers [G, G, G, A] x 2, block 16. One block slot is
+# 1,024 B for every layer: attention 2 (K/V) x 16 tokens x 2 heads x 8 x bf16,
+# and the 224 B GDN state (conv 3x16 bf16 + ssm 2x4x4 fp32) padded up to it.
+TINY_BLOCK = 16
+TINY_SLOT = 1024
+TINY_STATE = 3 * 16 * 2 + 2 * 4 * 4 * 4
+TINY_BLOCKS = 6
+TINY_GDN = [[0, 4], [1, 5], [2, 6]]
+TINY_ATTN = [3, 7]
+TINY_LAYER_BYTES = TINY_BLOCKS * TINY_SLOT
+
+
+def _mamba_spec():
+    return MambaSpec(
+        block_size=TINY_BLOCK,
+        shapes=((3, 16), (2, 4, 4)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=TINY_SLOT,
+        mamba_cache_mode="align",
+    )
+
+
+def _attn_kw():
+    return {
+        "block_size": TINY_BLOCK,
+        "num_kv_heads": 2,
+        "head_size": 8,
+        "dtype": torch.bfloat16,
+    }
+
+
+def tiny_config(gdn=TINY_GDN, attn=TINY_ATTN):
+    groups = [
+        KVCacheGroupSpec([f"layers.{i}.linear_attn" for i in layers], _mamba_spec())
+        for layers in gdn
+    ]
+    groups.append(
+        KVCacheGroupSpec(
+            [f"layers.{i}.attn" for i in attn], FullAttentionSpec(**_attn_kw())
+        )
+    )
+    return SimpleNamespace(kv_cache_groups=groups)
+
+
+def tiny_swa_config():
+    """A small gpt-oss: sliding-window layers 0, 2 and full layers 1, 3."""
+    return SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layers.0.attn", "layers.2.attn"],
+                SlidingWindowSpec(sliding_window=32, **_attn_kw()),
+            ),
+            KVCacheGroupSpec(
+                ["layers.1.attn", "layers.3.attn"], FullAttentionSpec(**_attn_kw())
+            ),
+        ]
+    )
+
+
+def _shared(positions=3):
+    """Every layer's block slots in one buffer, as vLLM allocates them: the
+    layer at position p of each group starts at p x blocks x slot, so the
+    groups overlap. Each byte holds a value derived from its offset."""
+    return (
+        torch.arange(positions * TINY_LAYER_BYTES, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+    )
+
+
+def _region(shared, position):
+    return shared[position * TINY_LAYER_BYTES : (position + 1) * TINY_LAYER_BYTES]
+
+
+def _gdn_tensor(region, version):
+    """A GDN layer as vLLM registers it: 0.23 a state list, 0.30 one int8 view."""
+    if version == "0.30":
+        return torch.as_strided(
+            region.view(torch.int8),
+            (TINY_BLOCKS, 1, 1, TINY_STATE),
+            (TINY_SLOT, TINY_STATE, TINY_STATE, 1),
+        )
+    conv = torch.as_strided(
+        region.view(torch.bfloat16), (TINY_BLOCKS, 3, 16), (TINY_SLOT // 2, 16, 1)
+    )
+    as_f32 = region.view(torch.float32)
+    ssm = torch.as_strided(
+        as_f32,
+        (TINY_BLOCKS, 2, 4, 4),
+        (TINY_SLOT // 4, 16, 4, 1),
+        as_f32.storage_offset() + 96 // 4,
+    )
+    return [conv, ssm]
+
+
+def _attn_tensor(region, version, kernel_block=TINY_BLOCK):
+    """An attention layer: 0.23 flash (NB, 2, BS, NH, HS); 0.30 fused K/V
+    (NB, NH, BS, 2 HS), split into kernel blocks when ``kernel_block`` is
+    smaller than a block."""
+    if version == "0.30":
+        split = TINY_BLOCK // kernel_block
+        return torch.as_strided(
+            region.view(torch.bfloat16),
+            (TINY_BLOCKS * split, 2, kernel_block, 16),
+            (TINY_SLOT // 2 // split, 16, 32, 1),
+        )
+    return region.view(torch.bfloat16).view(TINY_BLOCKS, 2, 16, 2, 8)
+
+
+def tiny_kv_caches(version, shared, gdn=TINY_GDN, attn=TINY_ATTN):
+    caches = {
+        f"layers.{i}.linear_attn": _gdn_tensor(_region(shared, p), version)
+        for layers in gdn
+        for p, i in enumerate(layers)
+    }
+    caches |= {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, p), version)
+        for p, i in enumerate(attn)
+    }
+    return caches
+
+
+def _worker(config=None, chunk=TINY_BLOCK, **kwargs):
+    kwargs.setdefault("num_kv_heads", 2)
+    kwargs.setdefault("head_size", 8)
+    worker = make_worker(
+        TINY_BLOCK,
+        chunk,
+        kv_groups=describe_kv_groups(config or tiny_config()),
+        **kwargs,
+    )
+    worker._ensure_handler = MagicMock()
+    return worker
+
+
+def _registered_worker(kv_caches, config=None, chunk=TINY_BLOCK):
+    worker = _worker(config, chunk)
+    worker.register_kv_caches(kv_caches)
+    return worker
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_worker_maps_each_vllm_format_onto_the_groups(version):
+    shared = _shared()
+    kv_caches = tiny_kv_caches(version, shared)
+    worker = _registered_worker(kv_caches)
+    caches = worker._group_caches
+    assert [c.group.kind for c in caches] == [GROUP_MAMBA] * 3 + [GROUP_FULL]
+    # Layers keep the group's order: index = position in the object.
+    assert caches[3].group.layer_names == ("layers.3.attn", "layers.7.attn")
+    assert caches[3].tensors[1] is kv_caches["layers.7.attn"]
+    # Each block's state reads as the first 224 B of its slot, at the layer's
+    # offset in the shared buffer.
+    for p, view in enumerate(caches[1].tensors):
+        region = _region(shared, p)
+        assert view.shape == (TINY_BLOCKS, TINY_STATE)
+        for b in range(TINY_BLOCKS):
+            slot = region[b * TINY_SLOT : b * TINY_SLOT + TINY_STATE]
+            assert torch.equal(view[b], slot)
+    # 0.23's flash layout has a kernel format; 0.30's fused K/V layout does not.
+    layout = caches[3].layout
+    assert (layout.format_name is not None) == (version == "0.23")
+    assert (layout.num_blocks, layout.block_size) == (TINY_BLOCKS, TINY_BLOCK)
+    # Two layers x one 1,024 B slot, for every group.
+    assert worker._page_size_bytes == 2 * TINY_SLOT
+    worker._ensure_handler.assert_called_once()
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_state_view_writes_reach_the_gpu_state(version):
+    """Load will write through the view, so it must alias vLLM's tensor."""
+    shared = _shared()
+    kv = _gdn_tensor(_region(shared, 1), version)
+    view = state_view("x", kv, TINY_SLOT, TINY_STATE)
+    view[4].fill_(0)
+    parts = kv if isinstance(kv, list) else [kv]
+    assert all(not t[4].any() for t in parts)
+    assert all(t[3].any() for t in parts)
+    # Only the state was written: the slot's padding and layer 0 are intact.
+    assert _region(shared, 1)[4 * TINY_SLOT + TINY_STATE :][:8].any()
+    assert torch.equal(_region(shared, 0), _region(_shared(), 0))
+
+
+def test_page_is_the_largest_group_object():
+    """GDN groups of 2, 3 and 2 layers: the page fits the middle one."""
+    gdn = [[0, 4], [1, 5, 8], [2, 6]]
+    shared = _shared()
+    worker = _registered_worker(tiny_kv_caches("0.30", shared, gdn), tiny_config(gdn))
+    assert [len(c.tensors) for c in worker._group_caches] == [2, 3, 2, 2]
+    assert worker._page_size_bytes == 3 * TINY_SLOT
+
+
+def test_attention_object_spans_the_chunk():
+    shared = _shared()
+    kv_caches = {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.30")
+        for i in range(4)
+    }
+    worker = _registered_worker(kv_caches, tiny_swa_config(), chunk=4 * TINY_BLOCK)
+    assert [c.group.kind for c in worker._group_caches] == [
+        GROUP_SLIDING_WINDOW,
+        GROUP_FULL,
+    ]
+    # Two layers x four blocks of 1,024 B.
+    assert worker._page_size_bytes == 2 * 4 * TINY_SLOT
+
+
+def test_split_kernel_blocks_are_refused():
+    shared = _shared()
+    kv_caches = tiny_kv_caches("0.30", shared)
+    for p, i in enumerate(TINY_ATTN):
+        kv_caches[f"layers.{i}.attn"] = _attn_tensor(
+            _region(shared, p), "0.30", kernel_block=8
+        )
+    with pytest.raises(ValueError, match="16-token blocks, laid out as 8-token"):
+        _registered_worker(kv_caches)
+
+
+def test_attention_layout_needs_the_head_count():
+    worker = _worker(num_kv_heads=None)
+    with pytest.raises(ValueError, match="KV head count"):
+        worker.register_kv_caches(tiny_kv_caches("0.30", _shared()))
+
+
+def test_state_must_sit_contiguously_at_the_slot_start():
+    region = _region(_shared(), 0)
+    conv, _ = _gdn_tensor(region, "0.23")
+    as_f32 = region.view(torch.float32)
+    gap = torch.as_strided(as_f32, (TINY_BLOCKS, 2, 4, 4), (256, 16, 4, 1), 32)
+    with pytest.raises(ValueError, match="contiguous state"):
+        state_view("x", [conv, gap], TINY_SLOT, TINY_STATE)
+    with pytest.raises(ValueError, match="contiguous state"):
+        state_view("x", _gdn_tensor(region, "0.30"), 2 * TINY_SLOT, TINY_STATE)
+
+
+def test_state_must_be_the_whole_spec_state():
+    conv, _ = _gdn_tensor(_region(_shared(), 0), "0.23")
+    with pytest.raises(ValueError, match="registers 96 B of Mamba state"):
+        state_view("x", [conv], TINY_SLOT, TINY_STATE)
+
+
+def test_registration_refuses_a_missing_layer():
+    kv_caches = tiny_kv_caches("0.30", _shared())
+    del kv_caches["layers.6.linear_attn"]
+    with pytest.raises(ValueError, match="no registered tensor"):
+        _registered_worker(kv_caches)
+
+
+def test_attention_layers_must_match_in_dtype():
+    kv_caches = tiny_kv_caches("0.23", _shared())
+    kv_caches["layers.7.attn"] = kv_caches["layers.7.attn"].view(torch.float16)
+    with pytest.raises(ValueError, match="differ in shape, dtype or strides"):
+        _registered_worker(kv_caches)
+
+
+def test_attention_block_may_not_exceed_the_spec():
+    kv_caches = tiny_kv_caches("0.23", _shared())
+    for i in TINY_ATTN:
+        kv_caches[f"layers.{i}.attn"] = torch.zeros(
+            TINY_BLOCKS, 2, 16, 2, 16, dtype=torch.bfloat16
+        )
+    with pytest.raises(ValueError, match="2048 B on the GPU, more than"):
+        _registered_worker(kv_caches)
+
+
+def test_a_padded_attention_page_is_accepted():
+    """vLLM may pad an attention page; the KV then fills only part of it."""
+    kv_caches = tiny_kv_caches("0.23", _shared())
+    for i in TINY_ATTN:
+        kv_caches[f"layers.{i}.attn"] = torch.zeros(
+            TINY_BLOCKS, 2, 16, 2, 4, dtype=torch.bfloat16
+        )
+    worker = _registered_worker(kv_caches)
+    assert worker._page_size_bytes == 2 * TINY_SLOT
+
+
+def test_explicit_page_size_must_hold_the_largest_object():
+    worker = make_worker(
+        TINY_BLOCK,
+        TINY_BLOCK,
+        {"maru_chunk_size": TINY_SLOT},
+        num_kv_heads=2,
+        head_size=8,
+        kv_groups=describe_kv_groups(tiny_config()),
+    )
+    worker._ensure_handler = MagicMock()
+    with pytest.raises(ValueError, match="cannot hold one"):
+        worker.register_kv_caches(tiny_kv_caches("0.30", _shared()))
