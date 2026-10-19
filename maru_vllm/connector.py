@@ -40,6 +40,12 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from maru_common.storage_types import StorageError
+from maru_vllm.kv_groups import (
+    KVGroup,
+    blocks_for_tokens,
+    check_multi_group_support,
+    describe_kv_groups,
+)
 from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
@@ -566,9 +572,10 @@ class MaruReqMeta:
 
     req_id: str
     token_ids: list[int]  # Full prompt token IDs
-    # vLLM block IDs covering the request from token 0 in token order.
-    # For chunked-prefill store continuations the scheduler accumulates
-    # each step's new blocks so slot lookup by absolute token offset works.
+    # vLLM block IDs of KV cache group 0, covering the request from token 0
+    # in token order. For chunked-prefill store continuations the scheduler
+    # accumulates each step's new blocks so slot lookup by absolute token
+    # offset works.
     block_ids: list[int]
     is_store: bool  # True = save to maru, False = load from maru
     num_matched_chunks: int = 0  # For load: how many chunks to load
@@ -586,6 +593,10 @@ class MaruReqMeta:
     # load when maru_overlap_load_with_compute is on, under either storage
     # format.
     layerwise_load: bool = False
+    # A model with several KV cache groups: the block IDs of every group, in
+    # vLLM's group order, each accumulated like block_ids (whose list is the
+    # first entry). Empty for a single-group model.
+    group_block_ids: tuple[list[int], ...] = ()
     # Per-step memo of _chunk_keys(token_ids). The same MaruReqMeta object is
     # shared across a step's per-layer save_kv_layer calls (and the step's
     # start_load_kv), so computing chunk keys once here avoids recomputing the
@@ -752,6 +763,14 @@ class MaruKVConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
 
         self._block_size = vllm_config.cache_config.block_size
+        self._kv_groups: list[KVGroup] = (
+            describe_kv_groups(
+                kv_cache_config,
+                getattr(vllm_config.cache_config, "mamba_cache_mode", None),
+            )
+            if kv_cache_config is not None
+            else []
+        )
         extra = self._kv_transfer_config.kv_connector_extra_config
         if _validate_storage_config(extra):
             extra = _cpu_engine_config(extra, vllm_config)
@@ -779,6 +798,21 @@ class MaruKVConnector(KVConnectorBase_V1):
                 self._kv_chunk_tokens,
             )
 
+        if len(self._kv_groups) > 1:
+            check_multi_group_support(
+                self._kv_groups,
+                block_size=self._block_size,
+                use_layerwise=bool(extra.get("maru_use_layerwise", False)),
+                speculative=vllm_config.speculative_config is not None,
+            )
+            # Load and store still handle one group. Until they handle several,
+            # MaruKVConnector does not declare SupportsHMA, so vLLM merges the
+            # groups into one or refuses the model before it gets here.
+            raise ValueError(
+                "MaruKVConnector does not support models with several KV "
+                "cache groups yet"
+            )
+
         self._scheduler: MaruSchedulerConnector | None
         self._worker: MaruWorkerConnector | None
         if role == KVConnectorRole.SCHEDULER:
@@ -792,6 +826,7 @@ class MaruKVConnector(KVConnectorBase_V1):
                 ),
                 num_lookahead_tokens=lookahead,
                 max_model_len=vllm_config.model_config.max_model_len,
+                kv_groups=self._kv_groups,
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -926,6 +961,18 @@ class MaruKVConnector(KVConnectorBase_V1):
         assert self._scheduler is not None
         return self._scheduler.request_finished(request, block_ids)
 
+    def request_finished_all_groups(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """``request_finished`` for every KV cache group (vLLM's SupportsHMA).
+
+        The answer is per request: vLLM keeps or frees the blocks of all
+        groups together.
+        """
+        return self.request_finished(request, block_ids[0] if block_ids else [])
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return block ids whose deferred load failed (vLLM recomputes them)."""
         assert self._worker is not None
@@ -960,10 +1007,13 @@ class MaruSchedulerConnector:
         num_gpu_blocks: int | None = None,
         num_lookahead_tokens: int = 0,
         max_model_len: int | None = None,
+        kv_groups: list[KVGroup] | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        self._kv_groups = list(kv_groups or ())
+        self._multi_group = len(self._kv_groups) > 1
         self._cpu_mode = _validate_storage_config(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
@@ -995,8 +1045,10 @@ class MaruSchedulerConnector:
             )
         # Deferred loads registered by update_state_after_alloc, emitted once
         # by the next build_connector_meta. req_id -> (request,
-        # num_matched_chunks, block_ids).
-        self._pending_deferred_loads: dict[str, tuple[Request, int, list[int]]] = {}
+        # num_matched_chunks, block ids per KV cache group).
+        self._pending_deferred_loads: dict[
+            str, tuple[Request, int, tuple[list[int], ...]]
+        ] = {}
         # Deferred-hit requests that are still live in the scheduler. Pending
         # admissions alone are not a concurrency signal: a burst may arrive
         # one request per scheduler step while earlier requests are decoding.
@@ -1032,11 +1084,14 @@ class MaruSchedulerConnector:
         self._load_ranges: dict[str, tuple[int, int]] = {}
 
         # Requests that need continued store across chunked prefill steps.
-        # req_id -> (full prompt token_ids, block ids accumulated from the
-        # first step in token order). The full block list lets the worker
-        # map any absolute token offset to its GPU slot — per-step new
-        # blocks alone cannot, because step boundaries are not chunk-aligned.
-        self._requests_need_store: dict[str, tuple[list[int], list[int]]] = {}
+        # req_id -> (full prompt token_ids, block ids per KV cache group,
+        # each accumulated from the first step in token order). The full
+        # block list lets the worker map any absolute token offset to its GPU
+        # slot — per-step new blocks alone cannot, because step boundaries
+        # are not chunk-aligned.
+        self._requests_need_store: dict[
+            str, tuple[list[int], tuple[list[int], ...]]
+        ] = {}
 
         # Local cache of keys known to exist (avoid repeated RPC).
         # TODO: add max size / eviction when long-running deployments
@@ -1217,7 +1272,17 @@ class MaruSchedulerConnector:
         tokens = int(tokens) + self._num_lookahead_tokens
         if self._max_model_len is not None:
             tokens = min(tokens, self._max_model_len)
+        if self._multi_group:
+            # Only vLLM < 0.23 gets here: several groups rule out speculative
+            # lookahead, the other reason _async_load_budget sets a budget.
+            return blocks_for_tokens(self._kv_groups, tokens)
         return -(-tokens // self._block_size)
+
+    def _group_block_ids(
+        self, block_ids: tuple[list[int], ...]
+    ) -> tuple[list[int], ...]:
+        """``MaruReqMeta.group_block_ids`` for vLLM's per-group block ids."""
+        return tuple(block_ids) if self._multi_group else ()
 
     def _match(
         self,
@@ -1308,7 +1373,7 @@ class MaruSchedulerConnector:
             self._pending_deferred_loads[request.request_id] = (
                 request,
                 num_chunks,
-                list(blocks.get_block_ids()[0]),
+                tuple(list(ids) for ids in blocks.get_block_ids()),
             )
         else:
             self._requests_need_load[request.request_id] = (request, num_chunks)
@@ -1342,11 +1407,12 @@ class MaruSchedulerConnector:
                 MaruReqMeta(
                     req_id=req_id,
                     token_ids=list(request.prompt_token_ids or []),
-                    block_ids=block_ids,
+                    block_ids=block_ids[0],
                     is_store=False,
                     num_matched_chunks=num_chunks,
                     deferred_load=True,
                     layerwise_load=layerwise_load,
+                    group_block_ids=self._group_block_ids(block_ids),
                 )
             )
         self._pending_deferred_loads.clear()
@@ -1372,14 +1438,12 @@ class MaruSchedulerConnector:
                     MaruReqMeta(
                         req_id=new_req.req_id,
                         token_ids=token_ids,
-                        # Currently only supports a single KV cache group
-                        # (index 0). Multi-group configs (e.g. MLA) will
-                        # silently ignore additional groups.
                         block_ids=new_req.block_ids[0],
                         is_store=False,
                         num_matched_chunks=num_chunks,
                         load_start_token=load_start,
                         load_end_token=load_end,
+                        group_block_ids=self._group_block_ids(new_req.block_ids),
                     )
                 )
             else:
@@ -1395,11 +1459,11 @@ class MaruSchedulerConnector:
                     MaruReqMeta(
                         req_id=new_req.req_id,
                         token_ids=token_ids,
-                        # Single KV cache group (see note above)
                         block_ids=new_req.block_ids[0],
                         is_store=True,
                         num_scheduled_tokens=num_scheduled,
                         num_computed_tokens=num_computed,
+                        group_block_ids=self._group_block_ids(new_req.block_ids),
                     )
                 )
                 # If chunked prefill means not all chunks are covered,
@@ -1409,7 +1473,7 @@ class MaruSchedulerConnector:
                 if stored_chunks < num_full_chunks:
                     self._requests_need_store[new_req.req_id] = (
                         token_ids,
-                        list(new_req.block_ids[0]),
+                        tuple(list(ids) for ids in new_req.block_ids),
                     )
 
         # Cached requests: chunked-prefill continuations and resumed loads.
@@ -1445,6 +1509,7 @@ class MaruSchedulerConnector:
                         num_matched_chunks=num_chunks,
                         load_start_token=self._load_ranges.get(req_id, (0, None))[0],
                         load_end_token=self._load_ranges.get(req_id, (0, None))[1],
+                        group_block_ids=self._group_block_ids(new_block_ids),
                     )
                 )
             elif req_id in self._requests_need_store:
@@ -1458,16 +1523,20 @@ class MaruSchedulerConnector:
                 # far.
                 token_ids, block_ids = self._requests_need_store[req_id]
                 if new_block_ids is not None:
-                    block_ids = block_ids + list(new_block_ids[0])
+                    block_ids = tuple(
+                        ids + list(new)
+                        for ids, new in zip(block_ids, new_block_ids, strict=True)
+                    )
                     self._requests_need_store[req_id] = (token_ids, block_ids)
                 meta.requests.append(
                     MaruReqMeta(
                         req_id=req_id,
                         token_ids=token_ids,
-                        block_ids=block_ids,
+                        block_ids=block_ids[0],
                         is_store=True,
                         num_scheduled_tokens=num_new,
                         num_computed_tokens=num_computed,
+                        group_block_ids=self._group_block_ids(block_ids),
                     )
                 )
                 # Drop tracking once all full chunks have been stored.

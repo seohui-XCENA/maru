@@ -85,14 +85,16 @@ def make_scheduler(
     block_size: int,
     kv_chunk_tokens: int,
     extra_config: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> MaruSchedulerConnector:
-    """Construct a MaruSchedulerConnector."""
+    """Construct a MaruSchedulerConnector; kwargs go to its constructor."""
     from maru_vllm.connector import MaruSchedulerConnector
 
     return MaruSchedulerConnector(
         block_size=block_size,
         kv_chunk_tokens=kv_chunk_tokens,
         extra_config={} if extra_config is None else extra_config,
+        **kwargs,
     )
 
 
