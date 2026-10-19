@@ -45,6 +45,8 @@ from maru_vllm.kv_groups import (
     blocks_for_tokens,
     check_multi_group_support,
     describe_kv_groups,
+    group_object_key,
+    hit_chunks,
 )
 from maru_vllm.kv_layout import (
     KVLayout,
@@ -1200,6 +1202,84 @@ class MaruSchedulerConnector:
 
         return local_hits + rpc_hits
 
+    def _stored_keys(self, keys: list[str]) -> set[str]:
+        """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
+
+        Remembers positives for good, as ``_count_matched_chunks`` does. Only
+        the cxl backend in chunkwise format gets here: CPU mode must re-probe
+        residency, and layerwise format checks ``_DONE`` markers, and the
+        constructor refuses both with several groups.
+        """
+        unknown = [k for k in keys if k not in self._known_keys]
+        if unknown:
+            self._ensure_handler()
+        if unknown and self._handler is not None:
+            try:
+                _t0 = time.monotonic()
+                results = self._handler.batch_exists(unknown)
+                if self._timing:
+                    _emit_timing(
+                        f"lookup batch_exists {len(unknown)} keys = "
+                        f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                    )
+            except Exception as e:
+                logger.warning("Maru batch_exists failed: %s", e)
+            else:
+                # A short reply leaves the rest unknown, i.e. a miss.
+                self._known_keys.update(
+                    k for k, exists in zip(unknown, results, strict=False) if exists
+                )
+        return {k for k in keys if k in self._known_keys}
+
+    def _count_matched_group_chunks(self, req_id: str, token_ids: list[int]) -> int:
+        """Chunks to load for a model with several KV cache groups.
+
+        Only whole chunks short of the prompt's last token count, since vLLM
+        must compute at least one token. A hit ends on a chunk boundary:
+        a Mamba state exists only at chunk ends, and a sliding-window object
+        holds the window that ends at its chunk's end, while earlier tokens
+        of the chunk may have left the GPU before the store. Keys already
+        known to exist are tried first; when they fall short of every chunk,
+        all groups' remaining keys go in one RPC. See ``kv_groups.hit_chunks``.
+        """
+        chunk_tokens = self._kv_chunk_tokens
+        num_chunks = (len(token_ids) - 1) // chunk_tokens
+        chunk_keys = _chunk_keys(token_ids[: num_chunks * chunk_tokens], chunk_tokens)
+        if not chunk_keys:
+            return 0
+
+        def hit_among(stored: set[str]) -> tuple[int, int]:
+            return hit_chunks(
+                self._kv_groups,
+                len(chunk_keys),
+                chunk_tokens,
+                lambda i, g: group_object_key(chunk_keys[i], g.group_id) in stored,
+            )
+
+        hit, prefix = hit_among(self._known_keys)
+        if hit < len(chunk_keys):
+            hit, prefix = hit_among(
+                self._stored_keys(
+                    [
+                        group_object_key(key, g.group_id)
+                        for key in chunk_keys
+                        for g in self._kv_groups
+                    ]
+                )
+            )
+        if hit < prefix:
+            # Most often the prompt matched past the last chunk where the
+            # earlier request's prefill step ended. Logged at a miss too:
+            # "stored but no hit" is the case worth explaining.
+            logger.info(
+                "Maru KV lookup: req=%s can resume after %d of %d chunks; the "
+                "later chunk ends lack a Mamba state or sliding window",
+                req_id,
+                hit,
+                prefix,
+            )
+        return hit
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -1298,7 +1378,11 @@ class MaruSchedulerConnector:
             return 0, False
 
         _t0 = time.monotonic()
-        num_matched_chunks = self._count_matched_chunks(token_ids)
+        num_matched_chunks = (
+            self._count_matched_group_chunks(request.request_id, token_ids)
+            if self._multi_group
+            else self._count_matched_chunks(token_ids)
+        )
         if self._timing:
             _emit_timing(
                 f"get_num_new_matched (incl _chunk_keys) {len(token_ids)} tok = "
@@ -1314,6 +1398,7 @@ class MaruSchedulerConnector:
         # kv_chunk_tokens is covered by its chunk keys with no remainder, so
         # reporting every chunk would report the whole prompt. Hold one token
         # back; the block alignment below then leaves a whole block to run.
+        # (With several groups the chunk count already stops short of it.)
         matched_tokens = min(matched_tokens, len(token_ids) - 1)
         # Align to block size
         matched_tokens = _align_down(matched_tokens, self._block_size)

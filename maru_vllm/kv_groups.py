@@ -4,19 +4,23 @@
 A hybrid model (Qwen3.5: Gated DeltaNet + full attention; gpt-oss: sliding
 window + full attention) reaches the connector as several KV cache groups.
 Each group has its own block table and spec. This module turns
-``kv_cache_config.kv_cache_groups`` into plain :class:`KVGroup` records and
-checks which group combinations the connector supports. It holds no connector
-state and imports no vLLM class, so it is testable without a GPU.
+``kv_cache_config.kv_cache_groups`` into plain :class:`KVGroup` records,
+checks which group combinations the connector supports, and decides how much
+of a prompt the stored objects of every group can resume. It holds no
+connector state and imports no vLLM class, so it is testable without a GPU.
 
 Storage unit: one Maru object per (chunk, group). vLLM gives every layer the
 same bytes per block slot in every group (Mamba state is padded up to it), so
 a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
-a Mamba group keeps only the state at the chunk's last block.
+a Mamba group keeps only the state at the chunk's last block. A model with
+one group keeps the bare chunk key; with several, each object is keyed
+``<chunk key>_g<group id>``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -141,6 +145,72 @@ def blocks_for_tokens(groups: list[KVGroup], tokens: int) -> int:
         g.state_blocks if g.kind == GROUP_MAMBA else -(-tokens // g.block_size)
         for g in groups
     )
+
+
+def group_object_key(chunk_key: str, group_id: int) -> str:
+    """Key of the (chunk, group) object for a model with several groups."""
+    return f"{chunk_key}_g{group_id}"
+
+
+def window_chunks(group: KVGroup, end: int, chunk_tokens: int) -> range:
+    """Chunks a sliding-window group needs to resume at token ``end``.
+
+    The token at ``end`` attends to the ``sliding_window`` tokens ending at
+    itself, so the cache must hold tokens ``[end - window + 1, end)``.
+    """
+    assert group.sliding_window is not None
+    first = max(0, end - group.sliding_window + 1) // chunk_tokens
+    return range(first, -(-end // chunk_tokens))
+
+
+def hit_chunks(
+    groups: list[KVGroup],
+    num_chunks: int,
+    chunk_tokens: int,
+    has_object: Callable[[int, KVGroup], bool],
+) -> tuple[int, int]:
+    """How many chunks a request can load when several groups must agree.
+
+    A hit of ``k`` chunks resumes at token ``k * chunk_tokens`` and needs:
+
+    - every full-attention group: chunks ``0 .. k-1``;
+    - every sliding-window group: the chunks its window covers there;
+    - every Mamba group: chunk ``k-1``, whose object is the state there.
+
+    A Mamba state is stored only for a chunk that ended a scheduler step, so
+    the hit is the longest full-attention prefix cut back to such a chunk.
+
+    Args:
+        groups: The model's KV cache groups.
+        num_chunks: Chunks that may hit, already short of the prompt's last
+            token.
+        chunk_tokens: Tokens per chunk.
+        has_object: Whether the object of (chunk index, group) is stored.
+
+    Returns:
+        ``(hit, prefix)``: the chunks to load, and the chunks the
+        full-attention groups allow (all ``num_chunks`` without such a
+        group). ``hit < prefix`` when a later chunk lacks a Mamba state or a
+        sliding window.
+    """
+    full = [g for g in groups if g.kind == GROUP_FULL]
+    prefix = next(
+        (i for i in range(num_chunks) if not all(has_object(i, g) for g in full)),
+        num_chunks,
+    )
+
+    def resumable(k: int, g: KVGroup) -> bool:
+        if g.kind == GROUP_MAMBA:
+            return has_object(k - 1, g)
+        if g.kind == GROUP_SLIDING_WINDOW:
+            window = window_chunks(g, k * chunk_tokens, chunk_tokens)
+            return all(has_object(i, g) for i in window)
+        return True
+
+    for k in range(prefix, 0, -1):
+        if all(resumable(k, g) for g in groups):
+            return k, prefix
+    return 0, prefix
 
 
 def chunk_tokens_for_groups(

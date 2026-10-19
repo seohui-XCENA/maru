@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache groups: description, support checks and per-group block ids.
+"""KV cache groups: description, support checks, hits and per-group block ids.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
 attention).
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -24,7 +25,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from maru_vllm.connector import MaruKVConnector
+from maru_vllm.connector import MaruKVConnector, _chunk_keys
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
@@ -35,6 +36,9 @@ from maru_vllm.kv_groups import (
     check_multi_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
+    group_object_key,
+    hit_chunks,
+    window_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
     fake_cached_reqs,
@@ -361,3 +365,185 @@ def test_resume_budget_counts_every_group():
         kv_groups=describe_kv_groups(qwen35_config()),
     )
     assert sched._resume_blocks(SimpleNamespace(num_tokens=1500)) == 9
+
+
+# =============================================================================
+# Hits across groups
+# =============================================================================
+
+
+def _has(objects):
+    """``has_object`` over a set of (chunk index, group id)."""
+    return lambda i, g: (i, g.group_id) in objects
+
+
+def test_hit_ends_where_every_mamba_group_has_a_state():
+    groups = describe_kv_groups(qwen35_config())
+    attention = {(i, 3) for i in range(4)}
+    # Prefill steps ended at chunks 2 and 3.
+    states = {(i, g) for i in (2, 3) for g in range(3)}
+    assert hit_chunks(groups, 4, QWEN35_BLOCK, _has(attention | states)) == (4, 4)
+    assert hit_chunks(groups, 2, QWEN35_BLOCK, _has(attention | states)) == (0, 2)
+    # Two of three Mamba groups are not a state.
+    partial = attention | {(3, 0), (3, 1)}
+    assert hit_chunks(groups, 4, QWEN35_BLOCK, _has(partial)) == (0, 4)
+
+
+def test_hit_stops_at_a_missing_attention_chunk():
+    groups = describe_kv_groups(qwen35_config())
+    attention = {(i, 3) for i in range(4)} - {(2, 3)}
+    states = {(i, g) for i in (1, 3) for g in range(3)}
+    assert hit_chunks(groups, 4, QWEN35_BLOCK, _has(attention | states)) == (2, 2)
+
+
+def test_sliding_window_needs_the_chunks_its_window_covers():
+    groups = describe_kv_groups(gpt_oss_config())  # group 0 window 128, chunk 256
+    full = {(i, 1) for i in range(4)}
+    assert hit_chunks(groups, 4, 256, _has(full | {(3, 0)})) == (4, 4)
+    # A window shorter than a chunk lies in the hit's last chunk alone.
+    assert hit_chunks(groups, 4, 256, _has(full | {(1, 0)})) == (2, 4)
+    assert hit_chunks(groups, 4, 256, _has(full)) == (0, 4)
+
+
+def test_window_chunks():
+    swa = describe_kv_groups(gpt_oss_config())[0]
+    assert window_chunks(swa, 1024, 256) == range(3, 4)  # tokens 897..1023
+    wide = dataclasses.replace(swa, sliding_window=300)
+    assert window_chunks(wide, 1024, 256) == range(2, 4)  # tokens 725..1023
+    assert window_chunks(wide, 256, 256) == range(0, 1)
+    # The window includes the token being computed: W = C + 1 still needs
+    # one chunk, W = C + 2 reaches into the one before.
+    assert window_chunks(dataclasses.replace(swa, sliding_window=257), 1024, 256) == (
+        range(3, 4)
+    )
+    assert window_chunks(dataclasses.replace(swa, sliding_window=258), 1024, 256) == (
+        range(2, 4)
+    )
+
+
+class _Store:
+    """A MaruHandler stand-in holding a set of keys."""
+
+    def __init__(self, keys=()):
+        self.keys = set(keys)
+        self.queries = []
+
+    def batch_exists(self, keys):
+        self.queries.append(list(keys))
+        return [k in self.keys for k in keys]
+
+
+def _stored_by(tokens, chunk, attention_groups, state_groups, state_chunks):
+    """Keys a request stores: attention objects for every chunk, states for some."""
+    keys = _chunk_keys(tokens, chunk)
+    stored = {group_object_key(k, g) for k in keys for g in attention_groups}
+    stored |= {group_object_key(keys[i], g) for i in state_chunks for g in state_groups}
+    return stored
+
+
+def _qwen35_scheduler(stored):
+    sched = make_scheduler(
+        QWEN35_BLOCK, QWEN35_BLOCK, kv_groups=describe_kv_groups(qwen35_config())
+    )
+    sched._handler = _Store(stored)
+    return sched
+
+
+def _hit(sched, tokens, num_computed_tokens=0):
+    request = SimpleNamespace(request_id="b", prompt_token_ids=tokens)
+    matched, _ = sched.get_num_new_matched_tokens(request, num_computed_tokens)
+    return matched
+
+
+def _other(n):
+    """Tokens no stored prompt contains."""
+    return list(range(100_000, 100_000 + n))
+
+
+def test_qwen35_prompt_of_whole_chunks_hits_nothing():
+    """1,088 tokens in one prefill step: the only state is at the last chunk,
+    which the held-back token excludes."""
+    a = list(range(1088))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    assert _hit(sched, a) == 0
+
+
+def test_qwen35_same_prompt_hits_up_to_the_state():
+    a = list(range(1200))  # step 1 ends at token 1,088
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    assert _hit(sched, a) == 1088
+
+
+def test_qwen35_partial_overlap_hits_only_at_a_step_end():
+    """A (2,300 tokens) ended prefill steps at tokens 1,632 and 2,176."""
+    a = list(range(2300))
+    stored = _stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [2, 3])
+    sched = _qwen35_scheduler(stored)
+    assert _hit(sched, a[:1500] + _other(300)) == 0
+    assert _hit(sched, a[:1700] + _other(300)) == 1632
+
+
+def test_gpt_oss_hits_whole_chunks():
+    sched = make_scheduler(16, 256, kv_groups=describe_kv_groups(gpt_oss_config()))
+    a = list(range(1200))
+    sched._handler = _Store(_stored_by(a, 256, [0, 1], [], []))
+    assert _hit(sched, a) == 1024
+    # A whole-chunk prompt holds back a chunk, not a block as one group would:
+    # a hit inside a chunk could need window tokens freed before the store.
+    assert _hit(sched, a[:1024]) == 768
+
+
+def test_lookup_asks_every_group_in_one_rpc():
+    a = list(range(2300))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [2, 3]))
+    b = a[:1700] + _other(300)
+    assert _hit(sched, b) == 1632
+    (query,) = sched._handler.queries
+    keys = _chunk_keys(b, QWEN35_BLOCK)[:3]
+    assert query == [group_object_key(k, g) for k in keys for g in range(4)]
+
+
+def test_known_keys_that_give_every_chunk_skip_the_rpc():
+    a = list(range(2300))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [2, 3]))
+    b = a[:1700] + _other(300)  # 3 chunks may hit, and all 3 do
+    assert _hit(sched, b) == 1632
+    assert _hit(sched, b) == 1632
+    assert len(sched._handler.queries) == 1
+
+
+def test_a_short_hit_asks_again_for_the_missing_keys_only():
+    a = list(range(2300))
+    stored = _stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [2, 3])
+    sched = _qwen35_scheduler(stored)
+    b = a[:1500] + _other(300)
+    assert _hit(sched, b) == 0
+    assert _hit(sched, b) == 0
+    first, second = sched._handler.queries
+    assert second == [k for k in first if k not in stored]
+
+
+def test_a_short_reply_leaves_the_rest_missing():
+    a = list(range(1200))
+    stored = _stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1])
+    sched = _qwen35_scheduler(stored)
+    answer = sched._handler.batch_exists
+    # Only chunk 0's four keys are answered.
+    sched._handler.batch_exists = lambda keys: answer(keys)[:4]
+    assert _hit(sched, a) == 0
+    sched._handler.batch_exists = answer
+    assert _hit(sched, a) == 1088
+
+
+def test_hit_counts_past_the_gpu_prefix_cache():
+    a = list(range(2300))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [2, 3]))
+    b = a[:1700] + _other(300)
+    assert _hit(sched, b, num_computed_tokens=544) == 1088
+    assert _hit(sched, b, num_computed_tokens=1632) == 0
+
+
+def test_lookup_failure_is_a_miss():
+    sched = _qwen35_scheduler(())
+    sched._handler.batch_exists = MagicMock(side_effect=RuntimeError("down"))
+    assert _hit(sched, list(range(1200))) == 0
