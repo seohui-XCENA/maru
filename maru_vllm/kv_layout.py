@@ -231,6 +231,34 @@ def _gather_kv(
     return gathered.reshape(gathered.shape[0], 2, -1).transpose(0, 1)
 
 
+def _scatter_kv(
+    paged: torch.Tensor, layout: KVLayout, slots: torch.Tensor, kv: torch.Tensor
+) -> None:
+    """Write ``kv`` (``[2, ntok, row]``) into ``slots`` of a paged KV tensor.
+
+    The inverse of :func:`_gather_kv`, through a view, so the writes land in
+    ``paged`` itself.
+
+    Raises:
+        RuntimeError: A fused row of odd width, which cannot be halved.
+    """
+    canon = _canonical_paged_view(paged, layout)
+    blocks = slots // layout.block_size
+    offsets = slots % layout.block_size
+    ntok = slots.shape[0]
+    if layout.kv_axis is not None:
+        canon[:, blocks, offsets] = kv.reshape(2, ntok, *canon.shape[3:])
+        return
+    if canon.shape[2:].numel() % 2:
+        raise RuntimeError(
+            "Maru: cannot inject KV for layout "
+            f"{tuple(paged.shape)}; odd fused K/V row width"
+        )
+    # Undo the gather side's halving of each token's row.
+    merged = kv.transpose(0, 1).reshape(ntok, -1)
+    canon[blocks, offsets] = merged.reshape(ntok, *canon.shape[2:])
+
+
 _kv_cache_layout_warned = False
 
 

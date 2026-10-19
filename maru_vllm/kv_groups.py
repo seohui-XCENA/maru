@@ -53,9 +53,6 @@ class KVGroup:
         slot_bytes: Bytes one layer uses for one block (``page_size_bytes``).
         sliding_window: Window in tokens for a sliding-window group.
         mamba_cache_mode: Mamba state caching mode (``"align"`` etc.).
-        state_blocks: For a Mamba group, blocks one request holds at most:
-            the state being written, the previous one until vLLM frees it,
-            and any speculative or prefill-checkpoint blocks. 0 otherwise.
         state_bytes: For a Mamba group, bytes of one layer's state in one
             block (its state shapes times dtypes), which vLLM pads up to
             ``slot_bytes``. 0 otherwise.
@@ -69,7 +66,6 @@ class KVGroup:
     slot_bytes: int
     sliding_window: int | None = None
     mamba_cache_mode: str | None = None
-    state_blocks: int = 0
     state_bytes: int = 0
 
     def object_bytes(self, chunk_tokens: int) -> int:
@@ -130,14 +126,6 @@ def describe_kv_groups(
                     if kind == GROUP_MAMBA
                     else None
                 ),
-                # vLLM's own bound (MambaSpec.max_memory_usage_bytes, align).
-                state_blocks=(
-                    2
-                    + getattr(spec, "num_speculative_blocks", 0)
-                    + getattr(spec, "num_prefill_checkpoint_blocks", 0)
-                    if kind == GROUP_MAMBA
-                    else 0
-                ),
                 state_bytes=(
                     sum(
                         math.prod(shape) * dtype.itemsize
@@ -149,20 +137,6 @@ def describe_kv_groups(
             )
         )
     return groups
-
-
-def blocks_for_tokens(groups: list[KVGroup], tokens: int) -> int:
-    """GPU blocks a request of ``tokens`` tokens holds across all groups.
-
-    vLLM allocates every group from one block pool, so the counts add up. An
-    attention group holds one block per ``block_size`` tokens; for a
-    sliding-window group, which frees blocks behind the window, that is an
-    upper bound. A Mamba group holds ``state_blocks``.
-    """
-    return sum(
-        g.state_blocks if g.kind == GROUP_MAMBA else -(-tokens // g.block_size)
-        for g in groups
-    )
 
 
 def group_object_key(chunk_key: str, group_id: int) -> str:
@@ -252,6 +226,20 @@ def chunk_tokens_for_groups(
     return chunk_tokens
 
 
+def one_group_hint(groups: list[KVGroup]) -> str:
+    """How to run a model without a Mamba group as one KV cache group instead.
+
+    vLLM can merge sliding-window layers into full attention when its hybrid
+    KV cache manager is off; Mamba layers it cannot merge.
+    """
+    if any(g.kind == GROUP_MAMBA for g in groups):
+        return ""
+    return (
+        "; or start vLLM with --disable-hybrid-kv-cache-manager to run the "
+        "model as one KV cache group"
+    )
+
+
 def check_multi_group_support(
     groups: list[KVGroup],
     *,
@@ -282,17 +270,17 @@ def check_multi_group_support(
         raise ValueError(
             "MaruKVConnector does not support KV cache groups of type "
             f"{', '.join(unsupported)} alongside other groups; supported are "
-            f"{', '.join(_SUPPORTED_SPECS)}"
+            f"{', '.join(_SUPPORTED_SPECS)}{one_group_hint(groups)}"
         )
     if use_layerwise:
         raise ValueError(
             "MaruKVConnector supports models with several KV cache groups only "
-            "in chunkwise format; set maru_use_layerwise=false"
+            f"in chunkwise format; set maru_use_layerwise=false{one_group_hint(groups)}"
         )
     if speculative:
         raise ValueError(
             "MaruKVConnector does not support speculative decoding with models "
-            "that have several KV cache groups"
+            f"that have several KV cache groups{one_group_hint(groups)}"
         )
     for g in groups:
         if g.kind == GROUP_MAMBA and g.mamba_cache_mode != "align":
@@ -305,7 +293,7 @@ def check_multi_group_support(
     if group_block_sizes != [block_size]:
         raise ValueError(
             "MaruKVConnector needs every KV cache group to use the block size "
-            f"{block_size} (got {group_block_sizes})"
+            f"{block_size} (got {group_block_sizes}){one_group_hint(groups)}"
         )
 
 

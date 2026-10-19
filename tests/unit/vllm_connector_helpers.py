@@ -130,6 +130,7 @@ def make_vllm_scheduler(
     speculative_method: Literal["draft_model", "eagle", "ngram"] | None = None,
     num_speculative_tokens: int = 16,
     max_model_len: int = 512,
+    kv_cache_groups: list[Any] | None = None,
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -147,6 +148,8 @@ def make_vllm_scheduler(
         speculative_method: Optional draft-model, EAGLE or ngram configuration.
         num_speculative_tokens: Draft tokens when speculation is enabled.
         max_model_len: Token limit used by the model and scheduler.
+        kv_cache_groups: ``KVCacheGroupSpec`` list replacing the default single
+            full-attention group, for models with several groups.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -221,7 +224,8 @@ def make_vllm_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[
+        kv_cache_groups=kv_cache_groups
+        or [
             KVCacheGroupSpec(
                 ["layer"],
                 FullAttentionSpec(

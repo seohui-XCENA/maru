@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV cache groups: description, support checks, hits, per-group block ids,
-worker registration and stores.
+worker registration, stores and loads.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
@@ -17,7 +17,10 @@ pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 import torch
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    supports_hma,
+)
 from vllm.v1 import kv_cache_interface
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -38,7 +41,6 @@ from maru_vllm.kv_groups import (
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
     _spec_kind,
-    blocks_for_tokens,
     check_multi_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
@@ -53,6 +55,7 @@ from tests.unit.vllm_connector_helpers import (
     fake_scheduler_output,
     make_flash_attn_metadata,
     make_scheduler,
+    make_vllm_scheduler,
     make_worker,
 )
 
@@ -144,7 +147,6 @@ def test_describe_qwen35_groups():
     # The padded Mamba state takes the attention slot size.
     assert {g.slot_bytes for g in groups} == {QWEN35_SLOT}
     assert [g.mamba_cache_mode for g in groups] == ["align"] * 3 + [None]
-    assert [g.state_blocks for g in groups] == [2, 2, 2, 0]
     # One object per (chunk, group), all the same size: 6 layers x 1 slot.
     assert {g.object_bytes(QWEN35_BLOCK) for g in groups} == {6 * QWEN35_SLOT}
     assert groups[0].object_bytes(QWEN35_BLOCK) == 6_684_672
@@ -162,13 +164,6 @@ def test_mamba_mode_falls_back_to_cache_config():
     """A spec without the mode (older vLLM) takes cache_config's."""
     groups = describe_kv_groups(qwen35_config(None), default_mamba_cache_mode="align")
     assert [g.mamba_cache_mode for g in groups] == ["align"] * 3 + [None]
-
-
-def test_blocks_for_tokens_adds_groups():
-    # Qwen3.5: 3 Mamba groups x 2 state blocks + ceil(1500 / 544) attention.
-    assert blocks_for_tokens(describe_kv_groups(qwen35_config()), 1500) == 9
-    # gpt-oss: ceil(1000 / 16) in each of two groups.
-    assert blocks_for_tokens(describe_kv_groups(gpt_oss_config()), 1000) == 126
 
 
 def test_chunk_is_one_block_with_a_mamba_group():
@@ -248,25 +243,37 @@ def _connector_config(block_size, **extra):
         kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
         cache_config=SimpleNamespace(block_size=block_size, mamba_cache_mode="align"),
         speculative_config=None,
+        model_config=SimpleNamespace(max_model_len=4096),
     )
 
 
-def test_connector_refuses_several_groups_until_supported():
-    with pytest.raises(ValueError, match="several KV cache groups yet"):
-        MaruKVConnector(
-            _connector_config(QWEN35_BLOCK),
-            KVConnectorRole.SCHEDULER,
-            qwen35_config(),
-        )
+def test_hybrid_support_is_declared_from_vllm_0_30():
+    """Older vLLM cannot recompute a failed load of a several-group model, so
+    Maru leaves its hybrid KV cache manager off there, as before."""
+    from maru_vllm.connector import _vllm_version_at_least
+
+    assert supports_hma(MaruKVConnector) == _vllm_version_at_least("0.30.0")
+
+
+def test_a_mamba_model_stores_one_block_per_chunk():
+    connector = MaruKVConnector(
+        _connector_config(QWEN35_BLOCK, maru_kv_chunk_tokens=2 * QWEN35_BLOCK),
+        KVConnectorRole.SCHEDULER,
+        qwen35_config(),
+    )
+    assert connector._kv_chunk_tokens == QWEN35_BLOCK
+    assert connector._scheduler._kv_chunk_tokens == QWEN35_BLOCK
+    assert connector._scheduler._multi_group
 
 
 def test_connector_reports_the_setting_to_change():
-    with pytest.raises(ValueError, match="maru_use_layerwise=false"):
+    with pytest.raises(ValueError, match="maru_use_layerwise=false") as refused:
         MaruKVConnector(
             _connector_config(16, maru_use_layerwise=True),
             KVConnectorRole.SCHEDULER,
             gpt_oss_config(),
         )
+    assert "--disable-hybrid-kv-cache-manager" in str(refused.value)
 
 
 def test_request_finished_all_groups_answers_per_request():
@@ -365,16 +372,6 @@ def test_resumed_load_carries_every_group():
     assert not req.is_store
     assert req.block_ids == [1, 2, 3, 4]
     assert req.group_block_ids == new_block_ids
-
-
-def test_resume_budget_counts_every_group():
-    sched = make_scheduler(
-        QWEN35_BLOCK,
-        QWEN35_BLOCK,
-        num_gpu_blocks=100,
-        kv_groups=describe_kv_groups(qwen35_config()),
-    )
-    assert sched._resume_blocks(SimpleNamespace(num_tokens=1500)) == 9
 
 
 # =============================================================================
@@ -1096,13 +1093,13 @@ def test_padded_pages_store_without_the_kernel():
     worker = _worker()
     worker.register_kv_caches(kv_caches)
     worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
-    assert worker._group_store_kernel(worker._group_caches[3]) is None
+    assert worker._build_group_kernel(worker._group_caches[3], None) is None
     worker._packed_load_kernel_ctx.assert_not_called()
 
     dense = _worker()
     dense.register_kv_caches(tiny_kv_caches("0.23", _shared()))
     dense._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
-    assert dense._group_store_kernel(dense._group_caches[3]) == ("ops",) * 6
+    assert dense._build_group_kernel(dense._group_caches[3], None) == ("ops",) * 6
 
 
 def _kernel_worker(extra=None):
@@ -1198,3 +1195,645 @@ def test_a_request_is_held_until_its_group_objects_are_registered():
     worker._store_executor.run()
     assert len(store) == 5
     assert worker.get_finished_saving(set()) == {"r1"}
+
+
+# =============================================================================
+# Loads
+# =============================================================================
+
+
+def _serve(worker, store):
+    """Let ``worker`` retrieve the objects ``store`` holds."""
+    worker._handler.batch_retrieve.side_effect = lambda keys: [
+        SimpleNamespace(view=memoryview(bytearray(store[k]))) if k in store else None
+        for k in keys
+    ]
+
+
+def _load_meta(tokens, group_block_ids, hit, computed=0, scheduled=0, **kwargs):
+    return MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                req_id="b",
+                token_ids=tokens,
+                block_ids=group_block_ids[0],
+                is_store=False,
+                num_matched_chunks=hit,
+                num_computed_tokens=computed,
+                num_scheduled_tokens=scheduled,
+                group_block_ids=group_block_ids,
+                **kwargs,
+            )
+        ]
+    )
+
+
+_FORWARD = SimpleNamespace(attn_metadata=None, no_compile_layers={})
+
+
+def _stored_qwen(version="0.30"):
+    """Request A's objects: 40 tokens, its first step ending at token 32."""
+    source = _shared()
+    worker, store = _storing_worker(tiny_kv_caches(version, source))
+    worker.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    return source, worker, store
+
+
+# B's blocks: GDN group g holds 2g+1 where the hit ends and 2g+2 where the step
+# ends; attention holds 7, 8, 9.
+B_BLOCKS = ([0, 1, 2], [0, 3, 4], [0, 5, 6], [7, 8, 9])
+
+
+def _loading_worker(store, version="0.30", config=None, chunk=TINY_BLOCK):
+    target = torch.zeros_like(_shared())
+    if config is None:
+        kv_caches = tiny_kv_caches(version, target)
+    else:
+        kv_caches = {
+            f"layers.{i}.attn": _attn_tensor(_region(target, i // 2), version)
+            for i in range(4)
+        }
+    worker, _ = _storing_worker(kv_caches, config, chunk)
+    _serve(worker, store)
+    return worker, target
+
+
+def _state(shared, layer, block):
+    return _region(shared, layer)[block * TINY_SLOT :][:TINY_STATE]
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_an_inline_load_restores_every_group(version):
+    source, stored, store = _stored_qwen(version)
+    worker, target = _loading_worker(store, version)
+    # B: same 40 tokens, hit 2 chunks (32 tokens), computes 32-39 this step.
+    worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
+
+    src = stored._group_caches[3].tensors
+    dst = worker._group_caches[3].tensors
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, version), _token_rows(a, a_block, version)
+            )
+    # The state goes where the hit ends and where this step ends.
+    for g in range(3):
+        a_block = QWEN_BLOCKS[g][1]
+        for b_block in B_BLOCKS[g][1:]:
+            for layer in range(2):
+                assert torch.equal(
+                    _state(target, layer, b_block), _state(source, layer, a_block)
+                )
+    assert worker.take_failed_load_blocks() == set()
+
+
+def test_a_parked_load_writes_the_state_only_where_the_hit_ends():
+    """vLLM copies it on to the step's block when the request resumes."""
+    source, _, store = _stored_qwen()
+    worker, target = _loading_worker(store)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads inline
+    for g in range(3):
+        assert torch.equal(
+            _state(target, 0, B_BLOCKS[g][1]), _state(source, 0, QWEN_BLOCKS[g][1])
+        )
+        assert not _state(target, 0, B_BLOCKS[g][2]).any()
+    assert worker.get_finished_loading() == {"b"}
+
+
+def test_a_sliding_window_load_writes_only_the_window():
+    """Window 32 at token 64: vLLM gave real blocks for tokens 32-63 only."""
+    source = _shared()
+    kv_caches = {
+        f"layers.{i}.attn": _attn_tensor(_region(source, i // 2), "0.30")
+        for i in range(4)
+    }
+    stored, store = _storing_worker(kv_caches, tiny_swa_config(), chunk=64)
+    tokens = list(range(80))
+    stored.wait_for_save(_store_meta(tokens, ([7, 8, 9, 10], [3, 4, 5, 6]), 0, 64))
+
+    worker, target = _loading_worker(store, config=tiny_swa_config(), chunk=64)
+    blocks = ([0, 0, 1, 2], [3, 4, 5, 6])
+    worker.start_load_kv(_FORWARD, _load_meta(tokens, blocks, 1, 64, 16))
+    swa_src = stored._group_caches[0].tensors
+    swa_dst = worker._group_caches[0].tensors
+    for a_block, b_block in ((9, 1), (10, 2)):
+        for a, b in zip(swa_src, swa_dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, "0.30"), _token_rows(a, a_block, "0.30")
+            )
+    # The null block is left alone.
+    assert not _token_rows(swa_dst[0], 0, "0.30").any()
+
+
+def test_a_missing_object_fails_the_blocks_maru_loads():
+    _, _, store = _stored_qwen()
+    k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
+    del store[group_object_key(k1, 2)]
+    worker, target = _loading_worker(store)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)
+    # Every group's real blocks over tokens 0-31: the states where the hit
+    # ends (1, 3, 5) and attention 7, 8. Not the null block, nor the blocks
+    # the step computes (2, 4, 6, 9).
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
+    assert worker.get_finished_loading() == {"b"}
+    assert not target.any()
+
+
+def test_a_load_skips_what_vllms_prefix_cache_holds():
+    """vLLM already holds tokens 0-15 (block 7, maybe shared with running
+    requests): Maru neither loads them nor reports them when it fails."""
+    source, stored, store = _stored_qwen()
+    worker, target = _loading_worker(store)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8, load_start_token=16)
+    worker.start_load_kv(_FORWARD, meta)
+    (keys,), _ = worker._handler.batch_retrieve.call_args
+    k0, k1 = _chunk_keys(list(range(40)), TINY_BLOCK)
+    assert group_object_key(k0, 3) not in keys
+    dst = worker._group_caches[3].tensors
+    assert not _token_rows(dst[0], 7, "0.30").any()
+    src = stored._group_caches[3].tensors
+    assert torch.equal(_token_rows(dst[0], 8, "0.30"), _token_rows(src[0], 5, "0.30"))
+
+    del store[group_object_key(k1, 3)]
+    worker.start_load_kv(_FORWARD, meta)
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 8}
+
+
+def test_loads_of_several_groups_carry_where_vllms_cache_ends():
+    a = list(range(96))
+    sched = _two_group_scheduler({"maru_async_load": True})
+    sched._handler = _Store(_stored_by(a, 32, [0, 1], [], []))
+    request = SimpleNamespace(request_id="r1", prompt_token_ids=a + _other(4))
+    # vLLM's prefix cache holds 32 tokens; Maru adds 64.
+    assert sched.get_num_new_matched_tokens(request, 32) == (64, True)
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([1, 2, 3, 4, 5, 6], [11, 12, 13, 14, 15, 16])
+    sched.update_state_after_alloc(request, blocks, 64)
+    req = sched.build_connector_meta(fake_scheduler_output()).requests[0]
+    assert (req.load_start_token, req.load_end_token) == (32, 96)
+
+
+def test_nothing_to_load_unparks_the_request():
+    worker, _ = _loading_worker({})
+    meta = _load_meta(list(range(40)), B_BLOCKS, 0, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)
+    assert worker.get_finished_loading() == {"b"}
+    worker._handler.batch_retrieve.assert_not_called()
+
+
+def test_inline_loads_of_several_groups_carry_their_step():
+    sched = _two_group_scheduler()
+    request = SimpleNamespace(request_id="r1", prompt_token_ids=list(range(64)))
+    sched.update_state_after_alloc(request, MagicMock(), 32)
+    new_req = _new_req(([1, 2, 3, 4], [11, 12, 13, 14]))
+    new_req.num_computed_tokens = 32
+    req = _step(sched, 32, new_reqs=[new_req])
+    assert not req.is_store
+    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (32, 32)
+
+    single = make_scheduler(16, 32)
+    single.update_state_after_alloc(request, MagicMock(), 32)
+    req = _step(single, 32, new_reqs=[new_req])
+    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (0, 0)
+
+
+def test_several_groups_load_each_request_whole():
+    extra = {"maru_async_load": True, "maru_overlap_load_with_compute": True}
+    assert not _two_group_scheduler(extra)._layerwise_overlap
+    assert make_scheduler(16, 32, extra)._layerwise_overlap
+
+
+def _cuda_loading_worker(store):
+    from maru_vllm.connector import _resolve_kv_ops
+
+    if not torch.cuda.is_available() or _resolve_kv_ops() is None:
+        pytest.skip("needs CUDA and the maru_kv_ops kernels")
+    target = torch.zeros_like(_shared()).cuda()
+    worker, _ = _storing_worker(tiny_kv_caches("0.23", target))
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    _serve(worker, store)
+    return worker, target
+
+
+def _check_loaded(stored, worker, source, target, in_place):
+    src = [t.cpu() for t in stored._group_caches[3].tensors]
+    dst = [t.cpu() for t in worker._group_caches[3].tensors]
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, "0.23"), _token_rows(a, a_block, "0.23")
+            )
+    for g in range(3):
+        b_blocks = B_BLOCKS[g][1:] if in_place else B_BLOCKS[g][1:2]
+        for b_block in b_blocks:
+            for layer in range(2):
+                assert torch.equal(
+                    _state(target, layer, b_block).cpu(),
+                    _state(source, layer, QWEN_BLOCKS[g][1]).cpu(),
+                )
+
+
+def test_kernel_load_restores_every_group():
+    stored, store, source = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    worker, target = _cuda_loading_worker(store)
+    worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
+    assert worker._group_kernels[3] is not None
+    assert worker.take_failed_load_blocks() == set()
+    _check_loaded(stored, worker, source, target, in_place=True)
+
+
+def test_a_parked_load_runs_on_the_loader_thread():
+    stored, store, source = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    worker, target = _cuda_loading_worker(store)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)
+    worker._deferred_executor.shutdown(wait=True)
+    torch.cuda.synchronize()
+    assert worker.get_finished_loading() == {"b"}
+    assert worker.take_failed_load_blocks() == set()
+    _check_loaded(stored, worker, source, target, in_place=False)
+
+
+# =============================================================================
+# vLLM's own scheduler
+# =============================================================================
+
+
+def test_vllm_scheduler_hands_every_group_to_the_connector(tmp_path):
+    """Sliding window 32 + full attention, block 16, chunk 32, on vLLM's own
+    scheduler: the hit, vLLM's block allocation and the finish callback."""
+    if not supports_hma(MaruKVConnector):
+        pytest.skip("Maru takes several KV cache groups from vLLM 0.30")
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request, RequestStatus
+
+    kw = {"block_size": 16, "num_kv_heads": 1, "head_size": 1, "dtype": torch.float32}
+    engine = make_vllm_scheduler(
+        tmp_path,
+        16,
+        32,
+        num_blocks=64,
+        kv_cache_groups=[
+            KVCacheGroupSpec(["swa"], SlidingWindowSpec(sliding_window=32, **kw)),
+            KVCacheGroupSpec(["full"], FullAttentionSpec(**kw)),
+        ],
+    )
+    tokens = list(range(100))
+    connector = engine.connector
+    connector._scheduler._handler = _Store(_stored_by(tokens, 32, [0, 1], [], []))
+    finished = MagicMock(wraps=connector.request_finished_all_groups)
+    connector.request_finished_all_groups = finished
+
+    engine.add_request(Request("b", tokens, SamplingParams(max_tokens=1), None))
+    output = engine.schedule()
+    # 3 whole chunks short of the last token: 96 tokens hit, 4 computed.
+    assert output.num_scheduled_tokens["b"] == 4
+    (req,) = output.kv_connector_metadata.requests
+    assert not req.is_store and req.num_matched_chunks == 3
+    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (96, 4)
+    assert (req.load_start_token, req.load_end_token) == (0, 96)
+    swa, full = req.group_block_ids
+    # vLLM gives the window (tokens 65-95) and the new token's block real
+    # blocks, and nothing before it.
+    assert swa[:4] == [0, 0, 0, 0] and all(swa[4:]) and len(swa) == 7
+    assert all(full) and len(full) == 7
+
+    engine.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    finished.assert_called_once()
+    assert len(finished.call_args.args[1]) == 2
+
+
+def _serve_pinned(worker, store):
+    """Serve objects from pinned host memory, as a registered CXL mapping."""
+    pinned = {
+        key: torch.frombuffer(bytearray(raw), dtype=torch.uint8).pin_memory()
+        for key, raw in store.items()
+    }
+    worker._handler.batch_retrieve.side_effect = lambda keys: [
+        SimpleNamespace(view=memoryview(pinned[k].numpy())) for k in keys
+    ]
+
+
+def _spy_kernel_sources(worker):
+    """Record the device of every slab handed to the attention kernel."""
+    cache = worker._group_caches[3]
+    ops, *rest = worker._group_kernel(cache)
+    sources = []
+
+    def transfer(src, *args, **kwargs):
+        sources.append(src.device.type)
+        return ops.multi_layer_kv_transfer(src, *args, **kwargs)
+
+    spy = SimpleNamespace(
+        multi_layer_kv_transfer=transfer, TransferDirection=ops.TransferDirection
+    )
+    worker._group_kernels[3] = (spy, *rest)
+    return sources
+
+
+@pytest.mark.parametrize(
+    ("parked", "source"), [(False, "cpu"), (True, "cuda")], ids=["inline", "parked"]
+)
+def test_only_a_parked_load_stages_slabs_before_the_kernel(parked, source):
+    """Inline: the kernel reads pinned CXL in place. Parked: the copy engine
+    moves the slab first, so the kernel does not hold SMs during the read."""
+    stored, store, original = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    worker, target = _cuda_loading_worker(store)
+    _serve_pinned(worker, store)
+    sources = _spy_kernel_sources(worker)
+    if parked:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    else:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
+    worker.start_load_kv(_FORWARD, meta)
+    if parked:
+        worker._deferred_executor.shutdown(wait=True)
+    torch.cuda.synchronize()
+    assert sources == [source, source]
+    _check_loaded(stored, worker, original, target, in_place=not parked)
+
+
+def _backend_layers(name):
+    """vLLM's static forward context, for the tiny model's attention layers."""
+    backend = SimpleNamespace(get_name=lambda: name)
+    return {
+        f"layers.{i}.attn": SimpleNamespace(attn_backend=backend) for i in TINY_ATTN
+    }
+
+
+@pytest.mark.parametrize(
+    ("backend", "builds"), [("TRITON_ATTN", False), ("FLASH_ATTN", True)]
+)
+def test_registration_decides_the_kernel_from_the_backend(backend, builds):
+    """Decided before any forward, so the first load already uses it."""
+    worker = _worker()
+    worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
+    worker.register_kv_caches(
+        tiny_kv_caches("0.23", _shared()), _backend_layers(backend)
+    )
+    expected = ("ops",) * 6 if builds else None
+    assert worker._group_kernels == {3: expected}
+    assert worker._packed_load_kernel_ctx.call_count == int(builds)
+    assert worker._group_kernel(worker._group_caches[3]) == expected
+
+
+def test_without_the_backend_the_first_forward_decides():
+    worker = _worker()
+    worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
+    worker.register_kv_caches(tiny_kv_caches("0.23", _shared()))
+    cache = worker._group_caches[3]
+    # No forward yet: go without the kernel, decide nothing.
+    assert worker._group_kernel(cache) is None
+    assert worker._group_kernels == {}
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    assert worker._group_kernel(cache) == ("ops",) * 6
+    assert worker._group_kernels == {3: ("ops",) * 6}
+
+
+def test_connector_hands_the_models_layers_to_the_worker():
+    connector = MaruKVConnector.__new__(MaruKVConnector)
+    connector._worker = MagicMock()
+    layers = {"layers.3.attn": object()}
+    connector._vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers)
+    )
+    connector.register_kv_caches({})
+    connector._worker.register_kv_caches.assert_called_once_with({}, layers)
+
+
+def test_the_first_parked_load_uses_the_kernel_before_any_forward():
+    stored, store, original = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    target = torch.zeros_like(_shared()).cuda()
+    worker = _worker()
+    worker.register_kv_caches(
+        tiny_kv_caches("0.23", target), _backend_layers("FLASH_ATTN")
+    )
+    attach_capturing_handler(worker)
+    assert worker._last_attn_metadata is None
+    assert worker._group_kernels[3] is not None
+    _serve_pinned(worker, store)
+    sources = _spy_kernel_sources(worker)
+    worker.start_load_kv(
+        _FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    )
+    worker._deferred_executor.shutdown(wait=True)
+    torch.cuda.synchronize()
+    assert sources == ["cuda", "cuda"]
+    _check_loaded(stored, worker, original, target, in_place=False)
+
+
+# =============================================================================
+# More vLLM scheduler, GPU and failure cases
+# =============================================================================
+
+
+def _mamba_engine(tmp_path, extra=None):
+    """vLLM's scheduler for a Mamba group and a full-attention group, block 16."""
+    if not supports_hma(MaruKVConnector):
+        pytest.skip("Maru takes several KV cache groups from vLLM 0.30")
+    kw = {"block_size": 16, "num_kv_heads": 1, "head_size": 1, "dtype": torch.float32}
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((32,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    return make_vllm_scheduler(
+        tmp_path,
+        16,
+        16,
+        extra,
+        num_blocks=64,
+        enable_prefix_caching=True,
+        kv_cache_groups=[
+            KVCacheGroupSpec(["m"], mamba),
+            KVCacheGroupSpec(["full"], FullAttentionSpec(**kw)),
+        ],
+    )
+
+
+def _add_hit_request(engine, tokens):
+    """Request b over ``tokens``, whose 6 chunks Maru holds with a Mamba state
+    at chunk 5, as a request ending a prefill step there would leave."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    engine.connector._scheduler._handler = _Store(_stored_by(tokens, 16, [1], [0], [5]))
+    engine.add_request(
+        Request(
+            "b",
+            tokens,
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+    )
+
+
+def test_vllm_scheduler_gives_an_inline_mamba_load_both_state_blocks(tmp_path):
+    engine = _mamba_engine(tmp_path)
+    _add_hit_request(engine, list(range(100)))
+    output = engine.schedule()
+    assert output.num_scheduled_tokens["b"] == 4
+    (req,) = output.kv_connector_metadata.requests
+    assert not req.is_store and not req.deferred_load and req.num_matched_chunks == 6
+    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (96, 4)
+    mamba, full = req.group_block_ids
+    # The hit's last block (position 5) and the step's (position 6) are real;
+    # the worker writes the state to both.
+    assert mamba[:5] == [0] * 5 and all(mamba[5:]) and len(mamba) == 7
+    assert all(full) and len(full) == 7
+
+
+def test_vllm_scheduler_gives_a_parked_mamba_load_the_hits_last_block(tmp_path):
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    engine = _mamba_engine(tmp_path, {"maru_async_load": True})
+    _add_hit_request(engine, list(range(100)))
+    output = engine.schedule()
+    assert "b" not in output.num_scheduled_tokens  # parked while it loads
+    (req,) = output.kv_connector_metadata.requests
+    assert req.deferred_load and req.num_matched_chunks == 6
+    assert req.num_scheduled_tokens == 0  # no step to write a second block for
+    mamba, full = req.group_block_ids
+    assert mamba[:5] == [0] * 5 and mamba[5] and len(mamba) == 6
+
+    engine.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(finished_recving={"b"}),
+        ),
+    )
+    resumed = engine.schedule()
+    assert resumed.num_scheduled_tokens["b"] == 4
+    (new_req,) = resumed.scheduled_new_reqs
+    assert new_req.num_computed_tokens == 96
+    # vLLM copies the loaded state from position 5 into the step's block.
+    assert new_req.block_ids[0][5] == mamba[5] and new_req.block_ids[0][6]
+
+
+def test_kernel_sliding_window_round_trip_skips_null_blocks():
+    from maru_vllm.connector import _resolve_kv_ops
+
+    if not torch.cuda.is_available() or _resolve_kv_ops() is None:
+        pytest.skip("needs CUDA and the maru_kv_ops kernels")
+
+    def swa_caches(shared):
+        return {
+            f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.23")
+            for i in range(4)
+        }
+
+    source = _shared().cuda()
+    stored, store = _storing_worker(swa_caches(source), tiny_swa_config(), chunk=64)
+    stored._last_attn_metadata = make_flash_attn_metadata()
+    tokens = list(range(80))
+    stored.wait_for_save(_store_meta(tokens, ([7, 8, 9, 10], [3, 4, 5, 6]), 0, 64))
+    assert stored._group_kernels[0] is not None
+
+    target = torch.zeros_like(source)
+    worker, _ = _storing_worker(swa_caches(target), tiny_swa_config(), chunk=64)
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    _serve(worker, store)
+    worker.start_load_kv(
+        _FORWARD, _load_meta(tokens, ([0, 0, 1, 2], [3, 4, 5, 6]), 1, 64, 16)
+    )
+    torch.cuda.synchronize()
+    swa_src, full_src = ([t.cpu() for t in c.tensors] for c in stored._group_caches)
+    swa_dst, full_dst = ([t.cpu() for t in c.tensors] for c in worker._group_caches)
+    for a_block, b_block in ((9, 1), (10, 2)):
+        for a, b in zip(swa_src, swa_dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, "0.23"), _token_rows(a, a_block, "0.23")
+            )
+    assert not _token_rows(swa_dst[0], 0, "0.23").any()
+    for block in (3, 4, 5, 6):
+        for a, b in zip(full_src, full_dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, block, "0.23"), _token_rows(a, block, "0.23")
+            )
+
+
+@pytest.mark.parametrize("parked", [False, True], ids=["inline", "parked"])
+def test_a_failure_while_placing_is_reported(parked):
+    _, _, store = _stored_qwen()
+    worker, _ = _loading_worker(store)
+    worker._place_state = MagicMock(side_effect=RuntimeError("copy failed"))
+    if parked:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    else:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
+    worker.start_load_kv(_FORWARD, meta)
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
+    assert worker.get_finished_loading() == ({"b"} if parked else None)
+
+
+def test_an_inline_load_of_a_missing_object_is_reported():
+    _, _, store = _stored_qwen()
+    k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
+    del store[group_object_key(k1, 0)]
+    worker, target = _loading_worker(store)
+    worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
+    assert worker.get_finished_loading() is None
+    assert not target.any()
+
+
+def test_a_failure_on_the_loader_thread_unparks_and_is_reported():
+    stored, store, _ = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    worker, _ = _cuda_loading_worker(store)
+    worker._place_state = MagicMock(side_effect=RuntimeError("copy failed"))
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)
+    worker._deferred_executor.shutdown(wait=True)
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
+    assert worker.get_finished_loading() == {"b"}
+
+
+def test_a_parked_load_lands_after_work_queued_before_it():
+    """Work vLLM queued on the compute stream for these blocks before the
+    load (a copy-on-write, say) must not overwrite it, however late it runs."""
+    stored, store, source = _kernel_worker()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    worker, target = _cuda_loading_worker(store)
+    _serve_pinned(worker, store)  # as CXL is: pinned copies are truly async
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+
+    def parked_load():
+        worker.start_load_kv(_FORWARD, meta)
+        worker._deferred_executor.shutdown(wait=True)
+        worker._deferred_executor = None
+        torch.cuda.synchronize()
+        assert worker.get_finished_loading() == {"b"}
+
+    # Warm up as a running server is: a first kernel launch or cudaMalloc
+    # synchronizes the device and would hide a missing wait.
+    target.fill_(0)
+    parked_load()
+    # The compute stream is busy, then overwrites every block. A stream of its
+    # own, since the legacy default stream would order the load implicitly.
+    compute = torch.cuda.Stream()
+    with torch.cuda.stream(compute):
+        torch.cuda._sleep(1_500_000_000)
+        target.fill_(7)
+        worker.start_load_kv(_FORWARD, meta)
+    worker._deferred_executor.shutdown(wait=True)
+    torch.cuda.synchronize()
+    assert worker.get_finished_loading() == {"b"}
+    _check_loaded(stored, worker, source, target, in_place=False)
