@@ -201,6 +201,36 @@ def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
     return t.movedim((layout.kv_axis, layout.block_axis, layout.token_axis), (0, 1, 2))
 
 
+def _gather_kv(
+    paged: torch.Tensor, layout: KVLayout, slots: torch.Tensor
+) -> torch.Tensor:
+    """Gather ``slots`` of a paged KV tensor as ``[2, ntok, row]``.
+
+    The order Maru stores a layer's KV in, whatever the paged axis order.
+    A layout without a K/V axis keeps K and V in one row per token; its row
+    is halved instead, a bijection the inject side reverses, which says
+    nothing about where K ends (diffkv splits it unevenly).
+
+    Raises:
+        RuntimeError: A fused row of odd width, which cannot be halved.
+    """
+    canon = _canonical_paged_view(paged, layout)
+    blocks = slots // layout.block_size
+    offsets = slots % layout.block_size
+    if layout.kv_axis is not None:
+        gathered = canon[:, blocks, offsets]  # [2, ntok, ...]
+        return gathered.reshape(2, gathered.shape[1], -1)
+    if canon.shape[2:].numel() % 2:
+        # No shipped backend produces one, but refuse cleanly rather than
+        # fail inside the reshape.
+        raise RuntimeError(
+            "Maru: cannot extract KV for layout "
+            f"{tuple(paged.shape)}; odd fused K/V row width"
+        )
+    gathered = canon[blocks, offsets]  # [ntok, ...]
+    return gathered.reshape(gathered.shape[0], 2, -1).transpose(0, 1)
+
+
 _kv_cache_layout_warned = False
 
 

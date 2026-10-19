@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache groups: description, support checks, hits, per-group block ids
-and worker registration.
+"""KV cache groups: description, support checks, hits, per-group block ids,
+worker registration and stores.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
@@ -26,7 +26,12 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from maru_vllm.connector import MaruKVConnector, _chunk_keys
+from maru_vllm.connector import (
+    MaruConnectorMetadata,
+    MaruKVConnector,
+    MaruReqMeta,
+    _chunk_keys,
+)
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
@@ -43,8 +48,10 @@ from maru_vllm.kv_groups import (
     window_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
+    attach_capturing_handler,
     fake_cached_reqs,
     fake_scheduler_output,
+    make_flash_attn_metadata,
     make_scheduler,
     make_worker,
 )
@@ -562,7 +569,7 @@ def test_lookup_failure_is_a_miss():
 TINY_BLOCK = 16
 TINY_SLOT = 1024
 TINY_STATE = 3 * 16 * 2 + 2 * 4 * 4 * 4
-TINY_BLOCKS = 6
+TINY_BLOCKS = 12
 TINY_GDN = [[0, 4], [1, 5], [2, 6]]
 TINY_ATTN = [3, 7]
 TINY_LAYER_BYTES = TINY_BLOCKS * TINY_SLOT
@@ -844,3 +851,350 @@ def test_explicit_page_size_must_hold_the_largest_object():
     worker._ensure_handler = MagicMock()
     with pytest.raises(ValueError, match="cannot hold one"):
         worker.register_kv_caches(tiny_kv_caches("0.30", _shared()))
+
+
+# =============================================================================
+# Stores
+# =============================================================================
+
+
+def _store_meta(tokens, group_block_ids, computed, scheduled, req_ids=("r1",)):
+    return MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                req_id=rid,
+                token_ids=tokens,
+                block_ids=group_block_ids[0],
+                is_store=True,
+                num_scheduled_tokens=scheduled,
+                num_computed_tokens=computed,
+                group_block_ids=group_block_ids,
+            )
+            for rid in req_ids
+        ]
+    )
+
+
+def _token_rows(kv, block, version):
+    """One block's KV as ``[2, block_size, row]``, the order Maru stores.
+
+    0.23's flash layout has a K/V axis; 0.30's fused layout keeps K and V in
+    one row per token, which Maru halves.
+    """
+    if version == "0.30":
+        rows = kv[block].transpose(0, 1).reshape(TINY_BLOCK, -1)
+        return rows.reshape(TINY_BLOCK, 2, -1).transpose(0, 1)
+    return kv[block].reshape(2, TINY_BLOCK, -1)
+
+
+def _expected_slab(tensors, blocks, version):
+    """KV_2LTD slab ``[2, layers, tokens, row]`` of ``blocks`` for each layer."""
+    return torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.cat([_token_rows(kv, b, version)[plane] for b in blocks])
+                    for kv in tensors
+                ]
+            )
+            for plane in range(2)
+        ]
+    )
+
+
+def _slab(raw, like):
+    return torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).view(like.shape)
+
+
+def _storing_worker(kv_caches, config=None, chunk=TINY_BLOCK, extra=None):
+    worker = make_worker(
+        TINY_BLOCK,
+        chunk,
+        extra,
+        num_kv_heads=2,
+        head_size=8,
+        kv_groups=describe_kv_groups(config or tiny_config()),
+    )
+    worker._ensure_handler = MagicMock()
+    worker.register_kv_caches(kv_caches)
+    store = attach_capturing_handler(worker)
+    return worker, store
+
+
+# GDN groups 0-2 hold a state only at block position 1; attention uses 4, 5.
+QWEN_BLOCKS = ([0, 1], [0, 2], [0, 3], [4, 5])
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_a_step_ending_on_a_chunk_stores_every_group(version):
+    shared = _shared()
+    worker, store = _storing_worker(tiny_kv_caches(version, shared))
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    # Attention: both chunks the step completed. Mamba: only the chunk the
+    # step ended on; chunk 0's state was overwritten within the step.
+    assert set(store) == {
+        group_object_key(k0, 3),
+        group_object_key(k1, 3),
+        *(group_object_key(k1, g) for g in range(3)),
+    }
+    attn = worker._group_caches[3].tensors
+    for key, block in ((k0, 4), (k1, 5)):
+        expected = _expected_slab(attn, [block], version)
+        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+    # A state object holds each layer's state at a stride of one block slot.
+    for g in range(3):
+        obj = store[group_object_key(k1, g)]
+        assert len(obj) == 2 * TINY_SLOT
+        block = QWEN_BLOCKS[g][1]
+        for p in range(2):
+            state = _region(shared, p)[block * TINY_SLOT :][:TINY_STATE]
+            assert obj[p * TINY_SLOT :][:TINY_STATE] == bytes(state)
+    # Everything stored in the step is registered in one RPC.
+    assert worker._handler.batch_store.call_count == 1
+
+
+def test_a_step_ending_inside_a_chunk_stores_no_state():
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    tokens = list(range(48))
+    worker.wait_for_save(
+        _store_meta(tokens, ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6]), 0, 40)
+    )
+    keys = _chunk_keys(tokens, TINY_BLOCK)
+    assert set(store) == {group_object_key(k, 3) for k in keys[:2]}
+
+
+def test_a_null_state_block_stores_no_state():
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, ([0, 0], [0, 2], [0, 3], [4, 5]), 0, 32))
+    k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
+    assert group_object_key(k1, 0) not in store
+    assert group_object_key(k1, 1) in store
+
+
+def test_shared_prefix_is_stored_once_per_key():
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32, ("r1", "r2")))
+    (keys, _), _ = worker._handler.batch_store.call_args
+    assert len(keys) == len(set(keys)) == 5
+    assert len(store) == 5
+
+
+def test_sliding_window_reads_the_null_block_behind_the_window():
+    """Window 32, chunk 64: when the step starting at token 48 began, vLLM
+    freed block 0 (tokens 0-15), whose id may now be another request's."""
+    shared = _shared()
+    kv_caches = {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.30")
+        for i in range(4)
+    }
+    worker, store = _storing_worker(kv_caches, tiny_swa_config(), chunk=64)
+    tokens = list(range(80))
+    blocks = ([7, 8, 9, 10], [3, 4, 5, 6])
+    worker.wait_for_save(_store_meta(tokens, blocks, 48, 16))
+
+    (k0,) = _chunk_keys(tokens, 64)
+    swa, full = (c.tensors for c in worker._group_caches)
+    expected = _expected_slab(swa, [0, 8, 9, 10], "0.30")
+    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+    expected = _expected_slab(full, [3, 4, 5, 6], "0.30")
+    assert torch.equal(_slab(store[group_object_key(k0, 1)], expected), expected)
+
+
+def test_without_the_kernel_a_write_behind_store_is_synchronous():
+    worker, store = _storing_worker(
+        tiny_kv_caches("0.23", _shared()), extra={"maru_async_store": True}
+    )
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert len(store) == 5
+
+
+def test_save_kv_layer_leaves_several_groups_to_wait_for_save():
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    kv = worker._group_caches[3].tensors[0]
+    worker.save_kv_layer(
+        "layers.3.attn", kv, None, _store_meta(list(range(40)), QWEN_BLOCKS, 0, 32)
+    )
+    worker._handler.alloc.assert_not_called()
+    assert store == {}
+
+
+def test_connector_wait_for_save_hands_several_groups_to_the_worker():
+    connector = MaruKVConnector.__new__(MaruKVConnector)
+    connector._kv_groups = describe_kv_groups(tiny_config())
+    connector._worker = MagicMock()
+    meta = MaruConnectorMetadata()
+    connector._connector_metadata = meta
+    connector.wait_for_save()
+    connector._worker.wait_for_save.assert_called_once_with(meta)
+
+    connector._kv_groups = connector._kv_groups[3:]
+    connector._worker.reset_mock()
+    connector.wait_for_save()
+    connector._worker.wait_for_save.assert_not_called()
+
+
+def test_a_later_step_stores_the_state_at_its_own_end():
+    """Tokens 32-47 of a 56-token prompt: the state is at block position 2."""
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    tokens = list(range(56))
+    blocks = ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6])
+    worker.wait_for_save(_store_meta(tokens, blocks, 32, 16))
+    k2 = _chunk_keys(tokens, TINY_BLOCK)[2]
+    assert set(store) == {group_object_key(k2, g) for g in range(4)}
+    shared = _shared()
+    obj = store[group_object_key(k2, 1)]
+    assert obj[:TINY_STATE] == bytes(_region(shared, 0)[2 * TINY_SLOT :][:TINY_STATE])
+
+
+def test_a_step_past_the_last_whole_chunk_stores_nothing():
+    """The step ends at 48, past the prompt's two whole chunks."""
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    blocks = ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6])
+    worker.wait_for_save(_store_meta(list(range(40)), blocks, 32, 16))
+    assert store == {}
+    worker._handler.alloc.assert_not_called()
+
+
+def test_a_failing_group_keeps_the_others_and_leaks_nothing():
+    """r2 lacks the attention group's block ids: its attention store fails
+    after r1's was gathered. r1's slab and both requests' states register."""
+    worker, store = _storing_worker(tiny_kv_caches("0.30", _shared()))
+    a, b = list(range(40)), list(range(1000, 1040))
+    meta = MaruConnectorMetadata(
+        requests=[
+            *_store_meta(a, QWEN_BLOCKS, 0, 32).requests,
+            *_store_meta(b, ([0, 6], [0, 7], [0, 8]), 0, 32, ("r2",)).requests,
+        ]
+    )
+    worker.wait_for_save(meta)
+    ka, kb = _chunk_keys(a, TINY_BLOCK), _chunk_keys(b, TINY_BLOCK)
+    assert set(store) == {
+        *(group_object_key(k, 3) for k in ka),
+        *(group_object_key(k, g) for k in (ka[1], kb[1]) for g in range(3)),
+    }
+    assert worker._handler.batch_store.call_count == 1
+    assert worker._handler.alloc.call_count == len(store)
+
+
+def test_padded_pages_store_without_the_kernel():
+    """vLLM pads a page with an as_strided view; the kernel, which knows only
+    the base pointer, would read the padding as KV."""
+    kv_caches = tiny_kv_caches("0.23", _shared())
+    padded = _shared()
+    for p, i in enumerate(TINY_ATTN):
+        kv_caches[f"layers.{i}.attn"] = torch.as_strided(
+            _region(padded, p).view(torch.bfloat16),
+            (TINY_BLOCKS, 2, 16, 2, 4),
+            (TINY_SLOT // 2, 128, 8, 4, 1),
+        )
+    worker = _worker()
+    worker.register_kv_caches(kv_caches)
+    worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
+    assert worker._group_store_kernel(worker._group_caches[3]) is None
+    worker._packed_load_kernel_ctx.assert_not_called()
+
+    dense = _worker()
+    dense.register_kv_caches(tiny_kv_caches("0.23", _shared()))
+    dense._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
+    assert dense._group_store_kernel(dense._group_caches[3]) == ("ops",) * 6
+
+
+def _kernel_worker(extra=None):
+    """A worker on CUDA whose attention group stores through maru_kv_ops."""
+    from maru_vllm.connector import _resolve_kv_ops
+
+    if not torch.cuda.is_available() or _resolve_kv_ops() is None:
+        pytest.skip("needs CUDA and the maru_kv_ops kernels")
+    shared = _shared().cuda()
+    worker, store = _storing_worker(tiny_kv_caches("0.23", shared), extra=extra)
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    return worker, store, shared
+
+
+def _check_qwen_objects(worker, store, shared, tokens):
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    attn = [t.cpu() for t in worker._group_caches[3].tensors]
+    for key, block in ((k0, 4), (k1, 5)):
+        expected = _expected_slab(attn, [block], "0.23")
+        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+    for g in range(3):
+        obj = store[group_object_key(k1, g)]
+        block = QWEN_BLOCKS[g][1]
+        for p in range(2):
+            state = _region(shared, p)[block * TINY_SLOT :][:TINY_STATE].cpu()
+            assert obj[p * TINY_SLOT :][:TINY_STATE] == bytes(state)
+
+
+def test_kernel_store_uses_the_group_pointer_table():
+    worker, store, shared = _kernel_worker()
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert worker._group_kernels[3] is not None
+    assert len(store) == 5
+    _check_qwen_objects(worker, store, shared, tokens)
+
+
+def test_kernel_write_behind_stores_attention_later_and_states_now():
+    worker, store, shared = _kernel_worker({"maru_async_store": True})
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
+    assert all(group_object_key(k1, g) in store for g in range(3))
+    worker._store_executor.shutdown(wait=True)
+    assert len(store) == 5
+    _check_qwen_objects(worker, store, shared, tokens)
+
+
+def test_kernel_store_reads_the_null_block_behind_the_window():
+    from maru_vllm.connector import _resolve_kv_ops
+
+    if not torch.cuda.is_available() or _resolve_kv_ops() is None:
+        pytest.skip("needs CUDA and the maru_kv_ops kernels")
+    shared = _shared().cuda()
+    kv_caches = {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.23")
+        for i in range(4)
+    }
+    worker, store = _storing_worker(kv_caches, tiny_swa_config(), chunk=64)
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, ([7, 8, 9, 10], [3, 4, 5, 6]), 48, 16))
+    assert worker._group_kernels[0] is not None
+
+    (k0,) = _chunk_keys(tokens, 64)
+    swa = [t.cpu() for t in worker._group_caches[0].tensors]
+    expected = _expected_slab(swa, [0, 8, 9, 10], "0.23")
+    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+
+
+class _HeldExecutor:
+    """Holds submitted write-behind completions until the test runs them."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, fn, *args):
+        self.jobs.append((fn, args))
+
+    def run(self):
+        for fn, args in self.jobs:
+            fn(*args)
+
+
+def test_a_request_is_held_until_its_group_objects_are_registered():
+    worker, store, _ = _kernel_worker({"maru_async_store": True})
+    worker._store_executor = _HeldExecutor()
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    # The states are in; the attention objects are still being written.
+    assert len(store) == 3
+    assert worker.get_finished_saving({"r1"}) is None
+    worker._store_executor.run()
+    assert len(store) == 5
+    assert worker.get_finished_saving(set()) == {"r1"}

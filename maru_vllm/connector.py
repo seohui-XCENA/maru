@@ -41,6 +41,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 from maru_common.storage_types import StorageError
 from maru_vllm.kv_groups import (
+    GROUP_FULL,
+    GROUP_MAMBA,
+    GROUP_SLIDING_WINDOW,
     GroupCache,
     KVGroup,
     blocks_for_tokens,
@@ -54,6 +57,7 @@ from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
     _detect_kv_layout,
+    _gather_kv,
     _layout_fits,
     _vllm_kv_cache_layout,
 )
@@ -620,6 +624,78 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
     return req_meta._chunk_keys_memo
 
 
+@dataclass(frozen=True)
+class _SlabTarget:
+    """Layers whose KV for one chunk is stored as one KV_2LTD slab.
+
+    A single-group model stores every layer under the bare chunk key. With
+    several KV cache groups each attention group is its own target, keyed
+    ``<chunk key>_g<group id>`` and reading that group's block ids.
+
+    Attributes:
+        num_layers: Layers in the slab.
+        layer_bytes: One layer's KV for one chunk.
+        dtype: KV element type.
+        device: Device of the paged KV tensors.
+        group: The group, or None for a single-group model.
+    """
+
+    num_layers: int
+    layer_bytes: int
+    dtype: torch.dtype
+    device: torch.device
+    group: KVGroup | None = None
+
+    def key(self, chunk_key: str) -> str:
+        if self.group is None:
+            return chunk_key
+        return group_object_key(chunk_key, self.group.group_id)
+
+    def block_ids(self, req_meta: MaruReqMeta) -> list[int]:
+        """Block ids to read this step's completed chunks from.
+
+        vLLM frees a sliding-window group's blocks behind the window when a
+        step begins, and their ids may already belong to another request.
+        Those positions read the null block (id 0) instead; no hit needs
+        them, because a hit's window always lies after them.
+        """
+        if self.group is None:
+            return req_meta.block_ids
+        ids = req_meta.group_block_ids[self.group.group_id]
+        if self.group.kind != GROUP_SLIDING_WINDOW:
+            return ids
+        assert self.group.sliding_window is not None
+        skipped = req_meta.num_computed_tokens - self.group.sliding_window + 1
+        freed = min(max(0, skipped) // self.group.block_size, len(ids))
+        return [0] * freed + ids[freed:]
+
+
+def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> range:
+    """Chunks of the prompt that ``req_meta``'s step completes.
+
+    Absolute chunk indices ``[computed // C, (computed + scheduled) // C)``,
+    so consecutive steps stay contiguous when step boundaries are not chunk
+    aligned: a chunk straddling a boundary belongs to the step finishing it.
+    """
+    if req_meta.num_scheduled_tokens <= 0:
+        return range(num_chunks)
+    end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
+    return range(
+        req_meta.num_computed_tokens // chunk_tokens,
+        min(end // chunk_tokens, num_chunks),
+    )
+
+
+def _is_dense(t: torch.Tensor) -> bool:
+    """Whether ``t`` covers its memory span with no gaps, in any axis order.
+
+    The placement kernels address a paged tensor from its base pointer and
+    shape alone, so padding between blocks would be read as KV.
+    """
+    span = 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride(), strict=True))
+    return span == t.numel()
+
+
 def _validate_deferred_loading(enabled: bool) -> None:
     """Require vLLM's receive-side block retention for cancelled loads."""
     if not enabled:
@@ -809,7 +885,7 @@ class MaruKVConnector(KVConnectorBase_V1):
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative=vllm_config.speculative_config is not None,
             )
-            # Load and store still handle one group. Until they handle several,
+            # Load still handles one group. Until it handles several,
             # MaruKVConnector does not declare SupportsHMA, so vLLM merges the
             # groups into one or refuses the model before it gets here.
             raise ValueError(
@@ -922,10 +998,17 @@ class MaruKVConnector(KVConnectorBase_V1):
         self._worker.save_kv_layer(layer_name, kv_layer, attn_metadata, metadata)
 
     def wait_for_save(self):
-        # Synchronous stores complete inside save_kv_layer. Write-behind stores
-        # intentionally outlive this forward; request/block lifetime is
-        # tracked through request_finished() + get_finished().
-        return
+        # A single-group model's synchronous stores complete inside
+        # save_kv_layer. Write-behind stores intentionally outlive this
+        # forward; request/block lifetime is tracked through
+        # request_finished() + get_finished(). Several groups store here,
+        # after the forward has written every group's KV and state.
+        if len(self._kv_groups) <= 1:
+            return
+        assert self._worker is not None
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, MaruConnectorMetadata)
+        self._worker.wait_for_save(metadata)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         """Protect blocks preempted while a write-behind D2H is in flight."""
@@ -1704,6 +1787,8 @@ class MaruWorkerConnector:
         # With several groups, register_kv_caches fills this instead of the
         # single-group fields (_num_layers, _kv_layout), which stay unset.
         self._group_caches: list[GroupCache] = []
+        # Store kernel ctx per attention group id; None = per-layer gather.
+        self._group_kernels: dict[int, tuple | None] = {}
         self._cpu_mode = _validate_storage_config(extra_config)
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
@@ -1849,6 +1934,11 @@ class MaruWorkerConnector:
         # Dedicated stream for the kernel store's per-chunk D2H transfers.
         self._store_stream: torch.cuda.Stream | None = None
         self._store_stream_device: torch.device | None = None
+        # Synchronous kernel stores use their own stream: with several groups
+        # a step can store some groups synchronously while write-behind copies
+        # of others are queued, and syncing must not wait for those.
+        self._sync_store_stream: torch.cuda.Stream | None = None
+        self._sync_store_stream_device: torch.device | None = None
         # Opt-in packed-store write-behind. After the forward, the engine thread
         # queues a short GPU gather plus copy-engine D2H on a dedicated stream;
         # a background thread waits for its event and registers the ready keys.
@@ -3464,7 +3554,10 @@ class MaruWorkerConnector:
                 )
 
     def _packed_load_kernel_ctx(
-        self, layers: list[tuple[str, torch.Tensor, int]], attn_metadata: Any
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        attn_metadata: Any,
+        layout: KVLayout | None = None,
     ) -> tuple | None:
         """Prepare multi_layer_kv_transfer args, or None to use the fallback.
 
@@ -3475,7 +3568,9 @@ class MaruWorkerConnector:
         configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
         Works with whatever paged axis order vLLM chose: dimensions and the
-        engine KV format both come from the layout resolved at registration.
+        engine KV format both come from the layout resolved at registration,
+        or from ``layout`` for one KV cache group's layers, whose third tuple
+        item is then the layer's position in the group.
         """
         if self._cpu_mode:
             return None  # M1 CPU pools are pageable, not direct-access GPU memory.
@@ -3484,7 +3579,7 @@ class MaruWorkerConnector:
             return None
         # No resolved layout, or one with no kernel form (the fused orders),
         # means we must not hand raw pointers to the kernel.
-        layout = self._kv_layout
+        layout = layout or self._kv_layout
         if layout is None or layout.format_name is None:
             return None
         # Flash layout only (exclude MLA/Triton).
@@ -3652,6 +3747,10 @@ class MaruWorkerConnector:
             return
         if attn_metadata is not None:
             self._last_attn_metadata = attn_metadata
+        if self._multi_group:
+            # Several groups store after the forward (wait_for_save): Mamba
+            # layers have no save hook, and their state is final only then.
+            return
 
         if not self._use_layerwise:
             self._save_kv_layer_packed(layer_name, kv_layer, attn_metadata, metadata)
@@ -3667,24 +3766,13 @@ class MaruWorkerConnector:
             if not chunk_keys:
                 continue
 
-            # In chunked prefill, store every chunk that became complete in
-            # this step: absolute chunk indices [computed // chunk_tokens,
-            # (computed + scheduled) // chunk_tokens). Flooring both ends
-            # keeps consecutive steps contiguous even when step boundaries
-            # are not chunk-aligned — a chunk straddling a boundary is
-            # stored by the step that finishes it. req_meta.block_ids covers
-            # the request from token 0, so slots are indexed by absolute
-            # token position.
-            if req_meta.num_scheduled_tokens > 0:
-                start_chunk = req_meta.num_computed_tokens // self._kv_chunk_tokens
-                end_chunk = (
-                    req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-                ) // self._kv_chunk_tokens
-            else:
-                start_chunk, end_chunk = 0, len(chunk_keys)
-            end_chunk = min(end_chunk, len(chunk_keys))
-            if start_chunk >= end_chunk:
+            # Store every chunk this step completed (see _step_chunks).
+            # req_meta.block_ids covers the request from token 0, so slots
+            # are indexed by absolute token position.
+            chunks = _step_chunks(req_meta, self._kv_chunk_tokens, len(chunk_keys))
+            if not chunks:
                 continue
+            start_chunk, end_chunk = chunks.start, chunks.stop
 
             needed_tokens = end_chunk * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, needed_tokens)
@@ -3846,16 +3934,10 @@ class MaruWorkerConnector:
             if not chunk_keys:
                 continue
 
-            if req_meta.num_scheduled_tokens > 0:
-                start_chunk = req_meta.num_computed_tokens // self._kv_chunk_tokens
-                end_chunk = (
-                    req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-                ) // self._kv_chunk_tokens
-            else:
-                start_chunk, end_chunk = 0, len(chunk_keys)
-            end_chunk = min(end_chunk, len(chunk_keys))
-            if start_chunk >= end_chunk:
+            chunks = _step_chunks(req_meta, self._kv_chunk_tokens, len(chunk_keys))
+            if not chunks:
                 continue
+            start_chunk, end_chunk = chunks.start, chunks.stop
 
             needed_tokens = end_chunk * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, needed_tokens)
@@ -3935,6 +4017,204 @@ class MaruWorkerConnector:
                 else:
                     logger.warning("Maru packed store failed: %s", base_key)
 
+    def wait_for_save(self, metadata: MaruConnectorMetadata) -> None:
+        """Store this step's objects of every KV cache group (several groups).
+
+        Runs after the forward, when every attention layer's KV and every
+        Mamba state of the step are final. Sliding-window and Mamba objects
+        are copied before this returns: vLLM frees their blocks while the
+        request still runs. Full-attention objects may be written behind
+        (``maru_async_store``) like a single-group model's, since their
+        blocks stay until the request finishes. Everything stored now is
+        registered with one ``batch_store``, including what a group gathered
+        before it failed.
+        """
+        if not self._multi_group or not self._group_caches:
+            return
+        if not any(r.is_store for r in metadata.requests):
+            return
+        self._ensure_handler()
+        if self._handler is None:
+            return
+        keys: list[str] = []
+        handles: list = []
+        for cache in self._group_caches:
+            group = cache.group
+            try:
+                if group.kind == GROUP_MAMBA:
+                    self._gather_states(cache, metadata, keys, handles)
+                    continue
+                target = self._group_target(cache)
+                kernel = self._group_store_kernel(cache)
+                if kernel is None:
+                    self._copy_group_slabs(cache, target, metadata, keys, handles)
+                elif self._write_behind and group.kind == GROUP_FULL:
+                    self._store_packed_slabs_write_behind(kernel, metadata, target)
+                else:
+                    self._gather_packed_slabs(kernel, metadata, target, keys, handles)
+            except Exception as e:
+                logger.error(
+                    "Maru store of KV cache group %d failed: %s", group.group_id, e
+                )
+        self._register_objects(keys, handles, "group")
+
+    def _group_target(self, cache: GroupCache) -> _SlabTarget:
+        """The slab of one attention group: its layers, in group order."""
+        first = cache.tensors[0]
+        assert cache.layout is not None
+        per_token = (
+            first.numel() * first.element_size() // cache.layout.page_buffer_size
+        )
+        return _SlabTarget(
+            len(cache.tensors),
+            per_token * self._kv_chunk_tokens,
+            first.dtype,
+            first.device,
+            cache.group,
+        )
+
+    def _group_store_kernel(self, cache: GroupCache) -> tuple | None:
+        """Store kernel ctx for an attention group, built once.
+
+        The pointer table is indexed by each layer's position in the group,
+        which is its plane in the group's slab. A tensor with padding between
+        its blocks (a padded page) has no kernel ctx: the kernel would read
+        the padding as KV.
+        """
+        gid = cache.group.group_id
+        if gid not in self._group_kernels:
+            ctx = None
+            if _is_dense(cache.tensors[0]):
+                layers = [
+                    (name, tensor, i)
+                    for i, (name, tensor) in enumerate(
+                        zip(cache.group.layer_names, cache.tensors, strict=True)
+                    )
+                ]
+                ctx = self._packed_load_kernel_ctx(
+                    layers, self._last_attn_metadata, cache.layout
+                )
+            self._group_kernels[gid] = ctx
+        return self._group_kernels[gid]
+
+    def _copy_group_slabs(
+        self,
+        cache: GroupCache,
+        target: _SlabTarget,
+        metadata: MaruConnectorMetadata,
+        keys: list[str],
+        handles: list,
+    ) -> None:
+        """Gather an attention group's completed chunks without the kernel.
+
+        Used where ``maru_kv_ops`` has no format for the layout (vLLM 0.30's
+        fused K/V, for one), the pages are padded, or there is no CUDA
+        device. Each chunk's layers are gathered into one slab on their
+        device and copied to CXL at once. Appends to the caller's ``keys``
+        and ``handles``.
+        """
+        handler = self._handler
+        assert handler is not None and cache.layout is not None
+        ct = self._kv_chunk_tokens
+        slab_bytes = target.layer_bytes * target.num_layers
+        for req_meta in metadata.requests:
+            if not req_meta.is_store:
+                continue
+            chunk_keys = _req_chunk_keys(req_meta, ct)
+            chunks = _step_chunks(req_meta, ct, len(chunk_keys))
+            if not chunks:
+                continue
+            needed_tokens = chunks.stop * ct
+            slot_mapping = self._build_slot_mapping(
+                target.block_ids(req_meta), needed_tokens
+            )
+            if slot_mapping.shape[0] < needed_tokens:
+                logger.error(
+                    "Maru group store: block_ids cover %d tokens but chunks up to "
+                    "%d need %d for req %s; skipping",
+                    slot_mapping.shape[0],
+                    chunks.stop,
+                    needed_tokens,
+                    req_meta.req_id,
+                )
+                continue
+            for ci in chunks:
+                key = target.key(chunk_keys[ci])
+                if self._is_stored(key) or key in keys:
+                    continue
+                handle = None
+                try:
+                    handle = handler.alloc(slab_bytes)
+                    slab = torch.frombuffer(
+                        handle.buf[:slab_bytes], dtype=target.dtype
+                    ).view(2, target.num_layers, ct, -1)
+                    slots = slot_mapping[ci * ct : (ci + 1) * ct].to(target.device)
+                    slab.copy_(
+                        torch.stack(
+                            [_gather_kv(t, cache.layout, slots) for t in cache.tensors],
+                            dim=1,
+                        )
+                    )
+                except Exception as e:
+                    logger.error("Maru group store error: %s: %s", key, e)
+                    if handle is not None:
+                        self._free_handles_best_effort([handle])
+                    continue
+                keys.append(key)
+                handles.append(handle)
+
+    def _gather_states(
+        self,
+        cache: GroupCache,
+        metadata: MaruConnectorMetadata,
+        keys: list[str],
+        handles: list,
+    ) -> None:
+        """Copy the Mamba state of every request whose step ended a chunk.
+
+        In align mode vLLM keeps a state only in the block where a scheduler
+        step ends, so a chunk gets a state object only when this step ended
+        exactly at its end. vLLM frees that block after the next step, so the
+        copy completes here. The object holds each layer's state at a stride
+        of one block slot; the rest of each slot keeps whatever the CXL page
+        held, since a load reads only ``state_bytes`` per layer. Appends to
+        the caller's ``keys`` and ``handles``.
+        """
+        handler = self._handler
+        assert handler is not None
+        group = cache.group
+        ct = self._kv_chunk_tokens
+        size = group.object_bytes(ct)
+        for req_meta in metadata.requests:
+            if not req_meta.is_store or req_meta.num_scheduled_tokens <= 0:
+                continue
+            end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
+            chunk_keys = _req_chunk_keys(req_meta, ct)
+            if end % ct or end // ct > len(chunk_keys):
+                continue
+            block_ids = req_meta.group_block_ids[group.group_id]
+            position = end // group.block_size - 1
+            if position >= len(block_ids) or block_ids[position] == 0:
+                continue
+            block = block_ids[position]
+            key = group_object_key(chunk_keys[end // ct - 1], group.group_id)
+            if self._is_stored(key) or key in keys:
+                continue
+            handle = None
+            try:
+                handle = handler.alloc(size)
+                obj = torch.frombuffer(handle.buf[:size], dtype=torch.uint8)
+                obj.view(len(cache.tensors), group.slot_bytes)[
+                    :, : group.state_bytes
+                ].copy_(torch.stack([states[block] for states in cache.tensors]))
+            except Exception as e:
+                logger.error("Maru Mamba state store error: %s: %s", key, e)
+                if handle is not None:
+                    self._free_handles_best_effort([handle])
+                continue
+            keys.append(key)
+            handles.append(handle)
+
     def _packed_store_kernel_ctx(self, attn_metadata: Any) -> tuple | None:
         """Kernel ctx for the coalesced packed store, or None for the fallback.
 
@@ -3971,160 +4251,193 @@ class MaruWorkerConnector:
             logger.info("Maru packed store: kernel unusable; per-layer fallback")
         return ctx
 
+    def _slab_target(self) -> _SlabTarget | None:
+        """The single-group model's slab: every registered layer."""
+        per_layer_bytes = self._chunk_object_bytes()
+        if per_layer_bytes is None:
+            return None
+        sample = next(iter(self._kv_caches.values()))
+        return _SlabTarget(
+            self._num_layers, per_layer_bytes, sample.dtype, sample.device
+        )
+
     def _store_packed_slabs(
         self, kernel: tuple, metadata: MaruConnectorMetadata
     ) -> None:
-        """Gather completed chunks directly to pinned CXL or stage a copy.
+        """Gather completed chunks to CXL and register them.
 
         Runs once per step, from the last layer's ``save_kv_layer`` call —
-        every layer's KV for the step is in the paged buffers by then. Each
-        chunk's whole KV_2LTD slab is written by one
+        every layer's KV for the step is in the paged buffers by then.
+        """
+        target = self._slab_target()
+        if target is None:
+            logger.error("Maru packed store: cannot size slab; skipping step")
+            return
+        keys: list[str] = []
+        handles: list = []
+        try:
+            self._gather_packed_slabs(kernel, metadata, target, keys, handles)
+        finally:
+            self._register_objects(keys, handles, "packed")
+
+    def _register_objects(self, keys: list[str], handles: list, what: str) -> None:
+        """Register gathered objects with one ``batch_store``."""
+        if not keys:
+            return
+        handler = self._handler
+        assert handler is not None
+        # batch_store takes ownership of every handle (frees duplicates and
+        # failures internally); it only raises before consuming any, so the
+        # except path must free them all.
+        try:
+            results = handler.batch_store(keys, handles)
+        except Exception as e:
+            logger.error("Maru %s batch_store failed: %s", what, e)
+            self._free_handles_best_effort(handles)
+            return
+        for key, ok in zip(keys, results, strict=False):
+            if ok:
+                self._record_stored(key)
+            else:
+                logger.warning("Maru %s store failed: %s", what, key)
+
+    def _gather_packed_slabs(
+        self,
+        kernel: tuple,
+        metadata: MaruConnectorMetadata,
+        slab_target: _SlabTarget,
+        keys: list[str],
+        handles: list,
+    ) -> None:
+        """Gather completed chunks directly to pinned CXL or stage a copy.
+
+        Each chunk's whole KV_2LTD slab is written by one
         ``multi_layer_kv_transfer(D2H)`` reading the paged GPU cache directly
-        into the pinned CXL slab (no staging), queued on a dedicated stream
-        that first waits on the compute stream so the step's KV writes are
-        visible. Unpinned slabs use one reusable device buffer followed by a
-        blocking copy to CXL. One stream synchronize gates ``batch_store`` so
-        a key is never registered before its slab bytes are fully in CXL.
+        into the pinned CXL slab (no staging), queued on a stream of its own
+        (not write-behind's) that first waits on the compute stream so the
+        step's KV writes are visible. Unpinned slabs use one reusable device
+        buffer followed by a blocking copy to CXL.
+
+        Appends each slab's key and handle to ``keys`` and ``handles``, which
+        the caller owns and registers. The stream is synchronized before
+        returning, on an exception too, so every appended slab is fully in
+        CXL and nothing allocated is lost.
         """
         ops, ptrs, pbs, block_size, head_size, fmt = kernel
         handler = self._handler
         assert handler is not None
-        per_layer_bytes = self._chunk_object_bytes()
-        if per_layer_bytes is None:
-            logger.error("Maru packed store: cannot size slab; skipping step")
-            return
-        slab_bytes = per_layer_bytes * self._num_layers
-        sample = next(iter(self._kv_caches.values()))
-        dev, dtype = sample.device, sample.dtype
+        num_layers = slab_target.num_layers
+        slab_bytes = slab_target.layer_bytes * num_layers
+        dev, dtype = slab_target.device, slab_target.dtype
         ct = self._kv_chunk_tokens
 
-        use_stream = dev.type == "cuda" and torch.cuda.is_available()
-        if use_stream:
-            if self._store_stream is None or self._store_stream_device != dev:
-                self._store_stream = torch.cuda.Stream(device=dev)
-                self._store_stream_device = dev
-            self._store_stream.wait_stream(torch.cuda.current_stream(dev))
-            stream_ctx = torch.cuda.stream(self._store_stream)
+        stream: torch.cuda.Stream | None = None
+        if dev.type == "cuda" and torch.cuda.is_available():
+            if self._sync_store_stream is None or self._sync_store_stream_device != dev:
+                self._sync_store_stream = torch.cuda.Stream(device=dev)
+                self._sync_store_stream_device = dev
+            stream = self._sync_store_stream
+            stream.wait_stream(torch.cuda.current_stream(dev))
+            stream_ctx = torch.cuda.stream(stream)
         else:
             import contextlib
 
             stream_ctx = contextlib.nullcontext()
 
-        ready_keys: list[str] = []
-        ready_handles: list = []
+        first_key = len(keys)
         staging: torch.Tensor | None = None
         staged_chunks = 0
         # Requests sharing a prefix can yield the same base_key within one
         # step; the single deferred batch_store no longer dedupes them the way
         # the per-request fallback's eager _stored_keys updates did.
         seen_keys: set[str] = set()
-        with stream_ctx:
-            for req_meta in metadata.requests:
-                if not req_meta.is_store:
-                    continue
-                chunk_keys = _req_chunk_keys(req_meta, ct)
-                if not chunk_keys:
-                    continue
-                if req_meta.num_scheduled_tokens > 0:
-                    start_chunk = req_meta.num_computed_tokens // ct
-                    end_chunk = (
-                        req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-                    ) // ct
-                else:
-                    start_chunk, end_chunk = 0, len(chunk_keys)
-                end_chunk = min(end_chunk, len(chunk_keys))
-                if start_chunk >= end_chunk:
-                    continue
-
-                needed_tokens = end_chunk * ct
-                slot_mapping = self._build_slot_mapping(
-                    req_meta.block_ids, needed_tokens
-                )
-                if slot_mapping.shape[0] < needed_tokens:
-                    logger.error(
-                        "Maru packed store: block_ids covers %d tokens but chunks "
-                        "up to %d need %d for req %s; skipping",
-                        slot_mapping.shape[0],
-                        end_chunk,
-                        needed_tokens,
-                        req_meta.req_id,
-                    )
-                    continue
-                slot_dev = slot_mapping.to(dev)
-
-                for ci in range(start_chunk, end_chunk):
-                    base_key = chunk_keys[ci]
-                    if self._is_stored(base_key) or base_key in seen_keys:
-                        continue
-                    seen_keys.add(base_key)
-                    handle = None
-                    try:
-                        handle = handler.alloc(slab_bytes)
-                        slab_host = torch.frombuffer(
-                            handle.buf[:slab_bytes], dtype=dtype
-                        ).view(2, self._num_layers, ct, -1)
-                        target = slab_host
-                        if not slab_host.is_pinned():
-                            # Bound staging to one chunk even when a whole
-                            # region failed CUDA registration. Copy before
-                            # reusing it for the next chunk on this stream.
-                            if staging is None:
-                                staging = torch.empty_like(slab_host, device=dev)
-                            target = staging
-                        ops.multi_layer_kv_transfer(
-                            target,
-                            ptrs,
-                            slot_dev[ci * ct : (ci + 1) * ct],
-                            dev,
-                            pbs,
-                            ops.TransferDirection.D2H,
-                            fmt,
-                            block_size=block_size,
-                            head_size=head_size,
-                        )
-                        if target is not slab_host:
-                            slab_host.copy_(target)
-                            staged_chunks += 1
-                    except Exception as e:
-                        logger.error("Maru packed save error: %s: %s", base_key, e)
-                        if handle is not None:
-                            try:
-                                handler.free(handle)
-                            except Exception:
-                                pass
-                        continue
-                    ready_keys.append(base_key)
-                    ready_handles.append(handle)
-
-        if not ready_keys:
-            return
-        if use_stream:
-            assert self._store_stream is not None
-            self._store_stream.synchronize()
-        # batch_store takes ownership of every handle (frees duplicates and
-        # failures internally); it only raises before consuming any, so the
-        # except path must free them all.
         try:
-            results = handler.batch_store(ready_keys, ready_handles)
-        except Exception as e:
-            logger.error("Maru packed batch_store failed: %s", e)
-            self._free_handles_best_effort(ready_handles)
-            return
-        for base_key, ok in zip(ready_keys, results, strict=False):
-            if ok:
-                self._record_stored(base_key)
-            else:
-                logger.warning("Maru packed store failed: %s", base_key)
-        if self._timing:
+            with stream_ctx:
+                for req_meta in metadata.requests:
+                    if not req_meta.is_store:
+                        continue
+                    chunk_keys = _req_chunk_keys(req_meta, ct)
+                    if not chunk_keys:
+                        continue
+                    chunks = _step_chunks(req_meta, ct, len(chunk_keys))
+                    if not chunks:
+                        continue
+
+                    needed_tokens = chunks.stop * ct
+                    slot_mapping = self._build_slot_mapping(
+                        slab_target.block_ids(req_meta), needed_tokens
+                    )
+                    if slot_mapping.shape[0] < needed_tokens:
+                        logger.error(
+                            "Maru packed store: block_ids covers %d tokens but "
+                            "chunks up to %d need %d for req %s; skipping",
+                            slot_mapping.shape[0],
+                            chunks.stop,
+                            needed_tokens,
+                            req_meta.req_id,
+                        )
+                        continue
+                    slot_dev = slot_mapping.to(dev)
+
+                    for ci in chunks:
+                        base_key = slab_target.key(chunk_keys[ci])
+                        if self._is_stored(base_key) or base_key in seen_keys:
+                            continue
+                        seen_keys.add(base_key)
+                        handle = None
+                        try:
+                            handle = handler.alloc(slab_bytes)
+                            slab_host = torch.frombuffer(
+                                handle.buf[:slab_bytes], dtype=dtype
+                            ).view(2, num_layers, ct, -1)
+                            target = slab_host
+                            if not slab_host.is_pinned():
+                                # Bound staging to one chunk even when a whole
+                                # region failed CUDA registration. Copy before
+                                # reusing it for the next chunk on this stream.
+                                if staging is None:
+                                    staging = torch.empty_like(slab_host, device=dev)
+                                target = staging
+                            ops.multi_layer_kv_transfer(
+                                target,
+                                ptrs,
+                                slot_dev[ci * ct : (ci + 1) * ct],
+                                dev,
+                                pbs,
+                                ops.TransferDirection.D2H,
+                                fmt,
+                                block_size=block_size,
+                                head_size=head_size,
+                            )
+                            if target is not slab_host:
+                                slab_host.copy_(target)
+                                staged_chunks += 1
+                        except Exception as e:
+                            logger.error("Maru packed save error: %s: %s", base_key, e)
+                            if handle is not None:
+                                try:
+                                    handler.free(handle)
+                                except Exception:
+                                    pass
+                            continue
+                        keys.append(base_key)
+                        handles.append(handle)
+        finally:
+            if stream is not None:
+                stream.synchronize()
+        if self._timing and len(keys) > first_key:
             mode = "kernel"
             if staged_chunks:
                 mode += f", {staged_chunks} unpinned chunks staged"
             _emit_timing(
-                f"packed-store {mode} {self._num_layers}L x {len(ready_keys)}c"
+                f"packed-store {mode} {num_layers}L x {len(keys) - first_key}c"
             )
 
     def _store_packed_slabs_write_behind(
-        self, kernel: tuple, metadata: MaruConnectorMetadata
+        self,
+        kernel: tuple,
+        metadata: MaruConnectorMetadata,
+        target: _SlabTarget | None = None,
     ) -> None:
         """Queue packed stores without blocking the engine's forward path.
 
@@ -4133,20 +4446,21 @@ class MaruWorkerConnector:
         share one ordered CUDA stream. Once the final D2H event fires, the
         completion thread registers every key with Maru. Keys are reserved
         before allocation so overlapping requests/steps never issue duplicate
-        stores while an earlier copy is still in flight.
+        stores while an earlier copy is still in flight. ``target`` defaults
+        to every registered layer of a single-group model.
         """
         handler = self._handler
         if handler is None:
             logger.error("Maru write-behind store: handler unavailable; skipping step")
             return
         ops, ptrs, pbs, block_size, head_size, fmt = kernel
-        per_layer_bytes = self._chunk_object_bytes()
-        if per_layer_bytes is None:
+        target = target or self._slab_target()
+        if target is None:
             logger.error("Maru write-behind store: cannot size slab; skipping step")
             return
-        slab_bytes = per_layer_bytes * self._num_layers
-        sample = next(iter(self._kv_caches.values()))
-        dev, dtype = sample.device, sample.dtype
+        num_layers = target.num_layers
+        slab_bytes = target.layer_bytes * num_layers
+        dev, dtype = target.device, target.dtype
         ct = self._kv_chunk_tokens
 
         # First collect request-to-key ownership on CPU. Shared-prefix keys
@@ -4158,14 +4472,7 @@ class MaruWorkerConnector:
             chunk_keys = _req_chunk_keys(req_meta, ct)
             if not chunk_keys:
                 continue
-            if req_meta.num_scheduled_tokens > 0:
-                start_chunk = req_meta.num_computed_tokens // ct
-                end_chunk = (
-                    req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-                ) // ct
-            else:
-                start_chunk, end_chunk = 0, len(chunk_keys)
-            end_chunk = min(end_chunk, len(chunk_keys))
+            end_chunk = _step_chunks(req_meta, ct, len(chunk_keys)).stop
             # Chunked-prefill intermediate steps have not produced a first
             # token yet. Defer them and, on the prompt-completing step, store
             # the whole prefix from the full accumulated block list. This
@@ -4178,7 +4485,9 @@ class MaruWorkerConnector:
                 continue
 
             needed_tokens = end_chunk * ct
-            slot_mapping = self._build_slot_mapping(req_meta.block_ids, needed_tokens)
+            slot_mapping = self._build_slot_mapping(
+                target.block_ids(req_meta), needed_tokens
+            )
             if slot_mapping.shape[0] < needed_tokens:
                 logger.error(
                     "Maru write-behind store: block_ids covers %d tokens but "
@@ -4190,7 +4499,7 @@ class MaruWorkerConnector:
                 )
                 continue
             for ci in range(start_chunk, end_chunk):
-                base_key = chunk_keys[ci]
+                base_key = target.key(chunk_keys[ci])
                 chunk_slots = slot_mapping[ci * ct : (ci + 1) * ct]
                 entry = key_entries.get(base_key)
                 if entry is None:
@@ -4234,7 +4543,7 @@ class MaruWorkerConnector:
                     handle = handler.alloc(slab_bytes)
                     slab_host = torch.frombuffer(
                         handle.buf[:slab_bytes], dtype=dtype
-                    ).view(2, self._num_layers, ct, -1)
+                    ).view(2, num_layers, ct, -1)
                     if (
                         self._store_staging is None
                         or self._store_staging.shape != slab_host.shape
@@ -4331,9 +4640,7 @@ class MaruWorkerConnector:
             results.extend([False] * (len(keys) - len(results)))
         self._complete_write_behind_keys(keys, results[: len(keys)])
         if self._timing:
-            _emit_timing(
-                f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
-            )
+            _emit_timing(f"write-behind packed-store {len(keys)}c")
 
     def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
         """Publish key outcomes and release all request waiters atomically."""
@@ -4670,25 +4977,7 @@ class MaruWorkerConnector:
                     "Maru: cannot extract KV for layout "
                     f"{tuple(kv_layer.shape)}; unrecognized paged KV tensor"
                 )
-            canon = _canonical_paged_view(kv_layer, layout)
-            blocks = slot_mapping // layout.block_size
-            offsets = slot_mapping % layout.block_size
-            if layout.kv_axis is not None:
-                gathered = canon[:, blocks, offsets]  # [2, ntok, ...]
-                return gathered.reshape(2, gathered.shape[1], -1)
-            # Fused: the leading 2 is a storage convention, not a K/V split.
-            # Halving each row is a bijection inject reverses, and claims
-            # nothing about where K ends — diffkv splits it unevenly.
-            if canon.shape[2:].numel() % 2:
-                # Cannot halve an odd row. No shipped backend produces one,
-                # but refuse cleanly rather than fail inside the reshape.
-                raise RuntimeError(
-                    "Maru: cannot extract KV for layout "
-                    f"{tuple(kv_layer.shape)}; odd fused K/V row width"
-                )
-            gathered = canon[blocks, offsets]  # [ntok, ...]
-            ntok = gathered.shape[0]
-            return gathered.reshape(ntok, 2, -1).transpose(0, 1)
+            return _gather_kv(kv_layer, layout, slot_mapping)
 
     def _layout_for(self, kv_layer: torch.Tensor) -> KVLayout | None:
         """Layout for ``kv_layer``: the registered one, else detect in place.
