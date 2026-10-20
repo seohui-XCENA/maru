@@ -230,14 +230,22 @@ def one_group_hint(groups: list[KVGroup]) -> str:
     """How to run a model without a Mamba group as one KV cache group instead.
 
     vLLM can merge sliding-window layers into full attention when its hybrid
-    KV cache manager is off; Mamba layers it cannot merge.
+    KV cache manager is off; Mamba layers it cannot merge. The attention
+    backend must then take layers with different windows in one group, which
+    FlashInfer (vLLM 0.30's default on Blackwell) does not.
     """
     if any(g.kind == GROUP_MAMBA for g in groups):
         return ""
-    return (
+    hint = (
         "; or start vLLM with --disable-hybrid-kv-cache-manager to run the "
         "model as one KV cache group"
     )
+    if any(g.kind == GROUP_SLIDING_WINDOW for g in groups):
+        hint += (
+            " (FlashInfer refuses one group whose layers use different sliding "
+            "windows; --attention-backend TRITON_ATTN accepts it)"
+        )
+    return hint
 
 
 def check_multi_group_support(

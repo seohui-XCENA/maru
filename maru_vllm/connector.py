@@ -966,10 +966,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 and policy == "recompute"
                 and not self._scheduler._deferred_loading
             ):
-                # Reproduced on vLLM 0.30 without Maru, by a connector that
-                # reports its claimed blocks as failed. vLLM recomputes a
-                # failed parked load correctly, and with maru_async_load
-                # every load is parked.
+                # vLLM's V2 model runner does not rewind its device-side state
+                # (vllm-project/vllm#49250); reproduced on vLLM 0.30 without
+                # Maru, by a connector that reports its claimed blocks as
+                # failed. vLLM recomputes a failed parked load correctly, and
+                # with maru_async_load every load is parked.
                 logger.warning(
                     "kv_load_failure_policy='recompute' with several KV cache "
                     "groups: vLLM recomputes a request whose inline KV load "

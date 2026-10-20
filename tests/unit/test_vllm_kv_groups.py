@@ -274,6 +274,8 @@ def test_connector_reports_the_setting_to_change():
             gpt_oss_config(),
         )
     assert "--disable-hybrid-kv-cache-manager" in str(refused.value)
+    # gpt-oss mixes window sizes, which FlashInfer refuses in one group.
+    assert "--attention-backend TRITON_ATTN" in str(refused.value)
 
 
 def _one_group_config():
