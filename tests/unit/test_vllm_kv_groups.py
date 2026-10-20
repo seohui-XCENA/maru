@@ -224,8 +224,10 @@ def test_speculative_decoding_is_rejected():
 
 @pytest.mark.parametrize("mode", ["none", "all"])
 def test_mamba_needs_align_mode(mode):
-    with pytest.raises(ValueError, match="--mamba-cache-mode align"):
+    with pytest.raises(ValueError, match="--mamba-cache-mode align") as refused:
         _check(describe_kv_groups(qwen35_config(mode)), QWEN35_BLOCK)
+    # vLLM sets "none" when prefix caching is off, whatever the flag says.
+    assert "prefix caching on" in str(refused.value)
 
 
 def test_block_size_must_match_cache_config():

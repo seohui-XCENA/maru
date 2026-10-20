@@ -292,10 +292,13 @@ def check_multi_group_support(
         )
     for g in groups:
         if g.kind == GROUP_MAMBA and g.mamba_cache_mode != "align":
+            # vLLM 0.30 sets "none" whenever prefix caching is off, even over
+            # --mamba-cache-mode align, and defaults to "align" when it is on.
             raise ValueError(
-                "MaruKVConnector needs Mamba state snapshots at block ends; "
-                "start vLLM with --mamba-cache-mode align "
-                f"(got {g.mamba_cache_mode!r})"
+                "MaruKVConnector needs Mamba state snapshots at block ends: "
+                "keep vLLM's prefix caching on and its Mamba cache mode "
+                "'align', the default with prefix caching "
+                f"(--mamba-cache-mode align; got {g.mamba_cache_mode!r})"
             )
     group_block_sizes = sorted({g.block_size for g in groups})
     if group_block_sizes != [block_size]:
