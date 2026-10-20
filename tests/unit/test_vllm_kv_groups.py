@@ -276,6 +276,39 @@ def test_connector_reports_the_setting_to_change():
     assert "--disable-hybrid-kv-cache-manager" in str(refused.value)
 
 
+def _one_group_config():
+    return SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"model.layers.{i}.attn" for i in range(24)],
+                FullAttentionSpec(**GPT_OSS_ATTN),
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_config", "policy", "async_load", "warns"),
+    [
+        (gpt_oss_config, "recompute", False, True),
+        (gpt_oss_config, "fail", False, False),
+        # Every load is parked, and vLLM recomputes a failed parked load right.
+        (gpt_oss_config, "recompute", True, False),
+        (_one_group_config, "recompute", False, False),
+    ],
+)
+def test_recompute_policy_warns_for_inline_loads_of_several_groups(
+    caplog, kv_cache_config, policy, async_load, warns
+):
+    """vLLM 0.30 recomputes a failed inline load of a several-group model
+    wrongly; the default policy fails the request instead."""
+    config = _connector_config(16, maru_async_load=async_load)
+    config.kv_transfer_config.kv_load_failure_policy = policy
+    with caplog.at_level("WARNING"):
+        MaruKVConnector(config, KVConnectorRole.SCHEDULER, kv_cache_config())
+    assert ("kv_load_failure_policy='recompute'" in caplog.text) == warns
+
+
 def test_request_finished_all_groups_answers_per_request():
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._scheduler = _two_group_scheduler({"maru_async_store": True})
@@ -540,6 +573,176 @@ def test_a_short_reply_leaves_the_rest_missing():
     assert _hit(sched, a) == 0
     sched._handler.batch_exists = answer
     assert _hit(sched, a) == 1088
+
+
+def _load_given(sched, request):
+    """Look the request up and give its hit blocks, as vLLM does."""
+    matched, _ = sched.get_num_new_matched_tokens(request, 0)
+    sched.update_state_after_alloc(request, MagicMock(), matched)
+    return matched
+
+
+def test_a_request_asked_for_again_checks_its_keys_with_maru():
+    """vLLM asks again only after the load failed or a preemption. An object
+    that went away must not be reported again from the known keys: under
+    kv_load_failure_policy="recompute" the failing load would repeat forever."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, request) == 1088
+    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    # Chunk 0 has no state, so without chunk 1 nothing hits.
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
+    assert len(sched._handler.queries) == 2
+
+
+def test_a_request_asked_for_once_more_trusts_the_known_keys():
+    """Asked again before any blocks (vLLM could not fit it): no extra RPC."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    for _ in range(2):
+        assert sched.get_num_new_matched_tokens(request, 0)[0] == 1088
+    assert len(sched._handler.queries) == 1
+
+
+def test_a_request_whose_loads_fail_twice_computes_without_maru(caplog):
+    """A load can fail while its objects exist (a mapping error, say). After
+    two failed loads the request gets no hit, until it finishes, and the log
+    says so once."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a, num_preemptions=0)
+    assert _load_given(sched, request) == 1088
+    assert _load_given(sched, request) == 1088  # after the first failure
+    queries = len(sched._handler.queries)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):  # vLLM may ask each step until it fits the request
+            assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
+    assert len(sched._handler.queries) == queries
+    assert caplog.text.count("loads failed for req b") == 1
+    sched.request_finished(request, [])
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 1088
+
+
+def test_a_preempted_request_keeps_its_hit():
+    """A preemption is not a failure: however often the request is preempted,
+    it is checked again and loads again."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a, num_preemptions=0)
+    assert _load_given(sched, request) == 1088
+    for preemptions in range(1, 4):
+        request.num_preemptions = preemptions
+        assert _load_given(sched, request) == 1088
+    assert len(sched._handler.queries) == 4  # the first lookup and one per return
+
+
+def test_a_request_waiting_for_blocks_checks_its_keys_once():
+    """vLLM asks a request it cannot fit again every step: only the first ask
+    after the failed load goes to MaruServer."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, request) == 1088
+    for _ in range(3):
+        assert sched.get_num_new_matched_tokens(request, 0)[0] == 1088
+    assert len(sched._handler.queries) == 2
+
+
+def test_a_parked_load_counts_once():
+    """vLLM calls update_state_after_alloc again, with no tokens, when a parked
+    load is done: that is not a second load."""
+    a = list(range(1200))
+    sched = make_scheduler(
+        QWEN35_BLOCK,
+        QWEN35_BLOCK,
+        {"maru_async_load": True},
+        kv_groups=describe_kv_groups(qwen35_config()),
+    )
+    sched._handler = _Store(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a, num_preemptions=0)
+    assert _load_given(sched, request) == 1088
+    sched.update_state_after_alloc(request, MagicMock(), 0)  # the load is done
+    assert _load_given(sched, request) == 1088  # its first failure
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 0  # its second
+
+
+@pytest.mark.parametrize("status", ["FINISHED_ERROR", "FINISHED_STOPPED"])
+def test_a_request_ending_in_an_error_after_its_load_forgets_its_keys(status):
+    """Under the default kv_load_failure_policy="fail" a failed load ends the
+    request in an error, and it is never asked about again. Its keys are
+    forgotten then, or every later request with the prefix would fail too."""
+    from vllm.v1.request import RequestStatus
+
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    first = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, first) == 1088
+    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    first.status = RequestStatus[status]
+    sched.request_finished(first, [])
+    # A later request with the prefix. Stopped normally, the load worked: the
+    # known keys stand.
+    assert _hit(sched, a) == (0 if status == "FINISHED_ERROR" else 1088)
+
+
+def test_layerwise_done_markers_are_checked_again():
+    a = list(range(1200))
+    keys = _chunk_keys(a, 256)
+    sched = make_scheduler(16, 256, {"maru_use_layerwise": True})
+    sched._handler = _Store(f"{k}_DONE" for k in keys)
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, request) == 1024
+    sched._handler.keys.discard(f"{keys[1]}_DONE")
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 256
+
+
+def test_cpu_mode_stops_after_two_failed_loads_without_forgetting(monkeypatch):
+    """CPU mode asks MaruServer at every lookup and keeps no known keys."""
+    a = list(range(1200))
+    sched = make_scheduler(16, 256)
+    sched._cpu_mode = True
+    sched._handler = _Store(_chunk_keys(a, 256))
+    forget = MagicMock()
+    monkeypatch.setattr(sched, "_forget_keys", forget)
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, request) == 1024
+    assert _load_given(sched, request) == 1024
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
+    forget.assert_not_called()
+
+
+def test_a_failed_layerwise_overlap_load_is_not_activated():
+    """A parked layerwise-overlap load that failed has nothing to activate when
+    the request is given blocks to compute."""
+    a = list(range(1200))
+    sched = make_scheduler(
+        16, 256, {"maru_async_load": True, "maru_overlap_load_with_compute": True}
+    )
+    sched._handler = _Store(_chunk_keys(a, 256))
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    matched, _ = sched.get_num_new_matched_tokens(request, 0)
+    assert matched == 1024
+    blocks = SimpleNamespace(get_block_ids=lambda: (list(range(1, 76)),))
+    sched.update_state_after_alloc(request, blocks, matched)
+    sched.build_connector_meta(fake_scheduler_output())
+    assert "b" in sched._deferred_layerwise_waiting
+    sched._handler.keys.clear()
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
+    sched.update_state_after_alloc(request, MagicMock(), 0)
+    assert "b" not in sched._deferred_layerwise_ready
+
+
+def test_a_single_group_request_asked_for_again_checks_its_keys_with_maru():
+    a = list(range(1200))
+    keys = _chunk_keys(a, 256)
+    sched = make_scheduler(16, 256)
+    sched._handler = _Store(keys)
+    request = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, request) == 1024
+    sched._handler.keys.discard(keys[1])
+    assert sched.get_num_new_matched_tokens(request, 0)[0] == 256
 
 
 def test_hit_counts_past_the_gpu_prefix_cache():
