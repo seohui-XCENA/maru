@@ -582,18 +582,47 @@ def _load_given(sched, request):
     return matched
 
 
-def test_a_request_asked_for_again_checks_its_keys_with_maru():
-    """vLLM asks again only after the load failed or a preemption. An object
-    that went away must not be reported again from the known keys: under
-    kv_load_failure_policy="recompute" the failing load would repeat forever."""
+def _report_failure(sched):
+    """vLLM hands the worker's failed blocks to the scheduler connector."""
+    sched.update_connector_output(
+        SimpleNamespace(finished_recving=None, invalid_block_ids={7})
+    )
+
+
+def test_a_reported_load_failure_makes_lookups_ask_maru_again():
+    """An object that went away must not be reported again from the known
+    keys: under kv_load_failure_policy="recompute" vLLM asks about the failed
+    request again, and the failing load would repeat forever."""
     a = list(range(1200))
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1088
     sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    _report_failure(sched)
     # Chunk 0 has no state, so without chunk 1 nothing hits.
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
     assert len(sched._handler.queries) == 2
+
+
+@pytest.mark.parametrize("reported", [True, False])
+def test_a_later_request_asks_maru_again_only_after_a_reported_failure(reported):
+    """Under the default "fail" the failed request ends in an error and vLLM
+    never asks about it again; a later request with the prefix must not get
+    the same failing hit. Without a failure the known keys stand."""
+    a = list(range(1200))
+    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
+    first = SimpleNamespace(request_id="b", prompt_token_ids=a)
+    assert _load_given(sched, first) == 1088
+    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    if reported:
+        _report_failure(sched)
+    else:  # vLLM passes every step's connector output, mostly with no failure
+        sched.update_connector_output(
+            SimpleNamespace(finished_recving={"x"}, invalid_block_ids=set())
+        )
+    sched.request_finished(first, [])
+    later = SimpleNamespace(request_id="c", prompt_token_ids=a)
+    assert sched.get_num_new_matched_tokens(later, 0)[0] == (0 if reported else 1088)
 
 
 def test_a_request_asked_for_once_more_trusts_the_known_keys():
@@ -614,7 +643,9 @@ def test_a_request_whose_loads_fail_twice_computes_without_maru(caplog):
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     request = SimpleNamespace(request_id="b", prompt_token_ids=a, num_preemptions=0)
     assert _load_given(sched, request) == 1088
-    assert _load_given(sched, request) == 1088  # after the first failure
+    _report_failure(sched)
+    assert _load_given(sched, request) == 1088  # the objects are there
+    _report_failure(sched)
     queries = len(sched._handler.queries)
     with caplog.at_level("WARNING"):
         for _ in range(3):  # vLLM may ask each step until it fits the request
@@ -627,7 +658,7 @@ def test_a_request_whose_loads_fail_twice_computes_without_maru(caplog):
 
 def test_a_preempted_request_keeps_its_hit():
     """A preemption is not a failure: however often the request is preempted,
-    it is checked again and loads again."""
+    it loads again, from the known keys."""
     a = list(range(1200))
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     request = SimpleNamespace(request_id="b", prompt_token_ids=a, num_preemptions=0)
@@ -635,16 +666,17 @@ def test_a_preempted_request_keeps_its_hit():
     for preemptions in range(1, 4):
         request.num_preemptions = preemptions
         assert _load_given(sched, request) == 1088
-    assert len(sched._handler.queries) == 4  # the first lookup and one per return
+    assert len(sched._handler.queries) == 1
 
 
-def test_a_request_waiting_for_blocks_checks_its_keys_once():
-    """vLLM asks a request it cannot fit again every step: only the first ask
-    after the failed load goes to MaruServer."""
+def test_a_request_waiting_for_blocks_asks_maru_once():
+    """vLLM asks a request it cannot fit again every step: after a failure
+    only the first of those asks goes to MaruServer."""
     a = list(range(1200))
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1088
+    _report_failure(sched)
     for _ in range(3):
         assert sched.get_num_new_matched_tokens(request, 0)[0] == 1088
     assert len(sched._handler.queries) == 2
@@ -668,26 +700,7 @@ def test_a_parked_load_counts_once():
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 0  # its second
 
 
-@pytest.mark.parametrize("status", ["FINISHED_ERROR", "FINISHED_STOPPED"])
-def test_a_request_ending_in_an_error_after_its_load_forgets_its_keys(status):
-    """Under the default kv_load_failure_policy="fail" a failed load ends the
-    request in an error, and it is never asked about again. Its keys are
-    forgotten then, or every later request with the prefix would fail too."""
-    from vllm.v1.request import RequestStatus
-
-    a = list(range(1200))
-    sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
-    first = SimpleNamespace(request_id="b", prompt_token_ids=a)
-    assert _load_given(sched, first) == 1088
-    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
-    first.status = RequestStatus[status]
-    sched.request_finished(first, [])
-    # A later request with the prefix. Stopped normally, the load worked: the
-    # known keys stand.
-    assert _hit(sched, a) == (0 if status == "FINISHED_ERROR" else 1088)
-
-
-def test_layerwise_done_markers_are_checked_again():
+def test_layerwise_done_markers_are_asked_for_again():
     a = list(range(1200))
     keys = _chunk_keys(a, 256)
     sched = make_scheduler(16, 256, {"maru_use_layerwise": True})
@@ -695,22 +708,21 @@ def test_layerwise_done_markers_are_checked_again():
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1024
     sched._handler.keys.discard(f"{keys[1]}_DONE")
+    _report_failure(sched)
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 256
 
 
-def test_cpu_mode_stops_after_two_failed_loads_without_forgetting(monkeypatch):
-    """CPU mode asks MaruServer at every lookup and keeps no known keys."""
+def test_cpu_mode_stops_after_two_failed_loads():
+    """CPU mode asks MaruServer at every lookup; the failure count still
+    applies."""
     a = list(range(1200))
     sched = make_scheduler(16, 256)
     sched._cpu_mode = True
     sched._handler = _Store(_chunk_keys(a, 256))
-    forget = MagicMock()
-    monkeypatch.setattr(sched, "_forget_keys", forget)
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1024
     assert _load_given(sched, request) == 1024
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
-    forget.assert_not_called()
 
 
 def test_a_failed_layerwise_overlap_load_is_not_activated():
@@ -729,12 +741,13 @@ def test_a_failed_layerwise_overlap_load_is_not_activated():
     sched.build_connector_meta(fake_scheduler_output())
     assert "b" in sched._deferred_layerwise_waiting
     sched._handler.keys.clear()
+    _report_failure(sched)
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
     sched.update_state_after_alloc(request, MagicMock(), 0)
     assert "b" not in sched._deferred_layerwise_ready
 
 
-def test_a_single_group_request_asked_for_again_checks_its_keys_with_maru():
+def test_a_single_group_request_asks_maru_again_after_a_failure():
     a = list(range(1200))
     keys = _chunk_keys(a, 256)
     sched = make_scheduler(16, 256)
@@ -742,6 +755,7 @@ def test_a_single_group_request_asked_for_again_checks_its_keys_with_maru():
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1024
     sched._handler.keys.discard(keys[1])
+    _report_failure(sched)
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 256
 
 

@@ -1270,15 +1270,11 @@ class MaruSchedulerConnector:
         # accumulate enough keys to matter.
         self._known_keys: set[str] = set()
 
-        # Requests given a load, with request.num_preemptions at that load.
-        # vLLM asks about such a request again only after the load failed or
-        # the request was preempted; num_preemptions tells the two apart.
+        # Requests given a load that vLLM has not asked about since, with
+        # request.num_preemptions at that load. vLLM asks about such a
+        # request again only after the load failed or the request was
+        # preempted; num_preemptions tells the two apart.
         self._load_preemptions: dict[str, int] = {}
-        # Requests whose last load nothing has asked about again yet. The
-        # first ask after a load checks the request's keys with MaruServer
-        # instead of trusting _known_keys; later asks (vLLM could not fit
-        # the request) use what that check found.
-        self._loads_to_recheck: set[str] = set()
         # Failed loads per request. A load can fail while its objects exist
         # (a mapping error, say); after _MAX_FAILED_LOADS the request
         # computes without Maru instead of retrying.
@@ -1386,70 +1382,41 @@ class MaruSchedulerConnector:
 
         return local_hits + rpc_hits
 
-    def _asked_again_after_load(self, request: Request) -> bool:
-        """Whether this is the first ask about ``request`` since its last load.
+    def _count_failed_load(self, request: Request) -> None:
+        """Count a failed load when vLLM asks about a request again after it.
 
         vLLM asks about a request it gave a load only after that load failed
-        or the request was preempted. A failure is counted; at the count
-        that stops further loads, say so once.
+        or the request was preempted. At the count that stops further loads,
+        say so once.
         """
         req_id = request.request_id
-        if req_id not in self._loads_to_recheck:
-            return False
-        self._loads_to_recheck.discard(req_id)
+        preemptions = self._load_preemptions.pop(req_id, None)
+        if preemptions is None:
+            return
         # A layerwise-overlap load that failed is never activated.
         self._deferred_layerwise_waiting.discard(req_id)
         self._deferred_layerwise_ready.discard(req_id)
-        if getattr(request, "num_preemptions", 0) == self._load_preemptions.get(
-            req_id, 0
-        ):
-            failed = self._failed_loads.get(req_id, 0) + 1
-            self._failed_loads[req_id] = failed
-            if failed == _MAX_FAILED_LOADS:
-                logger.warning(
-                    "Maru: %d loads failed for req %s; computing it without Maru",
-                    failed,
-                    req_id,
-                )
-        return True
+        if getattr(request, "num_preemptions", 0) != preemptions:
+            return
+        failed = self._failed_loads.get(req_id, 0) + 1
+        self._failed_loads[req_id] = failed
+        if failed == _MAX_FAILED_LOADS:
+            logger.warning(
+                "Maru: %d loads failed for req %s; computing it without Maru",
+                failed,
+                req_id,
+            )
 
     def _forget_load_history(self, request: Request) -> None:
-        """Drop a finished request's load records.
-
-        A request that was given a load and ended in an error most likely
-        failed that load (kv_load_failure_policy="fail"): its keys are
-        forgotten too, or every later request with the same prefix would be
-        given the same failing load.
-        """
-        req_id = request.request_id
-        self._loads_to_recheck.discard(req_id)
-        self._failed_loads.pop(req_id, None)
-        if self._load_preemptions.pop(req_id, None) is None or self._cpu_mode:
-            return
-        from vllm.v1.request import RequestStatus
-
-        if getattr(request, "status", None) == RequestStatus.FINISHED_ERROR:
-            self._forget_keys(list(request.prompt_token_ids or []))
-
-    def _forget_keys(self, token_ids: list[int]) -> None:
-        """Stop trusting that a prompt's chunks are stored.
-
-        The next lookup of these chunks asks MaruServer again.
-        """
-        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
-        if self._multi_group:
-            stale = {
-                group_object_key(k, g.group_id) for k in keys for g in self._kv_groups
-            }
-        else:
-            stale = {self._chunk_exists_key(k) for k in keys}
-        self._known_keys -= stale
+        """Drop a finished request's load records."""
+        self._load_preemptions.pop(request.request_id, None)
+        self._failed_loads.pop(request.request_id, None)
 
     def _stored_keys(self, keys: list[str]) -> set[str]:
         """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
 
         Remembers positives, as ``_count_matched_chunks`` does, until a
-        failed load forgets them (``_forget_keys``). Only
+        reported load failure clears them (``update_connector_output``). Only
         the cxl backend in chunkwise format gets here: CPU mode must re-probe
         residency, and layerwise format checks ``_DONE`` markers, and the
         constructor refuses both with several groups.
@@ -1633,13 +1600,9 @@ class MaruSchedulerConnector:
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
             return 0, False
-        recheck = self._asked_again_after_load(request)
+        self._count_failed_load(request)
         if self._failed_loads.get(request.request_id, 0) >= _MAX_FAILED_LOADS:
             return 0, False
-        if recheck and not self._cpu_mode:  # CPU mode checks every lookup anyway
-            # The objects the failed or preempted load was given may be gone,
-            # and a hit from _known_keys would fail again.
-            self._forget_keys(token_ids)
 
         _t0 = time.monotonic()
         num_matched_chunks = (
@@ -1716,7 +1679,6 @@ class MaruSchedulerConnector:
         self._load_preemptions[request.request_id] = getattr(
             request, "num_preemptions", 0
         )
-        self._loads_to_recheck.add(request.request_id)
         if self._cpu_mode or self._multi_group:
             start = self._load_starts.pop(request.request_id, 0)
             self._load_ranges[request.request_id] = (start, start + num_external_tokens)
@@ -1936,6 +1898,15 @@ class MaruSchedulerConnector:
         self._awaiting_deferred_recv.difference_update(
             connector_output.finished_recving or ()
         )
+        if getattr(connector_output, "invalid_block_ids", None):
+            # A load failed, so some key in _known_keys may name an object
+            # that is gone, and the report does not say which. Forget them
+            # all: the next lookups ask MaruServer again, so neither the
+            # failed request, when vLLM asks about it again, nor a later
+            # request with the same prefix gets the same failing hit.
+            # Requests looked up before the report arrives (a step or two
+            # later, more with async scheduling) can still fail once.
+            self._known_keys.clear()
 
     def request_finished(
         self,
