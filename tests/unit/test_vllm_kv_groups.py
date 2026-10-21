@@ -61,6 +61,8 @@ from tests.unit.vllm_connector_helpers import (
 
 QWEN35_BLOCK = 544
 QWEN35_SLOT = 1_114_112
+# vLLM < 0.23 sizes the async-load budget from num_blocks (_async_load_budget).
+NUM_BLOCKS = 128
 GPT_OSS_ATTN = {
     "block_size": 16,
     "num_kv_heads": 8,
@@ -91,7 +93,7 @@ def qwen35_config(mamba_cache_mode="align"):
             [f"model.layers.{i}.self_attn.attn" for i in range(3, 24, 4)], attn
         )
     )
-    return SimpleNamespace(kv_cache_groups=groups)
+    return SimpleNamespace(kv_cache_groups=groups, num_blocks=NUM_BLOCKS)
 
 
 def gpt_oss_config():
@@ -106,7 +108,8 @@ def gpt_oss_config():
                 [f"model.layers.{i}.attn" for i in range(1, 24, 2)],
                 FullAttentionSpec(**GPT_OSS_ATTN),
             ),
-        ]
+        ],
+        num_blocks=NUM_BLOCKS,
     )
 
 
@@ -287,7 +290,8 @@ def _one_group_config():
                 [f"model.layers.{i}.attn" for i in range(24)],
                 FullAttentionSpec(**GPT_OSS_ATTN),
             )
-        ]
+        ],
+        num_blocks=NUM_BLOCKS,
     )
 
 
@@ -822,7 +826,7 @@ def tiny_config(gdn=TINY_GDN, attn=TINY_ATTN):
             [f"layers.{i}.attn" for i in attn], FullAttentionSpec(**_attn_kw())
         )
     )
-    return SimpleNamespace(kv_cache_groups=groups)
+    return SimpleNamespace(kv_cache_groups=groups, num_blocks=NUM_BLOCKS)
 
 
 def tiny_swa_config():
@@ -836,7 +840,8 @@ def tiny_swa_config():
             KVCacheGroupSpec(
                 ["layers.1.attn", "layers.3.attn"], FullAttentionSpec(**_attn_kw())
             ),
-        ]
+        ],
+        num_blocks=NUM_BLOCKS,
     )
 
 
