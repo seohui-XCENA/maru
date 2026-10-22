@@ -8,6 +8,7 @@ attention).
 """
 
 import dataclasses
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -255,9 +256,42 @@ def _connector_config(block_size, **extra):
 def test_hybrid_support_is_declared_from_vllm_0_30():
     """Older vLLM cannot recompute a failed load of a several-group model, so
     Maru leaves its hybrid KV cache manager off there, as before."""
-    from maru_vllm.connector import _vllm_version_at_least
+    import vllm
 
-    assert supports_hma(MaruKVConnector) == _vllm_version_at_least("0.30.0")
+    from maru_vllm.connector import _vllm_supports_hybrid
+
+    assert supports_hma(MaruKVConnector) == _vllm_supports_hybrid(vllm.__version__)
+
+
+@pytest.mark.parametrize(
+    ("version", "declared", "warning"),
+    [
+        ("0.30.0", True, None),
+        # vllm-project/vllm#50388 is in 0.30.0rc1, so pre-releases count.
+        ("0.30.0rc1", True, None),
+        ("0.30.0rc2.dev5+gabc1234", True, None),
+        ("0.30.1rc1.dev12+gabc1234", True, None),
+        ("0.29.2", False, "vLLM 0.29.2 is older than 0.30.0"),
+        # A main build between the 0.29 and 0.30 releases.
+        ("0.29.1rc1.dev40+gabc1234", False, "older than 0.30.0"),
+        # vLLM reports "dev" when it cannot read its own version file.
+        ("dev", False, "cannot read the vLLM version 'dev'"),
+    ],
+)
+def test_hybrid_support_version_check_logs_when_it_says_no(
+    caplog, version, declared, warning
+):
+    from maru_vllm.connector import _vllm_supports_hybrid
+
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        assert _vllm_supports_hybrid(version) is declared
+    messages = [r.getMessage() for r in caplog.records]
+    if warning is None:
+        assert messages == []
+    else:
+        (message,) = messages
+        assert warning in message
+        assert "does not declare SupportsHMA" in message
 
 
 def test_a_mamba_model_stores_one_block_per_chunk():

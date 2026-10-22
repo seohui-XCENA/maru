@@ -776,13 +776,43 @@ class MaruConnectorMetadata(KVConnectorMetadata):
 # ============================================================================
 
 
-# vLLM hands a connector several KV cache groups only when it declares
-# SupportsHMA. Before 0.30, vLLM cannot recompute a failed load of such a model
-# (its invalid-block handling assumes one group and raises), so Maru declares
-# it from 0.30 on. Older vLLM then turns its hybrid KV cache manager off: a
-# sliding-window model runs as one group, a Mamba hybrid is refused by vLLM.
+def _vllm_supports_hybrid(version: str) -> bool:
+    """Whether Maru can declare SupportsHMA on this vLLM, logging when not.
+
+    vLLM hands a connector several KV cache groups only when it declares
+    SupportsHMA. Before 0.30, vLLM cannot recompute a failed load of such a
+    model (its invalid-block handling assumes one group and raises). The
+    base version is compared so that 0.30.0 pre-releases count: the fix
+    (vllm-project/vllm#50388) is in 0.30.0rc1, and vLLM's main builds carry
+    the next patch release (0.29.1rc1.devN), never 0.30.0.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        if Version(Version(version).base_version) >= Version("0.30.0"):
+            return True
+        reason = f"vLLM {version} is older than 0.30.0"
+    except InvalidVersion:
+        reason = f"Maru cannot read the vLLM version {version!r}"
+    logger.warning(
+        "%s, so MaruKVConnector does not declare SupportsHMA. vLLM then turns "
+        "its hybrid KV cache manager off: a sliding-window model runs as one "
+        "KV cache group, and a model that mixes Mamba and attention layers "
+        "fails at startup.",
+        reason,
+    )
+    return False
+
+
+def _installed_vllm_version() -> str:
+    import vllm
+
+    return str(getattr(vllm, "__version__", "unknown"))
+
+
+# Older vLLM turns its hybrid KV cache manager off for a connector without it.
 _HYBRID_SUPPORT: tuple[type, ...] = (
-    (SupportsHMA,) if _vllm_version_at_least("0.30.0") else ()
+    (SupportsHMA,) if _vllm_supports_hybrid(_installed_vllm_version()) else ()
 )
 
 
