@@ -509,21 +509,27 @@ def _async_load_budget(
     return total - 1 if total else None  # vLLM sets one null block aside.
 
 
-def _uncacheable_request(request: Any) -> bool:
-    """Whether a request's KV depends on more than its token ids.
+def _uncacheable_request(request: Any) -> str | None:
+    """The input that makes a request's KV depend on more than its token ids.
 
     Maru keys a chunk by its token ids alone, so a request with prompt
     embeddings, a cache salt, multimodal inputs or a LoRA adapter could load
     another request's KV. Such requests neither load nor store on any
     backend; vLLM's own prefix cache, which hashes these inputs, still
     applies to them (xcena-dev/maru#116).
+
+    Returns:
+        The name of the first such input, or None for a cacheable request.
     """
-    return (
-        getattr(request, "prompt_embeds", None) is not None
-        or getattr(request, "cache_salt", None) is not None
-        or bool(getattr(request, "mm_features", None))
-        or bool(getattr(request, "lora_request", None))
-    )
+    if getattr(request, "prompt_embeds", None) is not None:
+        return "prompt_embeds"
+    if getattr(request, "cache_salt", None) is not None:
+        return "cache_salt"
+    if getattr(request, "mm_features", None):
+        return "mm_features"
+    if getattr(request, "lora_request", None):
+        return "lora_request"
+    return None
 
 
 def _create_maru_handler(
@@ -1602,7 +1608,9 @@ class MaruSchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
-        if _uncacheable_request(request):
+        reason = _uncacheable_request(request)
+        if reason is not None:
+            logger.debug("Maru skips request %s: it has %s", request.request_id, reason)
             self._bypass_requests.add(request.request_id)
             return 0, False
         token_ids = list(request.prompt_token_ids or [])

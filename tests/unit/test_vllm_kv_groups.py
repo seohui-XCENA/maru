@@ -358,6 +358,25 @@ def _step(sched, scheduled, **kwargs):
     return req
 
 
+def test_an_image_request_skips_maru_with_several_groups():
+    """The Qwen3.5 image case of #116 takes this path."""
+    sched = _two_group_scheduler()
+    sched._handler = MagicMock()
+    request = SimpleNamespace(
+        request_id="r1", prompt_token_ids=list(range(96)), mm_features=[object()]
+    )
+
+    assert sched.get_num_new_matched_tokens(request, 0) == (0, False)
+    sched._handler.batch_exists.assert_not_called()
+    new_req = _new_req(([1, 2, 3], [11, 12, 13]), 96)
+    new_req.mm_features = request.mm_features
+    meta = sched.build_connector_meta(
+        fake_scheduler_output(new_reqs=[new_req], num_scheduled_tokens={"r1": 96})
+    )
+    assert meta.requests == []
+    assert "r1" not in sched._requests_need_store
+
+
 def test_store_carries_every_group_across_chunked_prefill():
     sched = _two_group_scheduler()
     # 96 tokens = 3 chunks of 32. Step 1 covers 40 tokens in 3 blocks.
