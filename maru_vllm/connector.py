@@ -509,8 +509,15 @@ def _async_load_budget(
     return total - 1 if total else None  # vLLM sets one null block aside.
 
 
-def _cpu_bypass_request(request: Any) -> bool:
-    """M1 does not key embeddings, adapter state, multimodal data or salts."""
+def _uncacheable_request(request: Any) -> bool:
+    """Whether a request's KV depends on more than its token ids.
+
+    Maru keys a chunk by its token ids alone, so a request with prompt
+    embeddings, a cache salt, multimodal inputs or a LoRA adapter could load
+    another request's KV. Such requests neither load nor store on any
+    backend; vLLM's own prefix cache, which hashes these inputs, still
+    applies to them (xcena-dev/maru#116).
+    """
     return (
         getattr(request, "prompt_embeds", None) is not None
         or getattr(request, "cache_salt", None) is not None
@@ -1182,7 +1189,7 @@ class MaruSchedulerConnector:
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
         self._max_model_len = max_model_len
-        self._cpu_bypass_requests: set[str] = set()
+        self._bypass_requests: set[str] = set()
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -1595,8 +1602,8 @@ class MaruSchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
-        if self._cpu_mode and _cpu_bypass_request(request):
-            self._cpu_bypass_requests.add(request.request_id)
+        if _uncacheable_request(request):
+            self._bypass_requests.add(request.request_id)
             return 0, False
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
@@ -1738,10 +1745,8 @@ class MaruSchedulerConnector:
         self._pending_deferred_loads.clear()
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if self._cpu_mode and (
-                new_req.req_id in self._cpu_bypass_requests
-                or _cpu_bypass_request(new_req)
-            ):
+            # NewRequestData has no cache_salt; _match recorded those.
+            if new_req.req_id in self._bypass_requests or _uncacheable_request(new_req):
                 continue
             token_ids = list(new_req.prompt_token_ids or [])
 
@@ -1879,7 +1884,7 @@ class MaruSchedulerConnector:
         for rid in stale_ids:
             self._load_starts.pop(rid, None)
             self._load_ranges.pop(rid, None)
-            self._cpu_bypass_requests.discard(rid)
+            self._bypass_requests.discard(rid)
             self._requests_need_store.pop(rid, None)
             self._requests_need_load.pop(rid, None)
             self._pending_deferred_loads.pop(rid, None)

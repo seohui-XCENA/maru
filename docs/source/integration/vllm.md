@@ -141,6 +141,10 @@ Instance B:
   → Loads chunk 0, 1 from CXL, computes the rest
 ```
 
+### Requests Maru does not cache
+
+Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and its own prefix cache, which hashes these inputs, still applies. Keying such requests so they can hit is tracked in [#116](https://github.com/xcena-dev/maru/issues/116).
+
 ## Setup
 
 **Start Maru server:**

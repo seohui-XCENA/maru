@@ -1820,6 +1820,71 @@ class TestBuildConnectorMetaStoreAccumulation:
 
 
 # =============================================================================
+# Requests whose KV depends on more than their token ids (CXL backend)
+# =============================================================================
+
+
+class TestUncacheableRequests:
+    """Images, LoRA, cache salts and prompt embeddings skip Maru (#116)."""
+
+    CHUNK = 8
+    EXTRA = {
+        "mm_features": [object()],
+        "lora_request": object(),
+        "cache_salt": "tenant-a",
+        "prompt_embeds": torch.ones(2, 2),
+    }
+
+    def _scheduler(self):
+        sched = make_scheduler(block_size=4, kv_chunk_tokens=self.CHUNK)
+        sched._handler = MagicMock()
+        sched._handler.batch_exists.return_value = [True] * 8
+        return sched
+
+    @staticmethod
+    def _request(req_id, **extra):
+        return SimpleNamespace(
+            request_id=req_id, prompt_token_ids=list(range(70)), **extra
+        )
+
+    @pytest.mark.parametrize("field", list(EXTRA))
+    def test_neither_loads_nor_stores(self, field):
+        sched = self._scheduler()
+
+        matched, load_async = sched.get_num_new_matched_tokens(
+            self._request("r1", **{field: self.EXTRA[field]}), 0
+        )
+
+        assert (matched, load_async) == (0, False)
+        sched._handler.batch_exists.assert_not_called()
+        # vLLM's NewRequestData carries no cache_salt; the scheduler skips the
+        # request by the id it recorded when matching.
+        new_req = fake_new_request_data(list(range(70)), list(range(18)))
+        if field != "cache_salt":
+            setattr(new_req, field, self.EXTRA[field])
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([new_req], fake_cached_reqs([], [], []), {"r1": 20})
+        )
+        assert meta.requests == []
+        assert "r1" not in sched._requests_need_store
+
+    def test_text_requests_still_load_and_store(self):
+        sched = self._scheduler()
+
+        matched, _ = sched.get_num_new_matched_tokens(
+            self._request("r1", mm_features=[], lora_request=None), 0
+        )
+        assert matched == 64
+
+        new_req = fake_new_request_data(list(range(70)), list(range(18)), "r2")
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([new_req], fake_cached_reqs([], [], []), {"r2": 20})
+        )
+        assert [r.req_id for r in meta.requests] == ["r2"]
+        assert meta.requests[0].is_store
+
+
+# =============================================================================
 # Deferred (between-step) loading
 # =============================================================================
 
