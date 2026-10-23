@@ -3751,14 +3751,25 @@ class MaruWorkerConnector:
         WAITING_FOR_REMOTE_KVS; unless they are reported through
         ``get_finished_loading`` (with their blocks through
         ``get_block_ids_with_load_errors``), vLLM keeps them parked forever
-        and never frees their blocks. Inline requests are unaffected —
-        ``_fail_deferred_load`` ignores them.
+        and never frees their blocks. With several KV cache groups an inline
+        load fails the same way: vLLM has counted its tokens as computed and
+        would otherwise run the forward on blocks nothing filled. With one
+        group ``_fail_deferred_load`` still ignores inline requests (#110).
 
         Args:
             metadata: The step's connector metadata.
         """
         for req_meta in metadata.requests:
-            self._fail_deferred_load(req_meta)
+            if (
+                self._multi_group
+                and not req_meta.is_store
+                and req_meta.num_matched_chunks > 0
+            ):
+                self._fail_load(
+                    req_meta, RuntimeError("worker MaruHandler unavailable")
+                )
+            else:
+                self._fail_deferred_load(req_meta)
 
     def _schedule_deferred_loads(
         self,

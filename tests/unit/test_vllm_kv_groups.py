@@ -9,6 +9,7 @@ attention).
 
 import dataclasses
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -2060,6 +2061,28 @@ def test_a_failure_while_placing_is_reported(parked):
     worker.start_load_kv(_FORWARD, meta)
     assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
     assert worker.get_finished_loading() == ({"b"} if parked else None)
+
+
+@pytest.mark.parametrize("parked", [False, True], ids=["inline", "parked"])
+def test_an_unavailable_handler_fails_the_loads(parked):
+    """The worker has no MaruHandler (it got no CXL region, say) while the
+    scheduler reported a hit: nothing fills the blocks, so they are reported."""
+    _, _, store = _stored_qwen()
+    worker, target = _loading_worker(store)
+    worker._handler = None
+    worker._handler_retry_after = time.monotonic() + 60.0
+    if parked:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    else:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
+    # A store in the same step is not a failed load.
+    meta.requests += _store_meta(
+        list(range(40)), QWEN_BLOCKS, 0, 32, req_ids=("a",)
+    ).requests
+    worker.start_load_kv(_FORWARD, meta)
+    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
+    assert worker.get_finished_loading() == ({"b"} if parked else None)
+    assert not target.any()
 
 
 def test_an_inline_load_of_a_missing_object_is_reported():
