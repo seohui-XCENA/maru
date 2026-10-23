@@ -989,6 +989,15 @@ def tiny_kv_caches(version, shared, gdn=TINY_GDN, attn=TINY_ATTN):
     return caches
 
 
+def _engine_layout(kv_caches):
+    """The KV cache layout vLLM reports with these tensors: "NHD" from 0.23
+    (flash, rank 5), the resolved "LBNHC" from 0.30 (logical page, rank 4)."""
+    attn = [t for name, t in kv_caches.items() if name.endswith(".attn")]
+    if not attn:
+        return None
+    return "NHD" if attn[0].dim() == 5 else "LBNHC"
+
+
 def _worker(config=None, chunk=TINY_BLOCK, **kwargs):
     kwargs.setdefault("num_kv_heads", 2)
     kwargs.setdefault("head_size", 8)
@@ -1003,7 +1012,7 @@ def _worker(config=None, chunk=TINY_BLOCK, **kwargs):
 
 
 def _registered_worker(kv_caches, config=None, chunk=TINY_BLOCK):
-    worker = _worker(config, chunk)
+    worker = _worker(config, chunk, kv_cache_layout=_engine_layout(kv_caches))
     worker.register_kv_caches(kv_caches)
     return worker
 
@@ -1026,9 +1035,11 @@ def test_worker_maps_each_vllm_format_onto_the_groups(version):
         for b in range(TINY_BLOCKS):
             slot = region[b * TINY_SLOT : b * TINY_SLOT + TINY_STATE]
             assert torch.equal(view[b], slot)
-    # 0.23's flash layout has a kernel format; 0.30's fused K/V layout does not.
+    # 0.23's flash layout has a kernel format; 0.30's page has none, and its
+    # K|V halves are read as a K/V axis.
     layout = caches[3].layout
     assert (layout.format_name is not None) == (version == "0.23")
+    assert layout.kv_packed == (version == "0.30")
     assert (layout.num_blocks, layout.block_size) == (TINY_BLOCKS, TINY_BLOCK)
     # Two layers x one 1,024 B slot, for every group.
     assert worker._page_size_bytes == 2 * TINY_SLOT
@@ -1182,12 +1193,12 @@ def _store_meta(tokens, group_block_ids, computed, scheduled, req_ids=("r1",)):
 def _token_rows(kv, block, version):
     """One block's KV as ``[2, block_size, row]``, the order Maru stores.
 
-    0.23's flash layout has a K/V axis; 0.30's fused layout keeps K and V in
-    one row per token, which Maru halves.
+    0.23's flash layout has a K/V axis. 0.30's page ``[B, H, N, K|V]`` holds
+    each head's K and V as the halves of its last axis, which Maru splits.
     """
     if version == "0.30":
-        rows = kv[block].transpose(0, 1).reshape(TINY_BLOCK, -1)
-        return rows.reshape(TINY_BLOCK, 2, -1).transpose(0, 1)
+        heads = kv[block].unflatten(-1, (2, -1))  # [H, N, 2, D]
+        return heads.permute(2, 1, 0, 3).reshape(2, TINY_BLOCK, -1)
     return kv[block].reshape(2, TINY_BLOCK, -1)
 
 
@@ -1217,6 +1228,7 @@ def _storing_worker(kv_caches, config=None, chunk=TINY_BLOCK, extra=None):
         extra,
         num_kv_heads=2,
         head_size=8,
+        kv_cache_layout=_engine_layout(kv_caches),
         kv_groups=describe_kv_groups(config or tiny_config()),
     )
     worker._ensure_handler = MagicMock()
@@ -1918,7 +1930,7 @@ def test_the_first_parked_load_uses_the_kernel_before_any_forward():
     stored, store, original = _kernel_worker()
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     target = torch.zeros_like(_shared()).cuda()
-    worker = _worker()
+    worker = _worker(kv_cache_layout="NHD")
     worker.register_kv_caches(
         tiny_kv_caches("0.23", target), _backend_layers("FLASH_ATTN")
     )

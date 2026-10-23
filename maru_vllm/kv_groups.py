@@ -422,7 +422,7 @@ def group_caches(
     groups: list[KVGroup],
     kv_caches: dict[str, Any],
     *,
-    kv_layout: str,
+    kv_layout: str | None,
     num_kv_heads: int | None,
     head_size: int | None,
 ) -> list[GroupCache]:
@@ -438,7 +438,8 @@ def group_caches(
     Args:
         groups: The model's KV cache groups.
         kv_caches: ``register_kv_caches``' argument.
-        kv_layout: vLLM's cache layout, "NHD" or "HND".
+        kv_layout: What ``_vllm_kv_cache_layout`` returned: "NHD"/"HND", a
+            vLLM 0.29+ layout name, or None when unknown.
         num_kv_heads: KV heads per rank. Required for attention groups: a
             fused layout read without it can take the head axis for K/V.
         head_size: Width of one head, when known.
