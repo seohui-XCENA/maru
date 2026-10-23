@@ -360,6 +360,25 @@ def test_recompute_policy_is_refused_for_inline_loads_of_several_groups(
     assert "kv_load_failure_policy='fail'" in str(refusal.value)
 
 
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_missing_kv_cache_config_is_reported_when_hma_is_declared(
+    monkeypatch, caplog, declared
+):
+    """vLLM 0.30 always passes the config; without it the groups are unknown."""
+    import maru_vllm.connector as connector_module
+
+    # Only whether the tuple is empty matters here.
+    monkeypatch.setattr(
+        connector_module, "_HYBRID_SUPPORT", (object,) if declared else ()
+    )
+    config = _connector_config(16)
+    config.cache_config.num_gpu_blocks = NUM_BLOCKS  # read on vLLM < 0.23
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        connector = MaruKVConnector(config, KVConnectorRole.SCHEDULER, None)
+    assert connector._kv_groups == []
+    assert ("got no kv_cache_config" in caplog.text) == declared
+
+
 def test_request_finished_all_groups_answers_per_request():
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._scheduler = _two_group_scheduler({"maru_async_store": True})

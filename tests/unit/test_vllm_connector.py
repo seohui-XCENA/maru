@@ -3512,6 +3512,16 @@ class TestWriteBehindStoreLifecycle:
         )
         assert worker._queued_store_batches == []
 
+    def test_shutdown_drains_the_sync_store_stream(self):
+        worker = self._make_worker()
+        stream = MagicMock()
+        worker._sync_store_stream = stream
+
+        worker.shutdown()
+
+        stream.synchronize.assert_called_once_with()
+        assert worker._sync_store_stream is None
+
     def test_shutdown_drains_layerwise_streams_before_unmapping(self):
         """Copies queued off-thread read pinned buffers and CXL views that
         closing the handler unmaps, and they run on no other stream."""

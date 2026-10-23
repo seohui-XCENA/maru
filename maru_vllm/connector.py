@@ -934,6 +934,14 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             if kv_cache_config is not None
             else []
         )
+        if kv_cache_config is None and _HYBRID_SUPPORT:
+            # vLLM 0.30 always passes it; without it the groups are unknown.
+            logger.warning(
+                "MaruKVConnector declares SupportsHMA but got no kv_cache_config, "
+                "so it treats the model as one KV cache group. A model with "
+                "several groups would be stored under wrong keys; run it with "
+                "--disable-hybrid-kv-cache-manager or pass the KV cache config."
+            )
         extra = self._kv_transfer_config.kv_connector_extra_config
         if _validate_storage_config(extra):
             extra = _cpu_engine_config(extra, vllm_config)
@@ -5377,6 +5385,12 @@ class MaruWorkerConnector:
                 logger.error("Error synchronizing Maru store stream: %s", e)
             self._store_stream = None
             self._store_staging = None
+        if self._sync_store_stream is not None:
+            try:
+                self._sync_store_stream.synchronize()
+            except Exception as e:
+                logger.error("Error synchronizing Maru sync store stream: %s", e)
+            self._sync_store_stream = None
         # Drain the loader thread before touching the handler or streams:
         # an in-flight job may still be retrieving/queueing copies.
         if self._deferred_executor is not None:
