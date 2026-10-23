@@ -183,12 +183,15 @@ def test_chunk_is_one_block_with_a_mamba_group():
 # =============================================================================
 
 
-def _check(groups, block_size, use_layerwise=False, speculative=False):
+def _check(
+    groups, block_size, use_layerwise=False, speculative=False, inline_recompute=False
+):
     check_multi_group_support(
         groups,
         block_size=block_size,
         use_layerwise=use_layerwise,
         speculative=speculative,
+        inline_recompute=inline_recompute,
     )
 
 
@@ -331,7 +334,7 @@ def _one_group_config():
 
 
 @pytest.mark.parametrize(
-    ("kv_cache_config", "policy", "async_load", "warns"),
+    ("kv_cache_config", "policy", "async_load", "refused"),
     [
         (gpt_oss_config, "recompute", False, True),
         (gpt_oss_config, "fail", False, False),
@@ -340,16 +343,21 @@ def _one_group_config():
         (_one_group_config, "recompute", False, False),
     ],
 )
-def test_recompute_policy_warns_for_inline_loads_of_several_groups(
-    caplog, kv_cache_config, policy, async_load, warns
+def test_recompute_policy_is_refused_for_inline_loads_of_several_groups(
+    kv_cache_config, policy, async_load, refused
 ):
     """vLLM 0.30 recomputes a failed inline load of a several-group model
     wrongly; the default policy fails the request instead."""
     config = _connector_config(16, maru_async_load=async_load)
     config.kv_transfer_config.kv_load_failure_policy = policy
-    with caplog.at_level("WARNING"):
+    if not refused:
         MaruKVConnector(config, KVConnectorRole.SCHEDULER, kv_cache_config())
-    assert ("kv_load_failure_policy='recompute'" in caplog.text) == warns
+        return
+    for role in (KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER):
+        with pytest.raises(ValueError, match="maru_async_load=true") as refusal:
+            MaruKVConnector(config, role, kv_cache_config())
+    assert "vllm-project/vllm#49250" in str(refusal.value)
+    assert "kv_load_failure_policy='fail'" in str(refusal.value)
 
 
 def test_request_finished_all_groups_answers_per_request():
@@ -1761,6 +1769,7 @@ def test_vllm_scheduler_hands_every_group_to_the_connector(tmp_path):
             KVCacheGroupSpec(["swa"], SlidingWindowSpec(sliding_window=32, **kw)),
             KVCacheGroupSpec(["full"], FullAttentionSpec(**kw)),
         ],
+        kv_load_failure_policy="fail",
     )
     tokens = list(range(100))
     connector = engine.connector
@@ -1931,6 +1940,7 @@ def _mamba_engine(tmp_path, extra=None):
         extra,
         num_blocks=64,
         enable_prefix_caching=True,
+        kv_load_failure_policy="fail",
         kv_cache_groups=[
             KVCacheGroupSpec(["m"], mamba),
             KVCacheGroupSpec(["full"], FullAttentionSpec(**kw)),

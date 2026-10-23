@@ -254,6 +254,7 @@ def check_multi_group_support(
     block_size: int,
     use_layerwise: bool,
     speculative: bool,
+    inline_recompute: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
@@ -267,6 +268,8 @@ def check_multi_group_support(
         block_size: ``cache_config.block_size``, which the connector uses.
         use_layerwise: ``maru_use_layerwise``.
         speculative: Whether speculative decoding is configured.
+        inline_recompute: Whether ``kv_load_failure_policy`` is
+            ``"recompute"`` while loads run inline (``maru_async_load`` off).
 
     Raises:
         ValueError: With the reason and the setting to change.
@@ -305,6 +308,19 @@ def check_multi_group_support(
         raise ValueError(
             "MaruKVConnector needs every KV cache group to use the block size "
             f"{block_size} (got {group_block_sizes}){one_group_hint(groups)}"
+        )
+    if inline_recompute:
+        # vLLM's V2 model runner does not rewind its device-side state
+        # (vllm-project/vllm#49250); reproduced on vLLM 0.30 without Maru, by
+        # a connector that reports its claimed blocks as failed. vLLM
+        # recomputes a failed parked load correctly.
+        raise ValueError(
+            "MaruKVConnector does not support kv_load_failure_policy="
+            "'recompute' with inline loads for models with several KV cache "
+            "groups: vLLM recomputes a request whose inline KV load failed and "
+            "can return wrong output (vllm-project/vllm#49250). Set "
+            "maru_async_load=true, under which vLLM recomputes a failed load "
+            "correctly, or keep kv_load_failure_policy='fail'"
         )
 
 

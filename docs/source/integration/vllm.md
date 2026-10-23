@@ -480,6 +480,7 @@ The connector refuses to start a model with several groups unless:
 - Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
 - The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
+- `kv_load_failure_policy="recompute"` comes with `maru_async_load=true` (see {ref}`vllm-load-failures`). The default `fail` needs nothing else.
 
 ```bash
 vllm serve Qwen/Qwen3.5-0.8B \
@@ -507,14 +508,15 @@ On B200 or GB200, add `--attention-backend TRITON_ATTN`.
 - **Loads.** `maru_overlap_load_with_compute` is turned off with a warning for any model with several groups: Mamba-type state must be complete before the forward, and per-layer overlap of the attention groups alone is not implemented.
 - **CXL space.** All groups share one pool and one page size, that of the largest (chunk, group) object. A chunk takes one page per attention group, plus one page per Mamba-type group at chunks where a prefill step ended. For gpt-oss-20b that is two 12-layer pages instead of one 24-layer page, so `maru_pool_size` estimates stay about the same. For Qwen3.5-0.8B a step-end chunk takes four pages, because its three Gated DeltaNet groups hold three times the chunk's attention KV; other chunks take one.
 
+(vllm-load-failures)=
 ### Load failures
 
 vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load fails:
 
 - `fail` (vLLM's default) ends the request with an error.
-- `recompute` computes the request again; with several groups vLLM 0.30 restarts it from the first token. With inline loads (`maru_async_load=false`), vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)); the connector warns at startup. With `maru_async_load=true` every load is parked and vLLM recomputes a failed load correctly.
+- `recompute` computes the request again; with several groups vLLM 0.30 restarts it from the first token. With inline loads (`maru_async_load=false`), vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)), so for a model with several groups the connector refuses `recompute` with inline loads at startup. With `maru_async_load=true` every load is parked and vLLM recomputes a failed load correctly.
 
-Use `recompute` together with `maru_async_load=true`, or keep `fail`.
+With several groups, use `recompute` together with `maru_async_load=true`, or keep `fail`.
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. A request whose load fails twice is computed without Maru.
 

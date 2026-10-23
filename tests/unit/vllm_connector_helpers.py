@@ -131,6 +131,7 @@ def make_vllm_scheduler(
     num_speculative_tokens: int = 16,
     max_model_len: int = 512,
     kv_cache_groups: list[Any] | None = None,
+    kv_load_failure_policy: str = "recompute",
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -150,6 +151,8 @@ def make_vllm_scheduler(
         max_model_len: Token limit used by the model and scheduler.
         kv_cache_groups: ``KVCacheGroupSpec`` list replacing the default single
             full-attention group, for models with several groups.
+        kv_load_failure_policy: vLLM's policy for a failed KV load. With
+            several groups and inline loads Maru refuses ``"recompute"``.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -213,7 +216,7 @@ def make_vllm_scheduler(
             kv_connector="MaruKVConnector",
             kv_connector_module_path="maru_vllm",
             kv_role="kv_both",
-            kv_load_failure_policy="recompute",
+            kv_load_failure_policy=kv_load_failure_policy,
             kv_connector_extra_config={
                 "maru_kv_chunk_tokens": kv_chunk_tokens,
                 **(extra_config or {}),

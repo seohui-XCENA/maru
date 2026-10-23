@@ -974,6 +974,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 block_size=self._block_size,
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative=vllm_config.speculative_config is not None,
+                inline_recompute=(
+                    getattr(self._kv_transfer_config, "kv_load_failure_policy", "fail")
+                    == "recompute"
+                    and not _get_knob(extra, "maru_async_load")
+                ),
             )
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
@@ -1003,26 +1008,6 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 kv_groups=self._kv_groups,
             )
             self._worker = None
-            policy = getattr(self._kv_transfer_config, "kv_load_failure_policy", "fail")
-            if (
-                len(self._kv_groups) > 1
-                and policy == "recompute"
-                and not self._scheduler._deferred_loading
-            ):
-                # vLLM's V2 model runner does not rewind its device-side state
-                # (vllm-project/vllm#49250); reproduced on vLLM 0.30 without
-                # Maru, by a connector that reports its claimed blocks as
-                # failed. vLLM recomputes a failed parked load correctly, and
-                # with maru_async_load every load is parked.
-                logger.warning(
-                    "kv_load_failure_policy='recompute' with several KV cache "
-                    "groups: vLLM recomputes a request whose inline KV load "
-                    "failed, and the recomputed request can return wrong "
-                    "output (seen on vLLM 0.30). The default 'fail' ends such "
-                    "a request with an error instead; with "
-                    "maru_async_load=true every load is parked, and vLLM "
-                    "recomputes a failed parked load correctly."
-                )
         elif role == KVConnectorRole.WORKER:
             self._scheduler = None
             # Read here, where vllm_config is in hand: get_current_vllm_config()
