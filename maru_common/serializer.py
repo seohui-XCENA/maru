@@ -75,25 +75,30 @@ def _number_as_float(value: Any) -> Any:
 
 def _to_serializable(obj: Any) -> Any:
     """Convert object to serializable format, handling nested objects with to_dict()."""
-    if hasattr(obj, "to_dict"):
-        return obj.to_dict()
-    elif is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _to_serializable(v) for k, v in asdict(obj).items()}
-    elif isinstance(obj, dict):
+    if obj is None or isinstance(obj, str | bytes | int | float):
+        return obj  # the common case first (enums are str or int)
+    if isinstance(obj, dict):
         return {k: _to_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list | tuple):
+    if isinstance(obj, list | tuple):
         return [_to_serializable(item) for item in obj]
-    else:
-        return obj
+    if hasattr(obj, "to_dict"):
+        return _to_serializable(obj.to_dict())
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {k: _to_serializable(v) for k, v in asdict(obj).items()}
+    return obj
 
 
 def _canonical(obj: Any) -> Any:
     """Plain values with dict keys sorted at every level."""
-    obj = _to_serializable(obj)
+    return _sorted(_to_serializable(obj))
+
+
+def _sorted(obj: Any) -> Any:
+    """Caller converted ``obj`` to plain values (one pass, not per level)."""
     if isinstance(obj, dict):
-        return {k: _canonical(obj[k]) for k in sorted(obj)}
+        return {k: _sorted(obj[k]) for k in sorted(obj)}
     if isinstance(obj, list):
-        return [_canonical(item) for item in obj]
+        return [_sorted(item) for item in obj]
     if isinstance(obj, Enum):
         return obj.value
     return obj

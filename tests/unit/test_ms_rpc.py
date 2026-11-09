@@ -16,7 +16,6 @@ from maru_common.protocol import (
     PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
     MessageType,
-    NodeReregisterRequest,
     RegionRequestRequest,
     StorageRequest,
 )
@@ -118,24 +117,34 @@ def test_malformed_request_is_rejected_with_its_header(served, code, payload):
     assert FakeNode(wire, "n1").open().status == Status.OK
 
 
+def test_resume_and_reregister_round_trip(served):
+    server, wire = served
+    server.ms_service.recovery_ends = time.monotonic() + 30  # in the window
+    node = FakeNode(wire, "n1")
+    opened = node.open(resume=5)
+    assert opened.status == Status.OK and opened.epoch_seq == 5
+    assert opened.recovering  # the default window follows the start
+    k = key("k")
+    response = node.reregister((k, node.loc(node.dram(), 0)), last=True)
+    assert response.status == Status.OK
+    assert [i.result.value for i in response.items] == ["ADDED"]
+    worker = FakeWorker(wire, node)
+    assert worker.open().recovering
+    lookup = worker.lookup(k, key("absent"))
+    assert [i.result.value for i in lookup.items] == ["HIT", "RECOVERING"]
+
+
 def test_stage_boundaries_answer_disabled(served):
     server, wire = served
     node = FakeNode(wire, "n1")
     node.open()
     op = OpRef(node.epoch, 1, b"\0" * 16, 0)
     response = wire.call(
-        MessageType.NODE_REREGISTER,
-        NodeReregisterRequest(**node.envelope(), op=op, items=[], last=False),
-    )
-    assert response.status == Status.DISABLED
-    response = wire.call(
         MessageType.REGION_REQUEST,
         RegionRequestRequest(
             **node.envelope(), op=op, rm_domain="rm1", size=1 << 30, count=1
         ),
     )
-    assert response.status == Status.DISABLED
-    response = node.open(resume=1)
     assert response.status == Status.DISABLED
 
 
@@ -182,6 +191,7 @@ def test_admin_delete_and_its_cli_over_zmq(served, capsys):
     from maru_server import ms_admin
 
     server, wire = served
+    server.ms_service.recovery_ends = 0.0  # past the window: absent is known
     node = FakeNode(wire, "n1")
     node.open()
     loc = node.loc(node.dram(), 1)

@@ -13,7 +13,7 @@ import math
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum, unique
 
@@ -128,6 +128,9 @@ class PoolManager:
         self._waiting: dict[str, tuple[int, float]] = {}
         # When each holder was last asked to return credit
         self._asked: dict[str, float] = {}
+        # (tag, generation): a page given before that generation is
+        # quarantined under tag instead of freed (see hold_frees)
+        self._hold: tuple[str, int] | None = None
         # How many times each transition ran, for tests and metrics
         self.transitions: collections.Counter[tuple[PageState, PageState]] = (
             collections.Counter()
@@ -194,6 +197,18 @@ class PoolManager:
     @property
     def epoch_seq(self) -> int | None:
         return self._epoch_seq
+
+    def hold_frees(self, tag: str | None) -> None:
+        """From now on, a page given before this call that would become FREE
+        is QUARANTINED under ``tag`` instead: who still reads it is not known.
+        Releasing a quarantine is not held. None ends the hold."""
+        with self._lock:
+            if tag is None:
+                self._hold = None
+                return
+            if self._epoch_seq is None:
+                raise InvalidTransitionError("no hold before the epoch_seq")
+            self._hold = (tag, make_generation(self._epoch_seq, self._counter))
 
     def stop_credit(self, reason: str) -> None:
         """No new credit from now on (safe state, exhausted counter)."""
@@ -537,6 +552,32 @@ class PoolManager:
             self._asked.pop(holder, None)
             return out
 
+    def quarantine_credited(
+        self, tag_of: Callable[[str], str], holders: set[str]
+    ) -> dict[str, int]:
+        """CREDITED -> QUARANTINED for each of ``holders``, under
+        ``tag_of(holder)``; returns the page count by holder."""
+        with self._lock:
+            out: dict[str, int] = {}
+            for pool in self._pools.values():
+                for page in pool.pages:
+                    holder = page.holder
+                    if (
+                        page.state != PageState.CREDITED
+                        or holder is None
+                        or holder not in holders
+                    ):
+                        continue
+                    self._move(pool, page, PageState.CREDITED, PageState.QUARANTINED)
+                    self._held[holder] -= pool.page_size
+                    page.holder = None
+                    page.tag = tag_of(holder)
+                    out[holder] = out.get(holder, 0) + 1
+            for holder in out:
+                if self._held[holder] == 0:
+                    del self._held[holder]
+            return out
+
     def release_quarantine(self, tag: str, pool_id: str | None = None) -> int:
         """QUARANTINED -> FREE for pages waiting on ``tag``; returns the count."""
         with self._lock:
@@ -580,6 +621,27 @@ class PoolManager:
                 page.generation = location.generation
                 pool.by_allocation[page.allocation_id] = page.index
                 out.append(PageRef(pool_id, page.index, page.generation))
+            return out
+
+    def drop_ready(self, ref: PageRef) -> None:
+        """READY -> FREE for a page not in the Catalog (held: QUARANTINED)."""
+        with self._lock:
+            pool, page = self._page(ref, PageState.READY)
+            self._to_free(pool, page, PageState.READY)
+
+    def ready_pages(self) -> list[tuple[PageRef, Key, Location]]:
+        """Every READY page with its key and location."""
+        with self._lock:
+            out = []
+            for pool in self._pools.values():
+                for page in pool.pages:
+                    if (
+                        page.state == PageState.READY
+                        and page.key is not None
+                        and page.location is not None
+                    ):
+                        ref = PageRef(pool.info.pool_id, page.index, page.generation)
+                        out.append((ref, page.key, page.location))
             return out
 
     def reserve_transfer(self, pool_id: str, count: int) -> list[PageRef]:
@@ -758,6 +820,16 @@ class PoolManager:
         self.transitions[(src, dst)] += 1
 
     def _to_free(self, pool: _Pool, page: Page, src: PageState) -> None:
+        if (
+            self._hold is not None
+            and src != PageState.QUARANTINED
+            and page.generation < self._hold[1]
+        ):
+            self._move(pool, page, src, PageState.QUARANTINED)
+            page.key = None
+            page.location = None
+            page.tag = self._hold[0]
+            return
         self._move(pool, page, src, PageState.FREE)
         pool.by_allocation.pop(page.allocation_id, None)
         page.key = None

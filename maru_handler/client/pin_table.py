@@ -48,11 +48,16 @@ class PinTable:
             return pin_id in self._pins
 
     def drop_epoch(self, server_epoch: str) -> list[str]:
-        """Ids of pins of an ended server epoch (never unpinned)."""
+        """Drop the pins of an ended server epoch, never to be unpinned;
+        returns their ids. The reads holding them finish on their own."""
         with self._cv:
-            return [
+            dropped = [
                 p.pin_id for p in self._pins.values() if p.server_epoch == server_epoch
             ]
+            for pin_id in dropped:
+                self._pins.pop(pin_id).released = True
+            self._cv.notify_all()
+            return dropped
 
     def outstanding(
         self, *, server_epoch: str | None = None, pool_id: str | None = None

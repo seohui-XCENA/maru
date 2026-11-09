@@ -7,13 +7,17 @@ A record lives from ATTACH until the process exits, or until a DETACH that
 leaves nothing behind. An exit quarantines the worker's credited pages for the
 GPU drain grace and is reported through ``on_exit``. Once every old worker is
 confirmed (exited or drained), the quarantined pages of adopted pools are free.
+After a MaruServer restart, the workers attached then drain the ended server
+epoch (ServerDrain) before its pages are reused.
 """
 
 import dataclasses
+import itertools
 import logging
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TypeVar
 
@@ -93,6 +97,28 @@ class OldWorker:
     how: str = ""
 
 
+# How often the workers an open server drain waits for are logged
+DRAIN_LOG_S = 30.0
+
+
+@dataclass(eq=False)
+class ServerDrain:
+    """One MaruServer restart: the workers attached when it was seen end
+    their accesses of the ended server epoch before its pages are reused."""
+
+    index: int
+    old_epoch: str
+    waiting: set[str]
+    started: float
+    # quarantine tag of each holder's credit given before the restart
+    credit_tags: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def tag(self) -> str:
+        """Quarantine tag of the pages freed while it is open."""
+        return f"restart:{self.index}"
+
+
 def _worker_key(incarnation: str) -> str:
     return f"worker:{incarnation}"
 
@@ -130,6 +156,10 @@ class WorkerRegistry:
         self._adopted_released = False
         self._stopping = False
         self._timers: set[threading.Timer] = set()
+        self._drains: list[ServerDrain] = []  # open, oldest first
+        self._drain_ids = itertools.count(1)
+        self._drain_logged = 0.0
+        self.server_drains_done = 0
 
     def stop(self) -> None:
         """Cancel the grace timers; no new one starts."""
@@ -230,17 +260,29 @@ class WorkerRegistry:
         return rec, ""
 
     def after_attach_reply(self, rec: WorkerRecord) -> None:
-        """Send NOTIFY drain to an old worker that attached again."""
+        """Send NOTIFY drain to an old worker that attached again, and to a
+        worker an open server drain still waits for."""
         with self._lock:
             old = self._old.get(rec.incarnation)
             draining = old is not None and old.state == OldState.DRAINING
             conn = rec.conn
-        if draining and conn is not None:
+            server = [d for d in self._drains if rec.incarnation in d.waiting]
+        if conn is None:
+            return
+        if draining:
             conn.post_notify(
                 Notify(
                     kind=NotifyKind.DRAIN,
                     drain_kind=DrainKind.NODE,
                     epoch=self.previous_node_epoch,
+                )
+            )
+        for drain in server:  # oldest first: each epoch it may still read
+            conn.post_notify(
+                Notify(
+                    kind=NotifyKind.DRAIN,
+                    drain_kind=DrainKind.SERVER,
+                    epoch=drain.old_epoch,
                 )
             )
 
@@ -292,7 +334,11 @@ class WorkerRegistry:
             # watcher nor the ledger calls back while holding its own lock
             self._watcher.unwatch(_worker_key(incarnation))
             self._ledger.drop(incarnation)
+            # a worker detaches only once it reads and writes nothing
+            tags = self._confirm_server_drain(incarnation, None)
         logger.info("worker %s detached and is forgotten", incarnation)
+        self._release(tags)
+        self._finish_server_drains()
 
     def get(self, incarnation: str) -> WorkerRecord | None:
         with self._lock:
@@ -333,9 +379,11 @@ class WorkerRegistry:
                 return
             rec.exited = True
             conn, rec.conn = rec.conn, None
+            # Under the lock a server drain starts with: its credit is never
+            # tagged as a live worker's
+            refs = self._pools.quarantine_holder(incarnation)
         if conn is not None:
             conn.close()
-        refs = self._pools.quarantine_holder(incarnation)
         logger.info(
             "worker %s (pid %d) ended: %d credited pages quarantined for %.1f s",
             incarnation,
@@ -344,15 +392,20 @@ class WorkerRegistry:
             self.gpu_drain_grace_s,
         )
         self._on_exit(rec.ref())
-        self._after(self.gpu_drain_grace_s, self._grace_over, incarnation)
+        with self._lock:
+            # its credit quarantined at a server restart waits the grace too
+            server_tags = self._confirm_server_drain(incarnation, None)
+        self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, server_tags)
         self._ledger.drop(incarnation)
         with self._lock:
             old = self._old.get(incarnation)
         if old is not None:
             self._confirm_old(old, "exited")
+        self._finish_server_drains()
 
-    def _grace_over(self, incarnation: str) -> None:
+    def _grace_over(self, incarnation: str, tags: list[str]) -> None:
         freed = self._pools.release_quarantine(holder_tag(incarnation))
+        freed += self._release(tags)
         if freed:
             logger.info("freed %d pages of ended worker %s", freed, incarnation)
 
@@ -395,7 +448,9 @@ class WorkerRegistry:
         self._maybe_release_adopted()
 
     def drain_ack(self, rec: WorkerRecord, req: DrainAckRequest) -> DrainAckResponse:
-        if req.kind == DrainKind.NODE:
+        if req.kind == DrainKind.SERVER:
+            self._server_drain_ack(rec.incarnation, req.epoch)
+        elif req.kind == DrainKind.NODE:
             if req.epoch == self.node_epoch:
                 return DrainAckResponse(
                     status=Status.REJECTED, error="the current node epoch has not ended"
@@ -407,6 +462,152 @@ class WorkerRegistry:
             if old is not None:
                 self._confirm_old(old, f"drained node epoch {req.epoch}")
         return DrainAckResponse(status=Status.OK)
+
+    # --------------------------------------------------- MaruServer restart
+
+    def start_server_drain(self, old_epoch: str) -> ServerDrain | None:
+        """MaruServer lost the session of ``old_epoch``: quarantine the credit
+        given so far, hold back frees of the pages given so far, and ask every
+        attached worker to drain. None if that epoch is drained already."""
+        with self._lock:
+            if self._stopping or any(d.old_epoch == old_epoch for d in self._drains):
+                return None
+            index = next(self._drain_ids)
+            # attached workers, and old workers of the run before that have
+            # not attached again if a pool was kept (they may read it; the
+            # old run's DRAM is never reused)
+            waiting = {r.incarnation for r in self._workers.values() if not r.exited}
+            if self._adopted:
+                waiting |= {
+                    i for i, o in self._old.items() if o.state == OldState.WAITING
+                }
+            drain = ServerDrain(
+                index=index,
+                old_epoch=old_epoch,
+                waiting=waiting,
+                started=time.monotonic(),
+            )
+            self._pools.hold_frees(drain.tag)
+            # Under the lock CREDIT takes too: credit given after this
+            # belongs to the new server epoch. An ended worker's credit waits
+            # its exit grace instead
+            live = {r.incarnation for r in self._workers.values() if not r.exited}
+            counts = self._pools.quarantine_credited(
+                lambda holder: f"server:{index}:{holder}", live
+            )
+            drain.credit_tags = {h: f"server:{index}:{h}" for h in counts}
+            self._drains.append(drain)
+            conns = [
+                r.conn
+                for r in self._workers.values()
+                if r.incarnation in drain.waiting and r.conn is not None
+            ]
+        notify = Notify(
+            kind=NotifyKind.DRAIN, drain_kind=DrainKind.SERVER, epoch=old_epoch
+        )
+        for conn in conns:
+            conn.post_notify(notify)
+        logger.warning(
+            "MaruServer epoch %s ended: %d credited pages quarantined; eviction "
+            "and space reclaim wait for %d workers to drain it",
+            old_epoch,
+            sum(counts.values()),
+            len(drain.waiting),
+        )
+        self._finish_server_drains()
+        return drain
+
+    def notify_all(self, notify: Notify) -> None:
+        """Post ``notify`` to every attached worker and probe."""
+        with self._lock:
+            records = [*self._workers.values(), *self._probes.values()]
+            conns = [r.conn for r in records if r.conn is not None]
+        for conn in conns:
+            conn.post_notify(notify)
+
+    def server_drain_open(self) -> bool:
+        with self._lock:
+            return bool(self._drains)
+
+    def server_drain_pending(self) -> dict[str, list[str]]:
+        """Workers the open server drains wait for, with the ended epochs."""
+        with self._lock:
+            out: dict[str, list[str]] = {}
+            for drain in self._drains:
+                for incarnation in sorted(drain.waiting):
+                    out.setdefault(incarnation, []).append(drain.old_epoch)
+            return out
+
+    def log_server_drain(self) -> None:
+        """Name the workers an open drain waits for, every DRAIN_LOG_S."""
+        now = time.monotonic()
+        with self._lock:
+            if not self._drains or now - self._drain_logged < DRAIN_LOG_S:
+                return
+            self._drain_logged = now
+            oldest = self._drains[0]
+        logger.warning(
+            "eviction and space reclaim paused for %.0f s after MaruServer epoch "
+            "%s ended: waiting for DRAIN_ACK or the exit of %s",
+            now - oldest.started,
+            oldest.old_epoch,
+            sorted(self.server_drain_pending()),
+        )
+
+    def _server_drain_ack(self, incarnation: str, epoch: str) -> None:
+        with self._lock:
+            upto = next((d.index for d in self._drains if d.old_epoch == epoch), None)
+            if upto is None:
+                return  # unknown, or that drain is over
+            tags = self._confirm_server_drain(incarnation, upto)
+        logger.info("worker %s drained server epoch %s", incarnation, epoch)
+        self._release(tags)
+        self._finish_server_drains()
+
+    def _confirm_server_drain(self, incarnation: str, upto: int | None) -> list[str]:
+        """Caller holds the lock. ``incarnation`` ended its accesses of the
+        open drains up to index ``upto`` (all if None); returns the tags of
+        its quarantined credit."""
+        tags = []
+        for drain in self._drains:
+            if upto is not None and drain.index > upto:
+                continue
+            drain.waiting.discard(incarnation)
+            tag = drain.credit_tags.pop(incarnation, None)
+            if tag is not None:
+                tags.append(tag)
+        return tags
+
+    def _finish_server_drains(self) -> None:
+        """End the drains no worker is left in. The provisional rule lives
+        here: a worker counts only once it sent DRAIN_ACK, exited or
+        detached, never by time, so one that stays silent keeps eviction and
+        space reclaim paused (a time limit would go here). A later drain that
+        ends ends the earlier ones: its workers include theirs, and a
+        DRAIN_ACK covers earlier epochs."""
+        with self._lock:
+            upto = max((d.index for d in self._drains if not d.waiting), default=None)
+            if upto is None:
+                return
+            done = [d for d in self._drains if d.index <= upto]
+            self._drains = [d for d in self._drains if d.index > upto]
+            if not self._drains:
+                self._pools.hold_frees(None)
+            self.server_drains_done += len(done)
+            tags = [t for d in done for t in d.credit_tags.values()]
+            tags += [d.tag for d in done]
+        freed = self._release(tags)
+        for drain in done:
+            logger.info(
+                "MaruServer epoch %s drained in %.1f s",
+                drain.old_epoch,
+                time.monotonic() - drain.started,
+            )
+        if freed:
+            logger.info("%d pages held since the MaruServer restart are free", freed)
+
+    def _release(self, tags: list[str]) -> int:
+        return sum(self._pools.release_quarantine(tag) for tag in tags)
 
     def old_workers(self) -> dict[str, OldWorker]:
         with self._lock:
@@ -424,6 +625,10 @@ class WorkerRegistry:
                 return
         self._on_exit(old.ref)
         self._confirm_old(old, "exited")
+        with self._lock:
+            tags = self._confirm_server_drain(incarnation, None)
+        self._release(tags)
+        self._finish_server_drains()
 
     def _confirm_old(self, old: OldWorker, how: str) -> None:
         with self._lock:

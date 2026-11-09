@@ -12,6 +12,9 @@ from maru_common.protocol import (
     CommitItem,
     CommitResponse,
     NodeHeartbeatResponse,
+    NodeOpenResponse,
+    NodeReregisterResponse,
+    ReregisterItem,
     RetireResponse,
     WorkerExitResponse,
 )
@@ -26,6 +29,15 @@ class EpochChanged(Exception):  # noqa: N818 - a state, not a failure
     """MaruServer answered EPOCH: the node session is gone."""
 
 
+class StaleOp(Exception):  # noqa: N818 - a state, not a failure
+    """The op was for a MaruServer run that ended; the session went on at a
+    newer one, which never gets it. Send it again as a new op."""
+
+
+class NodeOpenError(RuntimeError):
+    """MaruServer refused NODE_OPEN."""
+
+
 class ReplyError(RuntimeError):
     """MaruServer answered OK with the wrong number of items; the op is resolved."""
 
@@ -33,7 +45,20 @@ class ReplyError(RuntimeError):
 class MetadataPort(Protocol):
     """The node session with MaruServer. Each op is resent until its result is
     known (OK, REJECTED or DISABLED); EpochChanged, ServerStopped and
-    ReplyError end it otherwise."""
+    ReplyError end it otherwise. After EpochChanged no op is sent until
+    resume() succeeds."""
+
+    # server_epoch of the session, and the one found after losing it; when
+    # the session was last confirmed (monotonic)
+    server_epoch: str | None
+    new_server_epoch: str | None
+    session_ttl_s: float
+    last_heartbeat_ok: float
+
+    @property
+    def epoch_lost(self) -> bool:
+        """MaruServer no longer knows the session."""
+        ...
 
     def start_heartbeat(
         self,
@@ -49,6 +74,14 @@ class MetadataPort(Protocol):
     def worker_exit(
         self, workers: list[WorkerRef], cause: ExitCause
     ) -> WorkerExitResponse: ...
+
+    def resume(self) -> NodeOpenResponse:
+        """Reopen the session of this run at a restarted MaruServer."""
+        ...
+
+    def reregister(
+        self, items: list[ReregisterItem], last: bool
+    ) -> NodeReregisterResponse: ...
 
     def stop(self) -> None:
         """Give up unresolved ops and stop the heartbeat."""

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """CreditCache: unused credit, taken without an RPC. Credit of an
-ended StorageService run is dropped, never written."""
+ended StorageService run is dropped, never written; so is credit given before
+a MaruServer restart (a new era), which the node quarantined."""
 
 import collections
 import threading
@@ -19,6 +20,7 @@ class CreditCache:
         self._bytes: int = 0
         self._closed = False
         self.node_epoch: str | None = None
+        self.era = 0
 
     def reset(self, node_epoch: str) -> list[Location]:
         """Start holding credit of ``node_epoch``; returns what was dropped."""
@@ -30,11 +32,24 @@ class CreditCache:
             self.node_epoch = node_epoch
             return dropped
 
-    def put(self, credits: list[Location], node_epoch: str) -> bool:
-        """Add credit received from ``node_epoch``; refused for another run.
-        A page already held is not added twice."""
+    def new_era(self) -> list[Location]:
+        """Drop the credit held and refuse credit asked for before now;
+        returns what was dropped."""
         with self._lock:
-            if node_epoch != self.node_epoch:
+            dropped = list(self._credits)
+            self._credits.clear()
+            self._bytes = 0
+            self.era += 1
+            return dropped
+
+    def put(
+        self, credits: list[Location], node_epoch: str, era: int | None = None
+    ) -> bool:
+        """Add credit received from ``node_epoch``, asked for in ``era`` (now
+        if None); refused for another run or era. A page already held is not
+        added twice."""
+        with self._lock:
+            if node_epoch != self.node_epoch or (era is not None and era != self.era):
                 return False
             held = {_page(c) for c in self._credits}
             for credit in credits:
@@ -45,8 +60,8 @@ class CreditCache:
             self._added.notify_all()
             return True
 
-    def take(self, wait_s: float = 0.0) -> tuple[Location, str] | None:
-        """One unused credit and the node epoch it belongs to, waiting up to
+    def take(self, wait_s: float = 0.0) -> tuple[Location, str, int] | None:
+        """One unused credit with its node epoch and era, waiting up to
         ``wait_s`` for some to come (not once closed)."""
         deadline = time.monotonic() + wait_s
         with self._lock:
@@ -57,7 +72,7 @@ class CreditCache:
                 self._added.wait(remaining)
             credit = self._credits.popleft()
             self._bytes -= credit.length
-            return credit, self.node_epoch
+            return credit, self.node_epoch, self.era
 
     def take_bytes(self, nbytes: int) -> list[Location]:
         """Unused credit worth up to ``nbytes``, for CREDIT_RETURN."""

@@ -4,6 +4,7 @@
 
 import argparse
 import logging
+import math
 import signal
 from threading import RLock
 
@@ -14,6 +15,7 @@ from .allocation_manager import AllocationManager
 from .kv_manager import DeleteResult, KVManager
 from .ms_service import (
     DEFAULT_NODE_GIVE_UP_S,
+    DEFAULT_RECOVERY_WINDOW_S,
     DEFAULT_SESSION_TTL_S,
     MsService,
     PolicyError,
@@ -49,6 +51,7 @@ class MaruServer:
         op_window: int = DEFAULT_OP_WINDOW,
         op_bytes_max: int = DEFAULT_OP_BYTES_MAX,
         policy_file: str | None = None,
+        recovery_window_s: float = DEFAULT_RECOVERY_WINDOW_S,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
         # Remote CXL agents of the pool's memory nodes, handed to remote CXL workers in
@@ -80,6 +83,7 @@ class MaruServer:
             op_window=op_window,
             op_bytes_max=op_bytes_max,
             policy_file=policy_file,
+            recovery_window_s=recovery_window_s,
         )
         self._region_keeper = None
         if enable_cxl and self._remote_cxl_agents:
@@ -648,6 +652,16 @@ def main() -> None:
             '"key": "k"}]}; reloaded when it changes'
         ),
     )
+    parser.add_argument(
+        "--recovery-window-s",
+        type=float,
+        default=DEFAULT_RECOVERY_WINDOW_S,
+        help=(
+            "Seconds after the start in which keys not re-registered by the "
+            "nodes yet answer RECOVERING instead of MISS "
+            f"(default: {DEFAULT_RECOVERY_WINDOW_S:g})"
+        ),
+    )
     args = parser.parse_args()
     if args.policy_file is not None:
         try:
@@ -669,6 +683,8 @@ def main() -> None:
         parser.error("--node-give-up-s must be positive")
     if args.op_window < 1:
         parser.error("--op-window must be at least 1")
+    if not (math.isfinite(args.recovery_window_s) and args.recovery_window_s >= 0):
+        parser.error("--recovery-window-s must be finite and not negative")
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
     remote_cxl_agents = [
@@ -702,6 +718,7 @@ def main() -> None:
         op_window=args.op_window,
         op_bytes_max=args.op_bytes_max,
         policy_file=args.policy_file,
+        recovery_window_s=args.recovery_window_s,
     )
     rpc_server = RpcAsyncServer(
         server, host=args.host, port=args.port, num_workers=args.workers

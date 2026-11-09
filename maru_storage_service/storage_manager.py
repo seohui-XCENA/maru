@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """StorageManager: credit, WRITE_DONE -> COMMIT, removal (eviction, RETIRE and
-central deletes) and WORKER_EXIT reports, each in the order it needs.
+central deletes), WORKER_EXIT reports and the recovery after a MaruServer
+restart, each in the order it needs.
 
 Worker records live in a WorkerRegistry, op results in an OpLedger; MaruServer
 is reached through a MetadataPort.
@@ -28,7 +29,7 @@ from maru_common.node_protocol import (
     WriteDoneRequest,
     WriteDoneResponse,
 )
-from maru_common.protocol import CommitItem, NodeHeartbeatResponse
+from maru_common.protocol import CommitItem, NodeHeartbeatResponse, ReregisterItem
 from maru_common.serializer import DecodedRequest, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
@@ -55,9 +56,11 @@ from .pool_manager import InvalidTransitionError, PageRef, PageState, PoolManage
 from .ports import (
     EpochChanged,
     MetadataPort,
+    NodeOpenError,
     ProcessWatcher,
     ReplyError,
     ServerStopped,
+    StaleOp,
     WorkerEndpoint,
 )
 from .worker_registry import WorkerRecord, WorkerRegistry
@@ -72,6 +75,7 @@ DEFAULT_EVICT_INTERVAL_S = 0.05
 COMMIT_LINGER_S = 0.002
 EXIT_RETRY_S = 0.5
 EXIT_RETRY_MAX_S = 30.0
+RECOVERY_RETRY_S = 1.0
 
 
 @dataclass(eq=False)
@@ -104,6 +108,7 @@ class StorageManager:
         evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
         op_window: int = OP_WINDOW,
     ):
+        self.node_epoch = node_epoch
         self.pools = pool_manager
         self.placement = placement
         self.local_pins = local_pins
@@ -133,6 +138,25 @@ class StorageManager:
         self._blocks: dict[str, set[PageRef]] = {}
         self._evict_wake = threading.Event()
         self._safe: str | None = None
+        # MaruServer lost the node session: no COMMIT, RETIRE or WORKER_EXIT
+        # until it is resumed and every READY page is re-registered
+        self._recovering = False
+        self._recovery_wake = threading.Event()
+        # a COMMIT, RETIRE or WORKER_EXIT is out, or its result is applied
+        self._commit_busy = False
+        self._evict_busy = False
+        self._exit_busy = False
+        self.recoveries = 0
+        self.last_reregistration: dict | None = None
+        # The server epoch whose Catalog has every READY page (the first
+        # open's, then each completed re-registration's), and the one whose
+        # pages were sorted for re-registration (a retry re-sends them all)
+        self._complete_at: str | None = None
+        self._sorted_for: str | None = None
+        # Pages held because their RETIRE result is unknown; how many were
+        # still held after a resume that kept the Catalog
+        self._retire_unknown: set[PageRef] = set()
+        self.held_after_resume = 0
         self._stopping = False
         self._threads: list[threading.Thread] = []
         self._unmapped: set[tuple[str, str, int]] = set()
@@ -142,20 +166,23 @@ class StorageManager:
     # ------------------------------------------------------------- lifecycle
 
     def start(self) -> None:
+        """After the session opened: its Catalog has every page so far."""
+        self._complete_at = self.metadata.server_epoch
         self.watcher.start(self.workers.on_process_exit)
         for target, name in (
             (self._commit_loop, "maru-commit"),
             (self._evict_loop, "maru-evict"),
             (self._exit_loop, "maru-worker-exit"),
+            (self._recovery_loop, "maru-recovery"),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
 
     def start_heartbeat(self) -> None:
-        """Report pool usage and act on each reply; EPOCH enters the safe state."""
+        """Report pool usage and act on each reply; a lost session recovers."""
         self.metadata.start_heartbeat(
-            self.pools.usage, self.on_heartbeat, self.enter_safe_state
+            self.pools.usage, self.on_heartbeat, self.server_lost
         )
 
     def stop(self) -> None:
@@ -165,6 +192,7 @@ class StorageManager:
             self._cv.notify_all()
         self.workers.stop()
         self._evict_wake.set()
+        self._recovery_wake.set()
         self.metadata.stop()
         for thread in self._threads:
             thread.join(timeout=10.0)
@@ -177,8 +205,8 @@ class StorageManager:
         return self._safe
 
     def enter_safe_state(self, reason: str) -> None:
-        """No new credit, no eviction, no page reused; leaving it needs
-        re-registration, which is not supported yet."""
+        """No new credit, no eviction, no page reused, until the
+        StorageService restarts: MaruServer will not take this run back."""
         with self._cv:
             if self._safe is not None:
                 return
@@ -189,6 +217,262 @@ class StorageManager:
             "safe state (%s): no credit, no eviction until the StorageService restarts",
             reason,
         )
+
+    @property
+    def recovering(self) -> bool:
+        """The node session is lost or its locations are being re-registered."""
+        return self._recovering
+
+    def server_lost(self, reason: str) -> None:
+        """MaruServer no longer knows the node session (not an expiry it
+        renewed): resume it and re-register."""
+        with self._cv:
+            if self._safe is not None or self._stopping:
+                return
+            if not self._recovering:
+                self._recovering = True
+                logger.warning("node session lost (%s): recovering", reason)
+            self._cv.notify_all()
+        self._recovery_wake.set()
+
+    def local_pins_open(self) -> bool:
+        """Whether a new local pin may be given (none is while local pins are
+        off): never while recovering, nor once MaruServer has not confirmed
+        the session for node_stale_s (half the session TTL)."""
+        if self._safe is not None or self._recovering or self.metadata.epoch_lost:
+            return False
+        last = self.metadata.last_heartbeat_ok
+        stale_s = self.metadata.session_ttl_s / 2
+        return last > 0 and time.monotonic() - last < stale_s
+
+    def stats(self) -> dict:
+        with self._lock:
+            pending = len(self._tickets)
+            retire = dict(self.retire_results)
+        return {
+            "safe_state": self._safe,
+            "recovering": self._recovering,
+            "recoveries": self.recoveries,
+            "last_reregistration": self.last_reregistration,
+            "held_after_resume": self.held_after_resume,
+            "server_drain_waiting": self.workers.server_drain_pending(),
+            "pending_commits": pending,
+            "retire_results": retire,
+        }
+
+    # -------------------------------------------------------------- recovery
+
+    def _recovery_loop(self) -> None:
+        while True:
+            self._recovery_wake.wait()
+            self._recovery_wake.clear()
+            with self._cv:
+                if self._stopping:
+                    return
+                if self._safe is not None or not self._recovering:
+                    continue
+            try:
+                self._recover()
+            except ServerStopped:
+                return
+            except (EpochChanged, StaleOp) as e:
+                # restarted again meanwhile: start over with the new epoch
+                logger.warning("MaruServer lost the session again (%s)", e)
+                self._recovery_wake.set()
+            except NodeOpenError as e:
+                self.enter_safe_state(f"MaruServer does not resume this run: {e}")
+            except Exception:
+                logger.exception("recovery failed; trying again")
+                with self._cv:
+                    self._cv.wait(RECOVERY_RETRY_S)
+                self._recovery_wake.set()
+
+    def _recover(self) -> None:
+        """Drain the ended server epoch, resume the session, re-register the
+        READY pages; COMMIT, RETIRE and WORKER_EXIT go on after that, and
+        eviction once the drain is over."""
+        old_epoch = self.metadata.server_epoch
+        new_epoch = self.metadata.new_server_epoch
+        draining = False
+        if old_epoch is not None and new_epoch not in (None, old_epoch):
+            # Not when only the session was refused: the epoch goes on
+            self.workers.start_server_drain(old_epoch)
+            draining = True
+        with self._cv:
+            # A result applied after the snapshot below could leave a
+            # location out of step with the ledger, and an op of the ended
+            # epoch must be resolved before the session moves on
+            self._cv.wait_for(
+                lambda: (
+                    self._stopping
+                    or not (self._commit_busy or self._evict_busy or self._exit_busy)
+                )
+            )
+            if self._stopping:
+                raise ServerStopped("stopping")
+            deleted = set(self._central)  # blocked by the ended run
+        started = time.monotonic()
+        opened = self.metadata.resume()
+        epoch = opened.server_epoch
+        if epoch == self._complete_at:
+            # A MaruServer whose Catalog has every page took the session back
+            self._kept_catalog(epoch)
+            return
+        if epoch != old_epoch and not draining and old_epoch is not None:
+            # A restart seen only now (between a HANDSHAKE and its open)
+            self.workers.start_server_drain(old_epoch)
+        self.workers.notify_all(
+            Notify(
+                kind=NotifyKind.EPOCH,
+                node_epoch=self.node_epoch,
+                server_epoch=opened.server_epoch,
+            )
+        )
+        # Pages of the lost Catalog era are sorted once per server epoch; a
+        # retry after a failure part way sends every READY page again
+        first = self._sorted_for != epoch
+        sent, added = self._reregister(epoch, deleted if first else None)
+        self._complete_at = epoch
+        seconds = time.monotonic() - started
+        self._recovered(
+            opened.server_epoch,
+            {
+                "server_epoch": opened.server_epoch,
+                "locations": sent,
+                "added": added,
+                "seconds": seconds,
+            },
+        )
+        logger.warning(
+            "re-registered %d of %d READY pages with MaruServer epoch %s in "
+            "%.3f s; commits go on, eviction once the old epoch is drained",
+            added,
+            sent,
+            opened.server_epoch,
+            seconds,
+        )
+
+    def _kept_catalog(self, server_epoch: str) -> None:
+        """Resumed where nothing was lost. Pages held for an unknown RETIRE
+        stay held (never offered again): they are counted and logged."""
+        with self._lock:
+            unknown = list(self._retire_unknown)
+        held = 0
+        for ref in unknown:
+            page = self.pools.page(ref)
+            if page is not None and page.state == PageState.READY:
+                held += self.placement.is_held(ref)
+            else:
+                with self._lock:
+                    self._retire_unknown.discard(ref)  # left the ledger
+        self.held_after_resume = held
+        if held:
+            logger.warning(
+                "session resumed at MaruServer epoch %s with its Catalog; %d "
+                "READY pages held for an unknown RETIRE stay held",
+                server_epoch,
+                held,
+            )
+        self._recovered(server_epoch, None)
+
+    def _recovered(self, server_epoch: str, reregistration: dict | None) -> None:
+        """Requests go to MaruServer again, unless the session was lost
+        again meanwhile (then the recovery runs again)."""
+        with self._cv:
+            self.recoveries += 1
+            if reregistration is not None:
+                self.last_reregistration = reregistration
+            # A loss signalled before this point is seen here; one after it
+            # finds _recovering False and sets it again
+            again = self.metadata.epoch_lost
+            self._recovering = again
+            self._cv.notify_all()
+        if again:
+            logger.warning("the session was lost again during the recovery")
+            self._recovery_wake.set()
+        else:
+            logger.info("node session back at MaruServer epoch %s", server_epoch)
+        self._evict_wake.set()
+
+    def _reregister(self, epoch: str, deleted: set[PageRef] | None) -> tuple[int, int]:
+        """Send the READY pages again in batches, the last one marked; a page
+        MaruServer does not take is dropped. With ``deleted`` (the first try
+        at a new server epoch) a page the ended run was deleting and one
+        whose RETIRE result is unknown are dropped first; a retry sends every
+        READY page (those taken already come back ADDED). Returns (sent,
+        added)."""
+        if deleted is not None:
+            with self._lock:
+                self._blocks.clear()  # the block requests went with the server
+        pages: list[tuple[PageRef, ReregisterItem]] = []
+        for ref, key, location in self.pools.ready_pages():
+            if deleted is not None and (ref in deleted or self.placement.is_held(ref)):
+                self._drop_page(ref)
+            else:
+                pages.append((ref, ReregisterItem(key, location, location.length)))
+        # Sorted: from the first batch on, MaruServer may list what is sent
+        self._sorted_for = epoch
+        added = 0
+        for start in range(0, max(len(pages), 1), MAX_BATCH):
+            batch = pages[start : start + MAX_BATCH]
+            last = start + MAX_BATCH >= len(pages)
+            try:
+                response = self.metadata.reregister([i for _, i in batch], last)
+            except ReplyError:
+                for ref, _ in batch:  # unknown whether added: settle later
+                    self._settle_page(ref)
+                continue
+            if response.status != Status.OK:
+                logger.error(
+                    "NODE_REREGISTER refused as a whole: %s %s; %d pages dropped",
+                    response.status,
+                    response.error,
+                    len(batch),
+                )
+                for ref, _ in batch:
+                    self._drop_page(ref)
+                continue
+            for (ref, _), outcome in zip(batch, response.items, strict=True):
+                if outcome.result == ItemResult.ADDED:
+                    added += 1
+                    self._readded(ref)
+                else:
+                    self._drop_page(ref)
+        return len(pages), added
+
+    def _readded(self, ref: PageRef) -> None:
+        """MaruServer took the page again. One that was settling is an
+        ordinary READY page now; a delete that came meanwhile stays."""
+        with self._lock:
+            settling = ref in self._settle
+            self._settle.discard(ref)
+            deleting = ref in self._central
+            if settling and not deleting:
+                self._retire_queue.pop(ref, None)
+        if settling and not deleting:
+            self.local_pins.unblock([ref])
+            self.placement.on_ready(ref)
+
+    def _drop_page(self, ref: PageRef) -> None:
+        """A READY page not in the Catalog leaves the ledger (it is held back
+        from reuse until the server drain is over)."""
+        try:
+            self.pools.drop_ready(ref)
+        except InvalidTransitionError as e:
+            logger.error("dropping page %s: %s", ref, e)
+            return
+        self.placement.on_gone(ref)
+        self._forget_queued(ref)
+        self.local_pins.forget(ref)
+        with self._lock:
+            self._retire_unknown.discard(ref)
+
+    def _settle_page(self, ref: PageRef) -> None:
+        """A READY page that may or may not be in the Catalog: a RETIRE
+        tells (RETIRED frees it, PINNED proves it there)."""
+        with self._lock:
+            self._settle.add(ref)
+            self._retire_queue[ref] = 0.0
 
     # -------------------------------------------------------------- requests
 
@@ -450,10 +734,14 @@ class StorageManager:
 
     # ---------------------------------------------------------------- commit
 
+    def _paused(self) -> bool:
+        """Caller holds the lock: nothing goes to MaruServer now."""
+        return self._safe is not None or self._recovering
+
     def _commit_loop(self) -> None:
         while True:
             with self._cv:
-                while not self._stopping and (not self._tickets or self._safe):
+                while not self._stopping and (not self._tickets or self._paused()):
                     self._cv.wait()
                 if self._stopping:
                     return
@@ -461,34 +749,51 @@ class StorageManager:
                     self._cv.wait(COMMIT_LINGER_S)
                     if self._stopping:
                         return
+                    if self._paused():
+                        continue
                 batch = [
                     self._tickets.popleft()
                     for _ in range(min(MAX_BATCH, len(self._tickets)))
                 ]
-            if not batch:
-                continue
+                self._commit_busy = bool(batch)
             try:
-                response = self.metadata.commit([t.item for t in batch])
-            except EpochChanged as e:
+                if batch:
+                    self._commit_batch(batch)
+            finally:
                 with self._cv:
-                    self._tickets.extendleft(reversed(batch))
-                self.enter_safe_state(f"MaruServer answered EPOCH to COMMIT ({e})")
-                continue
-            except ServerStopped:
-                with self._cv:
-                    self._tickets.extendleft(reversed(batch))
+                    self._commit_busy = False
+                    self._cv.notify_all()
+            if self._stopping:
                 return
-            except ReplyError:
-                # It ran, but the results are unusable: settle each page
-                self._apply_commit(batch, None)
-                continue
-            except Exception:
-                logger.exception("COMMIT failed; the pages stay PENDING")
-                with self._cv:
-                    self._tickets.extendleft(reversed(batch))
-                time.sleep(0.1)
-                continue
-            self._apply_commit(batch, response)
+
+    def _commit_batch(self, batch: list[_Ticket]) -> None:
+        try:
+            response = self.metadata.commit([t.item for t in batch])
+        except EpochChanged as e:
+            # Sent again with a new op once re-registered
+            with self._cv:
+                self._tickets.extendleft(reversed(batch))
+            self.server_lost(f"MaruServer answered EPOCH to COMMIT ({e})")
+            return
+        except StaleOp:
+            with self._cv:
+                self._tickets.extendleft(reversed(batch))
+            return
+        except ServerStopped:
+            with self._cv:
+                self._tickets.extendleft(reversed(batch))
+            return
+        except ReplyError:
+            # It ran, but the results are unusable: settle each page
+            self._apply_commit(batch, None)
+            return
+        except Exception:
+            logger.exception("COMMIT failed; the pages stay PENDING")
+            with self._cv:
+                self._tickets.extendleft(reversed(batch))
+            time.sleep(0.1)
+            return
+        self._apply_commit(batch, response)
 
     def _apply_commit(self, batch: list[_Ticket], response) -> None:
         outcomes: list[ItemOutcome | None]
@@ -551,19 +856,29 @@ class StorageManager:
         while True:
             self._evict_wake.wait(self.evict_interval_s)
             self._evict_wake.clear()
-            with self._lock:
+            draining = self.workers.server_drain_open()
+            with self._cv:
                 if self._stopping:
                     return
-                safe = self._safe is not None
+                # After a MaruServer restart nothing is removed until every
+                # worker drained the ended epoch (see WorkerRegistry)
+                run = not (self._paused() or draining)
+                self._evict_busy = run
             try:
                 self._reclaim_retiring()
-                if not safe:
+                if run:
                     self._retire_queued()
                     self._evict_once()
+                elif draining:
+                    self.workers.log_server_drain()
             except ServerStopped:
                 return
             except Exception:
                 logger.exception("eviction pass failed")
+            finally:
+                with self._cv:
+                    self._evict_busy = False
+                    self._cv.notify_all()
 
     def _evict_once(self) -> None:
         for pool_id in self.pools.pool_ids():
@@ -618,23 +933,36 @@ class StorageManager:
 
     def retire(self, refs: list[PageRef], items: list[KeyLocation]) -> None:
         """Block local pins, RETIRE, act on each result."""
+        with self._lock:
+            paused = self._paused()
+        lost = self.metadata.epoch_lost
+        if paused or lost:
+            self._retire_failed(refs)  # not sent: offered again later
+            if lost:
+                self.server_lost("the node session is lost")
+            return
         self.local_pins.block(refs)
         try:
             response = self.metadata.retire(items)
         except EpochChanged as e:
-            # Unknown: the pages stay READY with their local pins blocked
-            self._hold(refs)
-            self.enter_safe_state(f"MaruServer answered EPOCH to RETIRE ({e})")
+            # Unknown: the pages stay READY with their local pins blocked,
+            # and are not re-registered
+            self._hold_unknown(refs)
+            self.server_lost(f"MaruServer answered EPOCH to RETIRE ({e})")
+            return
+        except StaleOp:
+            # never reached the MaruServer the session is at now
+            self._retire_failed(refs)
             return
         except ServerStopped:
-            self._hold(refs)
+            self._hold_unknown(refs)
             raise
         except ReplyError:
             self._retire_failed(refs)
             return
         except Exception:
             logger.exception("RETIRE failed")
-            self._hold(refs)
+            self._hold_unknown(refs)
             return
         if response.status != Status.OK:
             logger.error(
@@ -725,6 +1053,12 @@ class StorageManager:
         others = [r for r in refs if r not in queued]
         self.local_pins.unblock(others)
         self.placement.release(others)
+
+    def _hold_unknown(self, refs: list[PageRef]) -> None:
+        """Held: their RETIRE result is unknown."""
+        self._hold(refs)
+        with self._lock:
+            self._retire_unknown.update(refs)
 
     def _hold(self, refs: list[PageRef]) -> None:
         for ref in refs:
@@ -818,7 +1152,7 @@ class StorageManager:
         pause = EXIT_RETRY_S
         while True:
             with self._cv:
-                while not self._stopping and (not self._exits or self._safe):
+                while not self._stopping and (not self._exits or self._paused()):
                     self._cv.wait()
                 if self._stopping:
                     return
@@ -826,6 +1160,7 @@ class StorageManager:
                     self._exits.popleft()
                     for _ in range(min(MAX_BATCH, len(self._exits)))
                 ]
+                self._exit_busy = True
             try:
                 response = self.metadata.worker_exit(batch, ExitCause.EXIT)
                 ok = response.status == Status.OK
@@ -835,16 +1170,24 @@ class StorageManager:
                         response.status,
                         response.error,
                     )
-            except EpochChanged as e:
+            except (EpochChanged, StaleOp) as e:
+                # sent again with a new op once the session is back
                 with self._cv:
                     self._exits.extendleft(reversed(batch))
-                self.enter_safe_state(f"MaruServer answered EPOCH to WORKER_EXIT ({e})")
+                    self._exit_busy = False
+                    self._cv.notify_all()
+                if isinstance(e, EpochChanged):
+                    self.server_lost(f"MaruServer answered EPOCH to WORKER_EXIT ({e})")
                 continue
             except ServerStopped:
                 return
             except Exception:
                 logger.exception("WORKER_EXIT failed; trying again")
                 ok = False
+            finally:
+                with self._cv:
+                    self._exit_busy = False
+                    self._cv.notify_all()
             if not ok:
                 with self._cv:
                     self._exits.extendleft(reversed(batch))

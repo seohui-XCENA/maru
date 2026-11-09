@@ -79,6 +79,8 @@ def main() -> int:
                     else:
                         result = bytes(read.view).hex()
                         handler.release_retrieved([read])
+            elif op == "held":
+                result = bytes(reads[command["key"]].view).hex()
             elif op == "release":
                 handler.release_retrieved([reads.pop(command["key"])])
                 result = True
@@ -99,11 +101,15 @@ def main() -> int:
                     "unused_credit": client.credits.unused_bytes,
                     "pools": client.pools.pool_ids(),
                     "stats": dict(client.stats),
+                    "off": None if client.off is None else str(client.off),
+                    "server_epoch": client.server_conn.server_epoch
+                    if client.server_conn
+                    else None,
                 }
             elif op == "wait_credit":
                 import time
 
-                deadline = time.monotonic() + command.get("timeout", 10)
+                deadline = time.monotonic() + command.get("wait_s", 10)
                 while client.credits.unused_bytes < command["bytes"]:
                     if time.monotonic() > deadline:
                         raise TimeoutError("no credit")

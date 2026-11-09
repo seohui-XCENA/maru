@@ -3,7 +3,9 @@
 """In-process MaruServer for multi-storage tests.
 
 Keeps a Catalog, pins, sessions and op ledgers by MsService's rules.
-Failure injection: pause/resume, drop_responses, drop_requests, delay, restart.
+Failure injection: pause/resume, drop_responses, drop_requests, delay, restart
+(a new server epoch with no state, as after a crash; nodes resume and
+re-register).
 """
 
 import collections
@@ -28,6 +30,7 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenResponse,
     NodeRecoverListResponse,
+    NodeReregisterResponse,
     ProbeResponse,
     RecoverItem,
     RetireResponse,
@@ -174,7 +177,9 @@ class FakeMaruServer:
         op_window: int = 65536,
         op_bytes_max: int = 64 << 20,
         recover_page: int = 2,
+        recovery_window_s: float = 0.0,
     ):
+        self.recovery_window_s = recovery_window_s
         self.heartbeat_s = heartbeat_s
         self.session_ttl_s = session_ttl_s
         self.op_window = op_window
@@ -210,6 +215,9 @@ class FakeMaruServer:
 
     def _reset_state(self) -> None:
         self.server_epoch = uuid.uuid4().hex
+        self.recovering_until = time.monotonic() + self.recovery_window_s
+        # node_id -> [locations ADDED by NODE_REREGISTER, last seen]
+        self.reregistered: dict[str, list] = {}
         self.nodes: dict[str, NodeRec] = {}
         self.node_sessions: dict[str, str] = {}  # token -> node_id
         self.epoch_seqs: dict[str, int] = {}
@@ -270,9 +278,11 @@ class FakeMaruServer:
         with self._lock:
             self._delays[int(code)] = seconds
 
-    def restart(self) -> None:
+    def restart(self, recovery_window_s: float | None = None) -> None:
         """New server_epoch, no state."""
         with self._lock:
+            if recovery_window_s is not None:
+                self.recovery_window_s = recovery_window_s
             self._reset_state()
 
     def close(self) -> None:
@@ -464,7 +474,8 @@ class FakeMaruServer:
             for seq in [s for s in log.entries if s <= log.ack]:
                 log.bytes -= log.entries.pop(seq)[2]
         if op.seq <= log.ack:
-            count = len(getattr(request, "items", None) or request.workers)
+            items = getattr(request, "items", None)
+            count = len(items if items is not None else request.workers)
             return response_cls(
                 status=Status.OK, items=[ItemOutcome(ItemResult.STALE)] * count
             )
@@ -510,6 +521,12 @@ class FakeMaruServer:
             return NodeOpenResponse(status=Status.REJECTED, error="protocol")
         if req.node_epoch in self.ended_epochs:
             return NodeOpenResponse(status=Status.REJECTED, error="node epoch ended")
+        known = self.nodes.get(req.node_id)
+        if req.resume is not None and (
+            (known is not None and known.node_epoch != req.node_epoch)
+            or (known is not None and known.epoch_seq != req.resume)
+        ):
+            return NodeOpenResponse(status=Status.REJECTED, error="resume")
         for pool in req.pools:
             ok_id = pool.pool_id == f"dram:{req.node_id}:{req.node_epoch}" or (
                 pool.kind == PoolKind.SSD
@@ -549,6 +566,9 @@ class FakeMaruServer:
                         self.hidden_pools.add(pool.pool_id)
                 self._drop_hidden_unpinned()
         seq = self.epoch_seqs.get(req.node_id, 0) + 1
+        if req.resume is not None:  # a run this server has not seen
+            seq = req.resume
+            self.reregistered[req.node_id] = [0, False]
         self.epoch_seqs[req.node_id] = seq
         token = uuid.uuid4().hex
         adopted = self.adopt.pop(req.node_id, [])
@@ -574,6 +594,9 @@ class FakeMaruServer:
     def _adopted_of(self, node: NodeRec):
         return self.adopted_by.get(node.node_id, [])
 
+    def recovering(self) -> bool:
+        return time.monotonic() < self.recovering_until
+
     def _open_response(self, node: NodeRec, adopted) -> NodeOpenResponse:
         # Worker sessions of this node not closed (expired ones keep pins)
         old_workers = [
@@ -591,7 +614,7 @@ class FakeMaruServer:
             epoch_seq=node.epoch_seq,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=False,
+            recovering=self.recovering(),
             adopted=adopted,
             old_workers=old_workers,
             previous_node_epoch=self.previous_epochs.get(node.node_id),
@@ -712,7 +735,9 @@ class FakeMaruServer:
         if req.role == SessionRole.WORKER and (
             node is None or node.node_epoch != req.node_epoch
         ):
-            return WorkerOpenResponse(status=Status.EPOCH, error="node epoch")
+            return WorkerOpenResponse(
+                status=Status.EPOCH, error="node epoch", server_epoch=self.server_epoch
+            )
         old = self.by_incarnation.get(req.incarnation)
         if old is not None:
             w = self.workers[old]
@@ -760,7 +785,7 @@ class FakeMaruServer:
             worker_session=token,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=False,
+            recovering=self.recovering(),
         )
 
     def _worker_heartbeat(self, worker: WorkerRec, req):
@@ -808,6 +833,8 @@ class FakeMaruServer:
             return ItemResult.FETCH, best
         if offline:
             return ItemResult.MISS, MissReason.OFFLINE
+        if self.recovering():
+            return ItemResult.RECOVERING, None
         return ItemResult.MISS, MissReason.ABSENT
 
     def _probe(self, worker: WorkerRec, req):
@@ -849,6 +876,8 @@ class FakeMaruServer:
                         ),
                     )
                 )
+            elif result == ItemResult.RECOVERING:
+                items.append(ItemOutcome(ItemResult.RECOVERING))
             else:
                 items.append(ItemOutcome(ItemResult.MISS, reason=found))
         return LookupAndPinResponse(status=Status.OK, items=items)
@@ -885,11 +914,21 @@ class FakeMaruServer:
 
     # ---------------------------------------------------- publish, remove
 
-    def _commit(self, node: NodeRec, req):
+    def _node_reregister(self, node: NodeRec, req):
+        done = self.reregistered.get(node.node_id)
+        if done is None:  # only a resumed run
+            return NodeReregisterResponse(status=Status.REJECTED, error="not resumed")
+        response = self._commit(node, req, earlier_runs=True)
+        done[0] += sum(1 for o in response.items if o.result == ItemResult.ADDED)
+        done[1] = done[1] or req.last
+        return NodeReregisterResponse(status=Status.OK, items=response.items)
+
+    def _commit(self, node: NodeRec, req, earlier_runs: bool = False):
         items = []
         for item in req.items:
             loc = item.location
             pool = node.pools.get(loc.pool_id)
+            given_by = generation_epoch_seq(loc.generation)
             if (
                 pool is None
                 or loc.pool_id in self.hidden_pools
@@ -898,7 +937,8 @@ class FakeMaruServer:
                 or not 0 < item.logical_bytes <= loc.length
                 or loc.offset < 0
                 or loc.offset + loc.length > pool.capacity
-                or generation_epoch_seq(loc.generation) != node.epoch_seq
+                or given_by > node.epoch_seq
+                or (given_by != node.epoch_seq and not earlier_runs)
             ):
                 items.append(ItemOutcome(ItemResult.REJECTED))
                 continue
@@ -914,9 +954,12 @@ class FakeMaruServer:
                     ItemOutcome(ItemResult.DUPLICATE, location=same_pool[0].location)
                 )
                 continue
+            pin = getattr(item, "pin", CommitPin.NONE)
             if same_pool:  # the same location again: pinned as asked
                 items.append(
-                    ItemOutcome(ItemResult.ADDED, pin_id=self._node_pin(node, item))
+                    ItemOutcome(
+                        ItemResult.ADDED, pin_id=self._node_pin(node, pin, item)
+                    )
                 )
                 continue
             if self._page_holder(loc) is not None:
@@ -926,12 +969,12 @@ class FakeMaruServer:
             self.catalog.setdefault(item.key, []).append(entry)
             self.by_loc[loc_id(loc)] = entry
             items.append(
-                ItemOutcome(ItemResult.ADDED, pin_id=self._node_pin(node, item))
+                ItemOutcome(ItemResult.ADDED, pin_id=self._node_pin(node, pin, item))
             )
         return CommitResponse(status=Status.OK, items=items)
 
-    def _node_pin(self, node: NodeRec, item) -> str | None:
-        if item.pin != CommitPin.NODE:
+    def _node_pin(self, node: NodeRec, pin: CommitPin, item) -> str | None:
+        if pin != CommitPin.NODE:
             return None
         pin_id = uuid.uuid4().hex
         self.pins[pin_id] = Pin(pin_id, f"node:{node.node_id}", item.key, item.location)

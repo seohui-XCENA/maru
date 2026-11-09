@@ -10,7 +10,6 @@ import pytest
 
 from maru_common.protocol import (
     MessageType,
-    NodeReregisterRequest,
     RegionRequestRequest,
     RegionReturnRequest,
 )
@@ -96,12 +95,12 @@ class TestNodeOpen:
         ):
             assert node.open(pools=pools).status == Status.REJECTED
 
-    def test_resume_is_not_supported_yet(self, env):
+    @pytest.mark.parametrize("resume", [0, -1, EPOCH_SEQ_MAX + 1])
+    def test_resume_out_of_range_is_rejected(self, env, resume):
         _, _, wire = env
         node = FakeNode(wire, "n1")
-        response = node.open(resume=3)
-        assert response.status == Status.DISABLED
-        assert "not supported yet" in response.error
+        response = node.open(resume=resume)
+        assert response.status == Status.REJECTED and "resume" in response.error
 
     def test_same_epoch_reopen_keeps_the_run(self, env):
         clock, service, wire = env
@@ -823,17 +822,11 @@ class TestEpochChecks:
 
 
 class TestNotSupportedYet:
-    def test_reregister_and_regions_are_disabled(self, env):
+    def test_regions_are_disabled(self, env):
         _, service, wire = env
         node = FakeNode(wire, "n1")
         node.open()
         op = OpRef(node.epoch, 1, b"\0" * 16, 0)
-        reregister = wire.call(
-            MessageType.NODE_REREGISTER,
-            NodeReregisterRequest(**node.envelope(), op=op, items=[], last=True),
-        )
-        assert reregister.status == Status.DISABLED
-        assert "not supported yet" in reregister.error
         request = wire.call(
             MessageType.REGION_REQUEST,
             RegionRequestRequest(
@@ -851,7 +844,7 @@ class TestNotSupportedYet:
         assert give_back.status == Status.DISABLED
         assert "CXL regions are not supported yet" in give_back.error
 
-    def test_never_recovering(self, env):
+    def test_no_recovery_window_never_recovers(self, env):
         _, _, wire = env
         node = FakeNode(wire, "n1")
         assert node.open().recovering is False

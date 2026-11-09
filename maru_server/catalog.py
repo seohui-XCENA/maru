@@ -347,9 +347,16 @@ class Catalog:
         return pool
 
     def check_new_location(
-        self, node_id: str, epoch_seq: int, location: Location, logical_bytes: int
+        self,
+        node_id: str,
+        epoch_seq: int,
+        location: Location,
+        logical_bytes: int,
+        earlier_runs: bool = False,
     ) -> str | None:
-        """Why the node may not commit this location, or None."""
+        """Why the node may not commit this location, or None.
+        ``earlier_runs``: a page given by an earlier run of the node since the
+        pool was registered is allowed too (re-registration)."""
         pool = self.own_pool(node_id, location.pool_id)
         if pool is None:
             return f"pool {location.pool_id} is not an active pool of {node_id}"
@@ -366,7 +373,14 @@ class Catalog:
         if not 0 <= location.generation <= _GENERATION_MAX:
             return "generation out of range"
         # The high bits name the run that gave the page
-        if generation_epoch_seq(location.generation) != epoch_seq:
+        given_by = generation_epoch_seq(location.generation)
+        if earlier_runs:
+            if not pool.since_epoch_seq <= given_by <= epoch_seq:
+                return (
+                    f"generation {location.generation} is not of epoch_seq "
+                    f"{pool.since_epoch_seq}..{epoch_seq}"
+                )
+        elif given_by != epoch_seq:
             return f"generation {location.generation} is not of epoch_seq {epoch_seq}"
         return None
 

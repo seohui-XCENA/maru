@@ -31,6 +31,7 @@ def test_defaults():
     assert kwargs["op_window"] == 65536
     assert kwargs["op_bytes_max"] == 64 << 20
     assert kwargs["policy_file"] is None
+    assert kwargs["recovery_window_s"] == 30
     assert rpc_cls.call_args.kwargs["num_workers"] == 4
     rpc_cls.return_value.start.assert_called_once()
 
@@ -47,8 +48,11 @@ def test_options_reach_the_server():
         "60",
         "--op-window",
         "100",
+        "--recovery-window-s",
+        "0",
     )
     kwargs = server_cls.call_args.kwargs
+    assert kwargs["recovery_window_s"] == 0
     assert (kwargs["session_ttl_s"], kwargs["heartbeat_s"]) == (12, 3)
     assert (kwargs["node_give_up_s"], kwargs["op_window"]) == (60, 100)
     assert rpc_cls.call_args.kwargs["num_workers"] == 8
@@ -64,6 +68,9 @@ def test_options_reach_the_server():
         ["--node-give-up-s", "-1"],
         ["--op-window", "0"],
         ["--op-bytes-max", "0"],
+        ["--recovery-window-s", "-1"],
+        ["--recovery-window-s", "inf"],
+        ["--recovery-window-s", "nan"],
     ],
 )
 def test_bad_values_are_refused(argv):
@@ -74,10 +81,15 @@ def test_bad_values_are_refused(argv):
 
 def test_server_passes_times_and_shares_its_epoch():
     server = MaruServer(
-        enable_cxl=False, session_ttl_s=9, node_give_up_s=50, op_window=7
+        enable_cxl=False,
+        session_ttl_s=9,
+        node_give_up_s=50,
+        op_window=7,
+        recovery_window_s=2,
     )
     ms = server.ms_service
     assert ms.server_epoch == server.replica_directory.server_epoch
+    assert ms.recovery_window_s == 2 and ms.recovering()
     assert (ms.session_ttl_s, ms.heartbeat_s, ms.node_give_up_s) == (9, 3, 50)
     assert ms.ledger.op_window == 7
     ms.ensure_started()

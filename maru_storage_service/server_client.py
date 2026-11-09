@@ -4,7 +4,8 @@
 
 Ops whose result is unknown are resent with the same op. On EPOCH a HANDSHAKE
 tells an expired session (renewed with the same node_epoch) from a MaruServer
-restart (safe state; re-registration is not supported yet).
+restart, after which the session is lost until resume() reopens it; ops of the
+ended server epoch are never sent to the new one.
 """
 
 import dataclasses
@@ -29,7 +30,10 @@ from maru_common.protocol import (
     NodeOpenRequest,
     NodeOpenResponse,
     NodeRecoverListRequest,
+    NodeReregisterRequest,
+    NodeReregisterResponse,
     RecoverItem,
+    ReregisterItem,
     RetireRequest,
     RetireResponse,
     WorkerExitRequest,
@@ -49,17 +53,13 @@ from maru_common.storage_types import (
     WorkerRef,
 )
 
-from .ports import EpochChanged, ReplyError, ServerStopped
+from .ports import EpochChanged, NodeOpenError, ReplyError, ServerStopped, StaleOp
 
 logger = logging.getLogger(__name__)
 
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 RESEND_PAUSE_S = 0.05
 RESEND_PAUSE_MAX_S = 1.0
-
-
-class NodeOpenError(RuntimeError):
-    """MaruServer refused NODE_OPEN."""
 
 
 def read_host_boot_id(path: str = BOOT_ID_PATH) -> str:
@@ -100,11 +100,15 @@ class ServerClient:
         self.heartbeat_s = 0.0
         self.session_ttl_s = 0.0
         self._heartbeat: threading.Thread | None = None
+        self._on_epoch: Callable[[str], None] | None = None
         self._open_request: NodeOpenRequest | None = None
         self._renew_lock = threading.Lock()
         self.resends = 0
         self.renewals = 0
+        self.resumes = 0
         self.last_heartbeat_ok = 0.0  # monotonic time of the last OK heartbeat
+        # server_epoch a HANDSHAKE found after this session was lost
+        self.new_server_epoch: str | None = None
 
     # ---------------------------------------------------------------- session
 
@@ -126,6 +130,46 @@ class ServerClient:
             resume=None,
         )
         self._open_request = request
+        response = self._open_until_answered(request)
+        with self._renew_lock:
+            self._take_session(response)
+        logger.info(
+            "Node session open: node %s epoch %s epoch_seq %d (server epoch %s)",
+            self.node_id,
+            self.node_epoch,
+            self.epoch_seq,
+            self.server_epoch,
+        )
+        return response
+
+    def resume(self) -> NodeOpenResponse:
+        """After a MaruServer restart: NODE_OPEN with this run's epoch_seq
+        until answered, then the session works again. NodeOpenError if
+        refused."""
+        if self._open_request is None or self.epoch_seq is None:
+            raise RuntimeError("resume() needs an opened session")
+        request = dataclasses.replace(self._open_request, resume=self.epoch_seq)
+        response = self._open_until_answered(request)
+        if response.epoch_seq != self.epoch_seq:
+            raise NodeOpenError(
+                f"MaruServer resumed epoch_seq {response.epoch_seq}, not "
+                f"{self.epoch_seq}"
+            )
+        with self._renew_lock:
+            old = self.server_epoch
+            self._take_session(response)
+            self.new_server_epoch = None
+            self._epoch_lost.clear()
+        self.resumes += 1
+        logger.warning(
+            "node session resumed at MaruServer epoch %s (was %s), recovering %s",
+            self.server_epoch,
+            old,
+            response.recovering,
+        )
+        return response
+
+    def _open_until_answered(self, request: NodeOpenRequest) -> NodeOpenResponse:
         pause = RESEND_PAUSE_S
         while True:
             if self._stop.is_set():
@@ -154,19 +198,15 @@ class ServerClient:
                     f"heartbeat_s {response.heartbeat_s} and session_ttl_s "
                     f"{response.session_ttl_s} must be positive"
                 )
-            self.session = response.node_session
-            self.server_epoch = response.server_epoch
-            self.epoch_seq = response.epoch_seq
-            self.heartbeat_s = response.heartbeat_s
-            self.session_ttl_s = response.session_ttl_s
-            logger.info(
-                "Node session open: node %s epoch %s epoch_seq %d (server epoch %s)",
-                self.node_id,
-                self.node_epoch,
-                self.epoch_seq,
-                self.server_epoch,
-            )
             return response
+
+    def _take_session(self, response: NodeOpenResponse) -> None:
+        """Caller holds _renew_lock."""
+        self.session = response.node_session
+        self.server_epoch = response.server_epoch
+        self.epoch_seq = response.epoch_seq
+        self.heartbeat_s = response.heartbeat_s
+        self.session_ttl_s = response.session_ttl_s
 
     @property
     def epoch_lost(self) -> bool:
@@ -210,10 +250,12 @@ class ServerClient:
         on_response: Callable[[NodeHeartbeatResponse], None],
         on_epoch: Callable[[str], None],
     ) -> None:
+        self._on_epoch = on_epoch
+
         def loop() -> None:
             while not self._stop.wait(self.heartbeat_s):
                 if self.epoch_lost:
-                    return
+                    continue  # resume() opens the session again
                 session = self.session
                 try:
                     response = self.heartbeat(usage())
@@ -224,10 +266,8 @@ class ServerClient:
                     logger.exception("NODE_HEARTBEAT failed")
                     continue
                 if response.status == Status.EPOCH:
-                    renewed = self._renew(session)
-                    if renewed is False:
-                        self._lose_epoch(on_epoch, response.error)
-                        return
+                    if self._renew(session) is False:
+                        self._lose_epoch(response.error)
                     continue
                 if response.status != Status.OK:
                     logger.error(
@@ -281,14 +321,30 @@ class ServerClient:
                     self.server_epoch,
                     hello.server_epoch,
                 )
+                self.new_server_epoch = hello.server_epoch
                 return False
+            # resume: if MaruServer restarted since the HANDSHAKE, the new one
+            # takes this run back instead of opening a new one
+            assert self._open_request is not None
+            request = dataclasses.replace(self._open_request, resume=self.epoch_seq)
             try:
-                response = self._rpc.call(MessageType.NODE_OPEN, self._open_request)
+                response = self._rpc.call(MessageType.NODE_OPEN, request)
             except RpcUnknownError as e:
                 logger.warning("renewing the node session: %s", e)
                 return None
             if response.status == Status.BUSY:
                 return None
+            if (
+                response.status == Status.OK
+                and response.server_epoch != self.server_epoch
+            ):
+                logger.error(
+                    "MaruServer restarted (server epoch %s -> %s)",
+                    self.server_epoch,
+                    response.server_epoch,
+                )
+                self.new_server_epoch = response.server_epoch
+                return False
             if (
                 response.status != Status.OK
                 or response.server_epoch != self.server_epoch
@@ -308,12 +364,17 @@ class ServerClient:
             logger.warning("node session expired and was renewed (same node epoch)")
             return True
 
-    def _lose_epoch(self, on_epoch: Callable[[str], None] | None, error) -> None:
-        if not self._epoch_lost.is_set():
+    def _lose_epoch(self, error) -> None:
+        """MaruServer no longer knows the session: tell the heartbeat's
+        ``on_epoch`` (called on every loss seen, so idempotent)."""
+        with self._renew_lock:
+            first = not self._epoch_lost.is_set()
             self._epoch_lost.set()
+        if first:
             logger.error(
                 "MaruServer answered EPOCH to node session %s (%s)", self.session, error
             )
+        on_epoch = self._on_epoch
         if on_epoch is not None:
             on_epoch(f"MaruServer answered EPOCH: {error}")
 
@@ -367,6 +428,25 @@ class ServerClient:
         )
         return response
 
+    def reregister(
+        self, items: list[ReregisterItem], last: bool
+    ) -> NodeReregisterResponse:
+        """NODE_REREGISTER until its result is known; ``last`` ends them."""
+        session, epoch = self._ids()
+        response: NodeReregisterResponse = self._call_op(
+            MessageType.NODE_REREGISTER,
+            NodeReregisterRequest(
+                session=session,
+                server_epoch=epoch,
+                op=PLACEHOLDER_OP,
+                items=items,
+                last=last,
+            ),
+            len(items),
+            allow_empty=last,
+        )
+        return response
+
     def recover_list(self, pool_id: str) -> list[RecoverItem]:
         """All committed locations of an adopted pool (NODE_RECOVER_LIST)."""
         items: list[RecoverItem] = []
@@ -396,7 +476,7 @@ class ServerClient:
                 continue
             if response.status == Status.EPOCH:
                 if self._renew(session) is False:
-                    self._lose_epoch(None, response.error)
+                    self._lose_epoch(response.error)
                     raise EpochChanged(response.error)
                 self._stop.wait(pause)
                 continue
@@ -409,21 +489,39 @@ class ServerClient:
                 return items
             cursor = response.next_cursor
 
-    def _call_op(self, msg_type: MessageType, request, count: int):
+    def _call_op(
+        self, msg_type: MessageType, request, count: int, allow_empty: bool = False
+    ):
         """Stamp a new op and send it until a result (OK, REJECTED, DISABLED);
-        unknown results and BUSY are resent with the same op."""
-        if not 0 < count <= MAX_BATCH:
+        unknown results and BUSY are resent with the same op, but only to the
+        MaruServer run it was first sent to."""
+        if not (0 if allow_empty else 1) <= count <= MAX_BATCH:
             raise ValueError(f"{count} items; a request carries 1..{MAX_BATCH}")
         if self.epoch_lost:
             raise EpochChanged("the node session is gone")
         request = self._origin.stamp(request)
         seq = request.op.seq
+        op_epoch = request.server_epoch
         pause = RESEND_PAUSE_S
         attempt = 0
         while True:
             if self._stop.is_set():
                 raise ServerStopped(f"{msg_type.name} op {seq} left unresolved")
             if attempt:
+                # may wait while _renew holds the lock across its two RPCs
+                with self._renew_lock:
+                    session, epoch = self.session, self.server_epoch
+                if self.epoch_lost:
+                    # MaruServer lost the session meanwhile: it cannot take
+                    # this op any more (the recovery waits for it to end)
+                    self._origin.resolved(seq)
+                    raise EpochChanged(f"{msg_type.name} op {seq}: session lost")
+                if epoch != op_epoch:
+                    # the session went on at a newer MaruServer
+                    self._origin.resolved(seq)
+                    raise StaleOp(f"{msg_type.name} op {seq} was for epoch {op_epoch}")
+                if session != request.session:  # renewed meanwhile
+                    request = dataclasses.replace(request, session=session)
                 self.resends += 1
                 request = self._origin.refresh(request)
             attempt += 1
@@ -447,15 +545,13 @@ class ServerClient:
                 renewed = self._renew(request.session)
                 if renewed is False:
                     self._origin.resolved(seq)  # a new server keeps no record
-                    self._lose_epoch(None, response.error)
+                    self._lose_epoch(response.error)
                     raise EpochChanged(response.error)
                 if renewed is None:
                     self._stop.wait(pause)
                     pause = min(pause * 2, RESEND_PAUSE_MAX_S)
-                # The same op under the renewed session (digest leaves it out)
-                request = dataclasses.replace(
-                    request, session=self.session, server_epoch=self.server_epoch
-                )
+                # The same op under a renewed session (the digest leaves it
+                # out), checked at the top: never to another MaruServer
                 continue
             self._origin.resolved(seq)
             if response.status == Status.OK and len(response.items) != count:
