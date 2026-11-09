@@ -87,6 +87,7 @@ class MessageType(IntEnum):
     NODE_REREGISTER = 0x43
     NODE_RECOVER_LIST = 0x44
     WORKER_EXIT = 0x45
+    ADMIN_DELETE = 0x46
     WORKER_OPEN = 0x48
     WORKER_HEARTBEAT = 0x49
     WORKER_CLOSE = 0x4A
@@ -696,6 +697,9 @@ class NodeOpenResponse:
     recovering: bool = False
     adopted: list[PoolInfo] = field(default_factory=list)
     old_workers: list[WorkerRef] = field(default_factory=list)
+    # node_epoch of the run this open replaced (for NOTIFY drain); None for a
+    # first open or a renewal of the same run
+    previous_node_epoch: str | None = None
 
 
 @dataclass
@@ -704,7 +708,6 @@ class NodeHeartbeatRequest:
 
     session: str
     server_epoch: str
-    block_acks: list[str] = field(default_factory=list)
     usage: list[PoolUsage] = field(default_factory=list)
 
 
@@ -781,6 +784,21 @@ class WorkerExitRequest:
 
 @dataclass
 class WorkerExitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class AdminDeleteRequest:
+    """ADMIN_DELETE (0x46) - Remove keys through block requests to their
+    nodes; idempotent, so no session or op."""
+
+    items: list[Key]
+
+
+@dataclass
+class AdminDeleteResponse:
     status: Status
     error: str | None = None
     items: list[ItemOutcome] = field(default_factory=list)
@@ -1062,6 +1080,7 @@ MS_MESSAGE_CLASSES = {
     MessageType.NODE_REREGISTER: (NodeReregisterRequest, NodeReregisterResponse),
     MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),
     MessageType.WORKER_EXIT: (WorkerExitRequest, WorkerExitResponse),
+    MessageType.ADMIN_DELETE: (AdminDeleteRequest, AdminDeleteResponse),
     MessageType.WORKER_OPEN: (WorkerOpenRequest, WorkerOpenResponse),
     MessageType.WORKER_HEARTBEAT: (WorkerHeartbeatRequest, WorkerHeartbeatResponse),
     MessageType.WORKER_CLOSE: (WorkerCloseRequest, WorkerCloseResponse),

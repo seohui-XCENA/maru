@@ -282,6 +282,8 @@ class ItemOutcome:
     plan: FetchPlan | None = None
     reason: MissReason | None = None
     cause: KeptCause | None = None
+    # KEPT(MOVED): the key of the location now occupying the page
+    key: Key | None = None
 
 
 @dataclass(frozen=True)

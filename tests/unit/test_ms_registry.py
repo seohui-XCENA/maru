@@ -1,0 +1,992 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
+"""Node and worker sessions, node restarts (spec 7.2), give-up, access info,
+block requests and stage boundaries, through MsService."""
+
+import time
+from dataclasses import replace
+
+import pytest
+
+from maru_common.protocol import (
+    MessageType,
+    NodeReregisterRequest,
+    RegionRequestRequest,
+    RegionReturnRequest,
+)
+from maru_common.storage_types import (
+    EPOCH_SEQ_MAX,
+    CloseMode,
+    CommitPin,
+    KeptCause,
+    MissReason,
+    OpRef,
+    PoolUsage,
+    RmDomain,
+    SessionRole,
+    Status,
+)
+from maru_server.catalog import Entry
+from tests.unit.ms_fakes import (
+    PAGE,
+    FakeClock,
+    FakeNode,
+    FakeWorker,
+    Wire,
+    admin_delete,
+    key,
+    make_service,
+    policy_service,
+)
+
+
+@pytest.fixture
+def env():
+    clock = FakeClock()
+    service = make_service(clock)
+    return clock, service, Wire(service)
+
+
+def results(response):
+    return [item.result for item in response.items]
+
+
+def drain(service):
+    while service.maintain() >= service.maintenance_budget:
+        pass
+
+
+class TestNodeOpen:
+    def test_open_gives_epoch_seq_and_times(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        response = node.open()
+        assert response.status == Status.OK
+        assert response.server_epoch == service.server_epoch
+        assert response.epoch_seq == 1
+        assert response.session_ttl_s == 30.0 and response.heartbeat_s == 10.0
+        assert not response.recovering
+        assert response.adopted == [] and response.old_workers == []
+
+    @pytest.mark.parametrize(
+        "change, needle",
+        [
+            ({"protocol": "ms0"}, "protocol"),
+            ({"node_id": "bad id"}, "node_id"),
+            ({"host_boot_id": ""}, "host_boot_id"),
+        ],
+    )
+    def test_bad_open_is_rejected(self, env, change, needle):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        request = replace(node.open_request(), **change)
+        response = wire.call(MessageType.NODE_OPEN, request)
+        assert response.status == Status.REJECTED and needle in response.error
+
+    def test_bad_pools_are_rejected(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        for pools in (
+            [replace(node.dram(), pool_id="dram:n1:other")],
+            [replace(node.dram(), node_id="n2")],
+            [replace(node.dram(), pool_generation=0)],
+            [node.cxl()],
+            [replace(node.ssd(), path=None)],
+            [node.dram(), node.dram()],
+        ):
+            assert node.open(pools=pools).status == Status.REJECTED
+
+    def test_resume_is_stage_s4(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        response = node.open(resume=3)
+        assert response.status == Status.DISABLED and "S4" in response.error
+
+    def test_same_epoch_reopen_keeps_the_run(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        k = key("k")
+        loc = node.loc(node.ssd(), 1)
+        node.commit((k, loc), pin=CommitPin.NODE)
+        old_token = node.token
+        clock.advance(31)  # the session expired; the process is still there
+        assert node.heartbeat().status == Status.EPOCH
+        response = node.open(pools=[node.dram(), node.ssd()])
+        assert response.status == Status.OK and response.epoch_seq == 1
+        assert node.token != old_token
+        # its pin moved to the new session and its op records stayed
+        assert service.pins.held_by(node.token)
+        assert ("node", node.epoch) in service.ledger
+        # the old token stays dead
+        node.token, new = old_token, node.token
+        assert node.heartbeat().status == Status.EPOCH
+        node.token = new
+
+    def test_same_epoch_reopen_repeats_adoption(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        node.restart()
+        first = node.open(pools=[node.dram(), node.ssd()])
+        assert [p.pool_id for p in first.adopted] == [node.ssd().pool_id]
+        # the reply was lost and the same process opens again
+        again = node.open(pools=[node.dram(), node.ssd()])
+        assert again.adopted == first.adopted and again.epoch_seq == first.epoch_seq
+
+    def test_ended_epoch_cannot_come_back(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        zombie = node.epoch
+        node.restart()
+        assert node.open().status == Status.OK
+        node.epoch = node.origin = zombie
+        response = node.open(pools=[node.dram()])
+        assert response.status == Status.REJECTED
+
+    def test_epoch_seq_is_bounded(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        service.registry.nodes["n1"].epoch_seq = EPOCH_SEQ_MAX
+        node.restart()
+        response = node.open()
+        assert response.status == Status.REJECTED and "exhausted" in response.error
+
+    def test_previous_node_epoch_names_the_replaced_run(self, env):
+        clock, _, wire = env
+        node = FakeNode(wire, "n1")
+        assert node.open().previous_node_epoch is None
+        first = node.epoch
+        clock.advance(31)
+        assert node.open().previous_node_epoch is None  # a renewal
+        node.restart()
+        assert node.open().previous_node_epoch == first
+
+    def test_closed_epoch_cannot_reopen(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        node.close(CloseMode.RESTART)
+        assert node.open().status == Status.REJECTED
+
+
+class TestEpochReplacement:
+    """A StorageService restarts: NODE_OPEN with a new node_epoch (spec 7.2)."""
+
+    def _node(self, wire, service):
+        node = FakeNode(wire, "n1")
+        assert node.open(pools=[node.dram(), node.ssd()]).status == Status.OK
+        service.register_region(node.cxl())
+        worker = FakeWorker(wire, node)
+        assert worker.open().status == Status.OK
+        keys = {name: key(name) for name in ("d", "s", "c")}
+        locs = {
+            "d": node.loc(node.dram(), 1),
+            "s": node.loc(node.ssd(), 1),
+            "c": node.loc(node.cxl(), 1),
+        }
+        node.commit(*[(keys[n], locs[n]) for n in "dsc"])
+        return node, worker, keys, locs
+
+    def test_restart_adopts_cxl_and_ssd(self, env):
+        _, service, wire = env
+        node, worker, keys, locs = self._node(wire, service)
+        # the worker reads DRAM and CXL; the node pins the SSD for a fetch
+        worker_pins = [i.pin_id for i in worker.lookup(keys["d"], keys["c"]).items]
+        source_pin = node.source_pin((keys["s"], locs["s"])).items[0].pin_id
+        old_epoch, old_token, old_dram = node.epoch, node.token, node.dram_id
+        node.restart()
+        response = node.open(pools=[node.dram(), node.ssd()])
+        assert response.status == Status.OK
+        assert response.epoch_seq == 2
+        assert sorted(p.pool_id for p in response.adopted) == sorted(
+            [node.cxl().pool_id, node.ssd().pool_id]
+        )
+        assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
+        assert response.old_workers[0].worker_session == worker.token
+        # the old session gets EPOCH, its pins and op records are gone
+        node.token, new_token = old_token, node.token
+        assert node.heartbeat().status == Status.EPOCH
+        node.token = new_token
+        assert service.pins.get(source_pin) is None
+        assert old_epoch not in service.ledger
+        # the worker's pins stay; it reopens on the new run to look up
+        assert all(service.pins.get(p) for p in worker_pins)
+        assert worker.lookup(keys["d"]).status == Status.EPOCH
+        assert worker.open().status == Status.OK
+        response = worker.lookup(keys["d"], keys["s"], keys["c"])
+        assert results(response) == ["MISS", "FETCH", "HIT"]
+        assert response.items[0].reason == MissReason.ABSENT
+        # the old DRAM location goes once its last pin does
+        drain(service)
+        assert service.catalog.locations(keys["d"])
+        worker.unpin(worker_pins[0])
+        assert not service.catalog.locations(keys["d"])
+        assert service.catalog.pool(old_dram) is None
+
+    def test_recover_list_pages_through_an_adopted_pool(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd(pages=4096)])
+        locs = [(key(f"k{i}"), node.loc(node.ssd(), i)) for i in range(1500)]
+        node.commit(*locs[:1024])
+        node.commit(*locs[1024:])
+        worker = FakeWorker(wire, node)
+        worker.open()
+        node.restart()
+        response = node.open(pools=[node.dram(), node.ssd(pages=4096)])
+        ssd = node.ssd().pool_id
+        assert [p.pool_id for p in response.adopted] == [ssd]
+        first = node.recover_list(ssd)
+        assert first.status == Status.OK
+        assert len(first.items) == 1024 and first.next_cursor
+        # a resent page is the same page
+        assert node.recover_list(ssd).items[0] == first.items[0]
+        again = node.recover_list(ssd, first.next_cursor)
+        assert again == node.recover_list(ssd, first.next_cursor)
+        assert len(again.items) == 476 and again.next_cursor is None
+        listed = {(i.key, i.location) for i in first.items + again.items}
+        assert listed == set(locs)
+        assert all(i.logical_bytes == 4096 and not i.pinned for i in again.items)
+        # only adopted pools, only known cursors
+        assert node.recover_list(node.dram_id).status == Status.REJECTED
+        assert node.recover_list(ssd, "9:0").status == Status.REJECTED
+        assert node.recover_list(ssd, "garbage").status == Status.REJECTED
+
+    def test_recover_list_releases_its_snapshot_after_the_last_page(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        items = [(key(f"k{i}"), node.loc(node.ssd(), i)) for i in range(1030)]
+        node.commit(*items[:1024])
+        node.commit(*items[1024:])
+        node.restart()
+        node.open(pools=[node.dram(), node.ssd()])
+        ssd = node.ssd().pool_id
+        first = node.recover_list(ssd)
+        last = node.recover_list(ssd, first.next_cursor)
+        assert last.next_cursor is None and len(last.items) == 6
+        listing = next(iter(service.registry.nodes["n1"].listings.values()))
+        assert listing.entries == []
+        # a resent last page is still answered the same
+        assert node.recover_list(ssd, first.next_cursor) == last
+        assert node.recover_list(ssd, "1:0").status == Status.REJECTED
+
+    def test_recover_list_reports_pins(self, env):
+        _, service, wire = env
+        node, worker, keys, locs = self._node(wire, service)
+        worker.lookup(keys["c"])
+        node.restart()
+        node.open(pools=[node.dram(), node.ssd()])
+        listed = node.recover_list(node.cxl().pool_id)
+        assert [(i.key, i.location, i.pinned) for i in listed.items] == [
+            (keys["c"], locs["c"], True)
+        ]
+
+    def test_reboot_drops_cxl(self, env):
+        _, service, wire = env
+        node, worker, keys, locs = self._node(wire, service)
+        pin = worker.lookup(keys["c"]).items[0].pin_id
+        node.restart(boot="boot-2")
+        response = node.open(pools=[node.dram(), node.ssd()])
+        assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
+        # hidden at once, removed once unpinned, then its return is pending (S5)
+        worker.open()
+        assert worker.lookup(keys["c"]).items[0].result == "MISS"
+        drain(service)
+        assert service.pending_region_returns() == []
+        worker.unpin(pin)
+        assert [p.pool_id for p in service.pending_region_returns()] == [
+            node.cxl().pool_id
+        ]
+
+    def test_cxl_needs_the_same_rm_domain(self, env):
+        _, service, wire = env
+        node, _, keys, _ = self._node(wire, service)
+        node.restart()
+        response = node.open(
+            pools=[node.dram(), node.ssd()], rm_domains=[RmDomain("rm2", ())]
+        )
+        assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
+        drain(service)
+        assert not service.catalog.locations(keys["c"])
+
+    def test_ssd_needs_to_be_listed_unchanged(self, env):
+        _, service, wire = env
+        node, _, keys, locs = self._node(wire, service)
+        node.restart()
+        # the same path with a new pool_generation: its contents are gone
+        changed = node.ssd(generation=2)
+        response = node.open(pools=[node.dram(), changed])
+        assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
+        assert service.catalog.locations(keys["s"]) == [] or all(
+            e.pool.state == "removing" for e in service.catalog.locations(keys["s"])
+        )
+        # the new registration starts empty and takes the same pages
+        new = node.loc(changed, 1)
+        assert results(node.commit((keys["s"], new))) == ["ADDED"]
+        drain(service)
+        assert [e.location for e in service.catalog.locations(keys["s"])] == [new]
+
+    def test_ssd_not_listed_is_removed(self, env):
+        _, service, wire = env
+        node, _, keys, _ = self._node(wire, service)
+        node.restart()
+        response = node.open(pools=[node.dram()])
+        assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
+        drain(service)
+        assert not service.catalog.locations(keys["s"])
+
+    def test_old_workers_are_those_not_confirmed_gone(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        alive, expired, closed = (FakeWorker(wire, node, tp_rank=i) for i in range(3))
+        probe = FakeWorker(wire, node, role=SessionRole.PROBE)
+        for w in (alive, expired, closed, probe):
+            w.open()
+        closed.close()
+        clock.advance(20)
+        node.heartbeat()
+        alive.heartbeat()
+        clock.advance(15)  # "expired" expired; it may still hold credits
+        node.heartbeat()
+        node.restart()
+        response = node.open()
+        assert sorted(w.incarnation for w in response.old_workers) == sorted(
+            [alive.incarnation, expired.incarnation]
+        )
+
+    def test_worker_must_reopen_to_map_the_new_dram(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        node.restart()
+        node.open()
+        k = key("k")
+        node.commit((k, node.loc(node.dram(), 1)))
+        # still on the replaced run: lookups get EPOCH; other requests work
+        assert worker.lookup(k).status == Status.EPOCH
+        assert worker.probe(k).status == Status.EPOCH
+        assert worker.heartbeat().status == Status.OK
+        assert worker.unpin("x").status == Status.OK
+        # a WORKER_OPEN with the old node_epoch is refused
+        stale = FakeWorker(wire, node)
+        assert stale.open(node_epoch="old").status == Status.EPOCH
+        # after attaching again it reopens with the new node_epoch
+        assert worker.open().status == Status.OK
+        assert worker.lookup(k).items[0].result == "HIT"
+
+
+class TestNodeClose:
+    def test_leave_removes_every_location(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        service.register_region(node.cxl())
+        k = key("k")
+        cxl = node.loc(node.cxl(), 1)
+        node.commit(
+            (k, node.loc(node.dram(), 1)),
+            (key("s"), node.loc(node.ssd(), 1)),
+            (key("c"), cxl),
+        )
+        reader, idle = FakeWorker(wire, node), FakeWorker(wire, node, tp_rank=1)
+        reader.open()
+        idle.open()
+        reader.lookup(key("c"), k)  # pins CXL and DRAM
+        assert node.close(CloseMode.LEAVE).status == Status.OK
+        assert node.heartbeat().status == Status.EPOCH
+        # a worker without CXL pins goes with the node
+        assert idle.heartbeat().status == Status.EPOCH
+        # one still reading mapped CXL is kept for those pins only
+        assert reader.heartbeat().status == Status.OK
+        assert reader.lookup(k).status == Status.EPOCH
+        assert ("worker", reader.incarnation) not in service.ledger
+        drain(service)
+        assert service.pins.held_by(reader.token)[0].location == cxl
+        assert not service.catalog.locations(k)
+        assert not service.catalog.locations(key("s"))
+        assert service.pending_region_returns() == []
+        # the region goes back once the reader is done
+        reader.close()
+        assert not service.catalog.locations(key("c"))
+        assert [p.pool_id for p in service.pending_region_returns()] == [
+            node.cxl().pool_id
+        ]
+
+    def test_give_up_keeps_cxl_pins_past_expiry_until_worker_exit(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        service.register_region(node.cxl())
+        node.commit((key("c"), node.loc(node.cxl(), 1)))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        worker.lookup(key("c"))
+        for _ in range(32):  # the node stays away; the worker stays alive
+            clock.advance(20)
+            worker.heartbeat()
+            drain(service)
+        assert service.registry.nodes["n1"].gone
+        assert service.stats()["orphan_sessions"] == 1
+        clock.advance(600)  # the worker expires: pins never go by time
+        drain(service)
+        assert service.pins.held_by(worker.token)
+        assert service.pending_region_returns() == []
+        # the node's next run lists it in old_workers and confirms its end
+        node.restart()
+        response = node.open()
+        assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
+        assert results(node.worker_exit(response.old_workers[0])) == ["OK"]
+        assert service.stats()["orphan_sessions"] == 0
+        assert [p.pool_id for p in service.pending_region_returns()] == [
+            node.cxl().pool_id
+        ]
+
+    def test_an_orphan_without_cxl_pins_goes_on_expiry(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        service.register_region(node.cxl())
+        node.commit((key("c"), node.loc(node.cxl(), 1)))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        pin = worker.lookup(key("c")).items[0].pin_id
+        node.close(CloseMode.LEAVE)
+        worker.unpin(pin)  # done reading: nothing holds it any more
+        clock.advance(31)
+        drain(service)
+        assert service.registry.known_worker(worker.token) is None
+        assert service.stats()["orphan_sessions"] == 0
+
+    def test_give_up_after_node_give_up_s(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        k = key("k")
+        node.commit((k, node.loc(node.ssd(), 1)))
+        clock.advance(31)  # expired at +30: offline, locations kept
+        drain(service)
+        assert service.catalog.locations(k)
+        clock.advance(598)  # 1 s short of node_give_up_s after expiry
+        drain(service)
+        assert service.catalog.locations(k)
+        clock.advance(2)
+        drain(service)
+        assert not service.catalog.locations(k)
+        # the process lost everything: it opens as a new run
+        assert node.open().status == Status.REJECTED
+        node.restart()
+        assert node.open().epoch_seq == 2
+
+    def test_give_up_drops_the_nodes_workers(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        node.commit((k, node.loc(node.dram(), 1)))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        worker.lookup(k)
+        clock.advance(631)
+        drain(service)
+        assert service.registry.known_worker(worker.token) is None
+        assert ("worker", worker.incarnation) not in service.ledger
+        assert len(service.pins) == 0
+        assert not service.catalog.locations(k)
+
+    def test_cxl_goes_back_only_once_unpinned_even_when_forced(self, env):
+        _, service, wire = env
+        a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
+        a.open()
+        b.open()
+        service.register_region(a.cxl())
+        k = key("k")
+        loc = a.loc(a.cxl(), 1)
+        a.commit((k, loc))
+        # another node pins it as a fetch source
+        pin = b.source_pin((k, loc)).items[0].pin_id
+        a.close(CloseMode.LEAVE)
+        drain(service)
+        assert service.pending_region_returns() == []
+        assert b.unpin(pin).items[0].result == "OK"
+        assert [p.pool_id for p in service.pending_region_returns()] == [
+            a.cxl().pool_id
+        ]
+        assert not service.catalog.locations(k)
+
+    def test_give_up_also_after_a_restart_close(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        k = key("k")
+        node.commit((k, node.loc(node.ssd(), 1)))
+        node.close(CloseMode.RESTART)
+        clock.advance(601)
+        drain(service)
+        assert not service.catalog.locations(k)
+
+    def test_reopen_before_give_up_keeps_locations(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        k = key("k")
+        node.commit((k, node.loc(node.ssd(), 1)))
+        clock.advance(500)
+        node.restart()
+        assert node.open(pools=[node.dram(), node.ssd()]).status == Status.OK
+        clock.advance(500)
+        drain(service)
+        assert service.catalog.locations(k)
+
+
+class TestWorkerSessions:
+    def test_expired_session_keeps_pins_worker_exit_releases(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        loc = node.loc(node.dram(), 1)
+        node.commit((k, loc))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        pin = worker.lookup(k).items[0].pin_id
+        clock.advance(20)
+        node.heartbeat()
+        clock.advance(15)
+        node.heartbeat()
+        drain(service)
+        # expired: requests get EPOCH, the pin stays
+        assert worker.heartbeat().status == Status.EPOCH
+        assert worker.lookup(k).status == Status.EPOCH
+        assert service.pins.get(pin) is not None
+        assert node.retire((k, loc)).items[0].cause == KeptCause.PINNED
+        # the node saw the worker end
+        assert results(node.worker_exit(worker.ref())) == ["OK"]
+        assert service.pins.get(pin) is None
+        assert results(node.retire((k, loc))) == ["RETIRED"]
+        # a report for a worker MaruServer no longer knows is OK
+        assert results(node.worker_exit(worker.ref())) == ["OK"]
+
+    def test_reopen_with_same_incarnation_moves_pins(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        loc = node.loc(node.dram(), 1)
+        node.commit((k, loc))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        pin = worker.lookup(k).items[0].pin_id
+        old = worker.token
+        assert worker.open().status == Status.OK
+        assert service.pins.get(pin).holder == worker.token
+        worker.token, new = old, worker.token
+        assert worker.heartbeat().status == Status.EPOCH
+        worker.token = new
+        assert results(worker.unpin(pin)) == ["OK"]
+        assert results(node.retire((k, loc))) == ["RETIRED"]
+
+    def test_reopen_with_another_identity_is_rejected(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        assert worker.open(tp_rank=5).status == Status.REJECTED
+
+    def test_close_releases_pins(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        node.commit((k, node.loc(node.dram(), 1)))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        worker.lookup(k)
+        assert len(service.pins) == 1
+        assert worker.close().status == Status.OK
+        assert len(service.pins) == 0
+        assert worker.heartbeat().status == Status.EPOCH
+
+    def test_many_pins_are_released_in_bounded_steps(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(pages=3000)])
+        keys = [key(f"k{i}") for i in range(2500)]
+        for start in range(0, 2500, 1000):
+            node.commit(
+                *[(k, node.loc(node.dram(), i)) for i, k in enumerate(keys)][
+                    start : start + 1000
+                ]
+            )
+        worker = FakeWorker(wire, node)
+        worker.open()
+        for start in range(0, 2500, 1000):
+            worker.lookup(*keys[start : start + 1000])
+        assert len(service.pins) == 2500
+        worker.close()
+        assert len(service.pins) == 2500 - 1024  # the rest is queued
+        drain(service)
+        assert len(service.pins) == 0
+
+    def test_worker_exit_checks_the_node_and_pid(self, env):
+        _, service, wire = env
+        n1, n2 = FakeNode(wire, "n1"), FakeNode(wire, "n2")
+        n1.open()
+        n2.open()
+        worker = FakeWorker(wire, n1)
+        worker.open()
+        assert results(n2.worker_exit(worker.ref())) == ["REJECTED"]
+        other_pid = replace(worker.ref(), pid_start=1)
+        assert results(n1.worker_exit(other_pid)) == ["REJECTED"]
+        assert worker.heartbeat().status == Status.OK
+        assert results(n1.worker_exit(worker.ref())) == ["OK"]
+        assert worker.heartbeat().status == Status.EPOCH
+
+    def test_worker_open_rules(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        worker = FakeWorker(wire, node)
+        # its node has no session yet
+        assert worker.open().status == Status.EPOCH
+        node.open()
+        assert worker.open(protocol="ms0").status == Status.REJECTED
+        assert worker.open().status == Status.OK
+        # a scheduler that does not attach: no node check
+        probe = FakeWorker(wire, node, role=SessionRole.PROBE)
+        assert probe.open(node_epoch="unknown").status == Status.OK
+
+    def test_probe_and_worker_of_one_process_coexist(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        probe = FakeWorker(wire, node, role=SessionRole.PROBE)
+        probe.incarnation = worker.incarnation
+        probe.open()
+        assert worker.heartbeat().status == Status.OK
+        assert probe.heartbeat().status == Status.OK
+
+    def test_expired_probe_sessions_are_dropped(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        probe = FakeWorker(wire, node, role=SessionRole.PROBE)
+        probe.open()
+        clock.advance(31)
+        drain(service)
+        assert service.registry.known_worker(probe.token) is None
+
+
+class TestEpochChecks:
+    def test_stale_server_epoch_and_sessions_get_epoch(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        node.server_epoch = worker.server_epoch = "another-run"
+        assert node.heartbeat().status == Status.EPOCH
+        assert worker.heartbeat().status == Status.EPOCH
+        assert worker.lookup(key("k")).status == Status.EPOCH
+        assert node.commit((key("k"), node.loc(node.dram(), 1))).status == (
+            Status.EPOCH
+        )
+        assert worker.unpin("x").status == Status.EPOCH
+        node.server_epoch = worker.server_epoch = None
+        assert node.heartbeat().status == Status.OK
+        node.token = "unknown"
+        assert node.heartbeat().status == Status.EPOCH
+
+    def test_session_of_the_wrong_kind_is_rejected(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        node_token = node.token
+        node.token = worker.token
+        assert node.heartbeat().status == Status.REJECTED
+        worker.token = node_token
+        assert worker.heartbeat().status == Status.REJECTED
+
+    def test_batch_limits(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        keys = [key(f"k{i}") for i in range(1025)]
+        assert worker.lookup(*keys).status == Status.REJECTED
+        assert worker.probe(*keys).status == Status.REJECTED
+        assert worker.unpin(*[str(i) for i in range(1025)]).status == Status.REJECTED
+        usage = [PoolUsage(node.dram_id, 1, 1, 0, 0, 0, 0, 0, 0)] * 1025
+        assert node.heartbeat(usage=usage).status == Status.REJECTED
+        assert admin_delete(wire, *keys).status == Status.REJECTED
+        assert worker.lookup(*keys[:1024]).status == Status.OK
+
+
+class TestStageBoundaries:
+    def test_reregister_and_regions_are_disabled(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        op = OpRef(node.epoch, 1, b"\0" * 16, 0)
+        reregister = wire.call(
+            MessageType.NODE_REREGISTER,
+            NodeReregisterRequest(**node.envelope(), op=op, items=[], last=True),
+        )
+        assert reregister.status == Status.DISABLED and "S4" in reregister.error
+        request = wire.call(
+            MessageType.REGION_REQUEST,
+            RegionRequestRequest(
+                **node.envelope(), op=op, rm_domain="rm1", size=1 << 30, count=1
+            ),
+        )
+        assert request.status == Status.DISABLED and "S5" in request.error
+        give_back = wire.call(
+            MessageType.REGION_RETURN,
+            RegionReturnRequest(
+                **node.envelope(), op=op, pool_id="cxl:rm1:7", pool_generation=1
+            ),
+        )
+        assert give_back.status == Status.DISABLED and "S5" in give_back.error
+
+    def test_never_recovering(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        assert node.open().recovering is False
+        worker = FakeWorker(wire, node)
+        assert worker.open().recovering is False
+        assert "RECOVERING" not in results(worker.lookup(key("x")))
+
+
+class TestHeartbeatQueues:
+    def test_access_info_goes_to_the_owning_node_once(self, env):
+        _, _, wire = env
+        a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
+        a.open()
+        b.open()
+        k = key("k")
+        loc = a.loc(a.dram(), 1)
+        a.commit((k, loc))
+        worker = FakeWorker(wire, a)
+        worker.open()
+        for _ in range(3):
+            worker.lookup(k)
+        worker.probe(k)  # a hint, not a read
+        assert b.heartbeat().access == []
+        access = a.heartbeat().access
+        assert len(access) == 1
+        info = access[0]
+        assert (info.pool_id, info.allocation_id, info.generation) == (
+            loc.pool_id,
+            loc.allocation_id,
+            loc.generation,
+        )
+        assert info.hits == 3 and info.last_ts > 0
+        assert a.heartbeat().access == []
+
+    def test_block_requests_until_the_node_retired_them(self, env):
+        _, service, wire = env
+        a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
+        a.open()
+        b.open()
+        k, j = key("k"), key("j")
+        ka, kb, ja = a.loc(a.dram(), 1), b.loc(b.dram(), 1), a.loc(a.dram(), 2)
+        a.commit((k, ka), (j, ja))
+        b.commit((k, kb))
+        worker = FakeWorker(wire, a)
+        worker.open()
+        pin = worker.lookup(j).items[0].pin_id
+        response = admin_delete(wire, k, j, key("none"))
+        assert results(response) == ["OK", "OK", "MISS"]
+        assert response.items[2].reason == MissReason.ABSENT
+        # deleting again queues nothing new
+        assert results(admin_delete(wire, k)) == ["OK"]
+        (block,) = a.heartbeat().blocks
+        assert {(i.key, i.location) for i in block.items} == {(k, ka), (j, ja)}
+        # MaruServer removes nothing itself; the block comes until it is done
+        assert a.heartbeat().blocks == [block]
+        assert len(service.catalog.locations(k)) == 2
+        # the node retires them with ordinary RETIREs; pins still hold
+        response = a.retire((k, ka), (j, ja))
+        assert results(response) == ["RETIRED", "KEPT"]
+        assert response.items[1].cause == KeptCause.PINNED
+        (block,) = a.heartbeat().blocks
+        assert [(i.key, i.location) for i in block.items] == [(j, ja)]
+        worker.unpin(pin)
+        assert results(a.retire((j, ja))) == ["RETIRED"]
+        assert a.heartbeat().blocks == []
+        (block_b,) = b.heartbeat().blocks
+        assert results(b.retire((k, kb))) == ["RETIRED"]
+        assert b.heartbeat().blocks == []
+        assert service.registry.blocks_waiting() == 0
+
+    def test_a_preserved_key_is_not_queued(self, tmp_path):
+        service, wire, preserve = policy_service(tmp_path)
+        a = FakeNode(wire, "a")
+        a.open()
+        k, j = key("k"), key("j")
+        a.commit((k, a.loc(a.dram(), 1)), (j, a.loc(a.dram(), 2)))
+        preserve(k)
+        response = admin_delete(wire, k, j)
+        assert results(response) == ["KEPT", "OK"]
+        assert response.items[0].cause == KeptCause.PINNED
+        (block,) = a.heartbeat().blocks
+        assert [i.key for i in block.items] == [j]
+        preserve()
+        assert results(admin_delete(wire, k)) == ["OK"]
+
+    def test_every_block_is_delivered_past_stuck_ones(self, env):
+        _, service, wire = env
+        a = FakeNode(wire, "a")
+        a.open(pools=[a.dram(pages=3000)])
+        keys = [key(f"k{i}") for i in range(2000)]
+        items = [(k, a.loc(a.dram(pages=3000), i)) for i, k in enumerate(keys)]
+        a.commit(*items[:1024])
+        a.commit(*items[1024:])
+        # a reader pins one key in each of the first blocks: they never empty
+        reader = FakeWorker(wire, a)
+        reader.open()
+        reader.lookup(*[keys[i] for i in (0, 256, 512, 768)])
+        admin_delete(wire, *keys[:1024])
+        admin_delete(wire, *keys[1024:])
+        delivered = set()
+        for _ in range(10):
+            blocks = a.heartbeat().blocks
+            sent = [(i.key, i.location) for b in blocks for i in b.items]
+            delivered.update(k for k, _ in sent)
+            if sent:
+                a.retire(*sent)  # the node retires what it was asked to
+        assert delivered == set(keys)
+        assert service.registry.blocks_waiting() == 4  # the stuck ones
+
+    def test_blocks_follow_adopted_pools_into_a_new_run(self, env):
+        clock, service, wire = env
+        a = FakeNode(wire, "a")
+        a.open(pools=[a.dram(), a.ssd()])
+        s, d = key("s"), key("d")
+        ssd_loc = a.loc(a.ssd(), 1)
+        a.commit((s, ssd_loc), (d, a.loc(a.dram(), 1)))
+        admin_delete(wire, s, d)
+        clock.advance(31)  # a renewal continues the run: its blocks stay
+        assert a.open(pools=[a.dram(), a.ssd()]).status == Status.OK
+        assert a.heartbeat().blocks
+        a.restart()  # a new run keeps only the deletes of adopted pools
+        a.open(pools=[a.dram(), a.ssd()])
+        (block,) = a.heartbeat().blocks
+        assert [(i.key, i.location) for i in block.items] == [(s, ssd_loc)]
+
+    def test_delete_on_a_node_closed_for_restart_is_offline(self, env):
+        _, service, wire = env
+        a = FakeNode(wire, "a")
+        a.open(pools=[a.dram(), a.ssd()])
+        k, s = key("k"), key("s")
+        a.commit((k, a.loc(a.dram(), 1)), (s, a.loc(a.ssd(), 1)))
+        a.close(CloseMode.RESTART)
+        # hidden DRAM, and an SSD location no running node could block
+        response = admin_delete(wire, k, s)
+        assert [(i.result, i.reason) for i in response.items] == [
+            ("MISS", MissReason.OFFLINE)
+        ] * 2
+        assert service.registry.blocks_waiting() == 0
+
+    def test_usage_is_kept_for_own_pools(self, env):
+        _, service, wire = env
+        a = FakeNode(wire, "a")
+        a.open()
+        usage = PoolUsage(a.dram_id, 100, 50, 10, 0, 10, 30, 0, 0)
+        foreign = replace(usage, pool_id="dram:b:x")
+        assert a.heartbeat(usage=[usage, foreign]).status == Status.OK
+        assert service.registry.nodes["a"].usage == {a.dram_id: usage}
+
+
+class TestMaintenanceThread:
+    def test_thread_gives_up_a_node_and_sweeps(self):
+        service = make_service(
+            clock=time.monotonic,
+            session_ttl_s=0.2,
+            node_give_up_s=0.3,
+            maintenance_interval_s=0.02,
+        )
+        wire = Wire(service)
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        k = key("k")
+        node.commit((k, node.loc(node.ssd(), 1)))
+        service.ensure_started()
+        service.ensure_started()  # once
+        deadline = time.monotonic() + 5
+        while service.catalog.locations(k) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        service.stop()
+        assert not service.catalog.locations(k)
+
+    def test_budget_bounds_each_step(self):
+        clock = FakeClock()
+        service = make_service(clock, maintenance_budget=10)
+        wire = Wire(service)
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.ssd()])
+        node.commit(*[(key(f"k{i}"), node.loc(node.ssd(), i)) for i in range(35)])
+        node.close(CloseMode.LEAVE)
+        steps = 0
+        while service.maintain() >= 10:
+            steps += 1
+            assert len(service.catalog.locations(key("k0"))) <= 1
+        assert steps == 3
+        assert all(not service.catalog.locations(key(f"k{i}")) for i in range(35))
+
+    def test_large_forced_sweep_keeps_lookup_p99_low(self):
+        service = make_service(clock=time.monotonic, maintenance_interval_s=0.01)
+        wire = Wire(service)
+        reader = FakeNode(wire, "reader")
+        reader.open()
+        keys = [key(f"r{i}") for i in range(32)]
+        reader.commit(*[(k, reader.loc(reader.dram(), i)) for i, k in enumerate(keys)])
+        worker = FakeWorker(wire, reader)
+        worker.open()
+        big = FakeNode(wire, "big")
+        size = 300_000
+        big.open(pools=[big.dram(pages=size)])
+        pool = service.catalog.pool(big.dram_id)
+        for i in range(size):  # straight into the Catalog: fast to set up
+            loc = big.loc(big.dram(pages=size), i)
+            service.catalog._add(Entry(key(f"b{i}"), loc, PAGE, pool))
+
+        def lookup():
+            response = worker.lookup(*keys)
+            worker.unpin(*[item.pin_id for item in response.items])
+
+        def p99(samples):
+            return sorted(samples)[int(len(samples) * 0.99)]
+
+        def measure(n):
+            samples = []
+            for _ in range(n):
+                t0 = time.perf_counter()
+                lookup()
+                samples.append(time.perf_counter() - t0)
+            return samples
+
+        base = measure(300)
+        big.close(CloseMode.LEAVE)
+        service.ensure_started()
+        try:
+            loaded = measure(300)
+            assert len(pool.entries) < size  # the sweep ran meanwhile
+            deadline = time.monotonic() + 30
+            while pool.entries and time.monotonic() < deadline:
+                loaded += measure(20)
+        finally:
+            service.stop()
+        assert not pool.entries
+        assert p99(loaded) < p99(base) + 0.010, (p99(base), p99(loaded))
