@@ -19,6 +19,7 @@ from maru_common.protocol import (
     MS_MESSAGE_CLASSES,
     CommitItem,
     CommitRequest,
+    CommitResponse,
     HandshakeRequest,
     MessageType,
     NodeCloseRequest,
@@ -30,7 +31,9 @@ from maru_common.protocol import (
     NodeRecoverListRequest,
     RecoverItem,
     RetireRequest,
+    RetireResponse,
     WorkerExitRequest,
+    WorkerExitResponse,
 )
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
@@ -46,6 +49,8 @@ from maru_common.storage_types import (
     WorkerRef,
 )
 
+from .ports import EpochChanged, ReplyError, ServerStopped
+
 logger = logging.getLogger(__name__)
 
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
@@ -53,20 +58,8 @@ RESEND_PAUSE_S = 0.05
 RESEND_PAUSE_MAX_S = 1.0
 
 
-class ServerStopped(Exception):  # noqa: N818 - a state, not a failure
-    """The client is stopping; the request was given up unresolved."""
-
-
-class EpochChanged(Exception):  # noqa: N818 - a state, not a failure
-    """MaruServer answered EPOCH: the node session is gone."""
-
-
 class NodeOpenError(RuntimeError):
     """MaruServer refused NODE_OPEN."""
-
-
-class ReplyError(RuntimeError):
-    """MaruServer answered OK with the wrong number of items; the op is resolved."""
 
 
 def read_host_boot_id(path: str = BOOT_ID_PATH) -> str:
@@ -75,6 +68,8 @@ def read_host_boot_id(path: str = BOOT_ID_PATH) -> str:
 
 
 class ServerClient:
+    """Implements MetadataPort."""
+
     def __init__(
         self,
         url: str,
@@ -324,10 +319,10 @@ class ServerClient:
 
     # -------------------------------------------------------------------- ops
 
-    def commit(self, items: list[CommitItem]):
+    def commit(self, items: list[CommitItem]) -> CommitResponse:
         """COMMIT until its result is known."""
         session, epoch = self._ids()
-        return self._call_op(
+        response: CommitResponse = self._call_op(
             MessageType.COMMIT,
             CommitRequest(
                 session=session,
@@ -337,11 +332,12 @@ class ServerClient:
             ),
             len(items),
         )
+        return response
 
-    def retire(self, items: list[KeyLocation]):
+    def retire(self, items: list[KeyLocation]) -> RetireResponse:
         """RETIRE until its result is known."""
         session, epoch = self._ids()
-        return self._call_op(
+        response: RetireResponse = self._call_op(
             MessageType.RETIRE,
             RetireRequest(
                 session=session,
@@ -351,11 +347,14 @@ class ServerClient:
             ),
             len(items),
         )
+        return response
 
-    def worker_exit(self, workers: list[WorkerRef], cause: ExitCause):
+    def worker_exit(
+        self, workers: list[WorkerRef], cause: ExitCause
+    ) -> WorkerExitResponse:
         """WORKER_EXIT until its result is known."""
         session, epoch = self._ids()
-        return self._call_op(
+        response: WorkerExitResponse = self._call_op(
             MessageType.WORKER_EXIT,
             WorkerExitRequest(
                 session=session,
@@ -366,6 +365,7 @@ class ServerClient:
             ),
             len(workers),
         )
+        return response
 
     def recover_list(self, pool_id: str) -> list[RecoverItem]:
         """All committed locations of an adopted pool (NODE_RECOVER_LIST)."""

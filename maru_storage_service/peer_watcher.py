@@ -18,17 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 class PeerWatcher:
-    """Calls ``on_exit(key)`` once when a watched process ends."""
+    """Calls ``on_exit(key)``, given to start(), once when a watched process
+    ends."""
 
-    def __init__(self, on_exit: Callable[[str], None], name: str = "maru-peer-watcher"):
-        self._on_exit = on_exit
+    def __init__(self, name: str = "maru-peer-watcher"):
+        self._on_exit: Callable[[str], None] = lambda key: None  # set by start()
         self._lock = threading.Lock()
         self._fds: dict[str, int] = {}
         self._wake_r, self._wake_w = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
         self._stopped = False
         self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
 
-    def start(self) -> None:
+    def start(self, on_exit: Callable[[str], None]) -> None:
+        self._on_exit = on_exit
         self._thread.start()
 
     def stop(self) -> None:

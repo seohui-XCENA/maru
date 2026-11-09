@@ -17,7 +17,7 @@ from maru_common.storage_types import CloseMode, Key, SessionRole
 from maru_storage_service.cli import EXIT_START
 from maru_storage_service.drivers import dram
 from maru_storage_service.pool_manager import PageState
-from maru_storage_service.storage_manager import OldState
+from maru_storage_service.worker_registry import OldState
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -202,38 +202,49 @@ def test_storage_service_restart_drain(fake, sockdir, agents):
         first.stop(CloseMode.RESTART)
         y.kill()  # ends while the StorageService is down
         second = start_node(config)
-        old = second.manager.old_workers()
+        old = second.manager.workers.old_workers()
         assert set(old) == {x.incarnation, y.incarnation, "idle-worker"}
         wait_until(
             lambda: (
-                second.manager.old_workers()[y.incarnation].state == OldState.CONFIRMED
+                second.manager.workers.old_workers()[y.incarnation].state
+                == OldState.CONFIRMED
             ),
             what="the ended worker confirmed",
         )
-        assert second.manager.old_workers()[y.incarnation].how == "exited"
+        assert second.manager.workers.old_workers()[y.incarnation].how == "exited"
         wait_until(
             lambda: any(r.incarnation == y.incarnation for r, _ in fake.worker_exits),
             what="WORKER_EXIT",
         )
         wait_until(
             lambda: (
-                second.manager.old_workers()[x.incarnation].state == OldState.DRAINING
+                second.manager.workers.old_workers()[x.incarnation].state
+                == OldState.DRAINING
             ),
             what="attached again",
         )
         assert x.call("state")["node_epoch"] == second.node_epoch
-        assert second.manager.old_workers()[x.incarnation].state == OldState.DRAINING
+        assert (
+            second.manager.workers.old_workers()[x.incarnation].state
+            == OldState.DRAINING
+        )
         x.call("free_held", name="copy")
         wait_until(
             lambda: (
-                second.manager.old_workers()[x.incarnation].state == OldState.CONFIRMED
+                second.manager.workers.old_workers()[x.incarnation].state
+                == OldState.CONFIRMED
             ),
             what="drained",
         )
         # NOTIFY drain named the replaced node epoch, and the worker acked it
-        assert second.manager.previous_node_epoch == first.node_epoch
-        assert first.node_epoch in second.manager.old_workers()[x.incarnation].how
-        assert second.manager.old_workers()["idle-worker"].state == OldState.WAITING
+        assert second.manager.workers.previous_node_epoch == first.node_epoch
+        assert (
+            first.node_epoch in second.manager.workers.old_workers()[x.incarnation].how
+        )
+        assert (
+            second.manager.workers.old_workers()["idle-worker"].state
+            == OldState.WAITING
+        )
         # DRAM locations of the old run are gone; the new pool works
         assert x.call("retrieve", key="x0") is None
         store(x, "x1")
@@ -242,7 +253,8 @@ def test_storage_service_restart_drain(fake, sockdir, agents):
         sleeper.wait()
         wait_until(
             lambda: (
-                second.manager.old_workers()["idle-worker"].state == OldState.CONFIRMED
+                second.manager.workers.old_workers()["idle-worker"].state
+                == OldState.CONFIRMED
             ),
             what="the idle worker confirmed by its exit",
         )

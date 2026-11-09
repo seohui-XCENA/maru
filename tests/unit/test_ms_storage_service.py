@@ -46,7 +46,7 @@ from maru_handler.client import CreditUnavailableError
 from maru_storage_service.local_server import LocalServerError
 from maru_storage_service.pool_manager import PageState
 from maru_storage_service.service import StorageService
-from maru_storage_service.storage_manager import OldState
+from maru_storage_service.worker_registry import OldState
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -563,7 +563,10 @@ class TestSessions:
             assert node.adopted == [info.pool_id]
             assert node.pools.bytes_in(PageState.READY, info.pool_id) == 3 * PAGE
             assert node.pools.bytes_in(PageState.QUARANTINED, info.pool_id) == PAGE
-            assert node.manager.old_workers()["old-worker"].state == OldState.WAITING
+            assert (
+                node.manager.workers.old_workers()["old-worker"].state
+                == OldState.WAITING
+            )
             # the adopted pool gives no credit; the new DRAM pool does at once
             raw = RawWorker(node.config.socket)
             raw.attach()
@@ -576,7 +579,7 @@ class TestSessions:
                 lambda: node.pools.bytes_in(PageState.QUARANTINED, info.pool_id) == 0,
                 what="adopted quarantine freed",
             )
-            assert node.manager.old_workers()["old-worker"].how == "exited"
+            assert node.manager.workers.old_workers()["old-worker"].how == "exited"
             wait_until(
                 lambda: any(
                     r.incarnation == "old-worker" for r, _ in fake.worker_exits
@@ -604,24 +607,25 @@ class TestRestartDrain:
         wait_until(
             lambda: client.node_epoch == second.node_epoch, what="attached again"
         )
-        old = second.manager.old_workers()
+        old = second.manager.workers.old_workers()
         assert old[client.identity.incarnation].state == OldState.DRAINING
         time.sleep(0.2)
         # no DRAIN_ACK while the old copy is not done
         assert (
-            second.manager.old_workers()[client.identity.incarnation].state
+            second.manager.workers.old_workers()[client.identity.incarnation].state
             == OldState.DRAINING
         )
         h.free(held)
         wait_until(
             lambda: (
-                second.manager.old_workers()[client.identity.incarnation].state
+                second.manager.workers.old_workers()[client.identity.incarnation].state
                 == OldState.CONFIRMED
             ),
             what="drained",
         )
         assert (
-            "drained" in second.manager.old_workers()[client.identity.incarnation].how
+            "drained"
+            in second.manager.workers.old_workers()[client.identity.incarnation].how
         )
         # the old pool is gone from lookups, and unmapped once unused
         assert h.retrieve("old") is None
@@ -765,7 +769,7 @@ class TestClientRobustness:
         raw = RawWorker(node.config.socket)
         try:
             raw.attach()
-            node.manager.worker(raw.incarnation).exited = True
+            node.manager.workers.get(raw.incarnation).exited = True
             r = raw.credit(PAGE)
             assert r.status.value == "REJECTED"
             assert node.pools.held_bytes(raw.incarnation) == 0
@@ -1274,7 +1278,7 @@ class TestClientLifecycle:
         h.close()
         assert fake.worker_session_of(incarnation) is not None  # no WORKER_CLOSE
         assert not fake.requests(MessageType.WORKER_CLOSE)
-        assert not node.manager.worker(incarnation).detached  # no DETACH
+        assert not node.manager.workers.get(incarnation).detached  # no DETACH
         del held
 
     def test_close_keeps_the_pools_of_writing_handles(self, nodes, handlers):
@@ -1290,21 +1294,27 @@ class TestClientLifecycle:
         released = idle._cpu.pools.get(held.location.pool_id)
         assert kept is not None and released is not None
         registered = torch.cuda.is_available()
-        assert kept.pool.cuda_registered == released.pool.cuda_registered == registered
+        assert (
+            kept.mapping.cuda_registered
+            == released.mapping.cuda_registered
+            == registered
+        )
         writer.close()
         idle.close()
         try:
             # mapped and registered until the process ends; the view works
             assert kept in pool_maps._KEPT_UNTIL_EXIT
-            assert not kept.pool._closed and kept.pool.cuda_registered == registered
+            assert (
+                not kept.mapping._closed and kept.mapping.cuda_registered == registered
+            )
             held.buf[:2] = b"ok"
             # a pool without a writing handle is released
-            assert released.pool._closed and not released.pool.cuda_registered
+            assert released.mapping._closed and not released.mapping.cuda_registered
             assert writer._cpu.pools.pool_ids() == idle._cpu.pools.pool_ids() == []
         finally:
             pool_maps._KEPT_UNTIL_EXIT.remove(kept)
             held.buf.release()
-            kept.pool.close()
+            kept.mapping.close()
 
     def test_clean_closes_leave_no_records_or_fds(self, nodes, handlers):
         node = nodes()
@@ -1312,8 +1322,8 @@ class TestClientLifecycle:
 
         def left() -> tuple:
             return (
-                len(manager._workers),
-                len(manager.peer_watcher._fds),
+                len(manager.workers._workers),
+                len(manager.watcher._fds),
                 manager.ledger.origins(),
                 len(node.pools._held),
             )
@@ -1341,9 +1351,9 @@ class TestClientLifecycle:
             assert raw.request(NodeMessageType.DETACH, DetachRequest()).status == (
                 Status.OK
             )
-            rec = node.manager.worker(raw.incarnation)
+            rec = node.manager.workers.get(raw.incarnation)
             assert rec is not None and rec.detached
-            assert node.manager.peer_watcher.watching(f"worker:{raw.incarnation}")
+            assert node.manager.watcher.watching(f"worker:{raw.incarnation}")
             # a detached record gets no credit
             assert raw.credit(PAGE).status == Status.REJECTED
         finally:
@@ -1359,7 +1369,7 @@ class TestClientLifecycle:
         key = f"worker:{first.incarnation}"
         second = RawWorker(node.config.socket, incarnation=first.incarnation)
         attached = threading.Event()
-        unwatch = manager.peer_watcher.unwatch
+        unwatch = manager.watcher.unwatch
 
         def reattach_meanwhile(watched: str) -> None:
             if watched == key and not attached.is_set():
@@ -1370,15 +1380,15 @@ class TestClientLifecycle:
                 attached.wait(0.5)
             unwatch(watched)
 
-        monkeypatch.setattr(manager.peer_watcher, "unwatch", reattach_meanwhile)
+        monkeypatch.setattr(manager.watcher, "unwatch", reattach_meanwhile)
         try:
             assert first.request(NodeMessageType.DETACH, DetachRequest()).status == (
                 Status.OK
             )
             wait_until(attached.is_set, what="attached again")
-            rec = manager.worker(first.incarnation)
+            rec = manager.workers.get(first.incarnation)
             assert rec is not None and not rec.detached
-            assert manager.peer_watcher.watching(key)
+            assert manager.watcher.watching(key)
         finally:
             first.close()
             second.close()
@@ -1435,7 +1445,7 @@ class TestClientLifecycle:
             assert raw.request(NodeMessageType.DETACH, DetachRequest()).status == (
                 Status.OK
             )
-            wait_until(lambda: node.manager.worker(raw.incarnation) is None)
+            wait_until(lambda: node.manager.workers.get(raw.incarnation) is None)
             # on the detached connection: not attached
             late = raw.request(NodeMessageType.CREDIT, request)
             assert late.status == Status.REJECTED and late.error == "not attached"
@@ -1570,12 +1580,12 @@ class TestStaleRuns:
     def test_exit_between_watch_and_record_is_not_lost(self, fake, nodes, monkeypatch):
         node = nodes()
         # watch() succeeds, then the process ends before the record exists
-        monkeypatch.setattr(node.manager.peer_watcher, "watch", lambda *a: True)
+        monkeypatch.setattr(node.manager.watcher, "watch", lambda *a: True)
         raw = RawWorker(node.config.socket)
         try:
             with pytest.raises(StorageUnavailableError):
                 raw.attach()
-            assert node.manager.worker(raw.incarnation) is None
+            assert node.manager.workers.get(raw.incarnation) is None
             wait_until(
                 lambda: any(
                     r.incarnation == raw.incarnation for r, _ in fake.worker_exits

@@ -35,7 +35,8 @@ from maru_common.protocol import MessageHeader
 from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
 from maru_common.storage_types import MS_PROTOCOL, PoolDescriptor, Status
 
-from .storage_manager import AttachIdentity, StorageManager, WorkerRecord
+from .storage_manager import StorageManager
+from .worker_registry import AttachIdentity, WorkerRecord
 
 logger = logging.getLogger(__name__)
 
@@ -316,7 +317,7 @@ class LocalServer:
         with self._lock:
             self._conns.discard(conn)
         if conn.worker is not None and self.manager is not None:
-            self.manager.connection_lost(conn.worker, conn)
+            self.manager.workers.connection_lost(conn.worker, conn)
 
     def _accept_loop(self) -> None:
         listener = self._sock
@@ -386,12 +387,12 @@ class LocalServer:
         elif code == NodeMessageType.ABORT:
             conn.respond(header, manager.abort(rec, decoded))
         elif code == NodeMessageType.DRAIN_ACK:
-            conn.respond(header, manager.drain_ack(rec, request))
+            conn.respond(header, manager.workers.drain_ack(rec, request))
         elif code == NodeMessageType.UNMAP_ACK:
             conn.respond(header, manager.unmap_ack(rec, request))
         elif code == NodeMessageType.DETACH:
-            conn.respond(header, manager.detach(rec))
-            manager.after_detach_reply(rec)
+            conn.respond(header, manager.workers.detach(rec))
+            manager.workers.after_detach_reply(rec)
         else:  # every code of the table is handled above
             conn.respond(header, response_cls(status=Status.REJECTED, error="unknown"))
 
@@ -439,7 +440,7 @@ class LocalServer:
             namespace=req.namespace,
         )
         manager = self._manager()
-        rec, why = manager.attach(conn, ident)
+        rec, why = manager.workers.attach(conn, ident)
         if rec is None:
             return reject(why)
         conn.worker = rec
@@ -466,4 +467,4 @@ class LocalServer:
             req.tp_rank,
             node_pid,
         )
-        manager.after_attach_reply(rec)
+        manager.workers.after_attach_reply(rec)

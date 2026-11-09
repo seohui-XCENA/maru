@@ -11,19 +11,20 @@ import logging
 import threading
 import uuid
 
-from maru_common.storage_types import CloseMode, PoolDescriptor
+from maru_common.storage_types import CloseMode
 
 from .config import NodeConfig, NodeConfigError
-from .drivers.dram import DramPool, create_dram_pool
+from .drivers.dram import DramDriver, DramPool
 from .local_pin import LocalPins
 from .local_server import LocalServer
+from .op_ledger import OP_WINDOW
+from .peer_watcher import PeerWatcher
 from .placement import DEFAULT_KEPT_BACKOFF_S, PlacementPolicy
 from .pool_manager import PageState, PoolManager
 from .server_client import ServerClient
 from .storage_manager import (
     DEFAULT_EVICT_INTERVAL_S,
     DEFAULT_GPU_DRAIN_GRACE_S,
-    OP_WINDOW,
     StorageManager,
 )
 
@@ -103,12 +104,11 @@ class StorageService:
             socket_group=config.socket_group,
         )
         self.local.claim()
-        self.dram = create_dram_pool(
-            config.node_id,
-            self.node_epoch,
-            size,
-            config.page_size,
-            bool(top.hugepage),
+        self.dram = DramDriver().create(
+            top,
+            node_id=config.node_id,
+            node_epoch=self.node_epoch,
+            page_size=config.page_size,
         )
         self.pools = PoolManager(config.budgets, config.page_size)
         self.pools.add_pool(self.dram.info())
@@ -125,7 +125,8 @@ class StorageService:
             pool_manager=self.pools,
             placement=placement,
             local_pins=LocalPins(),
-            server=self.server,
+            metadata=self.server,
+            watcher=PeerWatcher(),
             gpu_drain_grace_s=self.gpu_drain_grace_s,
             evict_interval_s=self.evict_interval_s,
             op_window=self.op_window,
@@ -150,16 +151,12 @@ class StorageService:
                 len(refs),
             )
         self.manager.start()
-        self.manager.start_restart_drain(
+        self.manager.workers.start_restart_drain(
             opened.old_workers, self.adopted, opened.previous_node_epoch
         )
-        self.server.start_heartbeat(
-            self.pools.usage, self.manager.on_heartbeat, self.manager.enter_safe_state
-        )
+        self.manager.start_heartbeat()
         self.local.manager = self.manager
-        self.local.pools = [
-            (PoolDescriptor(pool=self.dram.info(), memfd=0), self.dram.fd)
-        ]
+        self.local.pools = [(self.dram.descriptor(memfd=0), self.dram.fd)]
         self.local.start()
         logger.info(
             "StorageService %s serving node %s: dram pool %s (%d MiB, pages of %d KiB)",

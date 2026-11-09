@@ -71,7 +71,8 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     """Run the StorageService until SIGTERM or SIGINT."""
     from .drivers.dram import DramPoolError
     from .local_server import LocalServerError
-    from .server_client import NodeOpenError, ServerStopped
+    from .ports import ServerStopped
+    from .server_client import NodeOpenError
     from .service import NotServableError, StorageService
 
     logging.basicConfig(

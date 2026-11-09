@@ -15,9 +15,9 @@ from maru_common.serializer import op_digest
 from maru_common.storage_types import AccessInfo, KeptCause, Key, OpRef
 from maru_storage_service.drivers import dram
 from maru_storage_service.local_pin import LocalPins
+from maru_storage_service.op_ledger import OpLedger, Verdict
 from maru_storage_service.placement import PlacementPolicy
 from maru_storage_service.pool_manager import PageRef
-from maru_storage_service.storage_manager import OpLedger, Verdict
 from tests.unit.ms_fake_server import FakeMaruServer
 
 M = 1 << 20
@@ -76,6 +76,27 @@ class TestDramDriver:
         monkeypatch.setattr(dram, "default_huge_page_size", lambda: None)
         with pytest.raises(dram.DramPoolError, match="no huge page size"):
             dram.create_dram_pool("n", "e", 4 * M, M, hugepage=True)
+
+    def test_meets_the_driver_contract(self):
+        from maru_common.storage_types import PoolDescriptor
+        from maru_storage_service.config import TierConfig
+        from maru_storage_service.drivers import DriverPool, PoolAccess
+
+        driver = dram.DramDriver()
+        tier = TierConfig(store="dram", size=4 * M + 1, hugepage=False)
+        pool = driver.create(tier, node_id="n", node_epoch="e", page_size=M)
+        try:
+            assert isinstance(pool, DriverPool)
+            assert pool.access == PoolAccess.MAPPED
+            assert (pool.pool_id, pool.capacity) == ("dram:n:e", 4 * M)
+            assert pool.descriptor(memfd=0) == PoolDescriptor(pool.info(), memfd=0)
+            assert pool.worker_fd() == pool.fd >= 0
+            # a DRAM pool ends with its run: nothing to adopt
+            with pytest.raises(dram.DramPoolError, match="ends with its run"):
+                driver.open(pool.info())
+        finally:
+            pool.close()
+        assert pool.worker_fd() is None
 
 
 def ref(i: int, pool: str = "p") -> PageRef:
@@ -196,7 +217,7 @@ class TestOpLedger:
         assert entry.response == "r"
 
     def test_waiters_of_one_connection_are_bounded(self):
-        from maru_storage_service.storage_manager import WAITERS_PER_CONNECTION
+        from maru_storage_service.op_ledger import WAITERS_PER_CONNECTION
 
         ledger = OpLedger()
         _, entry = ledger.begin("w", op(1), b"d")
@@ -289,7 +310,7 @@ class TestPoolMaps:
                 PoolDescriptor(pool=pool.info(), memfd=0), os.dup(pool.fd), "e"
             )
             # the #128 page-lock path registers the shared mapping with CUDA
-            assert mapped.pool.cuda_registered == torch.cuda.is_available()
+            assert mapped.mapping.cuda_registered == torch.cuda.is_available()
             loc = Location(pool.pool_id, "a", 1, M, 10, PoolKind.DRAM)
             view = maps.view(loc)
             view[:3] = b"abc"
@@ -322,7 +343,7 @@ class TestPoolMaps:
             mapped = maps.add(
                 PoolDescriptor(pool=pool.info(), memfd=0), os.dup(pool.fd), "e"
             )
-            registered = mapped.pool.cuda_registered
+            registered = mapped.mapping.cuda_registered
             loc = Location(pool.pool_id, "a", 1, 0, 8, PoolKind.DRAM)
             view = maps.view(loc)
             part = view[:4]  # a slice keeps the view's buffer alive
@@ -331,7 +352,9 @@ class TestPoolMaps:
             assert not maps.remove(pool.pool_id)
             # nothing was touched: still mapped and registered
             assert (
-                mapped.pool.cuda_registered == registered == torch.cuda.is_available()
+                mapped.mapping.cuda_registered
+                == registered
+                == torch.cuda.is_available()
             )
             part[:2] = b"ok"
             del part
@@ -357,14 +380,14 @@ class TestPoolMaps:
             second = maps.add(descriptor, os.dup(pool.fd), "e")
             assert maps.get(pool.pool_id) is second
             # a view of the old mapping is held: it stays mapped and registered
-            assert not first.pool._closed
-            assert first.pool.cuda_registered == torch.cuda.is_available()
+            assert not first.mapping._closed
+            assert first.mapping.cuda_registered == torch.cuda.is_available()
             view[:2] = b"ok"
             view.release()  # the last view unmaps it
-            assert first.pool._closed and not first.pool.cuda_registered
+            assert first.mapping._closed and not first.mapping.cuda_registered
             # no view held: the old mapping goes at once
             third = maps.add(descriptor, os.dup(pool.fd), "e")
-            assert second.pool._closed and maps.get(pool.pool_id) is third
+            assert second.mapping._closed and maps.get(pool.pool_id) is third
             assert maps.views(pool.pool_id) == 0
         finally:
             maps.close()
@@ -389,12 +412,12 @@ class TestPoolMaps:
         try:
             maps.close(keep={kept_pool.pool_id})
             assert maps.pool_ids() == []
-            assert kept in pool_maps._KEPT_UNTIL_EXIT and not kept.pool._closed
-            assert kept.pool.cuda_registered == torch.cuda.is_available()
-            assert other.pool._closed and not other.pool.cuda_registered
+            assert kept in pool_maps._KEPT_UNTIL_EXIT and not kept.mapping._closed
+            assert kept.mapping.cuda_registered == torch.cuda.is_available()
+            assert other.mapping._closed and not other.mapping.cuda_registered
         finally:
             pool_maps._KEPT_UNTIL_EXIT.remove(kept)
-            kept.pool.close()
+            kept.mapping.close()
             kept_pool.close()
             other_pool.close()
 

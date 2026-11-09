@@ -26,7 +26,7 @@ from maru_common.protocol import (
 )
 from maru_common.storage_types import CloseMode
 from maru_storage_service.pool_manager import PageState
-from maru_storage_service.storage_manager import OldState
+from maru_storage_service.worker_registry import OldState
 from tests.unit.ms_node_helpers import (
     PAGE,
     WORKTREE,
@@ -392,25 +392,30 @@ def test_storage_service_restart(servers, workdir, agents):
         first.wait(10)
         y.kill()  # and a worker ends while it is down
         second = start_node(config, rpc_timeout_s=0.5)
-        assert second.manager.previous_node_epoch == old_epoch
-        old = second.manager.old_workers()
+        assert second.manager.workers.previous_node_epoch == old_epoch
+        old = second.manager.workers.old_workers()
         assert {x.incarnation, y.incarnation} <= set(old)
         wait_until(
             lambda: (
-                second.manager.old_workers()[y.incarnation].state == OldState.CONFIRMED
+                second.manager.workers.old_workers()[y.incarnation].state
+                == OldState.CONFIRMED
             ),
             what="the ended worker confirmed",
         )
         wait_until(lambda: x.call("state")["node_epoch"] == second.node_epoch)
-        assert second.manager.old_workers()[x.incarnation].state == OldState.DRAINING
+        assert (
+            second.manager.workers.old_workers()[x.incarnation].state
+            == OldState.DRAINING
+        )
         x.call("free_held", name="copy")
         wait_until(
             lambda: (
-                second.manager.old_workers()[x.incarnation].state == OldState.CONFIRMED
+                second.manager.workers.old_workers()[x.incarnation].state
+                == OldState.CONFIRMED
             ),
             what="drained",
         )
-        assert old_epoch in second.manager.old_workers()[x.incarnation].how
+        assert old_epoch in second.manager.workers.old_workers()[x.incarnation].how
         assert not readable(x, "x0")  # DRAM of the old run is dropped
         assert store(x, "x1")  # reopened on the new run
         assert readable(x, "x1")

@@ -315,6 +315,10 @@ class CpuPool:
                 exc,
             )
 
+    def view(self, offset: int, length: int) -> memoryview:
+        """Bytes of the mapping at ``offset``; the caller releases the view."""
+        return memoryview(self._mapping)[offset : offset + length]
+
     def alloc(self, size: int) -> CpuAllocation:
         with self._lock:
             if self._closed:

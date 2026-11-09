@@ -3,7 +3,8 @@
 """DRAM driver: memfd pools, optionally on huge pages.
 
 Pools are fully allocated and size-sealed at creation, so a shortage fails at
-start rather than as a SIGBUS in a worker.
+start rather than as a SIGBUS in a worker. A pool ends with its run, so it is
+never opened again.
 """
 
 import errno
@@ -12,7 +13,10 @@ import os
 import re
 from dataclasses import dataclass
 
-from maru_common.storage_types import PoolInfo, PoolKind
+from maru_common.storage_types import PoolDescriptor, PoolInfo, PoolKind
+
+from ..config import TierConfig
+from . import PoolAccess
 
 _MEMINFO = "/proc/meminfo"
 
@@ -47,7 +51,7 @@ def default_huge_page_size() -> int | None:
 
 @dataclass
 class DramPool:
-    """One memfd pool; ``fd`` stays open for the ATTACH replies."""
+    """One memfd pool; ``fd`` stays open for the ATTACH replies. A DriverPool."""
 
     pool_id: str
     node_id: str
@@ -56,6 +60,10 @@ class DramPool:
     fd: int
     hugepage: bool
     pool_generation: int = 1
+
+    @property
+    def access(self) -> PoolAccess:
+        return PoolAccess.MAPPED
 
     def info(self) -> PoolInfo:
         return PoolInfo(
@@ -66,6 +74,12 @@ class DramPool:
             capacity=self.capacity,
             page_size=self.page_size,
         )
+
+    def descriptor(self, memfd: int | None = None) -> PoolDescriptor:
+        return PoolDescriptor(pool=self.info(), memfd=memfd)
+
+    def worker_fd(self) -> int | None:
+        return self.fd if self.fd >= 0 else None
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -143,3 +157,19 @@ def create_dram_pool(
         fd=fd,
         hugepage=hugepage,
     )
+
+
+class DramDriver:
+    """A TierDriver for the dram tier."""
+
+    def create(
+        self, tier: TierConfig, *, node_id: str, node_epoch: str, page_size: int
+    ) -> DramPool:
+        if tier.size is None:
+            raise DramPoolError("the dram tier needs a size")
+        return create_dram_pool(
+            node_id, node_epoch, tier.size, page_size, bool(tier.hugepage)
+        )
+
+    def open(self, info: PoolInfo) -> DramPool:
+        raise DramPoolError(f"{info.pool_id}: a DRAM pool ends with its run")

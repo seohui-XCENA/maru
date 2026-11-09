@@ -310,6 +310,8 @@ class PoolManager:
             return asks
 
     def _credit_pool(self, kind: PoolKind | None) -> _Pool | None:
+        """The pool credit comes from: the first creditable one of ``kind``.
+        Choosing among several pools of a tier belongs here."""
         for pool in self._pools.values():
             if pool.creditable and (kind is None or pool.info.kind == kind):
                 return pool

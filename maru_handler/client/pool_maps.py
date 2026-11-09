@@ -2,15 +2,17 @@
 # Copyright 2026 XCENA Inc.
 """PoolMaps: node pool mappings and their CUDA registration.
 
-DRAM pools are page-locked with the cpu backend's code (#128). Every location
-is checked against the mapped pools before a byte is touched (#59).
+Every location is checked against the mapped pools before a byte is touched
+(#59).
 """
 
 import logging
 import mmap
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, PoolKind
 from maru_handler.storage.cpu import CpuPool
@@ -25,12 +27,53 @@ class LocationError(ValueError):
     """A location that does not fall inside a mapped pool (#59)."""
 
 
+class PoolMapping(Protocol):
+    """A pool mapped into this process: views of its bytes, CUDA registration,
+    and the unmap once no view is held."""
+
+    @property
+    def cuda_registered(self) -> bool: ...
+
+    def view(self, offset: int, length: int) -> memoryview: ...
+
+    def page_lock(self) -> None:
+        """Register with CUDA, best effort."""
+        ...
+
+    def close(self) -> None:
+        """Unregister and unmap; RuntimeError while views are held."""
+        ...
+
+
+def map_dram_memfd(info: PoolInfo, fd: int) -> PoolMapping:
+    """A DRAM pool's memfd mapped shared; the fd stays the caller's. Page-locked
+    with the cpu backend's code (#128)."""
+    size = os.fstat(fd).st_size
+    if size < info.capacity:
+        raise LocationError(
+            f"pool {info.pool_id}: the memfd has {size} bytes, the pool {info.capacity}"
+        )
+    mapping = mmap.mmap(
+        fd,
+        info.capacity,
+        flags=mmap.MAP_SHARED,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    return CpuPool(
+        info.pool_id,
+        info.capacity,
+        info.page_size,
+        medium="dram",
+        mapping=mapping,
+        shared=True,
+    )
+
+
 @dataclass(eq=False)
 class MappedPool:
     info: PoolInfo
     node_epoch: str
-    # Wraps the mapping for its page-lock code only (#128)
-    pool: CpuPool
+    mapping: PoolMapping
     # Views handed out and not yet released (PEP 688 export count)
     views: int = 0
     removing: bool = False
@@ -51,9 +94,7 @@ class _PoolSlice:
         mapped = self._mapped
         with mapped.lock:
             mapped.views += 1
-        return memoryview(mapped.pool._mapping)[
-            self._offset : self._offset + self._length
-        ]
+        return mapped.mapping.view(self._offset, self._length)
 
     def __release_buffer__(self, view: memoryview) -> None:
         view.release()
@@ -64,12 +105,17 @@ class _PoolSlice:
             if close:
                 mapped.retired = False
         if close:
-            mapped.pool.close()
+            mapped.mapping.close()
 
 
 class PoolMaps:
-    def __init__(self, pin_pools: bool = True):
+    def __init__(
+        self,
+        pin_pools: bool = True,
+        map_memfd: Callable[[PoolInfo, int], PoolMapping] = map_dram_memfd,
+    ):
         self.pin_pools = pin_pools
+        self._map_memfd = map_memfd
         self._lock = threading.Lock()
         self._pools: dict[str, MappedPool] = {}
 
@@ -87,31 +133,12 @@ class PoolMaps:
                 or info.capacity % info.page_size
             ):
                 raise LocationError(f"pool {info.pool_id}: bad capacity or page size")
-            size = os.fstat(fd).st_size
-            if size < info.capacity:
-                raise LocationError(
-                    f"pool {info.pool_id}: the memfd has {size} bytes, the pool "
-                    f"{info.capacity}"
-                )
-            mapping = mmap.mmap(
-                fd,
-                info.capacity,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
+            mapping = self._map_memfd(info, fd)
         finally:
             os.close(fd)
-        pool = CpuPool(
-            info.pool_id,
-            info.capacity,
-            info.page_size,
-            medium="dram",
-            mapping=mapping,
-            shared=True,
-        )
         if self.pin_pools:
-            pool.page_lock()
-        mapped = MappedPool(info=info, node_epoch=node_epoch, pool=pool)
+            mapping.page_lock()
+        mapped = MappedPool(info=info, node_epoch=node_epoch, mapping=mapping)
         with self._lock:
             old = self._pools.get(info.pool_id)
             self._pools[info.pool_id] = mapped
@@ -121,7 +148,7 @@ class PoolMaps:
             "mapped %s (%d MiB, page-locked: %s)",
             info.pool_id,
             info.capacity >> 20,
-            pool.cuda_registered,
+            mapping.cuda_registered,
         )
         return mapped
 
@@ -179,7 +206,7 @@ class PoolMaps:
                 mapped.removing = True
             del self._pools[pool_id]
         # No view is left, so the unmap after the CUDA unregister succeeds
-        mapped.pool.close()
+        mapped.mapping.close()
         return True
 
     def close(self, keep: set[str] | frozenset[str] = frozenset()) -> None:
@@ -209,4 +236,4 @@ def _retire(mapped: MappedPool) -> None:
         if mapped.views:
             mapped.retired = True
             return
-    mapped.pool.close()
+    mapped.mapping.close()
