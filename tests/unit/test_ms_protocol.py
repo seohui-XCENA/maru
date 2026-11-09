@@ -1,0 +1,322 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
+"""Multi-storage MaruServer messages: codes, round trips and op digests."""
+
+import dataclasses
+import itertools
+
+import pytest
+
+from maru_common.protocol import (
+    MESSAGE_CLASSES,
+    MS_MESSAGE_CLASSES,
+    CommitItem,
+    CommitRequest,
+    FetchCompleteRequest,
+    MessageType,
+    NodeOpenRequest,
+    NodeOpenResponse,
+)
+from maru_common.serializer import (
+    RESPONSE_BIT,
+    MessageDecodeError,
+    Serializer,
+    op_digest,
+)
+from maru_common.storage_types import (
+    EPOCH_SEQ_MAX,
+    GENERATION_COUNTER_MAX,
+    Key,
+    Location,
+    OpRef,
+    PoolKind,
+    generation_epoch_seq,
+    make_generation,
+)
+from tests.unit.ms_samples import sample
+
+MS_CODES = sorted(MS_MESSAGE_CLASSES)
+
+
+def test_codes_are_in_the_multi_storage_range_and_unique():
+    assert len(set(MS_CODES)) == len(MS_CODES) == 19
+    assert all(0x40 <= code <= 0x5F for code in MS_CODES)
+    # the response code keeps the request code below the response bit
+    assert all(code & RESPONSE_BIT == 0 for code in MS_CODES)
+
+
+def test_maruserver_table_serves_both_backends():
+    for code, classes in MS_MESSAGE_CLASSES.items():
+        assert MESSAGE_CLASSES[code] == classes
+    assert MessageType.STORAGE in MESSAGE_CLASSES
+
+
+@pytest.mark.parametrize("code", MS_CODES, ids=lambda c: MessageType(c).name)
+def test_request_round_trip(code):
+    request_cls, _ = MS_MESSAGE_CLASSES[code]
+    request = sample(request_cls)
+    ser = Serializer()
+    header, decoded = ser.decode_request(ser.encode(code, request))
+    assert header.msg_type == code
+    assert decoded == request
+
+
+@pytest.mark.parametrize("code", MS_CODES, ids=lambda c: MessageType(c).name)
+def test_response_round_trip(code):
+    _, response_cls = MS_MESSAGE_CLASSES[code]
+    response = sample(response_cls)
+    ser = Serializer()
+    request_frame = ser.encode(code, sample(MS_MESSAGE_CLASSES[code][0]))
+    request_header, _ = ser.decode(request_frame)
+    frame = ser.encode_response(request_header, response)
+    header, decoded = ser.decode_response(frame)
+    assert header.msg_type == code | RESPONSE_BIT
+    assert header.sequence == request_header.sequence
+    assert decoded == response
+
+
+def test_enums_travel_as_plain_strings():
+    ser = Serializer()
+    request = sample(CommitRequest)
+    _, payload = ser.decode(ser.encode(MessageType.COMMIT, request))
+    item = payload["items"][0]
+    assert type(item["pin"]) is str and item["pin"] == request.items[0].pin.value
+    assert type(item["location"]["kind"]) is str
+
+
+def test_unknown_fields_are_ignored():
+    ser = Serializer()
+    payload = dataclasses.asdict(sample(CommitRequest))
+    payload["added_later"] = {"x": 1}
+    payload["items"][0]["also_new"] = 2
+    _, decoded = ser.decode_request(ser.encode(MessageType.COMMIT, payload))
+    assert decoded == sample(CommitRequest)
+
+
+def test_missing_required_field_is_an_error():
+    ser = Serializer()
+    payload = dataclasses.asdict(sample(CommitRequest))
+    del payload["op"]
+    with pytest.raises(MessageDecodeError):
+        ser.decode_request(ser.encode(MessageType.COMMIT, payload))
+
+
+def _commit(offset: int = 0) -> CommitRequest:
+    loc = Location("dram:n:e", "a1", make_generation(2, 9), offset, 4096, PoolKind.DRAM)
+    return CommitRequest(
+        session="s",
+        server_epoch="e",
+        op=OpRef(origin="node-epoch", seq=5, digest=b"", ack=4),
+        items=[CommitItem(key=Key("ns", "k"), location=loc, logical_bytes=4000)],
+    )
+
+
+class TestOpDigest:
+    def test_sender_and_receiver_agree(self):
+        request = _commit()
+        ser = Serializer()
+        _, payload = ser.decode(ser.encode(MessageType.COMMIT, request))
+        assert op_digest(request) == op_digest(payload)
+        assert len(op_digest(request)) == 16
+
+    def test_op_field_is_not_part_of_it(self):
+        a = _commit()
+        b = dataclasses.replace(a, op=OpRef(origin="other", seq=99, digest=b"x", ack=0))
+        assert op_digest(a) == op_digest(b)
+
+    def test_payload_change_changes_it(self):
+        assert op_digest(_commit(0)) != op_digest(_commit(4096))
+
+    def test_key_order_does_not_matter(self):
+        payload = dataclasses.asdict(_commit())
+        reordered = dict(reversed(list(payload.items())))
+        assert op_digest(payload) == op_digest(reordered)
+
+    def test_needs_a_request(self):
+        with pytest.raises(TypeError):
+            op_digest([1, 2])
+
+
+class TestGeneration:
+    def test_epoch_seq_is_in_the_high_bits(self):
+        g = make_generation(5, 123)
+        assert generation_epoch_seq(g) == 5
+        assert g & GENERATION_COUNTER_MAX == 123
+
+    def test_a_later_run_is_always_above(self):
+        assert make_generation(6, 0) > make_generation(5, GENERATION_COUNTER_MAX)
+
+    @pytest.mark.parametrize(
+        "epoch_seq,counter", [(-1, 0), (1, -1), (1, GENERATION_COUNTER_MAX + 1)]
+    )
+    def test_out_of_range(self, epoch_seq, counter):
+        with pytest.raises(ValueError):
+            make_generation(epoch_seq, counter)
+
+
+def test_cpu_is_the_old_name_of_dram():
+    assert PoolKind.parse("cpu") is PoolKind.DRAM
+    assert PoolKind.parse("cxl") is PoolKind.CXL
+    with pytest.raises(ValueError):
+        PoolKind.parse("remote")
+
+
+# ---------------------------------------------------------------------------
+# Optional and first-member branches, strict decoding, schema skew
+# ---------------------------------------------------------------------------
+
+LEGACY_CODES = {
+    MessageType.STORAGE,
+    MessageType.REQUEST_ALLOC,
+    MessageType.RETURN_ALLOC,
+    MessageType.LIST_ALLOCATIONS,
+    MessageType.REGISTER_KV,
+    MessageType.LOOKUP_KV,
+    MessageType.EXISTS_KV,
+    MessageType.DELETE_KV,
+    MessageType.PIN_KV,
+    MessageType.UNPIN_KV,
+    MessageType.BATCH_REGISTER_KV,
+    MessageType.BATCH_LOOKUP_KV,
+    MessageType.BATCH_EXISTS_KV,
+    MessageType.BATCH_PIN_KV,
+    MessageType.BATCH_UNPIN_KV,
+    MessageType.GET_STATS,
+    MessageType.GET_USAGE,
+    MessageType.HEARTBEAT,
+    MessageType.REPORT_STATS,
+    MessageType.HANDSHAKE,
+    MessageType.SHUTDOWN,
+}
+
+
+def test_legacy_table_is_unchanged():
+    assert set(MESSAGE_CLASSES) - set(MS_MESSAGE_CLASSES) == LEGACY_CODES
+    # legacy messages keep the lenient decode
+    assert Serializer()._strict_codes == {int(c) for c in MS_MESSAGE_CLASSES}
+
+
+@pytest.mark.parametrize("code", MS_CODES, ids=lambda c: MessageType(c).name)
+def test_minimal_round_trip(code):
+    ser = Serializer()
+    request_cls, response_cls = MS_MESSAGE_CLASSES[code]
+    request = sample(request_cls, minimal=True)
+    header, decoded = ser.decode_request(ser.encode(code, request))
+    assert decoded == request
+    response = sample(response_cls, minimal=True)
+    _, decoded = ser.decode_response(ser.encode_response(header, response))
+    assert decoded == response
+
+
+def test_cpu_on_the_wire_is_dram():
+    ser = Serializer()
+    payload = dataclasses.asdict(sample(CommitRequest))
+    payload["items"][0]["location"]["kind"] = "cpu"
+    _, decoded = ser.decode_request(ser.encode(MessageType.COMMIT, payload))
+    assert decoded.items[0].location.kind is PoolKind.DRAM
+
+
+def _corrupt(path, value):
+    payload = dataclasses.asdict(sample(CommitRequest))
+    node = payload
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+    return payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _corrupt(["items"], "abc"),
+        _corrupt(["items"], [1, 2]),
+        _corrupt(["op"], "x"),
+        _corrupt(["items", 0, "logical_bytes"], "x"),
+        _corrupt(["items", 0, "logical_bytes"], True),
+        _corrupt(["items", 0, "pin"], "sometimes"),
+        _corrupt(["items", 0, "location", "kind"], "tape"),
+        _corrupt(["op", "digest"], "not-bytes"),
+        {
+            k: v
+            for k, v in dataclasses.asdict(sample(CommitRequest)).items()
+            if k != "op"
+        },
+        5,
+    ],
+    ids=[
+        "items-str",
+        "items-ints",
+        "op-str",
+        "int-as-str",
+        "int-as-bool",
+        "bad-enum",
+        "bad-kind",
+        "digest-str",
+        "missing-op",
+        "not-a-map",
+    ],
+)
+def test_bad_payload_is_one_error_with_the_header(payload):
+    ser = Serializer()
+    frame = ser.encode(MessageType.COMMIT, payload, seq=77)
+    with pytest.raises(MessageDecodeError) as info:
+        ser.decode_request_payload(frame)
+    assert info.value.header.msg_type == MessageType.COMMIT
+    assert info.value.header.sequence == 77
+
+
+def test_int_is_a_valid_float():
+    ser = Serializer()
+    payload = dataclasses.asdict(sample(NodeOpenResponse))
+    payload["heartbeat_s"] = 10
+    request_header, _ = ser.decode(
+        ser.encode(MessageType.NODE_OPEN, sample(NodeOpenRequest))
+    )
+    _, decoded = ser.decode_response(ser.encode_response(request_header, payload))
+    assert decoded.heartbeat_s == 10.0 and isinstance(decoded.heartbeat_s, float)
+
+
+def test_unreadable_message_has_no_header():
+    with pytest.raises(MessageDecodeError) as info:
+        Serializer().decode_request_payload(b"\x00" * 4)
+    assert info.value.header is None
+
+
+def test_unknown_code_keeps_the_header():
+    ser = Serializer()
+    frame = ser.encode(0x7E, {"x": 1}, seq=5)
+    with pytest.raises(MessageDecodeError) as info:
+        ser.decode_request_payload(frame)
+    assert info.value.header.sequence == 5
+
+
+class TestDigestAcrossVersions:
+    def test_receiver_uses_the_raw_payload(self):
+        ser = Serializer()
+        sent = dataclasses.asdict(_commit())
+        sent["added_later"] = [1, 2]  # a field this receiver does not know
+        del sent["items"][0]["pin"]  # an older sender leaves a default out
+        decoded = ser.decode_request_payload(ser.encode(MessageType.COMMIT, sent))
+        assert op_digest(decoded.payload) == op_digest(sent)
+        # the dataclass lost the unknown field and gained the default
+        assert op_digest(decoded.request) != op_digest(sent)
+
+    def test_envelope_fields_are_left_out(self):
+        request = sample(FetchCompleteRequest)
+        reopened = dataclasses.replace(
+            request, session="new", server_epoch="new", worker_session="new"
+        )
+        assert op_digest(request) == op_digest(reopened)
+
+
+def test_header_sequence_wraps_and_skips_zero():
+    ser = Serializer()
+    ser._seq_counter = itertools.count((1 << 32) - 1)
+    assert ser._next_seq() == (1 << 32) - 1
+    assert ser._next_seq() == 1
+
+
+def test_epoch_seq_fits_64_bit_generations():
+    assert make_generation(EPOCH_SEQ_MAX, GENERATION_COUNTER_MAX) == (1 << 64) - 1
+    with pytest.raises(ValueError):
+        make_generation(EPOCH_SEQ_MAX + 1, 0)

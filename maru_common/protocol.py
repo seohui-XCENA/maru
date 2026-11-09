@@ -14,9 +14,28 @@ See docs/protocol.md for full specification.
 
 import struct
 from dataclasses import dataclass, field
-from enum import IntEnum, IntFlag
+from enum import IntEnum, IntFlag, unique
 
 from maru_shm.types import MaruHandle
+
+from .storage_types import (
+    AccessInfo,
+    BlockRequest,
+    CloseMode,
+    CommitPin,
+    ExitCause,
+    ItemOutcome,
+    Key,
+    KeyLocation,
+    Location,
+    OpRef,
+    PoolInfo,
+    PoolUsage,
+    RmDomain,
+    SessionRole,
+    Status,
+    WorkerRef,
+)
 
 # =============================================================================
 # Protocol Constants
@@ -34,6 +53,7 @@ HEADER_FORMAT = "!HBBBBBBII"  # network byte order, big-endian
 # =============================================================================
 
 
+@unique
 class MessageType(IntEnum):
     """Message type codes for the protocol."""
 
@@ -59,6 +79,27 @@ class MessageType(IntEnum):
 
     # Opt-in storage directory, independent of legacy CXL key semantics.
     STORAGE = 0x30
+
+    # Multi-storage (0x40 - 0x5F), see the multi-storage wire spec chapter 3
+    NODE_OPEN = 0x40
+    NODE_HEARTBEAT = 0x41
+    NODE_CLOSE = 0x42
+    NODE_REREGISTER = 0x43
+    NODE_RECOVER_LIST = 0x44
+    WORKER_EXIT = 0x45
+    WORKER_OPEN = 0x48
+    WORKER_HEARTBEAT = 0x49
+    WORKER_CLOSE = 0x4A
+    PROBE = 0x50
+    LOOKUP_AND_PIN = 0x51
+    UNPIN = 0x52
+    SOURCE_PIN = 0x53
+    COMMIT = 0x58
+    RETIRE = 0x59
+    FINALIZE_MOVE = 0x5A
+    FETCH_COMPLETE = 0x5B
+    REGION_REQUEST = 0x5E
+    REGION_RETURN = 0x5F
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -576,6 +617,414 @@ class ShutdownResponse:
 
 
 # =============================================================================
+# Multi-storage Messages (0x40 - 0x5F)
+# =============================================================================
+#
+# Requests of an open session carry its token (``session``) and the
+# ``server_epoch`` it was opened under; a state-changing request also carries
+# ``op`` (spec chapter 1). Every response carries ``status`` and ``error``, and
+# a response to a request with ``items`` answers them in the same order.
+
+
+@dataclass
+class ReregisterItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+
+
+@dataclass
+class RecoverItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+    pinned: bool
+
+
+@dataclass
+class CommitItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+    pin: CommitPin = CommitPin.NONE
+
+
+@dataclass
+class MoveItem:
+    key: Key
+    source: Location
+    dest: Location
+    dest_pin_id: str
+
+
+@dataclass
+class FetchCompleteItem:
+    key: Key
+    source_pin_id: str
+    copy: Location
+    logical_bytes: int
+
+
+@dataclass
+class RegionGrant:
+    pool: PoolInfo
+    handle: MaruHandle
+
+
+@dataclass
+class NodeOpenRequest:
+    """NODE_OPEN (0x40) - A StorageService opens its node session."""
+
+    node_id: str
+    node_epoch: str
+    host_boot_id: str
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+    pools: list[PoolInfo] = field(default_factory=list)
+    rm_domains: list[RmDomain] = field(default_factory=list)
+    # epoch_seq of this same process, when it opens again after a MaruServer
+    # restart; None for a new process
+    resume: int | None = None
+
+
+@dataclass
+class NodeOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    node_session: str = ""
+    epoch_seq: int = 0
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+    recovering: bool = False
+    adopted: list[PoolInfo] = field(default_factory=list)
+    old_workers: list[WorkerRef] = field(default_factory=list)
+
+
+@dataclass
+class NodeHeartbeatRequest:
+    """NODE_HEARTBEAT (0x41)."""
+
+    session: str
+    server_epoch: str
+    block_acks: list[str] = field(default_factory=list)
+    usage: list[PoolUsage] = field(default_factory=list)
+
+
+@dataclass
+class NodeHeartbeatResponse:
+    status: Status
+    error: str | None = None
+    access: list[AccessInfo] = field(default_factory=list)
+    blocks: list[BlockRequest] = field(default_factory=list)
+    policy_version: int = 0
+
+
+@dataclass
+class NodeCloseRequest:
+    """NODE_CLOSE (0x42)."""
+
+    session: str
+    server_epoch: str
+    mode: CloseMode
+
+
+@dataclass
+class NodeCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class NodeReregisterRequest:
+    """NODE_REREGISTER (0x43) - Locations sent again after a MaruServer restart."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[ReregisterItem]
+    last: bool
+
+
+@dataclass
+class NodeReregisterResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class NodeRecoverListRequest:
+    """NODE_RECOVER_LIST (0x44) - Committed locations of an adopted pool."""
+
+    session: str
+    server_epoch: str
+    pool_id: str
+    cursor: str | None = None
+
+
+@dataclass
+class NodeRecoverListResponse:
+    status: Status
+    error: str | None = None
+    items: list[RecoverItem] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass
+class WorkerExitRequest:
+    """WORKER_EXIT (0x45) - A node reports workers it saw end."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    workers: list[WorkerRef]
+    cause: ExitCause
+
+
+@dataclass
+class WorkerExitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenRequest:
+    """WORKER_OPEN (0x48) - A worker or a scheduler opens its session.
+
+    ``pid`` and ``pid_start`` are the values the StorageService returned in
+    ATTACH, so they name the process in the node's pid namespace even when
+    the worker runs in a container; a new StorageService uses them after a
+    restart. A scheduler that does not attach sends its own.
+    """
+
+    node_id: str
+    node_epoch: str
+    engine_id: str
+    dp_index: int
+    tp_rank: int
+    pid: int
+    pid_start: int
+    incarnation: str
+    namespace: str
+    role: SessionRole
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    worker_session: str = ""
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+    recovering: bool = False
+
+
+@dataclass
+class WorkerHeartbeatRequest:
+    """WORKER_HEARTBEAT (0x49)."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerHeartbeatResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class WorkerCloseRequest:
+    """WORKER_CLOSE (0x4A) - Ends the session and releases its pins."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class ProbeRequest:
+    """PROBE (0x50) - Hit hints for the scheduler; no pin, no location."""
+
+    session: str
+    server_epoch: str
+    items: list[Key]
+
+
+@dataclass
+class ProbeResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class LookupAndPinRequest:
+    """LOOKUP_AND_PIN (0x51)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[Key]
+
+
+@dataclass
+class LookupAndPinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class UnpinRequest:
+    """UNPIN (0x52) - Idempotent by pin_id, so it carries no op."""
+
+    session: str
+    server_epoch: str
+    pin_ids: list[str]
+
+
+@dataclass
+class UnpinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class SourcePinRequest:
+    """SOURCE_PIN (0x53) - A StorageService pins a fetch source."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+
+
+@dataclass
+class SourcePinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class CommitRequest:
+    """COMMIT (0x58)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[CommitItem]
+
+
+@dataclass
+class CommitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class RetireRequest:
+    """RETIRE (0x59)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+
+
+@dataclass
+class RetireResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class FinalizeMoveRequest:
+    """FINALIZE_MOVE (0x5A) - Removes a demotion source once the target holds."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[MoveItem]
+
+
+@dataclass
+class FinalizeMoveResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class FetchCompleteRequest:
+    """FETCH_COMPLETE (0x5B) - Commits a fetched copy, pins it for the worker
+    and releases the source pin, as one request."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    worker_session: str
+    items: list[FetchCompleteItem]
+
+
+@dataclass
+class FetchCompleteResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class RegionRequestRequest:
+    """REGION_REQUEST (0x5E) - CXL regions from an RM domain."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    rm_domain: str
+    size: int
+    count: int
+
+
+@dataclass
+class RegionRequestResponse:
+    status: Status
+    error: str | None = None
+    regions: list[RegionGrant] = field(default_factory=list)
+
+
+@dataclass
+class RegionReturnRequest:
+    """REGION_RETURN (0x5F) - Sent only after every mapping of it is gone."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    pool_id: str
+    pool_generation: int
+
+
+@dataclass
+class RegionReturnResponse:
+    status: Status
+    error: str | None = None
+
+
+# =============================================================================
 # Message Type Mapping
 # =============================================================================
 
@@ -610,3 +1059,30 @@ MESSAGE_CLASSES = {
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }
+
+# Multi-storage messages, served on the same MaruServer endpoint
+MS_MESSAGE_CLASSES = {
+    MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),
+    MessageType.NODE_HEARTBEAT: (NodeHeartbeatRequest, NodeHeartbeatResponse),
+    MessageType.NODE_CLOSE: (NodeCloseRequest, NodeCloseResponse),
+    MessageType.NODE_REREGISTER: (NodeReregisterRequest, NodeReregisterResponse),
+    MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),
+    MessageType.WORKER_EXIT: (WorkerExitRequest, WorkerExitResponse),
+    MessageType.WORKER_OPEN: (WorkerOpenRequest, WorkerOpenResponse),
+    MessageType.WORKER_HEARTBEAT: (WorkerHeartbeatRequest, WorkerHeartbeatResponse),
+    MessageType.WORKER_CLOSE: (WorkerCloseRequest, WorkerCloseResponse),
+    MessageType.PROBE: (ProbeRequest, ProbeResponse),
+    MessageType.LOOKUP_AND_PIN: (LookupAndPinRequest, LookupAndPinResponse),
+    MessageType.UNPIN: (UnpinRequest, UnpinResponse),
+    MessageType.SOURCE_PIN: (SourcePinRequest, SourcePinResponse),
+    MessageType.COMMIT: (CommitRequest, CommitResponse),
+    MessageType.RETIRE: (RetireRequest, RetireResponse),
+    MessageType.FINALIZE_MOVE: (FinalizeMoveRequest, FinalizeMoveResponse),
+    MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
+    MessageType.REGION_REQUEST: (RegionRequestRequest, RegionRequestResponse),
+    MessageType.REGION_RETURN: (RegionReturnRequest, RegionReturnResponse),
+}
+_overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
+if _overlap:
+    raise RuntimeError(f"message codes defined twice: {sorted(_overlap)}")
+MESSAGE_CLASSES.update(MS_MESSAGE_CLASSES)
