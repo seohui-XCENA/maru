@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """Typed MaruServer RPC for the multi-storage messages and the sender side of
-the op rule (spec 1, 3)."""
+ops (see OpRef)."""
 
 import collections
 import dataclasses
@@ -28,8 +28,7 @@ class RpcUnknownError(Exception):
 
 
 class OpOrigin:
-    """Sender side of the op rule (spec 1): seq from 1; ack never passes an
-    unresolved seq."""
+    """Sender side of ops: seq from 1; ack never passes an unresolved seq."""
 
     def __init__(self, origin: str):
         self.origin = origin

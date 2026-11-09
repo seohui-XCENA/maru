@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Catalog and pins through MsService with fake nodes and workers: lookup
 order, commit, retire, finalize_move, source pins, fetch_complete,
-preservation, unpin (wire spec 3.3, 3.4, 5)."""
+preservation, unpin."""
 
 from dataclasses import replace
 

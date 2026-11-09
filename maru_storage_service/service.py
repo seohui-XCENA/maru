@@ -2,9 +2,9 @@
 # Copyright 2026 XCENA Inc.
 """StorageService: builds and runs the parts of one node.
 
-Start order (design 5.1, spec 7.2): claim the socket, DRAM pool, NODE_OPEN,
-adopted ledgers, old worker drain, heartbeat, then accept on the UDS. S2
-serves a GPU node with one dram tier only; other configs are refused.
+Start order: claim the socket, DRAM pool, NODE_OPEN, adopted ledgers, old
+worker drain, heartbeat, then accept on the UDS. Only a GPU node with a
+single dram tier is served so far; other configs are refused.
 """
 
 import logging
@@ -31,22 +31,18 @@ logger = logging.getLogger(__name__)
 
 
 class NotServableError(RuntimeError):
-    """The config asks for something S2 does not serve."""
+    """The config asks for something not supported yet."""
 
 
 def check_servable(config: NodeConfig) -> None:
-    """Refuse configs S2 cannot serve in full."""
+    """Refuse configs that cannot be served in full yet."""
     if config.role != "gpu":
-        raise NotServableError(
-            "serving a memory node is not implemented yet (stage S7)"
-        )
+        raise NotServableError("serving a memory node is not implemented yet")
     stores = [t.store for t in config.tiers]
     if stores != ["dram"]:
-        later = {"cxl": "S5", "ssd": "S6", "remote": "S7"}
-        missing = ", ".join(f"{s} ({later[s]})" for s in stores if s in later)
         raise NotServableError(
             f"serving the tiers {stores} is not implemented yet: only a single "
-            f"dram tier is served in stage S2; {missing} come later"
+            "dram tier is served"
         )
 
 
@@ -137,8 +133,8 @@ class StorageService:
         opened = self.server.open([self.dram.info()], rm_domains=[])
         self.pools.set_epoch_seq(opened.epoch_seq)
         for info in opened.adopted:
-            # S2 asks for no CXL/SSD pool, but rebuilds any adopted ledger; no
-            # credit from them (they cannot be mapped yet)
+            # No CXL/SSD pool is asked for, but any adopted ledger is rebuilt;
+            # no credit from them (they cannot be mapped yet)
             self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
             items = self.server.recover_list(info.pool_id)
             refs = self.pools.recovered(

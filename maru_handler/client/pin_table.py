@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """PinTable: held pins, each released once. Pins of an ended server epoch are
-never unpinned (spec 7.1)."""
+never unpinned: a restarted MaruServer holds none of them."""
 
 import threading
 from dataclasses import dataclass

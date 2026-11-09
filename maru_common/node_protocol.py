@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService local protocol (wire spec 2 and 4).
+"""StorageService local protocol, between a node's workers and its StorageService.
 
 Same header and MessagePack payload as MaruServer, over an AF_UNIX stream
 socket. Only the ATTACH reply carries descriptors (memfds, SCM_RIGHTS), which
@@ -73,7 +73,7 @@ class GroupLayout:
 
 @dataclass
 class Budgets:
-    """Node budgets in bytes, as resolved from the node config (spec 9)."""
+    """Node budgets in bytes, as resolved from the node config."""
 
     credit_max_bytes: int
     credit_total_max_bytes: int
@@ -257,7 +257,7 @@ class FetchCancelResponse:
 
 @dataclass
 class LocalPinRequest:
-    """LOCAL_PIN (0x20) - Off in v1 (answered with DISABLED); fields in S9."""
+    """LOCAL_PIN (0x20) - Not supported yet (answered with DISABLED)."""
 
     items: list[KeyLocation] = field(default_factory=list)
 
@@ -271,7 +271,7 @@ class LocalPinResponse:
 
 @dataclass
 class LocalUnpinRequest:
-    """LOCAL_UNPIN (0x21) - Off in v1 (answered with DISABLED); fields in S9."""
+    """LOCAL_UNPIN (0x21) - Not supported yet (answered with DISABLED)."""
 
     pin_ids: list[str] = field(default_factory=list)
 

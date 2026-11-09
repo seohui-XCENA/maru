@@ -71,7 +71,7 @@ class MaruServer:
             release_cxl=self._release_storage_region if enable_cxl else None,
             largest_cxl_pool=self._largest_storage_pool if enable_cxl else None,
         )
-        # multi-storage (spec 3); one server_epoch per MaruServer run
+        # multi-storage; one server_epoch per MaruServer run
         self.ms_service = MsService(
             server_epoch=self.replica_directory.server_epoch,
             session_ttl_s=session_ttl_s,

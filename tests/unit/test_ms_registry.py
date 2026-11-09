@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Node and worker sessions, node restarts (spec 7.2), give-up, access info,
-block requests and stage boundaries, through MsService."""
+"""Node and worker sessions, node restarts, give-up, access info, block
+requests and requests not supported yet, through MsService."""
 
 import time
 from dataclasses import replace
@@ -96,11 +96,12 @@ class TestNodeOpen:
         ):
             assert node.open(pools=pools).status == Status.REJECTED
 
-    def test_resume_is_stage_s4(self, env):
+    def test_resume_is_not_supported_yet(self, env):
         _, _, wire = env
         node = FakeNode(wire, "n1")
         response = node.open(resume=3)
-        assert response.status == Status.DISABLED and "S4" in response.error
+        assert response.status == Status.DISABLED
+        assert "not supported yet" in response.error
 
     def test_same_epoch_reopen_keeps_the_run(self, env):
         clock, service, wire = env
@@ -173,7 +174,7 @@ class TestNodeOpen:
 
 
 class TestEpochReplacement:
-    """A StorageService restarts: NODE_OPEN with a new node_epoch (spec 7.2)."""
+    """A StorageService restarts: NODE_OPEN with a new node_epoch."""
 
     def _node(self, wire, service):
         node = FakeNode(wire, "n1")
@@ -292,7 +293,7 @@ class TestEpochReplacement:
         node.restart(boot="boot-2")
         response = node.open(pools=[node.dram(), node.ssd()])
         assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
-        # hidden at once, removed once unpinned, then its return is pending (S5)
+        # hidden at once, removed once unpinned, then its return is pending
         worker.open()
         assert worker.lookup(keys["c"]).items[0].result == "MISS"
         drain(service)
@@ -821,7 +822,7 @@ class TestEpochChecks:
         assert worker.lookup(*keys[:1024]).status == Status.OK
 
 
-class TestStageBoundaries:
+class TestNotSupportedYet:
     def test_reregister_and_regions_are_disabled(self, env):
         _, service, wire = env
         node = FakeNode(wire, "n1")
@@ -831,21 +832,24 @@ class TestStageBoundaries:
             MessageType.NODE_REREGISTER,
             NodeReregisterRequest(**node.envelope(), op=op, items=[], last=True),
         )
-        assert reregister.status == Status.DISABLED and "S4" in reregister.error
+        assert reregister.status == Status.DISABLED
+        assert "not supported yet" in reregister.error
         request = wire.call(
             MessageType.REGION_REQUEST,
             RegionRequestRequest(
                 **node.envelope(), op=op, rm_domain="rm1", size=1 << 30, count=1
             ),
         )
-        assert request.status == Status.DISABLED and "S5" in request.error
+        assert request.status == Status.DISABLED
+        assert "CXL regions are not supported yet" in request.error
         give_back = wire.call(
             MessageType.REGION_RETURN,
             RegionReturnRequest(
                 **node.envelope(), op=op, pool_id="cxl:rm1:7", pool_generation=1
             ),
         )
-        assert give_back.status == Status.DISABLED and "S5" in give_back.error
+        assert give_back.status == Status.DISABLED
+        assert "CXL regions are not supported yet" in give_back.error
 
     def test_never_recovering(self, env):
         _, _, wire = env

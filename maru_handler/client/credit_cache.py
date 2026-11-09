@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""CreditCache: unused credit, taken without an RPC (design 5.4). Credit of an
+"""CreditCache: unused credit, taken without an RPC. Credit of an
 ended StorageService run is dropped, never written."""
 
 import collections

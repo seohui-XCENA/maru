@@ -481,8 +481,9 @@ class TestSessions:
         assert h.store("late", handle) is False  # bounded wait
         assert node.pools.bytes_in(PageState.PENDING) == PAGE
         assert node.pools.bytes_in(PageState.RETIRING) == 0
-        # no node session at the new MaruServer yet (re-registration is S4),
-        # so the worker cannot reopen its session: reads are unavailable
+        # no node session at the new MaruServer (re-registration is not
+        # supported yet), so the worker cannot reopen its session: reads are
+        # unavailable
         assert h.retrieve("before") is None
         assert h._cpu.stats["retrieve_unavailable"] >= 1
 
@@ -1011,7 +1012,7 @@ class TestConfig:
     def test_maru_node_needs_identity(self):
         with pytest.raises(ValueError, match="engine_id"):
             MaruConfig(maru_node="/tmp/x.sock")
-        with pytest.raises(ValueError, match="S3"):
+        with pytest.raises(ValueError, match="metadata-only .* not supported yet"):
             MaruConfig(
                 maru_node="/tmp/x.sock",
                 engine_id="e",
@@ -1473,7 +1474,7 @@ class TestClientLifecycle:
             entry = Entry(Key(NS, "remote"), loc, 8, "other")
             fake.catalog[entry.key] = [entry]
             fake.by_loc[("dram:other:o", "x", 1)] = entry
-        assert h.batch_exists(["remote"]) == [False]  # FETCH is S6
+        assert h.batch_exists(["remote"]) == [False]  # FETCH is not readable yet
 
     def test_expired_worker_session_is_reopened_with_its_pins(
         self, fake, nodes, handlers

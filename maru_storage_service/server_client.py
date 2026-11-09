@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""ServerClient: the node session with MaruServer (spec 3.1).
+"""ServerClient: the node session with MaruServer.
 
 Ops whose result is unknown are resent with the same op. On EPOCH a HANDSHAKE
 tells an expired session (renewed with the same node_epoch) from a MaruServer
-restart (safe state; re-registration is S4).
+restart (safe state; re-registration is not supported yet).
 """
 
 import dataclasses

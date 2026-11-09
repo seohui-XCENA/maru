@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Node and worker sessions, node restarts (spec 3.1, 3.2, 7.2, 7.3), and
-what NODE_HEARTBEAT replies carry (access info, block requests).
+"""Node and worker sessions, node restarts, and what NODE_HEARTBEAT replies
+carry (access info, block requests).
 
 Not thread safe: callers hold the service lock.
 """
@@ -263,7 +263,7 @@ class NodeRegistry:
         )
 
     def can_map(self, worker: WorkerSession, pool: PoolRecord) -> bool:
-        """Spec 3.3: the worker maps its node's DRAM of the run it attached
+        """The worker maps its node's DRAM of the run it attached
         to and that run's CXL regions; a probe answers for its node."""
         if pool.node_id != worker.node_id:
             return self._maps_shared_cxl(worker, pool)
@@ -277,7 +277,7 @@ class NodeRegistry:
 
     @staticmethod
     def _maps_shared_cxl(worker: WorkerSession, pool: PoolRecord) -> bool:
-        """S8 hook: another host's CXL region mapped directly."""
+        """Another host's CXL region mapped directly: not supported yet."""
         return False
 
     # ============================================================ node open
@@ -307,7 +307,7 @@ class NodeRegistry:
             raise OpenError(
                 Status.DISABLED,
                 "NODE_OPEN with resume (reopening after a MaruServer restart) "
-                "is stage S4 and not implemented",
+                "is not supported yet",
             )
         if not NODE_ID_RE.match(req.node_id):
             raise OpenError(Status.REJECTED, f"bad node_id {req.node_id!r}")
@@ -326,7 +326,7 @@ class NodeRegistry:
 
     @staticmethod
     def _pool_error(req: NodeOpenRequest, info: PoolInfo) -> str | None:
-        """Spec 3.1: only this run's DRAM pool and its SSD pools; CXL regions
+        """Only this run's DRAM pool and its SSD pools; CXL regions
         come from MaruServer."""
         if info.node_id != req.node_id:
             return f"belongs to node {info.node_id}"
@@ -341,7 +341,7 @@ class NodeRegistry:
                 return "an SSD pool needs its path"
             expected = f"ssd:{req.node_id}:{info.path}"
         else:
-            return "CXL regions are granted by MaruServer (REGION_REQUEST, S5)"
+            return "CXL regions are granted by MaruServer (REGION_REQUEST)"
         if info.pool_id != expected:
             return f"pool_id must be {expected!r}"
         return None
@@ -435,7 +435,7 @@ class NodeRegistry:
         req: NodeOpenRequest,
         listed: dict[str, PoolInfo],
     ) -> bool:
-        """Spec 7.2: CXL if no reboot and the same rm_domain is listed; SSD
+        """CXL if no reboot and the same rm_domain is listed; SSD
         if listed unchanged (a changed one starts empty); never DRAM."""
         if pool.kind == PoolKind.DRAM:
             return False
@@ -795,7 +795,7 @@ class NodeRegistry:
     # ========================================================== access info
 
     def record_hit(self, pool: PoolRecord, location: Location) -> None:
-        """A reference-path HIT, for the owning node's LRU (spec 3.1)."""
+        """A reference-path HIT, for the owning node's LRU."""
         access = self._access.get(pool.node_id)
         if access is None:
             access = self._access[pool.node_id] = OrderedDict()
@@ -820,7 +820,7 @@ class NodeRegistry:
     # ======================================================= block requests
 
     def delete(self, keys: Iterable[Key], reason: str = "delete") -> list[ItemOutcome]:
-        """Spec 3.1: block requests to the owning nodes, which retire the
+        """Block requests to the owning nodes, which retire the
         locations themselves. OK when queued (or already queued); MISS when
         the key has no location (offline: none a running node can block)."""
         outcomes = []

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""MaruClient: the storage client behind MaruHandler on maru_node (design 4.2).
+"""MaruClient: the storage client behind MaruHandler on maru_node.
 
 ATTACH to the node, map its pools, open the worker session with the node-view
 pid, keep credit at hand. On a UDS break it attaches again: to the same run it
 keeps credit and resends unresolved ops; to a new run it drops them, answers
-the restart drain and unmaps the old pool once unused (spec 7.2).
+the restart drain and unmaps the old pool once unused.
 """
 
 import collections
@@ -81,7 +81,7 @@ def _release_view(view: memoryview) -> None:
 
 
 class CreditUnavailableError(ValueError):
-    """No credit at hand: this store is skipped (design 5.4)."""
+    """No credit at hand: this store is skipped."""
 
 
 @dataclass(eq=False)
@@ -157,7 +157,7 @@ class MaruClient:
         self._credit_op: tuple[OpTracker, int] | None = None
         self._sends: collections.deque = collections.deque()
         self._sends_cv = threading.Condition()
-        # Unavailable and absent are counted apart (design 5.2)
+        # Unavailable and absent are counted apart
         self.stats: collections.Counter[str] = collections.Counter()
 
     # ------------------------------------------------------------- lifecycle
@@ -169,7 +169,9 @@ class MaruClient:
             if self._connected:
                 return True
         if self.config.metadata_only:
-            raise RuntimeError("a metadata-only handler on maru_node is stage S3")
+            raise RuntimeError(
+                "a metadata-only handler on maru_node is not supported yet"
+            )
         server = None
         try:
             conn, response, fds = self._first_attach()
@@ -291,7 +293,7 @@ class MaruClient:
             else:
                 for descriptor in response.pools:
                     if descriptor.memfd is None:
-                        continue  # CXL and later kinds: stage S5
+                        continue  # only DRAM pools are mapped so far
                     # pools.add closes the fd, also on failure
                     fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
                     self.pools.add(descriptor, fd, response.node_epoch)
@@ -356,7 +358,7 @@ class MaruClient:
         if handles:
             # Copies into them may still run: no DETACH, no WORKER_CLOSE, and
             # their pools stay mapped and registered; the node cleans up when
-            # this process ends (spec 3.2, 4.1)
+            # this process ends
             logger.warning(
                 "closing with %d allocations not stored or freed; their credit "
                 "stays with the StorageService until this process ends",
@@ -1016,7 +1018,8 @@ class MaruClient:
             if outcomes is None:
                 out.extend([False] * len(batch))
                 continue
-            # FETCH is not readable until fetch comes (S6)
+            # Only a HIT is readable: fetching from another node is not
+            # supported yet
             out.extend(o.result == ItemResult.HIT for o in outcomes)
         return out
 
@@ -1121,7 +1124,7 @@ class MaruClient:
             ).start()
         elif notify.kind == NotifyKind.POOL_ADD:
             logger.warning(
-                "pool_add for %s: mapping added pools comes with stage S5",
+                "pool_add for %s: mapping added pools is not supported yet",
                 notify.pool.pool.pool_id if notify.pool else None,
             )
         elif notify.kind == NotifyKind.EPOCH:
@@ -1132,8 +1135,7 @@ class MaruClient:
             )
 
     def _drain(self, notify: Notify) -> None:
-        """DRAIN_ACK once the ended epoch's accesses finish; never on a timeout
-        (spec 4.1)."""
+        """DRAIN_ACK once the ended epoch's accesses finish; never on a timeout."""
         kind = notify.drain_kind
         if kind is None:
             logger.warning("NOTIFY drain without drain_kind; ignored")

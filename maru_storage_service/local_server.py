@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""LocalServer: the UDS endpoint for this node's workers (spec 2, 4.1).
+"""LocalServer: the UDS endpoint for this node's workers.
 
 Per connection a reader answers in order and a writer sends what other threads
 finish later (WRITE_DONE answers, NOTIFY), both under the send lock, so a
@@ -41,10 +41,10 @@ logger = logging.getLogger(__name__)
 
 _LISTEN_BACKLOG = 128
 _DISABLED = {
-    NodeMessageType.FETCH: "fetch comes with stage S6",
-    NodeMessageType.FETCH_CANCEL: "fetch comes with stage S6",
-    NodeMessageType.LOCAL_PIN: "local pins are off in v1",
-    NodeMessageType.LOCAL_UNPIN: "local pins are off in v1",
+    NodeMessageType.FETCH: "fetch is not supported yet",
+    NodeMessageType.FETCH_CANCEL: "fetch is not supported yet",
+    NodeMessageType.LOCAL_PIN: "local pins are not supported yet",
+    NodeMessageType.LOCAL_UNPIN: "local pins are not supported yet",
 }
 
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""maru-server options for multi-storage times (spec 9) and the async default."""
+"""maru-server options for multi-storage times and the async default."""
 
 from unittest.mock import MagicMock, patch
 
@@ -22,7 +22,7 @@ def run_main(*argv):
     return server_cls, rpc_cls
 
 
-def test_defaults_follow_the_spec():
+def test_defaults():
     server_cls, rpc_cls = run_main()
     kwargs = server_cls.call_args.kwargs
     assert kwargs["session_ttl_s"] == 30

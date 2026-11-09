@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Reference pins on exact locations (spec 3.3, 6.1).
+"""Reference pins on exact locations.
 
 Pins never expire by time. Not thread safe: callers hold the service lock.
 """

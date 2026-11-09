@@ -100,7 +100,7 @@ def _canonical(obj: Any) -> Any:
 
 
 def op_digest(request: Any) -> bytes:
-    """BLAKE2b-128 of the canonical request without ENVELOPE_FIELDS (spec 1).
+    """BLAKE2b-128 of the canonical request without ENVELOPE_FIELDS.
 
     The receiver computes it from DecodedRequest.payload, not the dataclass,
     so fields unknown to one side do not change it.

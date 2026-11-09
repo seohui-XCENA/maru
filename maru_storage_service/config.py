@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService node config (wire spec 8): JSON, checked before anything starts.
+"""StorageService node config: JSON, checked before anything starts.
 
 Unknown keys are errors so a typo never falls back to a default.
 """
@@ -37,7 +37,7 @@ DEFAULT_HIGH_WATERMARK = 0.9
 DEFAULT_LOW_WATERMARK = 0.8
 DEFAULT_RDMA_TIMEOUT_S = 30.0  # the same as maru_rdma_timeout_s today
 
-# Budget defaults (spec 9, all provisional until measured)
+# Budget defaults (all provisional until measured)
 CREDIT_MAX_PAGES = 16
 CREDIT_TOTAL_FRACTION = 0.10
 CREDIT_REFILL_LOW_FRACTION = 0.25
@@ -443,7 +443,7 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
     local_pin = _bool(raw, "local_pin", "config", False)
     if local_pin:
         raise NodeConfigError(
-            "config.local_pin: the local pin path is not available in v1 (S9)"
+            "config.local_pin: the local pin path is not supported yet"
         )
 
     raw_tiers = raw.get("tiers")

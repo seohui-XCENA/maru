@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Catalog: key -> locations, and the pool registry (spec 3.3, 3.4).
+"""Catalog: key -> locations, and the pool registry.
 
 Not thread safe: callers hold the service lock.
 """
@@ -102,7 +102,7 @@ class Selection:
 
 
 def location_cost(requester_node: str, pool: PoolRecord) -> int:
-    """Spec 3.3: node DRAM < node CXL < memory node DRAM/CXL < node SSD <
+    """Cost order: node DRAM < node CXL < memory node DRAM/CXL < node SSD <
     memory node SSD; any other node counts as a memory node."""
     same = pool.node_id == requester_node
     if pool.kind == PoolKind.DRAM:
@@ -134,7 +134,8 @@ class Catalog:
         self._preserved: frozenset[Key] = frozenset()
         self._removing: set[PoolRecord] = set()
         self._sweeps: dict[PoolRecord, None] = {}  # REMOVING pools to sweep
-        # CXL regions with no locations (so no pins) left; S5 returns them
+        # CXL regions with no locations (so no pins) left; nothing returns
+        # them yet
         self.pending_returns: dict[str, PoolInfo] = {}
 
     # ------------------------------------------------------------- registry
@@ -364,7 +365,7 @@ class Catalog:
             return "logical_bytes must be in (0, length]"
         if not 0 <= location.generation <= _GENERATION_MAX:
             return "generation out of range"
-        # spec 1: the high bits name the run that gave the page
+        # The high bits name the run that gave the page
         if generation_epoch_seq(location.generation) != epoch_seq:
             return f"generation {location.generation} is not of epoch_seq {epoch_seq}"
         return None
@@ -480,10 +481,10 @@ class Catalog:
         item: FetchCompleteItem,
         copy_error: str | None,
     ) -> ItemOutcome:
-        """Commit the copy, pin it for the worker, release the source pin
-        (spec 3.4). An existing copy in the node's DRAM (or the copy's pool)
-        is used instead. With no worker the copy stays as cache (spec 6.3).
-        Every outcome releases this node's source pin."""
+        """Commit the copy, pin it for the worker, release the source pin. An
+        existing copy in the node's DRAM (or the copy's pool) is used instead.
+        With no worker the copy stays as cache. Every outcome releases this
+        node's source pin."""
         source_pin = self.pins.get(item.source_pin_id)
         own_source = source_pin is not None and source_pin.holder == node_holder
         try:
@@ -581,7 +582,7 @@ class Catalog:
     # ------------------------------------------------------------- lookup
 
     def select(self, key: Key, requester: Requester) -> Selection:
-        """Spec 3.3: the cheapest mapped location is a HIT (no StorageService
+        """The cheapest mapped location is a HIT (no StorageService
         needed); else the cheapest one both StorageServices can fetch; else
         MISS, offline if the key still has a location, absent if not."""
         entries = self._by_key.get(key)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Op ledger rules (spec 1, op), on their own and through MsService."""
+"""Op ledger rules, on their own and through MsService."""
 
 import dataclasses
 import threading

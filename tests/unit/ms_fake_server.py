@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""In-process MaruServer for multi-storage tests (spec 3), until S1 is joined.
+"""In-process MaruServer for multi-storage tests.
 
-Keeps a Catalog, pins, sessions and op ledgers by the spec and S1's rules.
+Keeps a Catalog, pins, sessions and op ledgers by MsService's rules.
 Failure injection: pause/resume, drop_responses, drop_requests, delay, restart.
 """
 
@@ -60,7 +60,7 @@ from maru_common.storage_types import (
     WorkerRef,
     generation_epoch_seq,
 )
-from maru_server.ms_service import result_bytes  # S1's estimate, for op_bytes_max
+from maru_server.ms_service import result_bytes  # MsService's op_bytes_max estimate
 
 OP_CODES = {
     MessageType.LOOKUP_AND_PIN,
@@ -271,7 +271,7 @@ class FakeMaruServer:
             self._delays[int(code)] = seconds
 
     def restart(self) -> None:
-        """New server_epoch, no state (spec 7.1)."""
+        """New server_epoch, no state."""
         with self._lock:
             self._reset_state()
 
@@ -407,7 +407,7 @@ class FakeMaruServer:
         if code == MessageType.HANDSHAKE:
             return HandshakeResponse(success=True, server_epoch=self.server_epoch)
         if code == MessageType.ADMIN_DELETE:
-            return self._admin_delete(request)  # no session (S1)
+            return self._admin_delete(request)  # no session
         _, response_cls = MS_MESSAGE_CLASSES[code]
         now = time.monotonic()
         self._expire(now)
@@ -439,7 +439,7 @@ class FakeMaruServer:
             if code in (MessageType.PROBE, MessageType.LOOKUP_AND_PIN) and (
                 node is None or node.node_epoch != worker.node_epoch
             ):
-                # Opened on an older node run: attach again and reopen (S1)
+                # Opened on an older node run: attach again and reopen
                 return response_cls(status=Status.EPOCH, error="stale node epoch")
         else:
             return response_cls(status=Status.DISABLED, error="not in the fake")
@@ -448,7 +448,7 @@ class FakeMaruServer:
         handler = getattr(self, f"_{MessageType(code).name.lower()}")
         if code not in OP_CODES:
             return handler(actor, request)
-        # Op rules (spec 1)
+        # Op rules
         op = request.op
         digest = op_digest(decoded.payload)
         if op.origin != origin or op.digest != digest or op.seq < 1 or op.ack >= op.seq:
@@ -489,9 +489,9 @@ class FakeMaruServer:
         for worker in list(self.workers.values()):
             if now - worker.last_seen <= self.session_ttl_s:
                 continue
-            worker.open = False  # pins stay (spec 3.2)
+            worker.open = False  # pins stay
             if f"worker:{worker.incarnation}" not in held:
-                # S1 maintenance: expired and pinless, it goes with its ops
+                # Expired and pinless, it goes with its ops
                 del self.workers[worker.token]
                 if self.by_incarnation.get(worker.incarnation) == worker.token:
                     del self.by_incarnation[worker.incarnation]
@@ -526,7 +526,7 @@ class FakeMaruServer:
             old.last_seen = now
             old.online = True
             self.node_sessions[old.session] = req.node_id
-            self.previous_epochs[req.node_id] = None  # S1: none on a renewal
+            self.previous_epochs[req.node_id] = None  # none on a renewal
             return self._open_response(old, list(self._adopted_of(old)))
         previous = None
         if old is not None:
@@ -622,7 +622,7 @@ class FakeMaruServer:
             if key in self.preserved:
                 items.append(ItemOutcome(ItemResult.KEPT, cause=KeptCause.PINNED))
                 continue
-            # S1: only ACTIVE pools of nodes whose run goes on can block
+            # Only ACTIVE pools of nodes whose run goes on can block
             entries = self.catalog.get(key, [])
             queued = False
             for entry in entries:
@@ -708,7 +708,7 @@ class FakeMaruServer:
         old = self.by_incarnation.get(req.incarnation)
         if old is not None:
             w = self.workers[old]
-            # S1 identity: node, engine, ranks, pid and start time, namespace
+            # Identity: node, engine, ranks, pid and start time, namespace
             if (
                 w.node_id,
                 w.engine_id,
@@ -892,7 +892,7 @@ class FakeMaruServer:
             ):
                 items.append(ItemOutcome(ItemResult.REJECTED))
                 continue
-            # S1 Catalog.commit: the key's location in this pool first (the very
+            # As Catalog.commit: the key's location in this pool first (the very
             # same one is ADDED again), then any page holder REJECTS
             same_pool = [
                 e
@@ -904,7 +904,7 @@ class FakeMaruServer:
                     ItemOutcome(ItemResult.DUPLICATE, location=same_pool[0].location)
                 )
                 continue
-            if same_pool:  # the same location again: pinned as asked (S1)
+            if same_pool:  # the same location again: pinned as asked
                 items.append(
                     ItemOutcome(ItemResult.ADDED, pin_id=self._node_pin(node, item))
                 )
@@ -937,7 +937,7 @@ class FakeMaruServer:
                 continue
             entry = self.by_loc.get(loc_id(loc))
             if entry is None or entry.key != kl.key or entry.location != loc:
-                # S1: MOVED only when another published location (another key,
+                # MOVED only when another published location (another key,
                 # or this key at another generation) occupies the page
                 occupant = self._page_holder(loc)
                 items.append(
@@ -959,8 +959,8 @@ class FakeMaruServer:
         return RetireResponse(status=Status.OK, items=items)
 
     def _page_holder(self, loc: Location) -> Entry | None:
-        """S1: a live location with this allocation_id, else one overlapping
-        these bytes."""
+        """A live location with this allocation_id, else one overlapping these
+        bytes."""
         in_pool = [e for e in self.by_loc.values() if e.location.pool_id == loc.pool_id]
         for e in in_pool:
             if e.location.allocation_id == loc.allocation_id:

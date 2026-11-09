@@ -2,7 +2,7 @@
 """Descriptors for the storage directory.
 
 The session backends (cpu, mixed, remote_cxl) use StorageLocation; the rest is
-the multi-storage wire types (wire spec chapters 1, 2, 5).
+the multi-storage wire types.
 """
 
 from dataclasses import dataclass
@@ -45,7 +45,7 @@ class StorageUnavailableError(ConnectionError):
 # =============================================================================
 
 MS_PROTOCOL = "ms1"
-# Items in one multi-storage request (spec 9, MAX_BATCH)
+# Items in one multi-storage request
 MAX_BATCH = MAX_STORAGE_BATCH
 # generation = epoch_seq << 40 | counter: a new run always gives higher
 # generations. It travels as uint64, which bounds epoch_seq.
@@ -210,7 +210,8 @@ class KeyLocation:
 
 @dataclass(frozen=True)
 class OpRef:
-    """Identifies a state-changing request for resends (spec 1).
+    """Identifies a state-changing request; a resend gets the first result
+    instead of running again.
 
     ``ack``: highest seq whose result the sender holds, along with all below it.
     """
@@ -294,7 +295,7 @@ class RmDomain:
 
 @dataclass(frozen=True)
 class PoolUsage:
-    """Bytes per page state (spec 6.2); they add up to ``capacity``."""
+    """Bytes per page state; they add up to ``capacity``."""
 
     pool_id: str
     capacity: int

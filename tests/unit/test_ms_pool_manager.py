@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""PoolManager states, budgets and the bytes invariant (spec 6.2), including a
-stateful property test over every transition."""
+"""PoolManager states, budgets and the bytes invariant, including a stateful
+property test over every transition."""
 
 import dataclasses
 
@@ -356,7 +356,7 @@ class TestServiceTransitions:
         pm2.add_pool(info, creditable=False, state=PageState.QUARANTINED)
         with pytest.raises(InvalidTransitionError):
             pm2.recovered("ssd:n:/x", [(Key("ns", "x"), bad)])
-        # credit never comes from a pool this stage cannot map
+        # credit never comes from a pool workers cannot map yet
         pm2 = PoolManager(budgets(), PS)
         pm2.add_pool(info, creditable=False, state=PageState.QUARANTINED)
         pm2.set_epoch_seq(1)

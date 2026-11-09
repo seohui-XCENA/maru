@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""PeerWatcher: pidfd per worker process (spec 7.3).
+"""PeerWatcher: pidfd per worker process.
 
 A process is (pid, pid_start); the start time is read again after
 pidfd_open so a reused pid is never mistaken for it.

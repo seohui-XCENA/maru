@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService UDS rules, request by request (spec 2, 4.1, 5, 6)."""
+"""StorageService UDS rules, request by request."""
 
 import dataclasses
 import mmap

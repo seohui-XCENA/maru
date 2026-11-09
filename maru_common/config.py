@@ -179,7 +179,7 @@ class MaruConfig:
                 raise ValueError("maru_node requires engine_id and cache_namespace")
             if self.metadata_only:
                 raise ValueError(
-                    "a metadata-only handler on maru_node comes with stage S3"
+                    "a metadata-only handler on maru_node is not supported yet"
                 )
             if not 0 < self.store_timeout_s < float("inf"):
                 raise ValueError("store_timeout_s must be a positive number")

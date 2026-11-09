@@ -3,5 +3,5 @@
 """TransferEngine: submits, completes, cancels and drains byte transfers.
 
 CPU copies between tiers, RDMA and SSD I/O. It waits outside every metadata
-lock. Implemented from stage S5.
+lock. Not implemented yet.
 """

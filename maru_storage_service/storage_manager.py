@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """StorageManager: op ledger, WRITE_DONE -> COMMIT, removal, worker exit and
-restart drain, in the order the spec gives (spec 1, 4.1, 6.3, 7.2, 7.3)."""
+restart drain."""
 
 import collections
 import dataclasses
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 R = TypeVar("R")
 
-# spec 9, op_window
+# Unacknowledged ops kept per origin
 OP_WINDOW = 65536
 DEFAULT_GPU_DRAIN_GRACE_S = 5.0
 DEFAULT_EVICT_INTERVAL_S = 0.05
@@ -79,7 +79,7 @@ EXIT_RETRY_MAX_S = 30.0
 
 
 # ============================================================================
-# Op ledger (receiver side of spec 1, op)
+# Op ledger (receiver side of ops)
 # ============================================================================
 
 
@@ -111,7 +111,7 @@ class _OriginLog:
 
 
 class OpLedger:
-    """Receiver side of the op rule (spec 1): results per origin until acked."""
+    """Receiver side of ops: results per origin until acked."""
 
     def __init__(self, window: int = OP_WINDOW):
         self.window = window
@@ -393,7 +393,8 @@ class StorageManager:
         return self._safe
 
     def enter_safe_state(self, reason: str) -> None:
-        """No new credit, no eviction, no page reused (re-registration is S4)."""
+        """No new credit, no eviction, no page reused; leaving it needs
+        re-registration, which is not supported yet."""
         with self._cv:
             if self._safe is not None:
                 return
@@ -401,7 +402,8 @@ class StorageManager:
             self._cv.notify_all()
         self.pools.stop_credit(reason)
         logger.error(
-            "safe state (%s): no credit, no eviction (S4 re-registers)", reason
+            "safe state (%s): no credit, no eviction until the StorageService restarts",
+            reason,
         )
 
     # --------------------------------------------------------------- workers
@@ -463,7 +465,7 @@ class StorageManager:
         return rec, ""
 
     def after_attach_reply(self, rec: WorkerRecord) -> None:
-        """Send NOTIFY drain to an old worker that attached again (spec 7.2)."""
+        """Send NOTIFY drain to an old worker that attached again."""
         with self._lock:
             old = self._old.get(rec.incarnation)
             draining = old is not None and old.state == OldState.DRAINING
@@ -478,7 +480,7 @@ class StorageManager:
             )
 
     def connection_lost(self, rec: WorkerRecord, conn) -> None:
-        """The UDS closed; the credit stays until the process exits (spec 7.3)."""
+        """The UDS closed; the credit stays until the process exits."""
         with self._lock:
             if rec.conn is conn:
                 rec.conn = None
@@ -499,7 +501,7 @@ class StorageManager:
     def after_detach_reply(self, rec: WorkerRecord) -> None:
         """Forget a worker that detached holding nothing: its record, pidfd
         and op records go. One with credit, an op running or an old run to
-        drain waits for its exit (spec 7.3)."""
+        drain waits for its exit."""
         incarnation = rec.incarnation
         with self._lock:
             old = self._old.get(incarnation)
@@ -585,7 +587,7 @@ class StorageManager:
         adopted: list[str],
         previous_node_epoch: str | None = None,
     ) -> None:
-        """Start confirming the old workers (spec 7.2); before workers attach."""
+        """Start confirming the old workers; before workers attach."""
         with self._lock:
             self.previous_node_epoch = previous_node_epoch
             self._adopted = list(adopted)
@@ -789,7 +791,7 @@ class StorageManager:
         reply: Callable[[WriteDoneResponse], None],
         waiter: object = None,
     ) -> None:
-        """Answer via ``reply`` once every item is published (spec 4.1)."""
+        """Answer via ``reply`` once every item is published."""
         req: WriteDoneRequest = decoded.request
         if not req.items or len(req.items) > MAX_BATCH:
             reply(
@@ -907,7 +909,7 @@ class StorageManager:
         return DrainAckResponse(status=Status.OK)
 
     def unmap_ack(self, rec: WorkerRecord, req: UnmapAckRequest) -> UnmapAckResponse:
-        # Pool removal is S5 (CXL region return)
+        # Recorded only: no pool is removed yet
         with self._lock:
             self._unmapped.add((rec.incarnation, req.pool_id, req.pool_generation))
         return UnmapAckResponse(status=Status.OK)
@@ -1081,7 +1083,7 @@ class StorageManager:
                 self.retire(refs, items)
 
     def retire(self, refs: list[PageRef], items: list[KeyLocation]) -> None:
-        """Block local pins, RETIRE, act on each result (design 5.5)."""
+        """Block local pins, RETIRE, act on each result."""
         self.local_pins.block(refs)
         try:
             response = self.server.retire(items)

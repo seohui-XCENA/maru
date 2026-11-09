@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""MaruServer side of the multi-storage structure (spec 3).
+"""MaruServer side of the multi-storage structure.
 
 One lock guards Catalog, pins, registry and op ledger, apart from the legacy
-ReplicaDirectory lock (D10). Expiry scans, deferred removals and policy
-reloads run on a maintenance thread in bounded steps.
+ReplicaDirectory lock, so a slow resource manager never holds up
+multi-storage requests. Expiry scans, deferred removals and policy reloads
+run on a maintenance thread in bounded steps.
 """
 
 import json
@@ -97,9 +98,6 @@ DEFAULT_NODE_GIVE_UP_S = 600.0
 DEFAULT_MAINTENANCE_BUDGET = 512
 DEFAULT_MAINTENANCE_INTERVAL_S = 1.0
 MAINTENANCE_YIELD_S = 0.0005
-
-_S4 = "stage S4 (MaruServer restart recovery)"
-_S5 = "stage S5 (CXL regions: an AllocationManager per RM domain, D11)"
 
 R = TypeVar("R")
 
@@ -301,8 +299,8 @@ class MsService:
         n_items: int,
         run: Callable[[_Batch], R],
     ) -> R:
-        """Spec 1 op rules. A run that fails after changing the Catalog is
-        recorded with its applied items (the rest REJECTED), never dropped."""
+        """Op rules (see OpLedger). A run that fails after changing the Catalog
+        is recorded with its applied items (the rest REJECTED), never dropped."""
         error = self._op_error(op, origin[1], digest)
         if error is not None:
             return response_cls(status=Status.REJECTED, error=error)
@@ -385,7 +383,10 @@ class MsService:
     ) -> NodeReregisterResponse:
         return NodeReregisterResponse(
             status=Status.DISABLED,
-            error=f"NODE_REREGISTER is {_S4} and not implemented",
+            error=(
+                "NODE_REREGISTER (recovery after a MaruServer restart) is not "
+                "supported yet"
+            ),
         )
 
     def node_recover_list(
@@ -431,7 +432,7 @@ class MsService:
     def admin_delete(
         self, req: AdminDeleteRequest, payload: dict
     ) -> AdminDeleteResponse:
-        """Block requests to the owning nodes, which retire (spec 3.1)."""
+        """Block requests to the owning nodes, which retire."""
         with self.lock:
             rejected = self._too_many(req.items, AdminDeleteResponse, "items")
             if rejected:
@@ -777,20 +778,22 @@ class MsService:
         if pin is not None and pin.holder == session.token:
             self.pins.unpin(pin_id)
 
-    # ================================================================ S5
+    # ======================================================= CXL regions
 
     def region_request(
         self, req: RegionRequestRequest, payload: dict
     ) -> RegionRequestResponse:
         return RegionRequestResponse(
-            status=Status.DISABLED, error=f"REGION_REQUEST is {_S5} and not implemented"
+            status=Status.DISABLED,
+            error="REGION_REQUEST: CXL regions are not supported yet",
         )
 
     def region_return(
         self, req: RegionReturnRequest, payload: dict
     ) -> RegionReturnResponse:
         return RegionReturnResponse(
-            status=Status.DISABLED, error=f"REGION_RETURN is {_S5} and not implemented"
+            status=Status.DISABLED,
+            error="REGION_RETURN: CXL regions are not supported yet",
         )
 
     # =========================================================== admin
@@ -825,7 +828,7 @@ class MsService:
                 logger.info("policy reloaded: %d preserved keys", len(preserved))
 
     def register_region(self, info: PoolInfo) -> None:
-        """Stand-in for S5 REGION_REQUEST: register a granted CXL region."""
+        """Register a granted CXL region (stands in for REGION_REQUEST)."""
         with self.lock:
             node = self.registry.nodes.get(info.node_id)
             if node is None or node.session is None or node.session.ended:
@@ -837,7 +840,7 @@ class MsService:
             self.catalog.register_pool(info, node.epoch_seq)
 
     def pending_region_returns(self) -> list[PoolInfo]:
-        """CXL regions with no locations left, for S5 to return."""
+        """CXL regions with no locations left, to be returned."""
         with self.lock:
             return list(self.catalog.pending_returns.values())
 

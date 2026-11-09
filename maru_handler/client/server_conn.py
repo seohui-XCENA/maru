@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""ServerConn: the worker session with MaruServer (spec 3.2, 3.3).
+"""ServerConn: the worker session with MaruServer.
 
 Reopening with the same incarnation keeps pins unless the server epoch
 changed. A lookup with an unknown result is resent with the same op in the
@@ -112,7 +112,7 @@ class ServerConn:
             raise StorageUnavailableError(f"WORKER_OPEN: {e}") from e
         if response.status == Status.EPOCH:
             # Refused for this node epoch: the stale-node callback may reopen
-            # on the run the UDS is attached to (S1 rule E)
+            # on the run the UDS is attached to
             with self._lock:
                 self._reopen = True
                 generation = self._opens
@@ -169,7 +169,7 @@ class ServerConn:
 
     def close(self, goodbye: bool = True) -> None:
         """Flush UNPINs and stop; with ``goodbye`` also WORKER_CLOSE (only after
-        every GPU copy ended, spec 3.2)."""
+        every GPU copy ended)."""
         self._stop.set()
         self._wake.set()
         for thread in (self._thread, self._resolver):
@@ -291,7 +291,7 @@ class ServerConn:
                     return None
                 if not same:
                     return None  # the op and its pins are gone with the server
-                # The digest leaves out the session (spec 1)
+                # The digest leaves out the session
                 session, epoch = self._ids()
                 request = dataclasses.replace(
                     request, session=session, server_epoch=epoch
@@ -433,7 +433,7 @@ class ServerConn:
                     if outcome.result != ItemResult.OK
                 ]
                 if refused:
-                    # Not this session's pins (S1): nothing to retry
+                    # Not this session's pins: nothing to retry
                     logger.error(
                         "UNPIN refused for %d pins: %s", len(refused), refused[:4]
                     )

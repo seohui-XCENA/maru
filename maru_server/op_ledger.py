@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Per-origin replay records of state-changing requests (spec 1, op).
+"""Per-origin replay records of state-changing requests (see OpRef).
 
 Not thread safe: callers hold the service lock.
 """

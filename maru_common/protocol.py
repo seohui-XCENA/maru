@@ -80,7 +80,7 @@ class MessageType(IntEnum):
     # Opt-in storage directory, independent of legacy CXL key semantics.
     STORAGE = 0x30
 
-    # Multi-storage (0x40 - 0x5F), see the multi-storage wire spec chapter 3
+    # Multi-storage (0x40 - 0x5F)
     NODE_OPEN = 0x40
     NODE_HEARTBEAT = 0x41
     NODE_CLOSE = 0x42
@@ -621,7 +621,7 @@ class ShutdownResponse:
 # Multi-storage Messages (0x40 - 0x5F)
 # =============================================================================
 # Session requests carry ``session`` and ``server_epoch``; state changes carry
-# ``op`` (spec 1). Response ``items`` follow the request's order.
+# ``op`` (see OpRef). Response ``items`` follow the request's order.
 
 
 @dataclass

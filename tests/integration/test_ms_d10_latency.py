@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""D10 over RPC: legacy requests stuck on a 2 s RM release leave
+"""Request lanes over RPC: legacy requests stuck on a 2 s RM release leave
 lookup_and_pin p99 unchanged. Needs no resource manager."""
 
 import socket

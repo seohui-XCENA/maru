@@ -80,7 +80,7 @@ class MaruHandler:
         self._mapper: DaxMapper | None = None
         self._cpu = None
         if self._config.maru_node:
-            # Same methods as the storage clients below (design 4.2)
+            # Same methods as the storage clients below
             from .client.maru_client import MaruClient
 
             self._cpu = MaruClient(self._config)

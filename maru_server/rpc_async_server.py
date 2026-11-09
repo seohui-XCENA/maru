@@ -3,8 +3,8 @@
 """RpcAsyncServer - ZeroMQ RPC server with a poll-based proxy and worker pool.
 
 The proxy routes multi-storage requests (0x40-0x5F) to their own worker lane,
-so legacy requests stuck on a slow resource manager never take their threads
-(D10); a full lane is answered at once instead of stalling the other.
+so legacy requests stuck on a slow resource manager never take their threads;
+a full lane is answered at once instead of stalling the other.
 """
 
 import logging

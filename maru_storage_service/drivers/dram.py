@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""DRAM driver: memfd pools, optionally on huge pages (spec 1, 7.2).
+"""DRAM driver: memfd pools, optionally on huge pages.
 
 Pools are fully allocated and size-sealed at creation, so a shortage fails at
 start rather than as a SIGBUS in a worker.

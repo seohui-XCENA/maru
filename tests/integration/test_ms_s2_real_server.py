@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""S2 completion scenarios against the real MaruServer (no RM needed).
+"""StorageService scenarios against the real MaruServer (no RM needed).
 
 MaruServer runs as ``python -m maru_server --cpu-only``, the StorageService
 in-process (or as ``maru-storage``), workers as separate processes through

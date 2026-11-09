@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""PlacementPolicy: LRU removal candidates per pool (design 4.3).
+"""PlacementPolicy: LRU removal candidates per pool.
 
-A candidate is not an approval: the policy sends no RPC. Demotion plans come
-with S5.
+A candidate is not an approval: the policy sends no RPC. Demotion to a lower
+tier is not supported yet.
 """
 
 import collections

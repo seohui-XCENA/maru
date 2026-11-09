@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""PoolManager: page states, holders, credit budgets and bytes per state (spec 6.2).
+"""PoolManager: page states, holders, credit budgets and bytes per state.
 
 A page gets a new generation each time it leaves FREE. Worker requests that do
 not match the ledger are refused; a wrong transition asked by the service is a
@@ -140,7 +140,7 @@ class PoolManager:
         creditable: bool = True,
         state: PageState = PageState.FREE,
     ) -> None:
-        """Add a pool: FREE if made here, QUARANTINED if adopted (spec 7.2)."""
+        """Add a pool: FREE if made here, QUARANTINED if adopted."""
         if state not in (PageState.FREE, PageState.QUARANTINED):
             raise ValueError(f"a pool starts FREE or QUARANTINED, not {state}")
         if info.page_size != self.page_size:
@@ -185,7 +185,7 @@ class PoolManager:
         with self._lock:
             if self._epoch_seq is not None and self._epoch_seq != epoch_seq:
                 raise InvalidTransitionError(
-                    f"epoch_seq already {self._epoch_seq}; a new one is stage S4"
+                    f"epoch_seq already {self._epoch_seq}; changing it is not supported"
                 )
             self._epoch_seq = epoch_seq
 
@@ -209,7 +209,7 @@ class PoolManager:
     def credit(
         self, holder: str, want_bytes: int, kind: PoolKind | None = None
     ) -> list[Location]:
-        """FREE pages for ``holder`` within every budget (spec 4.1, 9); empty when
+        """FREE pages for ``holder`` within every budget; empty when
         credit is stopped or the commit-pending bytes reached their cap."""
         if want_bytes <= 0:
             return []
@@ -501,7 +501,7 @@ class PoolManager:
             return PageRef(ref.pool_id, page.index, page.generation)
 
     def quarantine_holder(self, holder: str) -> list[PageRef]:
-        """CREDITED -> QUARANTINED for an ended holder (spec 7.3)."""
+        """CREDITED -> QUARANTINED for an ended holder."""
         with self._lock:
             out = []
             for pool in self._pools.values():
@@ -538,7 +538,7 @@ class PoolManager:
     def recovered(
         self, pool_id: str, items: Iterable[tuple[Key, Location]]
     ) -> list[PageRef]:
-        """QUARANTINED -> READY for pages NODE_RECOVER_LIST lists (spec 7.2)."""
+        """QUARANTINED -> READY for pages NODE_RECOVER_LIST lists."""
         with self._lock:
             pool = self._pools.get(pool_id)
             if pool is None:

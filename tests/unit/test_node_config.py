@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService node config: the spec examples, defaults and every rule."""
+"""StorageService node config: example configs, defaults and every rule."""
 
 import copy
 import json
@@ -21,7 +21,7 @@ M = 1 << 20
 G = 1 << 30
 T = 1 << 40
 
-# The two examples of the wire spec, chapter 8
+# Example configs: a GPU node and a memory node
 GPU_NODE = {
     "node_id": "gpu-a",
     "socket": "/run/maru/node.sock",
@@ -223,7 +223,7 @@ class TestRules:
         )
         rejects(with_tier(GPU_NODE, 1, visibility="fenced"), "visibility")
 
-    def test_local_pin_is_not_in_v1(self):
+    def test_local_pin_is_not_supported_yet(self):
         rejects(edit(GPU_NODE, local_pin=True), "local pin")
 
     def test_role(self):

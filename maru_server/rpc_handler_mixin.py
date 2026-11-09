@@ -109,7 +109,7 @@ class RpcHandlerMixin:
 
     def _process_ms_frame(self, serializer: Serializer, raw_data: bytes) -> bytes:
         """Strict decode; a malformed payload or a failed handler gets the
-        request's response with REJECTED (spec 2). Raises only for an
+        request's response with REJECTED. Raises only for an
         unreadable header."""
         try:
             decoded = serializer.decode_request_payload(raw_data)

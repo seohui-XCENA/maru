@@ -7,6 +7,4 @@ node pools, hands pages to workers as credit, commits finished writes to
 MaruServer, chooses eviction and demotion candidates, moves bytes between
 tiers and nodes, and takes space back once MaruServer approved the removal
 and every access ended. MaruServer stays the authority on which KV exists.
-
-See the multi-storage design (section 4.3) and wire spec (chapters 4, 6, 7).
 """

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageConn: the UDS connection to the node's StorageService (spec 4).
+"""StorageConn: the UDS connection to the node's StorageService.
 
 Several requests may be in flight, matched by header sequence; NOTIFY is
 handled on its own thread. OpTracker keeps unresolved ops for a resend after
-reconnecting to the same run (spec 7.2).
+reconnecting to the same run.
 """
 
 import collections
