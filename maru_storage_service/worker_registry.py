@@ -23,7 +23,13 @@ from maru_common.node_protocol import (
     DrainAckResponse,
     Notify,
 )
-from maru_common.storage_types import DrainKind, NotifyKind, Status, WorkerRef
+from maru_common.storage_types import (
+    DrainKind,
+    NotifyKind,
+    SessionRole,
+    Status,
+    WorkerRef,
+)
 
 from .op_ledger import OpLedger
 from .pool_manager import RECOVERY_TAG, PoolManager, holder_tag
@@ -54,6 +60,8 @@ class WorkerRecord:
     worker_session: str | None = None
     detached: bool = False
     exited: bool = False
+    # A probe holds nothing and is forgotten with its connection
+    role: SessionRole = SessionRole.WORKER
 
     @property
     def incarnation(self) -> str:
@@ -116,6 +124,7 @@ class WorkerRegistry:
         self._on_exit = on_exit
         self._lock = threading.RLock()
         self._workers: dict[str, WorkerRecord] = {}
+        self._probes: dict[str, WorkerRecord] = {}
         self._old: dict[str, OldWorker] = {}
         self._adopted: list[str] = []
         self._adopted_released = False
@@ -138,6 +147,8 @@ class WorkerRegistry:
     ) -> tuple[WorkerRecord | None, str]:
         """Register or re-bind an attaching worker; (None, reason) to refuse."""
         with self._lock:
+            if ident.incarnation in self._probes:
+                return None, "the incarnation is attached as a probe"
             rec = self._workers.get(ident.incarnation)
             if rec is not None:
                 return self._rebind(rec, conn, ident)
@@ -173,6 +184,35 @@ class WorkerRegistry:
             return None, "the process has ended"
         return rec, ""
 
+    def attach_probe(
+        self, conn: WorkerEndpoint, ident: AttachIdentity
+    ) -> tuple[WorkerRecord | None, str]:
+        """Record a probe (a scheduler): no pidfd, credit or drain; it is
+        forgotten when its connection closes."""
+        with self._lock:
+            if ident.incarnation in self._workers:
+                return None, "the incarnation is attached as a worker"
+            rec = self._probes.get(ident.incarnation)
+            if rec is not None:
+                return self._rebind(rec, conn, ident)
+            rec = WorkerRecord(ident=ident, conn=conn, role=SessionRole.PROBE)
+            self._probes[ident.incarnation] = rec
+            return rec, ""
+
+    def probes(self) -> list[str]:
+        """Incarnations of the attached probes."""
+        with self._lock:
+            return list(self._probes)
+
+    def _forget_probe(self, rec: WorkerRecord, conn: WorkerEndpoint | None) -> None:
+        """Caller holds the lock; ``conn`` None forgets it whatever its link."""
+        if self._probes.get(rec.incarnation) is rec and (
+            conn is None or rec.conn is conn
+        ):
+            del self._probes[rec.incarnation]
+            rec.conn = None
+            rec.detached = True
+
     def _rebind(
         self, rec: WorkerRecord, conn: WorkerEndpoint, ident: AttachIdentity
     ) -> tuple[WorkerRecord | None, str]:
@@ -205,14 +245,21 @@ class WorkerRegistry:
             )
 
     def connection_lost(self, rec: WorkerRecord, conn: WorkerEndpoint) -> None:
-        """The UDS closed; the credit stays until the process exits."""
+        """The UDS closed; the credit stays until the process exits. A probe
+        is forgotten."""
         with self._lock:
+            if rec.role == SessionRole.PROBE:
+                self._forget_probe(rec, conn)
+                return
             if rec.conn is conn:
                 rec.conn = None
         self._ledger.forget_waiter(rec.incarnation, conn)
 
     def detach(self, rec: WorkerRecord) -> DetachResponse:
         with self._lock:
+            if rec.role == SessionRole.PROBE:
+                self._forget_probe(rec, None)
+                return DetachResponse(status=Status.OK)
             rec.detached = True
             held = self._pools.held_bytes(rec.incarnation)
         if held:

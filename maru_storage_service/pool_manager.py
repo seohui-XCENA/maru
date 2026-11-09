@@ -119,8 +119,10 @@ class PoolManager:
         self._epoch_seq: int | None = None
         self._counter = 0
         self._credit_stopped: str | None = None
-        # Credited bytes per holder (worker incarnation)
+        # Credited bytes per holder (worker incarnation), and the cap of
+        # each holder whose ATTACH sized it
         self._held: collections.Counter[str] = collections.Counter()
+        self._credit_max: dict[str, int] = {}
         # Holders below their fair share, short by the node-total budget:
         # bytes still owed and when they last asked
         self._waiting: dict[str, tuple[int, float]] = {}
@@ -231,7 +233,11 @@ class PoolManager:
             owed = sum(w[0] for h, w in self._waiting.items() if h != holder)
             uncapped = min(
                 math.ceil(want_bytes / ps),
-                (self.budgets.credit_max_bytes - self._held[holder]) // ps,
+                (
+                    self._credit_max.get(holder, self.budgets.credit_max_bytes)
+                    - self._held[holder]
+                )
+                // ps,
                 (pool.bytes[PageState.FREE] - reserve) // ps,
             )
             count = min(
@@ -335,6 +341,11 @@ class PoolManager:
         self._counter += 1
         pool.by_allocation[page.allocation_id] = page.index
 
+    def set_credit_max(self, holder: str, nbytes: int) -> None:
+        """``holder``'s own credit cap (the default otherwise)."""
+        with self._lock:
+            self._credit_max[holder] = nbytes
+
     def held_bytes(self, holder: str) -> int:
         with self._lock:
             return self._held[holder]
@@ -345,6 +356,7 @@ class PoolManager:
             if self._held[holder]:
                 return False
             del self._held[holder]
+            self._credit_max.pop(holder, None)
             self._waiting.pop(holder, None)
             self._asked.pop(holder, None)
             return True
@@ -520,6 +532,7 @@ class PoolManager:
                         )
             if self._held[holder] == 0:
                 del self._held[holder]
+            self._credit_max.pop(holder, None)
             self._waiting.pop(holder, None)
             self._asked.pop(holder, None)
             return out

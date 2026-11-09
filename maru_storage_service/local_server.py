@@ -33,8 +33,14 @@ from maru_common.node_protocol import (
 )
 from maru_common.protocol import MessageHeader
 from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
-from maru_common.storage_types import MS_PROTOCOL, PoolDescriptor, Status
+from maru_common.storage_types import (
+    MS_PROTOCOL,
+    PoolDescriptor,
+    SessionRole,
+    Status,
+)
 
+from .config import worker_budgets
 from .storage_manager import StorageManager
 from .worker_registry import AttachIdentity, WorkerRecord
 
@@ -196,6 +202,7 @@ class LocalServer:
         pools: list[tuple[PoolDescriptor, int]],
         transfer_defaults: TransferDefaults | None = None,
         socket_group: str | None = None,
+        budget_keys: frozenset[str] = frozenset(),
     ):
         self.path = path
         self.socket_group = socket_group
@@ -205,6 +212,7 @@ class LocalServer:
         self.server_address = server_address
         self.page_size = page_size
         self.budgets = budgets
+        self.budget_keys = budget_keys
         # (descriptor, fd); memfd indexes the fds sent with the reply
         self.pools = pools
         self.transfer_defaults = transfer_defaults or TransferDefaults()
@@ -373,6 +381,12 @@ class LocalServer:
             return
         request = decoded.request
         manager = self._manager()
+        if rec.role == SessionRole.PROBE and code != NodeMessageType.DETACH:
+            conn.respond(
+                header,
+                response_cls(status=Status.REJECTED, error="a probe only detaches"),
+            )
+            return
         if code == NodeMessageType.CREDIT:
             conn.respond(header, manager.credit(rec, decoded))
         elif code == NodeMessageType.CREDIT_RETURN:
@@ -410,15 +424,20 @@ class LocalServer:
             return reject(f"protocol {req.protocol!r}; this node speaks {MS_PROTOCOL}")
         if not req.incarnation:
             return reject("incarnation is empty")
-        if not req.groups:
-            return reject("groups is empty")
-        if any(g.object_bytes <= 0 for g in req.groups):
-            return reject("a group has no object bytes")
-        largest = max(g.object_bytes for g in req.groups)
-        if largest > self.page_size:
-            return reject(
-                f"object_bytes {largest} is larger than the page size {self.page_size}"
-            )
+        if req.step_objects < 0:
+            return reject(f"step_objects {req.step_objects} is negative")
+        probe = req.role == SessionRole.PROBE
+        if not probe:
+            if not req.groups:
+                return reject("groups is empty")
+            if any(g.object_bytes <= 0 for g in req.groups):
+                return reject("a group has no object bytes")
+            largest = max(g.object_bytes for g in req.groups)
+            if largest > self.page_size:
+                return reject(
+                    f"object_bytes {largest} is larger than the page size "
+                    f"{self.page_size}"
+                )
         try:
             same_ns = same_pid_namespace(conn.peer_pid)
             node_pid = conn.peer_pid
@@ -440,31 +459,48 @@ class LocalServer:
             namespace=req.namespace,
         )
         manager = self._manager()
-        rec, why = manager.workers.attach(conn, ident)
+        if probe:
+            rec, why = manager.workers.attach_probe(conn, ident)
+        else:
+            rec, why = manager.workers.attach(conn, ident)
         if rec is None:
             return reject(why)
         conn.worker = rec
+        budgets = None
+        if not probe:
+            budgets = worker_budgets(
+                self.budgets, self.budget_keys, self.page_size, req.step_objects
+            )
+            manager.pools.set_credit_max(req.incarnation, budgets.credit_max_bytes)
         response = AttachResponse(
             status=Status.OK,
             node_id=self.node_id,
             node_epoch=self.node_epoch,
             server=self.server_address,
             page_size=self.page_size,
-            pools=[descriptor for descriptor, _ in self.pools],
-            budgets=self.budgets,
+            pools=[] if probe else [descriptor for descriptor, _ in self.pools],
+            budgets=budgets,
             transfer_defaults=self.transfer_defaults,
             local_pin=False,
             pid=node_pid,
             pid_start=pid_start,
         )
-        if not conn.respond(header, response, [fd for _, fd in self.pools]):
+        fds = [] if probe else [fd for _, fd in self.pools]
+        if not conn.respond(header, response, fds):
             return
         logger.info(
-            "worker %s attached: engine %s dp %d tp %d pid %d",
+            "%s %s attached: engine %s dp %d tp %d pid %d%s",
+            req.role.value,
             req.incarnation,
             req.engine_id,
             req.dp_index,
             req.tp_rank,
             node_pid,
+            ""
+            if budgets is None
+            else f"; credit up to {budgets.credit_max_bytes} bytes "
+            f"({budgets.credit_max_bytes // self.page_size} pages) for "
+            f"{req.step_objects or 'an unknown number of'} objects a step",
         )
-        manager.workers.after_attach_reply(rec)
+        if not probe:
+            manager.workers.after_attach_reply(rec)

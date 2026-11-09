@@ -334,6 +334,8 @@ def test_maruserver_stopped_then_back(servers, nodes, agents):
     finally:
         server.resume()
     wait_until(lambda: node.pools.bytes_in(PageState.PENDING) == 0, what="published")
+    # The worker looks keys up again once a heartbeat is answered
+    wait_until(lambda: readable(w, stored[0]), what="MaruServer answers the worker")
     for key in stored:
         assert readable(w, key)
     assert store(w, "after")

@@ -100,7 +100,9 @@ class StorageService:
             server_address=config.server,
             page_size=config.page_size,
             budgets=config.budgets,
+            budget_keys=config.budget_keys,
             pools=[],
+            transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
         )
         self.local.claim()

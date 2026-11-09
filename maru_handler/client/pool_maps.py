@@ -194,6 +194,12 @@ class PoolMaps:
         with self._lock:
             return list(self._pools)
 
+    def page_locked(self) -> bool:
+        """Some pool is mapped and every one is registered with CUDA."""
+        with self._lock:
+            pools = list(self._pools.values())
+        return bool(pools) and all(m.mapping.cuda_registered for m in pools)
+
     def remove(self, pool_id: str) -> bool:
         """Unregister and unmap; False (nothing touched) while views are held."""
         with self._lock:

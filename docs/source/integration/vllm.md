@@ -373,12 +373,52 @@ request stay in one pool. A pool whose maru-server does not answer when the
 worker starts only makes its prefixes miss; the worker connects to it once it
 answers.
 
+### Node StorageService (maru_node, experimental)
+
+With `maru_node`, the connector uses the node's StorageService instead of a storage backend: every vLLM instance on the node shares one DRAM pool that the StorageService owns, and MaruServer keeps which KV exists. Start MaruServer, then `maru-storage --config node.json`, then vLLM:
+
+```json
+{
+  "node_id": "gpu-a",
+  "socket": "/run/maru/node.sock",
+  "server": "tcp://127.0.0.1:5555",
+  "page_size": "32M",
+  "tiers": [{"store": "dram", "size": "64G"}]
+}
+```
+
+```bash
+vllm serve <model> \
+    --kv-transfer-config '{
+        "kv_connector": "MaruKVConnector",
+        "kv_connector_module_path": "maru_vllm",
+        "kv_role": "kv_both",
+        "kv_load_failure_policy": "recompute",
+        "kv_connector_extra_config": {
+            "maru_node": "/run/maru/node.sock",
+            "maru_engine_id": "inference-a",
+            "maru_cache_namespace": "llama-3.1-8b-instruct"
+        }
+    }'
+```
+
+- `page_size` must hold one object: a chunk of every layer of a rank's KV (32 MiB for Llama 3.1 8B at 256-token chunks and TP=1), or one layer of it with `maru_use_layerwise`. The worker is refused a larger object and warned about a much smaller one.
+- Pool sizes, tier order, page size, RDMA and MaruServer's address belong to the node config: `maru_pool_size`, `maru_cpu_pool_size`, `maru_cxl_pool_size`, `maru_write_order`, `maru_read_order`, `maru_chunk_size`, `maru_rdma_*`, `maru_remote_cxl_agent_key_file`, `maru_server_url`, `maru_node_id`, `maru_instance_id`, `maru_storage_backend`, `maru_pin_pools` and `maru_eager_map` are refused with `maru_node`.
+- `maru_async_load` and `maru_async_store` default to what the node advises (a DRAM node advises the cxl defaults), asked once when the engine starts; set both to start vLLM without asking the node. With vLLM's async scheduling (its default) loads are parked whatever the node advises, and `maru_async_load=false` is refused unless vLLM runs with `--no-async-scheduling`.
+- Async load and store, overlap, layerwise, CUDA graphs, TP and DP work as on the cxl backend. Every TP rank uses the same `maru_engine_id`. PP and context parallelism are refused.
+- The scheduler and every worker connect when vLLM starts: each waits up to 30 s for the node to attach it, then a few seconds for MaruServer, and vLLM fails to start if the node refuses one (an object larger than the page). One not connected by then keeps trying in the background, and no lookup, load or store waits for it: until it is connected, and while MaruServer does not answer, loads are computed and stores skipped.
+- Each worker gets credit for what one vLLM step may store, which it computes from `max_num_batched_tokens`, `max_num_seqs`, `maru_kv_chunk_tokens` and the storage format and tells the node when it attaches; at least 16 pages or 512 MiB, whichever is more, and within the node's total credit (`budgets.credit_total_max_bytes`). A `budgets.credit_max_bytes` in the node config sets it for every worker instead. A store that finds no credit is skipped, except that with `maru_async_store` a chunk waits up to a second for some (at most 256 MiB of such chunks per worker, kept on the GPU); a layerwise chunk becomes readable with all its layers or not at all.
+- A worker refills its credit up to its cap once it falls below a quarter of it, so a worker alone on a node may keep up to `credit_total_max_bytes` (default 10% of the top tier) credited but unused, which the cache cannot use meanwhile; lower `credit_total_max_bytes` or `credit_max_bytes` to keep less. One step may also bring the stores waiting for MaruServer's commit to `commit_pending_max_bytes` (default 5% of the top tier): no worker gets new credit until a commit round lands.
+- A load whose KV is unavailable (MaruServer or the node down) or gone is computed again; the connector logs both counts apart when it shuts down.
+- Only a single `dram` tier is served so far.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `maru_node` | str | unset | Socket of the node's StorageService; set, the connector takes the node path (see above) and the storage settings below are refused |
 | `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
 | `maru_pool_size` | str/int | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, etc.): its first allocation, and each further one when its memory is full; required with `remote_cxl`, where each allocation is one region |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |

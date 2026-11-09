@@ -1000,31 +1000,393 @@ class TestHandlerFacade:
         node = nodes()
         h = handlers(node)
         wait_credit(h, 2)
-        read = None
         assert put(h, "c")
         read = h.retrieve("c")
-        with pytest.raises(RuntimeError):
-            h.close()  # a read is still pinned
         h.release_retrieved([read])
         h.close()
         incarnation = h._cpu.identity.incarnation
         assert node.pools.held_bytes(incarnation) == 0
         assert fake.worker_session_of(incarnation) is None  # WORKER_CLOSE
+        wait_until(lambda: node.manager.workers.get(incarnation) is None)  # DETACH
+
+    def test_close_with_a_held_read_keeps_its_pool_and_pin(self, fake, nodes, handlers):
+        node = nodes()
+        h = handlers(node)
+        wait_credit(h, 2)
+        assert put(h, "c")
+        read = h.retrieve("c")
+        incarnation = h._cpu.identity.incarnation
+        h.close()
+        assert node.pools.held_bytes(incarnation) == 0  # credit back
+        # No WORKER_CLOSE and no DETACH: the node keeps the worker and reports
+        # its exit, which releases the pin; a copy may still read the pool
+        assert fake.worker_session_of(incarnation) is not None
+        assert fake.pin_count(incarnation) == 1
+        time.sleep(0.3)
+        assert node.manager.workers.get(incarnation) is not None
+        assert bytes(read.view) == b"c"
+        h.release_retrieved([read])
+
+
+class TestCreditRefill:
+    def test_a_write_done_asks_for_credit_at_once(
+        self, fake, nodes, handlers, monkeypatch
+    ):
+        """An empty CREDIT is retried once a WRITE_DONE frees credit, not
+        after a pause."""
+        import maru_handler.client.maru_client as maru_client
+
+        monkeypatch.setattr(maru_client, "REFILL_EMPTY_S", 30.0)
+        node = nodes(
+            budgets={
+                "credit_max_bytes": 2 * PAGE,
+                "credit_refill_low": 2 * PAGE,
+                "credit_refill_high": 2 * PAGE,
+            }
+        )
+        h = handlers(node)
+        wait_credit(h, 2)
+        handles = [h.alloc(PAGE), h.alloc(PAGE)]
+        # The node holds 2 pages for us: a CREDIT now comes back empty
+        h._cpu._refill_wake.set()
+        wait_until(lambda: h._cpu.stats["store_skipped_no_credit"] == 0)
+        time.sleep(0.2)
+        assert h._cpu.credits.unused_bytes == 0
+        for i, handle in enumerate(handles):
+            handle.buf[:1] = b"x"
+            assert h.store(f"w{i}", handle)
+        wait_credit(h, 2)  # long before REFILL_EMPTY_S
+
+
+def test_store_async_answers_once_when_its_batches_end_together(monkeypatch):
+    """Batches answered on different threads complete the future once."""
+    from concurrent.futures import Future
+
+    import maru_handler.client.maru_client as maru_client
+
+    answers = []
+
+    class Counting(Future):
+        def set_result(self, result):
+            answers.append(result)
+            time.sleep(0.01)  # another answer would come meanwhile
+            super().set_result(result)
+
+    class Batch(Future):
+        """Runs its callbacks once both batches are answered."""
+
+        def __init__(self, both: threading.Barrier):
+            super().__init__()
+            self.both = both
+
+        def _invoke_callbacks(self):
+            self.both.wait()
+            super()._invoke_callbacks()
+
+    monkeypatch.setattr(maru_client, "Future", Counting)
+    client = maru_client.MaruClient(
+        MaruConfig(
+            maru_node="/tmp/unused.sock",
+            engine_id="e",
+            cache_namespace=NS,
+            auto_connect=False,
+        )
+    )
+    for _ in range(20):
+        answers.clear()
+        both = threading.Barrier(2)
+        batches = [(0, Batch(both)), (1, Batch(both))]
+        monkeypatch.setattr(client, "_submit_store", lambda *_a, b=batches: b)
+        future = client.store_async(["a", "b"], [None, None])
+        threads = [
+            threading.Thread(target=batch.set_result, args=([i],))
+            for i, (_, batch) in enumerate(batches)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert future.result(1) == [0, 1]
+        assert len(answers) == 1
+
+
+def test_the_credit_cache_keeps_its_byte_total_exact():
+    import random
+
+    from maru_handler.client.credit_cache import CreditCache
+
+    rng = random.Random(0)
+    cache = CreditCache()
+    cache.reset("e1")
+    serial = 0
+    for _ in range(3000):
+        op = rng.choice(["put", "put", "take", "bytes", "pool", "all", "reset"])
+        if op == "put":
+            credits = []
+            for _ in range(rng.randint(1, 4)):
+                serial += 1
+                credits.append(
+                    Location(
+                        f"p{serial % 3}",
+                        PoolKind.DRAM,
+                        serial * PAGE,
+                        rng.choice([PAGE, PAGE // 2]),
+                        make_generation(1, serial),
+                        f"a{serial}",
+                    )
+                )
+            cache.put(credits, cache.node_epoch or "e1")
+        elif op == "take":
+            cache.take()
+        elif op == "bytes":
+            cache.take_bytes(rng.randint(0, 3 * PAGE))
+        elif op == "pool":
+            cache.remove_pool(f"p{rng.randint(0, 2)}")
+        elif op == "all" and rng.random() < 0.1:
+            cache.take_all()
+        elif op == "reset" and rng.random() < 0.05:
+            cache.reset(f"e{serial}")
+        assert cache.unused_bytes == sum(c.length for c in cache._credits)
+
+
+class TestCreditCounters:
+    def test_a_miss_retried_later_is_deferred_not_skipped(self, nodes, handlers):
+        node = nodes(
+            budgets={
+                "credit_max_bytes": 2 * PAGE,
+                "credit_refill_low": PAGE,
+                "credit_refill_high": 2 * PAGE,
+            }
+        )
+        h = handlers(node)
+        wait_credit(h, 2)
+        held = [h.alloc(PAGE), h.alloc(PAGE)]
+        with pytest.raises(CreditUnavailableError):
+            h.alloc(PAGE, retry_later=True)
+        with pytest.raises(CreditUnavailableError):
+            h.alloc(PAGE)
+        counters = h.get_stats()["maru_node"]["counters"]
+        assert counters["store_deferred_no_credit"] == 1
+        assert counters["store_skipped_no_credit"] == 1
+        for handle in held:
+            h.free(handle)
+
+    def test_close_ends_a_wait_for_credit(self, nodes, handlers):
+        node = nodes(
+            budgets={
+                "credit_max_bytes": 2 * PAGE,
+                "credit_refill_low": PAGE,
+                "credit_refill_high": 2 * PAGE,
+            }
+        )
+        h = handlers(node)
+        wait_credit(h, 2)
+        held = [h.alloc(PAGE), h.alloc(PAGE)]
+        for handle in held:
+            h.free(handle)
+        h._cpu.credits.take_all()  # none at hand; the node still counts them
+        outcome = []
+
+        def wait():
+            t0 = time.monotonic()
+            try:
+                h.alloc(PAGE, wait_s=10.0)
+            except Exception as e:
+                outcome.append((type(e).__name__, time.monotonic() - t0))
+
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        h.close()
+        waiter.join(5)
+        assert outcome and outcome[0][1] < 2.0
+        assert time.monotonic() - t0 < 2.0
+
+
+def test_stopping_credit_waits_ends_one_under_way_and_keeps_the_rest(nodes, handlers):
+    node = nodes(
+        budgets={
+            "credit_max_bytes": 2 * PAGE,
+            "credit_refill_low": PAGE,
+            "credit_refill_high": 2 * PAGE,
+        }
+    )
+    h = handlers(node)
+    wait_credit(h, 2)
+    held = [h.alloc(PAGE), h.alloc(PAGE)]  # none left at hand
+    ended = []
+    waiter = threading.Thread(
+        target=lambda: ended.append(
+            pytest.raises(CreditUnavailableError, h.alloc, PAGE, wait_s=10.0)
+        )
+    )
+    waiter.start()
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    h.stop_credit_waits()
+    waiter.join(5)
+    assert ended and time.monotonic() - t0 < 1.0
+    for handle in held:
+        h.free(handle)  # credit back in the cache, a store still finds it
+    assert put(h, "after")
+    incarnation = h._cpu.identity.incarnation
+    h.close()
+    assert node.pools.held_bytes(incarnation) == 0  # CREDIT_RETURN went
+
+
+class TestBackgroundConnect:
+    def config(self, socket_path, **kwargs):
+        return MaruConfig(
+            maru_node=socket_path,
+            engine_id="bg",
+            cache_namespace=NS,
+            chunk_size_bytes=kwargs.pop("chunk_size_bytes", PAGE),
+            pool_size=PAGE,
+            pin_pools=False,
+            timeout_ms=300,
+            auto_connect=False,
+            node_connect_timeout_s=kwargs.pop("node_connect_timeout_s", 5.0),
+            **kwargs,
+        )
+
+    def test_connects_once_the_node_is_up(self, fake, nodes, sockdir):
+        handler = MaruHandler(self.config(f"{sockdir}/node.sock"))
+        try:
+            t0 = time.monotonic()
+            assert handler.connect(wait=False) is False
+            assert time.monotonic() - t0 < 0.1
+            assert not handler.connected
+            with pytest.raises(StorageUnavailableError):
+                handler.batch_retrieve(["k"])
+            nodes()
+            assert handler.wait_connected(10.0)
+            wait_credit(handler)
+            assert put(handler, "late")
+        finally:
+            handler.close()
+
+    def test_maps_the_pools_once_across_a_maruserver_outage(
+        self, fake, nodes, monkeypatch
+    ):
+        from maru_handler.client.pool_maps import PoolMaps
+
+        added = []
+        add = PoolMaps.add
+
+        def counting(self, *args, **kwargs):
+            added.append(args[0].pool.pool_id)
+            return add(self, *args, **kwargs)
+
+        monkeypatch.setattr(PoolMaps, "add", counting)
+        node = nodes()
+        fake.pause(hold=False)
+        handler = MaruHandler(self.config(node.config.socket))
+        try:
+            handler.connect(wait=False)
+            assert handler.wait_attached()
+            assert not handler.wait_connected(1.5)  # WORKER_OPEN unanswered
+            fake.resume()
+            assert handler.wait_connected(10.0)
+            assert len(added) == 1
+            wait_credit(handler)
+            assert put(handler, "after-outage")
+        finally:
+            handler.close()
+
+    def test_a_refusal_stops_it_and_is_raised(self, fake, nodes):
+        from maru_handler.client import AttachRefusedError
+
+        node = nodes()
+        handler = MaruHandler(
+            self.config(node.config.socket, chunk_size_bytes=2 * PAGE)
+        )
+        try:
+            handler.connect(wait=False)
+            with pytest.raises(AttachRefusedError, match="larger than the page"):
+                handler.wait_attached(10.0)
+            with pytest.raises(AttachRefusedError):
+                handler.wait_connected(0)
+            assert not handler.connected
+        finally:
+            handler.close()
+
+    def test_close_while_waiting_for_the_node_returns_promptly(self, sockdir):
+        handler = MaruHandler(self.config(f"{sockdir}/node.sock"))
+        handler.connect(wait=False)
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        handler.close()
+        assert time.monotonic() - t0 < 2.0
+        assert not handler.connected
+
+
+class TestMaruServerDown:
+    def test_lookups_miss_at_once_until_it_answers(self, fake, nodes, handlers):
+        node = nodes()
+        h = handlers(node, timeout_ms=500)
+        wait_credit(h)
+        assert put(h, "k")
+        assert h.batch_exists(["k"]) == [True]
+        fake.pause(hold=False)
+        try:
+            t0 = time.monotonic()
+            assert h.batch_exists(["k"]) == [False]
+            assert time.monotonic() - t0 < 2.0  # one RPC timeout at most
+            for _ in range(20):
+                t0 = time.monotonic()
+                assert h.batch_exists(["k"]) == [False]
+                assert h.batch_retrieve(["k"]) == [None]
+                assert time.monotonic() - t0 < 0.05
+        finally:
+            fake.resume()
+        wait_until(lambda: h.batch_exists(["k"]) == [True], timeout=5.0)
+        counters = h.get_stats()["maru_node"]["counters"]
+        assert counters["probe_unavailable"] >= 21
+        assert counters["retrieve_unavailable"] >= 20
+
+    def test_close_does_not_wait_for_it(self, fake, nodes, handlers):
+        node = nodes()
+        h = handlers(node, timeout_ms=500)
+        wait_credit(h)
+        fake.pause(hold=False)
+        try:
+            h.batch_exists(["k"])  # finds it down
+            t0 = time.monotonic()
+            h.close()
+            assert time.monotonic() - t0 < 3.0
+            # WORKER_CLOSE did not go: no DETACH, the node reports the exit
+            time.sleep(0.3)
+            assert node.manager.workers.get(h._cpu.identity.incarnation) is not None
+        finally:
+            fake.resume()
 
 
 class TestConfig:
     def test_maru_node_needs_identity(self):
         with pytest.raises(ValueError, match="engine_id"):
             MaruConfig(maru_node="/tmp/x.sock")
-        with pytest.raises(ValueError, match="metadata-only .* not supported yet"):
+        with pytest.raises(ValueError, match="tp_rank"):
             MaruConfig(
-                maru_node="/tmp/x.sock",
-                engine_id="e",
-                cache_namespace="n",
-                metadata_only=True,
+                maru_node="/tmp/x.sock", engine_id="e", cache_namespace="n", tp_rank=-1
             )
+        probe = MaruConfig(
+            maru_node="/tmp/x.sock",
+            engine_id="e",
+            cache_namespace="n",
+            metadata_only=True,
+        )
+        assert probe.metadata_only
         config = MaruConfig(maru_node="/tmp/x.sock", engine_id="e", cache_namespace="n")
         assert config.maru_node == "/tmp/x.sock"
+        # The StorageService sizes the pool
+        assert MaruConfig(
+            maru_node="/tmp/x.sock",
+            engine_id="e",
+            cache_namespace="n",
+            chunk_size_bytes=1 << 30,
+            pool_size=1,
+        )
 
 
 def test_kept_cause_reopen_table():
@@ -1226,7 +1588,7 @@ class TestRepliesAndResults:
         assert fake.pin_count(a._cpu.identity.incarnation) == 1
         a.release_retrieved([read])
 
-    def test_unresolved_lookups_are_capped(self, fake, nodes, handlers):
+    def test_unresolved_lookups_are_capped(self, fake, nodes, handlers, monkeypatch):
         from maru_handler.client.server_conn import MAX_UNRESOLVED_LOOKUPS
 
         node = nodes()
@@ -1234,6 +1596,13 @@ class TestRepliesAndResults:
         assert put(h, "k")
         conn = h._cpu.server_conn
         fake.pause(hold=False)
+        for _ in range(5):
+            assert h.retrieve("k") is None
+        # Once one is unanswered the rest are not sent while it is down
+        assert conn.down and conn.unresolved_lookups() == 1
+        # Without that, the cap still bounds them
+        monkeypatch.setattr(conn, "_set_down", lambda *args, **kwargs: None)
+        conn._down = False
         for _ in range(MAX_UNRESOLVED_LOOKUPS + 5):
             assert h.retrieve("k") is None
         assert conn.unresolved_lookups() == MAX_UNRESOLVED_LOOKUPS

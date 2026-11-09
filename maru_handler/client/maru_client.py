@@ -5,10 +5,12 @@
 ATTACH to the node, map its pools, open the worker session with the node-view
 pid, keep credit at hand. On a UDS break it attaches again: to the same run it
 keeps credit and resends unresolved ops; to a new run it drops them, answers
-the restart drain and unmaps the old pool once unused.
+the restart drain and unmaps the old pool once unused. A metadata-only client
+(a vLLM scheduler) attaches as a probe: no pool, credit or pin, PROBE only.
 """
 
 import collections
+import dataclasses
 import functools
 import logging
 import os
@@ -46,7 +48,9 @@ from maru_common.storage_types import (
     ItemResult,
     Key,
     Location,
+    MissReason,
     NotifyKind,
+    SessionRole,
     Status,
     StorageLocation,
     StorageUnavailableError,
@@ -58,13 +62,21 @@ from .credit_cache import CreditCache
 from .pin_table import PinTable
 from .pool_maps import LocationError, PoolMaps
 from .server_conn import ServerConn, WorkerIdentity
-from .storage_conn import NodeNotListeningError, OpTracker, StorageConn, close_fds
+from .storage_conn import (
+    AttachRefusedError,
+    NodeNotListeningError,
+    OpTracker,
+    StorageConn,
+    close_fds,
+)
 
 logger = logging.getLogger(__name__)
 
 RECONNECT_S = 0.5
 REFILL_IDLE_S = 0.2
 REFILL_EMPTY_S = 0.05
+# Longest pause between attempts of a background connect
+CONNECT_RETRY_MAX_S = 1.0
 # Wait for DETACH and the last requests of close()
 CLOSE_TIMEOUT_S = 5.0
 BUSY_RESEND_S = 0.2
@@ -105,13 +117,41 @@ class PinnedRead(CpuReadLease):
     server_epoch: str = ""
 
 
+class _Throttle:
+    """Log a failure that repeats at most once per ATTACH_WARN_S."""
+
+    def __init__(self) -> None:
+        self._since: float | None = None
+        self._last = 0.0
+
+    def __call__(self, what: str, error: Exception) -> None:
+        now = time.monotonic()
+        self._since = self._since or now
+        if now - self._last >= ATTACH_WARN_S:
+            self._last = now
+            logger.warning("%s for %.0f s: %s", what, now - self._since, error)
+
+
+def probe_node(config: MaruConfig) -> AttachResponse:
+    """One probe ATTACH, closed at once: what the node tells its workers
+    (node, MaruServer, page size, transfer defaults). Waits up to
+    ``node_connect_timeout_s`` for a node that is not listening yet."""
+    client = MaruClient(dataclasses.replace(config, metadata_only=True))
+    conn, response, fds = client._first_attach()
+    close_fds(fds)
+    try:
+        conn.request(NodeMessageType.DETACH, DetachRequest(), client.rpc_timeout_s)
+    except Exception as e:
+        logger.debug("DETACH of a node probe: %s", e)
+    conn.close()
+    return response
+
+
 class MaruClient:
     def __init__(
         self,
         config: MaruConfig,
         *,
-        dp_index: int = 0,
-        tp_rank: int = 0,
         rpc_timeout_s: float | None = None,
         reconnect_s: float = RECONNECT_S,
     ):
@@ -121,11 +161,14 @@ class MaruClient:
             raise ValueError("maru_node needs engine_id and cache_namespace")
         self.config = config
         self._socket_path: str = config.maru_node
+        self.role = SessionRole.PROBE if config.metadata_only else SessionRole.WORKER
+        # Probes and load-only workers never write
+        self._writes = not config.metadata_only and not config.load_only
         # Per client: one process may hold two (TP=1 scheduler and worker)
         self.identity = WorkerIdentity(
             engine_id=config.engine_id,
-            dp_index=dp_index,
-            tp_rank=tp_rank,
+            dp_index=config.dp_index,
+            tp_rank=config.tp_rank,
             incarnation=uuid.uuid4().hex,
             namespace=config.cache_namespace,
         )
@@ -152,13 +195,21 @@ class MaruClient:
         self._connected = False
         self._closing = threading.Event()
         self._refill_wake = threading.Event()
+        # Set when a WRITE_DONE or ABORT frees credit the node holds for us
+        self._credit_freed = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Background connect: pools mapped (or refused), and the refusal
+        self._connect_thread: threading.Thread | None = None
+        self._attached = threading.Event()
+        self._ready = threading.Event()  # connected, or refused
+        self.refused: AttachRefusedError | None = None
         self._lost = threading.Event()
         self._credit_op: tuple[OpTracker, int] | None = None
         self._sends: collections.deque = collections.deque()
         self._sends_cv = threading.Condition()
-        # Unavailable and absent are counted apart
+        # Outcomes by class: unavailable, not_found and fetch apart
         self.stats: collections.Counter[str] = collections.Counter()
+        self._stats_lock = threading.Lock()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -168,10 +219,6 @@ class MaruClient:
                 raise RuntimeError("Create a fresh handler after close")
             if self._connected:
                 return True
-        if self.config.metadata_only:
-            raise RuntimeError(
-                "a metadata-only handler on maru_node is not supported yet"
-            )
         server = None
         try:
             conn, response, fds = self._first_attach()
@@ -184,6 +231,7 @@ class MaruClient:
                 pid=response.pid,
                 pid_start=response.pid_start,
                 timeout_s=self.rpc_timeout_s,
+                role=self.role,
             )
             server.on_server_epoch.append(self._server_epoch_changed)
             server.on_stale_node.append(self._stale_node)
@@ -195,7 +243,8 @@ class MaruClient:
                 self._connected = True
             conn.start_notifications()
             server.start()
-            self._refill_once()
+            if self._writes:
+                self._refill_once()
         except BaseException:
             if server is not None and self._server is not server:
                 server.close()  # no allocation yet: WORKER_CLOSE is safe
@@ -204,15 +253,150 @@ class MaruClient:
             except Exception:
                 logger.exception("cleaning up a failed connect")
             raise
-        for target, name in (
-            (self._refill_loop, "maru-credit-refill"),
-            (self._send_loop, "maru-write-done"),
-            (self._keep_attached, "maru-storage-keeper"),
-        ):
+        self._attached.set()
+        self._ready.set()
+        self._start_thread(self._keep_attached, "maru-storage-keeper")
+        self._start_session_threads()
+        return True
+
+    def connect_background(self) -> None:
+        """Connect on a thread of its own, retrying until close(): attach and
+        map the pools once, then open the worker session. ``connected`` turns
+        True once both are done; a MaruServer outage never unmaps the pools.
+        A refusal by the node stops it (``refused``, ``wait_attached``)."""
+        with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("Create a fresh handler after close")
+            if self._connected or self._connect_thread is not None:
+                return
+            self._connect_thread = threading.Thread(
+                target=self._connect_loop, name="maru-connect", daemon=True
+            )
+            thread = self._connect_thread
+        thread.start()
+
+    def stop_credit_waits(self) -> None:
+        """End every wait for credit, now and later; allocations go on."""
+        self.credits.close()
+
+    def wait_attached(self, timeout_s: float | None = None) -> bool:
+        """Wait until the pools are mapped (by default up to
+        ``node_connect_timeout_s``); whether they are.
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        self._attached.wait(
+            self.config.node_connect_timeout_s if timeout_s is None else timeout_s
+        )
+        if self.refused is not None:
+            raise self.refused
+        return self._attached.is_set()
+
+    def wait_connected(self, timeout_s: float) -> bool:
+        """Wait until connected; whether it is.
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        self._ready.wait(timeout_s)
+        if self.refused is not None:
+            raise self.refused
+        return self.connected
+
+    def _start_thread(self, target: Callable[[], None], name: str) -> None:
+        with self._lock:
+            if self._closing.is_set():
+                return
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
-        return True
+
+    def _start_session_threads(self) -> None:
+        if self.role == SessionRole.WORKER:
+            self._start_thread(self._send_loop, "maru-write-done")
+        if self._writes:
+            self._start_thread(self._refill_loop, "maru-credit-refill")
+
+    def _connect_loop(self) -> None:
+        """connect_background's thread."""
+        warned = _Throttle()
+        pause = 0.05
+        while True:
+            try:
+                conn, response, fds = self._attach(
+                    max(self.config.node_connect_timeout_s, self.rpc_timeout_s)
+                )
+                self._take_attach(conn, response, fds, first=True)
+                break
+            except AttachRefusedError as e:
+                self.refused = e
+                logger.error("the StorageService refuses this client: %s", e)
+                self._attached.set()
+                self._ready.set()
+                return
+            except Exception as e:
+                if self._closing.is_set():
+                    return
+                warned("cannot attach to the StorageService", e)
+            if self._closing.wait(pause):
+                return
+            pause = min(pause * 2, CONNECT_RETRY_MAX_S)
+        self._attached.set()
+        with self._lock:
+            storage = self._storage
+        if storage is not None:
+            try:
+                storage.start_notifications()
+            except RuntimeError:
+                pass  # closed meanwhile; the keeper attaches again
+        self._start_thread(self._keep_attached, "maru-storage-keeper")
+        server = None
+        pause = 0.05
+        while not self._closing.is_set():
+            with self._lock:
+                info = self.attach_info
+            if info is not None:
+                if server is None:
+                    server = ServerConn(
+                        info.server,
+                        self.identity,
+                        node_id=info.node_id,
+                        node_epoch=info.node_epoch,
+                        pid=info.pid,
+                        pid_start=info.pid_start,
+                        timeout_s=self.rpc_timeout_s,
+                        role=self.role,
+                    )
+                    server.on_server_epoch.append(self._server_epoch_changed)
+                else:
+                    # The node may have restarted meanwhile
+                    server.node_epoch = info.node_epoch
+                    server.pid, server.pid_start = info.pid, info.pid_start
+                try:
+                    server.open()
+                    break
+                except StorageUnavailableError as e:
+                    warned("cannot open the MaruServer session", e)
+            if self._closing.wait(pause):
+                break
+            pause = min(pause * 2, CONNECT_RETRY_MAX_S)
+        with self._lock:
+            installed = server is not None and not self._closing.is_set()
+            if installed:
+                self._server = server
+                self._connected = True
+        if not installed:
+            if server is not None:
+                server.close()  # no allocation yet: WORKER_CLOSE is safe
+            return
+        assert server is not None
+        server.on_stale_node.append(self._stale_node)
+        server.start()
+        self._start_session_threads()
+        self._refill_wake.set()
+        self._ready.set()
+        logger.info("connected to the StorageService and MaruServer")
 
     def _attach_request(self) -> AttachRequest:
         pid = os.getpid()
@@ -224,7 +408,9 @@ class MaruClient:
             pid_start=process_start_time(pid),
             incarnation=self.identity.incarnation,
             namespace=self.identity.namespace,
-            groups=[
+            groups=[]
+            if self.role == SessionRole.PROBE
+            else [
                 GroupLayout(
                     object_bytes=self.config.chunk_size_bytes,
                     layout=self.config.storage_schema,
@@ -232,6 +418,8 @@ class MaruClient:
             ],
             protocol=MS_PROTOCOL,
             capabilities=[],
+            role=self.role,
+            step_objects=self.config.step_objects if self._writes else 0,
         )
 
     def _first_attach(self) -> tuple[StorageConn, AttachResponse, list[int]]:
@@ -280,13 +468,30 @@ class MaruClient:
         try:
             if self._closing.is_set():
                 raise StorageUnavailableError("the client is closed")
-            if response.page_size < self.config.chunk_size_bytes:
-                raise StorageUnavailableError(
-                    f"the node page ({response.page_size} bytes) is smaller than "
-                    f"chunk_size_bytes ({self.config.chunk_size_bytes})"
-                )
-            if response.budgets is None:
-                raise StorageUnavailableError("the ATTACH reply has no budgets")
+            if self.role == SessionRole.WORKER:
+                if response.page_size < self.config.chunk_size_bytes:
+                    raise AttachRefusedError(
+                        f"the node page ({response.page_size} bytes) is smaller "
+                        f"than an object ({self.config.chunk_size_bytes} bytes)"
+                    )
+                if response.budgets is None:
+                    raise StorageUnavailableError("the ATTACH reply has no budgets")
+                if first and self._writes:
+                    credit_max = response.budgets.credit_max_bytes
+                    logger.info(
+                        "credit up to %d bytes (%d pages) for %s objects a step",
+                        credit_max,
+                        credit_max // response.page_size,
+                        self.config.step_objects or "an unknown number of",
+                    )
+                if first and 2 * self.config.chunk_size_bytes <= response.page_size:
+                    logger.warning(
+                        "objects of %d bytes fill %d%% of the node's %d-byte pages; "
+                        "a node page_size near the object size wastes less",
+                        self.config.chunk_size_bytes,
+                        100 * self.config.chunk_size_bytes // response.page_size,
+                        response.page_size,
+                    )
             same_run = response.node_epoch == self.node_epoch
             if same_run:
                 close_fds(fds)  # the pools of this run are mapped already
@@ -323,7 +528,7 @@ class MaruClient:
                     self.credits.reset(response.node_epoch)
                 self.attach_info = response
                 self._storage = conn
-                self.stats["attach"] += 1
+                self._count("attach")
                 self._cv.notify_all()
         if closed:
             conn.close()
@@ -342,17 +547,18 @@ class MaruClient:
             self._unmap_unused_old_pools()
 
     def close(self) -> None:
-        """Return unused credit, DETACH, WORKER_CLOSE and unmap the pools.
-        Pools of allocations a copy may still write stay mapped and
-        registered until the process ends, so each such close() keeps them."""
+        """Return unused credit, WORKER_CLOSE, DETACH and unmap the pools.
+        Pools of allocations a copy may still write, and of reads not yet
+        released, stay mapped and registered until the process ends, so each
+        such close() keeps them."""
         with self._lock:
-            if self._reads:
-                raise RuntimeError("Release read pins before closing the handler")
             if self._closing.is_set():
                 return
             self._closing.set()
             handles = [h for h in self._handles if h.state == "writing"]
+            reads = list(self._reads)
             connecting = self._connecting
+            connect_thread = self._connect_thread
         if connecting is not None:
             connecting.close()
         if handles:
@@ -364,11 +570,25 @@ class MaruClient:
                 "stays with the StorageService until this process ends",
                 len(handles),
             )
+        if reads:
+            # A copy may still read them: their pins stay until the node
+            # reports this process's exit (no WORKER_CLOSE, no DETACH)
+            logger.warning(
+                "closing with %d pinned reads not released; their pools stay "
+                "mapped and their pins held until this process ends",
+                len(reads),
+            )
         self._refill_wake.set()
+        self._credit_freed.set()
+        self.credits.close()  # no credit wait outlasts close()
         self._lost.set()
         with self._sends_cv:
             self._sends_cv.notify_all()
-        for thread in self._threads:
+        if connect_thread is not None:
+            connect_thread.join(timeout=CLOSE_TIMEOUT_S)
+        with self._lock:
+            threads = list(self._threads)
+        for thread in threads:
             thread.join(timeout=CLOSE_TIMEOUT_S)
         storage = self._storage
         if storage is not None and not storage.closed:
@@ -380,19 +600,32 @@ class MaruClient:
                         CreditReturnRequest(credits=unused[i : i + MAX_BATCH]),
                         CLOSE_TIMEOUT_S,
                     )
-                if not handles:
+            except Exception as e:
+                logger.warning("returning credit before closing failed: %s", e)
+        # MaruServer drops our pins on WORKER_CLOSE, or on the WORKER_EXIT the
+        # node reports once this process ends. A DETACH makes the node forget
+        # us, so it goes only once MaruServer holds nothing of ours.
+        with self._lock:
+            server, self._server = self._server, None
+        ended = server.close(goodbye=not (handles or reads)) if server else True
+        if ended and not (handles or reads):
+            try:
+                if storage is not None and not storage.closed:
                     storage.request(
                         NodeMessageType.DETACH, DetachRequest(), CLOSE_TIMEOUT_S
                     )
             except Exception as e:
-                logger.warning("returning credit before closing failed: %s", e)
-        self._teardown(goodbye=not handles, writing=handles)
+                logger.warning("DETACH before closing failed: %s", e)
+        self._teardown(writing=handles, reading=reads)
 
     def _teardown(
-        self, goodbye: bool = True, writing: list[CreditHandle] | None = None
+        self,
+        goodbye: bool = True,
+        writing: list[CreditHandle] | None = None,
+        reading: list[PinnedRead] | None = None,
     ) -> None:
-        """``writing``: handles a copy may still write; their views and pools
-        are left as they are."""
+        """``writing``: handles a copy may still write, ``reading``: reads it
+        may still read; their views and pools are left as they are."""
         kept = set(writing or ())
         with self._lock:
             storage, self._storage = self._storage, None
@@ -411,7 +644,10 @@ class MaruClient:
             storage.close()
         if server is not None:
             server.close(goodbye=goodbye)
-        self.pools.close(keep={h.location.pool_id for h in kept})
+        self.pools.close(
+            keep={h.location.pool_id for h in kept}
+            | {r.location.pool_id for r in reading or ()}
+        )
 
     @property
     def connected(self) -> bool:
@@ -437,6 +673,10 @@ class MaruClient:
             and server.heartbeat_once()
         )
 
+    def _count(self, name: str, n: int = 1) -> None:
+        with self._stats_lock:
+            self.stats[name] += n
+
     def local_stats(self) -> dict:
         """This client's counters and holdings (no MaruServer call)."""
         with self._lock:
@@ -447,8 +687,12 @@ class MaruClient:
                 "allocations": len(self._handles),
                 "pinned_reads": len(self._reads),
                 "pools": self.pools.pool_ids(),
-                "counters": dict(self.stats),
+                "counters": self._counters(),
             }
+
+    def _counters(self) -> dict[str, int]:
+        with self._stats_lock:
+            return dict(self.stats)
 
     @property
     def server_conn(self) -> ServerConn | None:
@@ -458,23 +702,44 @@ class MaruClient:
     def page_size(self) -> int:
         return self.attach_info.page_size if self.attach_info else 0
 
+    def storage_gpu_accessible(self) -> bool:
+        """Whether every mapped pool is page-locked for GPU copy kernels."""
+        return self.pools.page_locked()
+
     # ----------------------------------------------------------------- writes
 
-    def alloc(self, size: int, route_key: str | None = None) -> CreditHandle:
-        """A credit page for ``size`` bytes, without an RPC."""
+    def alloc(
+        self,
+        size: int,
+        route_key: str | None = None,
+        wait_s: float = 0.0,
+        retry_later: bool = False,
+    ) -> CreditHandle:
+        """A credit page for ``size`` bytes, without an RPC; with ``wait_s``
+        it waits that long for the refill when no credit is at hand.
+        ``retry_later``: a miss is counted as deferred, not as a skip."""
         self._ensure()
+        if self.role == SessionRole.PROBE:
+            raise RuntimeError("A metadata-only handler cannot allocate memory")
+        if not self._writes:
+            raise CreditUnavailableError("this worker only loads; it holds no credit")
         if type(size) is not int or not 0 < size <= self.config.chunk_size_bytes:
             raise ValueError(
                 f"an allocation holds 1..{self.config.chunk_size_bytes} bytes"
             )
         if not self.storage_connected:
-            self.stats["store_skipped_unavailable"] += 1
+            self._count("store_skipped_unavailable")
             raise CreditUnavailableError(
                 "the StorageService is unreachable; skipping this store"
             )
         taken = self.credits.take()
+        if taken is None and wait_s > 0:
+            self._refill_wake.set()
+            taken = self.credits.take(wait_s)
         if taken is None:
-            self.stats["store_skipped_no_credit"] += 1
+            self._count(
+                "store_deferred_no_credit" if retry_later else "store_skipped_no_credit"
+            )
             self._refill_wake.set()
             raise CreditUnavailableError("no credit at hand; skipping this store")
         credit, node_epoch = taken
@@ -539,7 +804,7 @@ class MaruClient:
             try:
                 results = future.result(max(0.0, deadline - time.monotonic()))
             except FutureTimeout:
-                self.stats["store_timeout"] += 1
+                self._count("store_timeout")
                 continue
             out[start : start + len(results)] = results
         return out
@@ -553,12 +818,19 @@ class MaruClient:
             future.set_result([])
             return future
 
+        lock = threading.Lock()
+        remaining = [len(chunks)]
+
         def gather(_=None) -> None:
-            if all(c.done() for _, c in chunks) and not future.done():
-                out = []
-                for _, c in chunks:
-                    out.extend(c.result())
-                future.set_result(out)
+            # Chunks may finish on different threads: the last one answers
+            with lock:
+                remaining[0] -= 1
+                if remaining[0]:
+                    return
+            out = []
+            for _, c in chunks:
+                out.extend(c.result())
+            future.set_result(out)
 
         for _, c in chunks:
             c.add_done_callback(gather)
@@ -631,7 +903,7 @@ class MaruClient:
                     self._finish_handle(handle, "dropped")
                 elif storage is None or storage.closed:
                     self._finish_handle(handle, "freed")
-                    self.stats["store_skipped_unavailable"] += 1
+                    self._count("store_skipped_unavailable")
                     self.credits.put([handle.location], handle.node_epoch)
                 else:
                     live.append(i)
@@ -676,12 +948,15 @@ class MaruClient:
                 self._abort(rejected)
 
         reply = self._send_op(NodeMessageType.WRITE_DONE, request, on_result, ops)
+        # The node no longer counts these pages against our credit
+        self._credit_freed.set()
+        self._refill_wake.set()
 
         def done(f: Future) -> None:
             try:
                 response = f.result()
             except Exception:
-                self.stats["write_done_unknown"] += 1
+                self._count("write_done_unknown")
                 future.set_result(results)
                 return
             if response.status == Status.OK and len(response.items) == len(live):
@@ -708,6 +983,8 @@ class MaruClient:
                 AbortRequest(op=PLACEHOLDER_OP, credits=credits[i : i + MAX_BATCH])
             )
             self._send_op(NodeMessageType.ABORT, request, lambda _r: None, ops)
+        self._credit_freed.set()
+        self._refill_wake.set()
 
     def _send_op(
         self,
@@ -780,6 +1057,8 @@ class MaruClient:
 
     def _refill_once(self) -> bool:
         """One CREDIT if below the low mark; whether credit came."""
+        if not self._writes:
+            return False
         with self._lock:
             storage, ops, server, info = (
                 self._storage,
@@ -847,8 +1126,11 @@ class MaruClient:
             if self._closing.is_set():
                 return
             try:
+                # A CREDIT sent after a WRITE_DONE sees the credit it freed
+                self._credit_freed.clear()
                 if not self._refill_once() and self.credits.unused_bytes == 0:
-                    self._closing.wait(REFILL_EMPTY_S)
+                    # Ask again as soon as a WRITE_DONE frees credit
+                    self._credit_freed.wait(REFILL_EMPTY_S)
                     self._refill_wake.set()
             except Exception:
                 logger.exception("credit refill failed")
@@ -896,13 +1178,13 @@ class MaruClient:
             return []
         server = self._server
         if server is None:
-            self.stats["retrieve_unavailable"] += len(keys)
+            self._count("retrieve_unavailable", len(keys))
             return [None] * len(keys)
         outcomes = server.lookup_and_pin(
             [Key(self.identity.namespace, k) for k in keys]
         )
         if outcomes is None:
-            self.stats["retrieve_unavailable"] += len(keys)
+            self._count("retrieve_unavailable", len(keys))
             return [None] * len(keys)
         epoch = server.server_epoch
         out: list[PinnedRead | None] = []
@@ -925,7 +1207,7 @@ class MaruClient:
         server_epoch: str | None,
     ) -> PinnedRead | None:
         if outcome.result != ItemResult.HIT:
-            self.stats[f"retrieve_{outcome.result.value.lower()}"] += 1
+            self._count_miss("retrieve", outcome)
             if outcome.pin_id is not None:
                 server.unpin([outcome.pin_id])
             return None
@@ -943,7 +1225,7 @@ class MaruClient:
         except LocationError as e:
             # #59: never touch bytes outside a mapped pool
             logger.error("MaruServer gave %s for %s: %s", outcome.location, key, e)
-            self.stats["retrieve_bad_location"] += 1
+            self._count("retrieve_bad_location")
             server.unpin([outcome.pin_id])
             return None
         if server_epoch is None:  # not open any more
@@ -974,7 +1256,7 @@ class MaruClient:
         read._release = functools.partial(self._release_reads, [read])
         with self._lock:
             self._reads.add(read)
-        self.stats["retrieve_hit"] += 1
+        self._count("retrieve_hit")
         return read
 
     def release_retrieved(self, infos: list) -> None:
@@ -1016,12 +1298,35 @@ class MaruClient:
                 else server.probe([Key(self.identity.namespace, k) for k in batch])
             )
             if outcomes is None:
+                self._count("probe_unavailable", len(batch))
                 out.extend([False] * len(batch))
                 continue
             # Only a HIT is readable: fetching from another node is not
             # supported yet
+            for outcome in outcomes:
+                if outcome.result == ItemResult.HIT:
+                    self._count("probe_hit")
+                else:
+                    self._count_miss("probe", outcome)
             out.extend(o.result == ItemResult.HIT for o in outcomes)
         return out
+
+    def _count_miss(self, prefix: str, outcome: ItemOutcome) -> None:
+        """Count a key that cannot be read now. Unavailable (MaruServer or a
+        node down: MISS offline, RECOVERING) is not a sign the KV is gone, so
+        it is counted apart from not_found (MISS absent); FETCH (no fetch
+        path yet) apart from both."""
+        result = outcome.result
+        if result == ItemResult.FETCH:
+            self._count(f"{prefix}_fetch")
+        elif result == ItemResult.MISS and outcome.reason != MissReason.OFFLINE:
+            self._count(f"{prefix}_not_found")
+        elif result in (ItemResult.MISS, ItemResult.RECOVERING):
+            self._count(f"{prefix}_unavailable")
+            detail = "offline" if result == ItemResult.MISS else "recovering"
+            self._count(f"{prefix}_unavailable_{detail}")
+        else:
+            self._count(f"{prefix}_{result.value.lower()}")
 
     def _server_epoch_changed(self, old: str, new: str) -> None:
         dead = self.pins.drop_epoch(old)
@@ -1062,7 +1367,13 @@ class MaruClient:
                 failing_since = failing_since or now
                 if now - last_warning >= ATTACH_WARN_S:
                     last_warning = now
-                    logger.warning(
+                    # A refusal (a node restarted with smaller pages) does not
+                    # heal by itself: this client stores and loads nothing
+                    (
+                        logger.error
+                        if isinstance(e, AttachRefusedError)
+                        else logger.warning
+                    )(
                         "cannot attach to the StorageService for %.0f s: %s",
                         now - failing_since,
                         e,

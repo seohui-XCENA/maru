@@ -40,6 +40,11 @@ class NodeNotListeningError(StorageUnavailableError):
     """No StorageService listens on the socket yet (ENOENT, ECONNREFUSED)."""
 
 
+class AttachRefusedError(StorageUnavailableError):
+    """The node refused the ATTACH (a config or version mismatch, not a
+    passing outage)."""
+
+
 def close_fds(fds: list[int]) -> None:
     """Close the fds; -1 marks one already handed on."""
     for fd in fds:
@@ -118,7 +123,7 @@ class StorageConn:
             ):
                 raise StorageUnavailableError("the ATTACH reply does not match")
             if response.status != Status.OK:
-                raise StorageUnavailableError(
+                raise AttachRefusedError(
                     f"ATTACH refused: {response.status} {response.error}"
                 )
             wanted = sorted(d.memfd for d in response.pools if d.memfd is not None)

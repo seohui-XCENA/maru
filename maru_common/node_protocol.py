@@ -29,6 +29,7 @@ from .storage_types import (
     OpRef,
     PoolDescriptor,
     PoolKind,
+    SessionRole,
     Status,
     WaitLevel,
 )
@@ -118,7 +119,11 @@ class AttachRequest:
     """ATTACH (0x01).
 
     ``pid``/``pid_start`` are the worker's own view; checked against SO_PEERCRED
-    only when it shares the node's pid namespace.
+    only when it shares the node's pid namespace. A probe (a vLLM scheduler)
+    learns the node and MaruServer but gets no pool, credit or pin; its
+    ``groups`` may be empty. ``step_objects``: how many objects the worker
+    may store in one engine step, each taking one credit page (0: unknown);
+    the node sizes the worker's credit to hold them.
     """
 
     engine_id: str
@@ -131,10 +136,14 @@ class AttachRequest:
     groups: list[GroupLayout]
     protocol: str
     capabilities: list[str] = field(default_factory=list)
+    role: SessionRole = SessionRole.WORKER
+    step_objects: int = 0
 
 
 @dataclass
 class AttachResponse:
+    """A probe's reply has no pools and no budgets."""
+
     status: Status
     error: str | None = None
     node_id: str = ""

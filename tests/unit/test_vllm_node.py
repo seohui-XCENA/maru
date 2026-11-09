@@ -1,0 +1,1934 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
+"""MaruKVConnector on maru_node: the node's StorageService and MaruServer.
+
+Config checks, transfer defaults, rank identity, and loads and stores through
+a StorageService and the fake MaruServer. CPU tensors only: loads and stores
+take their per-layer paths (the GPU kernels run in the GPU smoke test).
+"""
+
+import threading
+import time
+from concurrent.futures import Future
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
+import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+import maru_handler.client as client_module
+import maru_vllm.connector as connector_module
+from maru_common.kv_shard import WHOLE_MODEL, tp_kv_shard
+from maru_common.node_protocol import AttachResponse, TransferDefaults
+from maru_common.storage_types import Key, Status, StorageUnavailableError
+from maru_handler.client import CreditUnavailableError
+from maru_handler.storage.cpu import CpuReadLease
+from maru_vllm.connector import (
+    _NODE_KEYS_ELSEWHERE,
+    MaruConnectorMetadata,
+    MaruHandshakeMetadata,
+    MaruKVConnector,
+    MaruReqMeta,
+    _chunk_keys,
+    _node_engine_config,
+    _node_transfer_defaults,
+    _validate_storage_config,
+)
+from maru_vllm.kv_groups import describe_kv_groups, group_object_key
+from tests.unit.ms_fake_server import FakeMaruServer
+from tests.unit.ms_node_helpers import (
+    PAGE,
+    node_config,
+    remove_tree,
+    short_tmpdir,
+    start_node,
+    wait_until,
+)
+from tests.unit.test_vllm_kv_groups import (
+    _FORWARD,
+    B_BLOCKS,
+    QWEN_BLOCKS,
+    TINY_BLOCK,
+    _engine_layout,
+    _load_meta,
+    _shared,
+    _state,
+    _store_meta,
+    _token_rows,
+    gpt_oss_config,
+    tiny_config,
+    tiny_kv_caches,
+)
+from tests.unit.test_vllm_remote_cxl_tp_groups import remote_vllm_config
+from tests.unit.test_vllm_tp import (
+    BLOCK,
+    CHUNK,
+    HEAD_SIZE,
+    LAYER_NAMES,
+    NUM_BLOCKS,
+    NUM_LAYERS,
+    PROMPT,
+    assert_same_kv,
+    load_into,
+    rank_kv,
+)
+from tests.unit.vllm_connector_helpers import (
+    make_flash_attn_metadata,
+    make_scheduler,
+    make_worker,
+)
+
+SOCKET = "/run/maru/test-node.sock"
+
+
+def node_extra(socket: str = SOCKET, **kwargs):
+    return {
+        "maru_node": socket,
+        "maru_engine_id": "eng",
+        "maru_cache_namespace": "ns",
+        **kwargs,
+    }
+
+
+@pytest.fixture(autouse=True)
+def no_cached_defaults(monkeypatch):
+    monkeypatch.setattr(connector_module, "_node_transfer_cache", {})
+
+
+@pytest.fixture
+def fake():
+    server = FakeMaruServer(heartbeat_s=0.1)
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def node(fake):
+    sockdir = short_tmpdir()
+    # Credit for a layerwise burst: every (chunk, layer) object takes a page
+    budgets = {
+        "credit_max_bytes": 16 * PAGE,
+        "credit_total_max_bytes": 32 * PAGE,
+        "credit_refill_low": 8 * PAGE,
+        "credit_refill_high": 16 * PAGE,
+        "commit_pending_max_bytes": 16 * PAGE,
+    }
+    config = node_config(fake.url, f"{sockdir}/node.sock", pages=64, budgets=budgets)
+    service = start_node(config)
+    yield service
+    service.stop()
+    remove_tree(sockdir)
+
+
+@pytest.fixture
+def workers(node):
+    made = []
+
+    def make(shard=WHOLE_MODEL, heads: int = 2, **extra):
+        worker = make_worker(
+            BLOCK,
+            CHUNK,
+            node_extra(node.config.socket, **extra),
+            head_size=HEAD_SIZE,
+            kv_shard=shard,
+        )
+        worker._num_layers = NUM_LAYERS
+        per_layer = 2 * CHUNK * heads * HEAD_SIZE * 4
+        use_layerwise = extra.get("maru_use_layerwise", False)
+        worker._page_size_bytes = per_layer * (1 if use_layerwise else NUM_LAYERS)
+        worker._take_node_handler(wait=True)  # as register_kv_caches does
+        assert worker._handler is not None
+        made.append(worker)
+        return worker
+
+    yield make
+    for worker in made:
+        worker.shutdown()
+
+
+def store(worker, kv, start: int = 0) -> None:
+    """One prefill step, then wait for its WRITE_DONE."""
+    metadata = MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                req_id="r1",
+                token_ids=list(range(PROMPT)),
+                block_ids=list(range(NUM_BLOCKS)),
+                is_store=True,
+                num_scheduled_tokens=PROMPT - start,
+                num_computed_tokens=start,
+                store_start_token=start,
+            )
+        ]
+    )
+    attn = make_flash_attn_metadata()
+    for name, layer in zip(LAYER_NAMES, kv, strict=True):
+        worker.save_kv_layer(name, layer, attn, metadata)
+    drain(worker)
+
+
+def drain(worker) -> None:
+    """Wait for the step's stores, and MaruServer's answers to them."""
+    if worker._store_executor is not None:
+        worker._store_executor.submit(lambda: None).result(10)
+    worker._wait_node_stores(10)
+    assert not worker._node_store_futures
+
+
+def reads_held(worker) -> int:
+    return len(worker._handler._cpu._reads)
+
+
+# =============================================================================
+# Config
+# =============================================================================
+
+
+@pytest.mark.parametrize("key", sorted(_NODE_KEYS_ELSEWHERE))
+def test_a_key_the_storage_service_owns_is_refused_by_name(key):
+    with pytest.raises(ValueError, match=f"^{key} does not go with maru_node"):
+        _validate_storage_config(node_extra(**{key: "1"}))
+
+
+def test_remote_cxl_settings_and_missing_identity_are_refused():
+    with pytest.raises(ValueError, match="maru_read_hints is a remote_cxl"):
+        _validate_storage_config(node_extra(maru_read_hints=True))
+    extra = node_extra()
+    del extra["maru_engine_id"]
+    with pytest.raises(ValueError, match="requires maru_engine_id"):
+        _validate_storage_config(extra)
+    with pytest.raises(ValueError, match="path of the StorageService socket"):
+        _validate_storage_config(node_extra(""))
+    assert _validate_storage_config(node_extra()) is False  # not a session backend
+
+
+def node_vllm_config(tp_size: int = 1, total_heads: int = 8, **parallel):
+    config = remote_vllm_config(
+        tp_size,
+        total_heads,
+        extra=node_extra(
+            maru_async_load=True,
+            maru_async_store=True,
+            maru_overlap_load_with_compute=True,
+        ),
+        **parallel,
+    )
+    config.model_config.enforce_eager = False  # CUDA graphs
+    return config
+
+
+def test_cpu_backend_refusals_are_lifted():
+    """Async loads and stores, overlap, layerwise, CUDA graphs and TP>1."""
+    config = node_vllm_config(2)
+    extra = {
+        **config.kv_transfer_config.kv_connector_extra_config,
+        "maru_use_layerwise": True,
+    }
+    out = _node_engine_config(extra, config)
+    assert out["maru_cache_namespace"] != "ns"
+    assert out["maru_use_layerwise"] and out["maru_overlap_load_with_compute"]
+
+
+@pytest.mark.parametrize(
+    "parallel",
+    [{"pipeline_parallel_size": 2}, {"prefill_context_parallel_size": 2}],
+)
+def test_pipeline_and_context_parallelism_stay_refused(parallel):
+    config = node_vllm_config(1, **parallel)
+    with pytest.raises(ValueError, match="supports tensor parallelism but not"):
+        _node_engine_config(config.kv_transfer_config.kv_connector_extra_config, config)
+
+
+def test_a_failed_load_must_be_recomputed():
+    config = node_vllm_config()
+    config.kv_transfer_config.kv_load_failure_policy = "fail"
+    with pytest.raises(ValueError, match="kv_load_failure_policy='recompute'"):
+        _node_engine_config(config.kv_transfer_config.kv_connector_extra_config, config)
+
+
+def test_the_namespace_is_bound_to_the_geometry_and_the_path():
+    from tests.unit.test_vllm_cpu_config import engine_config
+    from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
+
+    config = engine_config()
+    tp1 = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    assert tp1 == _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    remote = connector_module._cpu_engine_config(remote_cxl_extra(), config)
+    assert remote["maru_cache_namespace"] != tp1
+    config.parallel_config.tensor_parallel_size = 2
+    assert _node_engine_config(node_extra(), config)["maru_cache_namespace"] != tp1
+
+
+# =============================================================================
+# Transfer defaults
+# =============================================================================
+
+
+def advise(monkeypatch, defaults: TransferDefaults | Exception):
+    calls = []
+
+    def probe(config):
+        calls.append(config.maru_node)
+        if isinstance(defaults, Exception):
+            raise defaults
+        return AttachResponse(
+            status=Status.OK, node_id="gpu-a", transfer_defaults=defaults
+        )
+
+    monkeypatch.setattr(client_module, "probe_node", probe)
+    # No node runs here: the scheduler does not connect at startup
+    monkeypatch.setattr(
+        connector_module.MaruSchedulerConnector, "connect_node", lambda *a, **k: None
+    )
+    return calls
+
+
+def test_the_node_advises_unset_modes_once_per_process(monkeypatch):
+    calls = advise(monkeypatch, TransferDefaults(async_load=True, async_store=False))
+    out = _node_transfer_defaults(node_extra())
+    assert out["maru_async_load"] is True and out["maru_async_store"] is False
+    # Asked once: another connector of the process takes the same answer
+    again = _node_transfer_defaults(node_extra(maru_async_load=False))
+    assert again["maru_async_load"] is False and again["maru_async_store"] is False
+    assert calls == [SOCKET]
+
+
+def test_explicit_modes_win_and_need_no_node(monkeypatch):
+    calls = advise(monkeypatch, StorageUnavailableError("down"))
+    extra = node_extra(maru_enable_deferred_loading=False, maru_async_store=True)
+    assert _node_transfer_defaults(extra) == extra
+    assert calls == []
+
+
+def test_an_unreachable_node_stops_the_engine_when_a_mode_is_unset(monkeypatch):
+    advise(monkeypatch, StorageUnavailableError("no socket"))
+    with pytest.raises(ValueError, match=f"StorageService at {SOCKET}"):
+        _node_transfer_defaults(node_extra(maru_async_load=True))
+
+
+def test_none_keeps_the_connector_default(monkeypatch):
+    advise(monkeypatch, TransferDefaults())
+    out = _node_transfer_defaults(node_extra())
+    assert "maru_async_load" not in out and "maru_async_store" not in out
+
+
+def test_a_dram_node_advises_the_cxl_defaults(node):
+    connector_module._node_transfer_cache.clear()
+    out = _node_transfer_defaults(node_extra(node.config.socket))
+    assert out["maru_async_load"] is False and out["maru_async_store"] is False
+
+
+# =============================================================================
+# Connector roles
+# =============================================================================
+
+
+def test_ranks_keep_the_engine_id_and_name_their_ranks(monkeypatch):
+    advise(monkeypatch, TransferDefaults(False, False))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    config = node_vllm_config(
+        2, 8, data_parallel_size=1, data_parallel_rank=0, data_parallel_index=1
+    )
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER)
+    scheduler = MaruKVConnector(config, KVConnectorRole.SCHEDULER)
+    w, s = worker._worker._extra_config, scheduler._scheduler._extra_config
+    assert w["maru_engine_id"] == s["maru_engine_id"] == "eng"
+    assert (w["_maru_dp_index"], w["_maru_tp_rank"]) == (1, 1)
+    assert s["_maru_dp_index"] == 1 and "_maru_tp_rank" not in s
+    assert worker._worker._kv_shard.suffix == "_h4-8"
+    assert scheduler._scheduler._shard_suffixes == ("_h0-4", "_h4-8")
+    assert scheduler._scheduler._deferred_loading  # TP parks every load
+    assert worker._worker._layerwise_overlap
+    # The scheduler loads no model under TP: it takes the workers' namespace
+    meta = worker.get_handshake_metadata()
+    assert meta.cache_namespace == w["maru_cache_namespace"]
+
+
+def test_tp_parks_loads_whatever_the_node_advises(monkeypatch):
+    advise(monkeypatch, TransferDefaults(async_load=False, async_store=False))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 0)
+    config = node_vllm_config(2)
+    config.kv_transfer_config.kv_connector_extra_config = node_extra()
+    scheduler = MaruKVConnector(config, KVConnectorRole.SCHEDULER)._scheduler
+    assert scheduler._deferred_loading and not scheduler._write_behind
+
+
+def test_several_kv_cache_groups_are_taken(monkeypatch):
+    advise(monkeypatch, TransferDefaults(False, False))
+    config = node_vllm_config()
+    config.cache_config.block_size = 16
+    connector = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
+    assert connector._scheduler._multi_group
+    assert connector._scheduler._deferred_loading
+
+
+def test_the_scheduler_probes_every_lookup():
+    """MaruServer is the directory of record: no key is remembered."""
+    tokens = list(range(2 * CHUNK))
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra())
+    scheduler._handler = MagicMock()
+    scheduler._handler.batch_exists.side_effect = lambda keys, **_: [True] * len(keys)
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert scheduler._handler.batch_exists.call_count == 2
+    assert scheduler._known_keys == set()
+
+
+# =============================================================================
+# Loads and stores on a node
+# =============================================================================
+
+
+def test_store_and_load_round_trip(fake, node, workers):
+    writer, reader = workers(), workers()
+    kv = rank_kv(1, 2)
+    writer._handler.batch_store = MagicMock(side_effect=AssertionError("waits"))
+    store_async = MagicMock(wraps=writer._handler.store_async)
+    writer._handler.store_async = store_async
+    store(writer, kv)
+    # WRITE_DONE is posted; nothing waits for MaruServer's commit
+    assert store_async.call_count == 1
+    keys = _chunk_keys(list(range(PROMPT)), CHUNK)
+    assert {Key("ns", k) for k in keys} <= fake.keys()
+
+    dst = [torch.zeros_like(layer) for layer in kv]
+    load_into(reader, dst, make_flash_attn_metadata())
+    assert_same_kv(dst, kv)
+    assert reader.take_failed_load_blocks() == set()
+    assert reads_held(reader) == 0
+    wait_until(lambda: fake.pin_count() == 0, what="every pin released")
+
+
+def test_a_gone_key_recomputes_only_the_external_range(fake, node, workers):
+    writer, reader = workers(), workers()
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    first, second = _chunk_keys(list(range(PROMPT)), CHUNK)
+    with fake._lock:
+        for entry in fake.catalog.pop(Key("ns", second)):
+            fake.by_loc.pop(
+                (
+                    entry.location.pool_id,
+                    entry.location.allocation_id,
+                    entry.location.generation,
+                ),
+                None,
+            )
+    dst = [torch.zeros_like(layer) for layer in kv]
+    forward = SimpleNamespace(
+        no_compile_layers={
+            name: SimpleNamespace(kv_cache=layer)
+            for name, layer in zip(LAYER_NAMES, dst, strict=True)
+        },
+        attn_metadata=make_flash_attn_metadata(),
+    )
+    # vLLM's own prefix cache holds the first block
+    meta = MaruReqMeta(
+        req_id="r1",
+        token_ids=list(range(PROMPT)),
+        block_ids=list(range(NUM_BLOCKS)),
+        is_store=False,
+        num_matched_chunks=2,
+        load_start_token=BLOCK,
+        load_end_token=PROMPT,
+    )
+    reader.start_load_kv(forward, MaruConnectorMetadata(requests=[meta]))
+    assert reader.take_failed_load_blocks() == {1, 2, 3}
+    assert reads_held(reader) == 0
+    counters = reader._handler.get_stats()["maru_node"]["counters"]
+    assert counters["retrieve_not_found"] == 1
+    wait_until(lambda: fake.pin_count() == 0, what="every pin released")
+
+
+def test_an_unavailable_maruserver_fails_the_load(fake, node, workers):
+    writer, reader = workers(), workers()
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    fake.pause(hold=False)
+    try:
+        load_into(reader, [torch.zeros_like(layer) for layer in kv], None)
+    finally:
+        fake.resume()
+    assert reader.take_failed_load_blocks() == set(range(NUM_BLOCKS))
+    counters = reader._handler.get_stats()["maru_node"]["counters"]
+    assert counters["retrieve_unavailable"] == 2
+
+
+@pytest.mark.parametrize(("tp_size", "total_heads"), [(2, 4), (2, 1)])
+def test_ranks_store_their_slices_and_a_replica_only_loads(
+    fake, node, workers, tp_size, total_heads
+):
+    shards = [tp_kv_shard(rank, tp_size, total_heads) for rank in range(tp_size)]
+    heads = max(1, total_heads // tp_size)
+    ranks = [workers(shard, heads=heads) for shard in shards]
+    kvs = [rank_kv(rank + 1, heads) for rank in range(tp_size)]
+    writers = [s.is_writer for s in shards]
+    for rank, kv in zip(ranks, kvs, strict=True):
+        store(rank, kv)
+    keys = _chunk_keys(list(range(PROMPT)), CHUNK)
+    expected = {
+        Key("ns", key + shard.suffix)
+        for key in keys
+        for shard in shards
+        if shard.is_writer
+    }
+    assert fake.keys() == expected
+    for rank, kv, writes in zip(ranks, kvs, writers, strict=True):
+        client = rank._handler._cpu
+        assert client.config.load_only is (not writes)
+        assert node.pools.held_bytes(client.identity.incarnation) == 0 or writes
+        dst = [torch.zeros_like(layer) for layer in kv]
+        load_into(rank, dst, make_flash_attn_metadata())
+        # A replica holds the same heads as the rank that stored them
+        assert_same_kv(dst, kvs[0] if not writes else kv)
+        assert rank.take_failed_load_blocks() == set()
+    if total_heads == 1:
+        assert not writers[1]
+
+
+def test_layerwise_objects_and_their_done_marker(fake, node, workers):
+    writer = workers(maru_use_layerwise=True)
+    reader = workers(maru_use_layerwise=True)
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    keys = _chunk_keys(list(range(PROMPT)), CHUNK)
+    stored = {k.key for k in fake.keys()}
+    for key in keys:
+        assert {f"{key}_L{i}" for i in range(NUM_LAYERS)} | {f"{key}_DONE"} <= stored
+    dst = [torch.zeros_like(layer) for layer in kv]
+    load_into(reader, dst, make_flash_attn_metadata())
+    assert_same_kv(dst, kv)
+    assert reads_held(reader) == 0
+
+
+def test_stores_behind_are_found_only_once_committed(fake, node, workers):
+    """#143: a chunk is invisible to lookups until MaruServer commits it."""
+    writer = workers()
+    held = []
+    store_async = writer._handler.store_async
+
+    def hold(keys, handles):
+        future = Future()
+        held.append(
+            lambda: store_async(keys, handles).add_done_callback(
+                lambda f: future.set_result(f.result())
+            )
+        )
+        return future
+
+    writer._handler.store_async = hold
+    kv = rank_kv(1, 2)
+    metadata = MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                req_id="r1",
+                token_ids=list(range(PROMPT)),
+                block_ids=list(range(NUM_BLOCKS)),
+                is_store=True,
+                num_scheduled_tokens=PROMPT,
+            )
+        ]
+    )
+    attn = make_flash_attn_metadata()
+    for name, layer in zip(LAYER_NAMES, kv, strict=True):
+        writer.save_kv_layer(name, layer, attn, metadata)
+    keys = _chunk_keys(list(range(PROMPT)), CHUNK)
+    assert writer._handler.batch_exists(keys) == [False, False]
+    assert all(writer._store_pending(k) for k in keys)  # not stored again
+    for send in held:
+        send()
+    drain(writer)
+    assert writer._handler.batch_exists(keys) == [True, True]
+    assert not any(writer._store_pending(k) for k in keys)
+
+
+def test_several_groups_on_a_node(fake, node):
+    def group_worker(shared):
+        caches = tiny_kv_caches("0.30", shared)
+        worker = make_worker(
+            TINY_BLOCK,
+            TINY_BLOCK,
+            node_extra(node.config.socket),
+            num_kv_heads=2,
+            head_size=8,
+            kv_cache_layout=_engine_layout(caches),
+            kv_groups=describe_kv_groups(tiny_config()),
+        )
+        worker.register_kv_caches(caches)  # attaches with the group page
+        assert worker._handler is not None
+        return worker
+
+    source = _shared()
+    writer = group_worker(source)
+    target = torch.zeros_like(_shared())
+    reader = group_worker(target)
+    try:
+        tokens = list(range(40))
+        writer.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        drain(writer)
+        assert len(fake.keys()) == 5
+        reader.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
+        assert reader.take_failed_load_blocks() == set()
+        src = writer._group_caches[3].tensors
+        dst = reader._group_caches[3].tensors
+        for a_block, b_block in ((4, 7), (5, 8)):
+            for a, b in zip(src, dst, strict=True):
+                assert torch.equal(
+                    _token_rows(b, b_block, "0.30"), _token_rows(a, a_block, "0.30")
+                )
+        for g in range(3):
+            for b_block in B_BLOCKS[g][1:]:
+                for layer in range(2):
+                    assert torch.equal(
+                        _state(target, layer, b_block),
+                        _state(source, layer, QWEN_BLOCKS[g][1]),
+                    )
+        assert reads_held(reader) == 0
+        key = _chunk_keys(tokens, TINY_BLOCK)[1]
+        assert Key("ns", group_object_key(key, 3, TINY_BLOCK)) in fake.keys()
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+# =============================================================================
+# Read pins held across queued copies (overlap and layerwise paths)
+# =============================================================================
+
+
+class Done:
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
+
+
+class Pending(Done):
+    def query(self):
+        return False
+
+
+def lease(name: str) -> CpuReadLease:
+    return CpuReadLease(view=memoryview(bytearray(4)), location=name, _release=None)
+
+
+def pinning_worker():
+    worker = make_worker(BLOCK, CHUNK, node_extra())
+    worker._handler = MagicMock()
+    return worker
+
+
+def released(worker) -> list:
+    return [
+        info
+        for call in worker._handler.release_retrieved.call_args_list
+        for info in call.args[0]
+    ]
+
+
+def test_queued_reads_are_released_once_their_copies_end():
+    worker = pinning_worker()
+    done, pending = lease("done"), lease("pending")
+    worker._active_load_refs = [
+        (Done(), [[done], torch.zeros(1)]),
+        (Pending(), [[pending]]),
+    ]
+    worker._release_completed_load_refs()
+    assert released(worker) == [done]
+    assert len(worker._active_load_refs) == 1
+
+
+def test_a_finished_parked_load_releases_its_reads():
+    worker = pinning_worker()
+    read = lease("a")
+    worker._deferred_events["r1"] = Done()
+    worker._deferred_refs["r1"] = [[read], torch.zeros(1)]
+    assert worker.get_finished_loading() == {"r1"}
+    assert released(worker) == [read]
+
+
+def test_a_reclaimed_request_releases_reads_never_copied():
+    worker = pinning_worker()
+    retained = {0: [lease("l0")], 1: [lease("l1")]}
+    worker._deferred_layerwise_loads["r1"] = ("meta", 1, torch.zeros(1), retained)
+    worker._drain_layerwise_copies({"r1"}, report=False)
+    assert released(worker) == retained[0] + retained[1]
+
+
+def test_shutdown_releases_every_held_read_before_closing():
+    worker = pinning_worker()
+    handler = worker._handler
+    reads = [lease(str(i)) for i in range(3)]
+    worker._active_load_refs = [(Pending(), [[reads[0]]])]
+    worker._deferred_refs["r1"] = [[reads[1]]]
+    worker._deferred_layerwise_loads["r2"] = ("meta", 1, None, [reads[2]])
+    order = []
+    handler.release_retrieved.side_effect = lambda infos: order.append("release")
+    handler.close.side_effect = lambda: order.append("close")
+    worker.shutdown()
+    assert order == ["release", "close"]
+    assert {id(r) for r in handler.release_retrieved.call_args.args[0]} == {
+        id(r) for r in reads
+    }
+
+
+def test_other_backends_hold_no_pins():
+    worker = make_worker(BLOCK, CHUNK, {})
+    worker._handler = MagicMock()
+    worker._release_held([[lease("x")]])
+    worker._handler.release_retrieved.assert_not_called()
+
+
+def test_pinned_reads_are_copied_one_by_one():
+    """A read names no CXL page: never combined into a run."""
+    worker = pinning_worker()
+    worker._effective_page_size_bytes = 4
+    reads = [lease("a"), lease("b")]
+    runs = worker._chunk_runs(reads)
+    assert [(start, n) for start, n, _ in runs] == [(0, 1), (1, 1)]
+
+
+def test_the_kernel_follows_the_page_lock_of_the_node_pools():
+    worker = pinning_worker()
+    worker._handler.storage_gpu_accessible.return_value = False
+    assert worker._lease_buffers_gpu_accessible() is False
+    assert worker._packed_load_kernel_ctx([("l", torch.zeros(1), 0)], None) is None
+    worker._handler.storage_gpu_accessible.return_value = True
+    assert worker._lease_buffers_gpu_accessible() is True
+
+
+def test_no_credit_is_an_expected_skip():
+    worker = pinning_worker()
+    assert worker._expected_store_skip(CreditUnavailableError("none"))
+    assert worker._expected_store_skip(StorageUnavailableError("down"))
+    assert not worker._expected_store_skip(RuntimeError("bug"))
+
+
+# =============================================================================
+# Async scheduling, connecting off the engine thread, refusals
+# =============================================================================
+
+
+def test_async_scheduling_parks_loads_whatever_the_node_advises(monkeypatch, caplog):
+    calls = advise(monkeypatch, TransferDefaults(async_load=False, async_store=False))
+    with caplog.at_level("INFO", logger="maru_vllm.connector"):
+        out = _node_transfer_defaults(node_extra(), async_scheduling=True)
+    assert out["maru_async_load"] is True and out["maru_async_store"] is False
+    assert calls == [SOCKET]
+    assert "overriding the node's advice" in caplog.text
+
+
+def test_async_scheduling_refuses_explicit_inline_loads(monkeypatch):
+    advise(monkeypatch, TransferDefaults(False, False))
+    for name in ("maru_async_load", "maru_enable_deferred_loading"):
+        with pytest.raises(ValueError, match="--no-async-scheduling"):
+            _node_transfer_defaults(node_extra(**{name: False}), async_scheduling=True)
+    out = _node_transfer_defaults(
+        node_extra(maru_async_load=False), async_scheduling=False
+    )
+    assert out["maru_async_load"] is False
+
+
+@pytest.mark.parametrize("async_load", [None, False])
+def test_the_connector_follows_vllm_async_scheduling(monkeypatch, async_load):
+    advise(monkeypatch, TransferDefaults(async_load=False, async_store=False))
+    config = node_vllm_config()
+    extra = node_extra()
+    if async_load is not None:
+        extra["maru_async_load"] = async_load
+    config.kv_transfer_config.kv_connector_extra_config = extra
+    config.scheduler_config.async_scheduling = True
+    if async_load is False:
+        with pytest.raises(ValueError, match="--no-async-scheduling"):
+            MaruKVConnector(config, KVConnectorRole.SCHEDULER)
+        return
+    scheduler = MaruKVConnector(config, KVConnectorRole.SCHEDULER)._scheduler
+    assert scheduler._deferred_loading
+
+
+def absent_worker(sockdir, **extra):
+    worker = make_worker(
+        BLOCK, CHUNK, node_extra(f"{sockdir}/node.sock", **extra), head_size=HEAD_SIZE
+    )
+    worker._num_layers = NUM_LAYERS
+    worker._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
+    return worker
+
+
+def test_no_engine_step_waits_for_an_absent_node(fake):
+    sockdir = short_tmpdir()
+    worker = absent_worker(sockdir)
+    created = MagicMock(wraps=worker._create_node_worker_handler)
+    worker._create_node_worker_handler = created
+    kv = rank_kv(1, 2)
+    try:
+        for _ in range(3):
+            t0 = time.monotonic()
+            store(worker, kv)
+            load_into(worker, [torch.zeros_like(layer) for layer in kv], None)
+            assert time.monotonic() - t0 < 0.5
+            assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
+        assert created.call_count == 1  # created once, never again
+        # The node comes up: the same handler connects and serves
+        service = start_node(node_config(fake.url, f"{sockdir}/node.sock", pages=64))
+        try:
+            wait_until(
+                lambda: worker._ensure_handler() or worker._handler, what="connect"
+            )
+            assert created.call_count == 1
+            wait_until(lambda: worker._handler._cpu.credits.unused_bytes >= 2 * PAGE)
+            # A new request: r1 computed over a failed inline load stores nothing
+            save_step(worker, kv, [store_meta("r2", 0)])
+            drain(worker)
+            assert len(fake.keys()) == 2
+        finally:
+            worker.shutdown()
+            service.stop()
+    finally:
+        remove_tree(sockdir)
+
+
+def test_a_scheduler_lookup_does_not_wait_for_a_maruserver_that_is_down(
+    fake, node, workers
+):
+    writer = workers()
+    store(writer, rank_kv(1, 2))
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
+    scheduler.connect_node()
+    try:
+        tokens = list(range(PROMPT))
+        assert scheduler._count_matched_chunks(tokens) == 2
+        fake.pause(hold=False)
+        try:
+            scheduler._count_matched_chunks(tokens)  # finds it down
+            for _ in range(10):
+                t0 = time.monotonic()
+                assert scheduler._count_matched_chunks(tokens) == 0
+                assert time.monotonic() - t0 < 0.05
+        finally:
+            fake.resume()
+        wait_until(lambda: scheduler._count_matched_chunks(tokens) == 2, timeout=5)
+    finally:
+        scheduler.shutdown()
+
+
+def test_a_refusal_stops_startup_but_only_disables_a_running_worker(fake, node, caplog):
+    worker = make_worker(BLOCK, CHUNK, node_extra(node.config.socket))
+    worker._page_size_bytes = 2 * PAGE  # an object larger than the node page
+    try:
+        with pytest.raises(ValueError, match="refused this worker"):
+            worker._take_node_handler(wait=True)
+    finally:
+        worker.shutdown()
+    # The same refusal later (a node restarted with smaller pages)
+    worker = make_worker(BLOCK, CHUNK, node_extra(node.config.socket))
+    worker._num_layers = NUM_LAYERS
+    worker._page_size_bytes = 2 * PAGE
+    try:
+        with caplog.at_level("ERROR", logger="maru_vllm.connector"):
+            worker._ensure_handler()
+            wait_until(lambda: worker._ensure_handler() or worker._node_refused)
+        assert "serves without the cache" in caplog.text
+        kv = rank_kv(1, 2)
+        store(worker, kv)  # skipped, no exception
+        load_into(worker, [torch.zeros_like(layer) for layer in kv], None)
+        assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
+        assert fake.keys() == set()
+    finally:
+        worker.shutdown()
+
+
+# =============================================================================
+# Stores: non-blocking WRITE_DONE, chunk-atomic layerwise chunks
+# =============================================================================
+
+
+def store_meta(req_id: str, offset: int) -> MaruReqMeta:
+    """A prefill step that stores a whole prompt of tokens from ``offset``."""
+    return MaruReqMeta(
+        req_id=req_id,
+        token_ids=list(range(offset, offset + PROMPT)),
+        block_ids=list(range(NUM_BLOCKS)),
+        is_store=True,
+        num_scheduled_tokens=PROMPT,
+    )
+
+
+def save_step(worker, kv, requests) -> None:
+    metadata = MaruConnectorMetadata(requests=list(requests))
+    attn = make_flash_attn_metadata()
+    for name, layer in zip(LAYER_NAMES, kv, strict=True):
+        worker.save_kv_layer(name, layer, attn, metadata)
+
+
+def stored_keys(fake) -> set[str]:
+    return {k.key for k in fake.keys()}
+
+
+def chunk_keys_of(offset: int) -> list[str]:
+    return _chunk_keys(list(range(offset, offset + PROMPT)), CHUNK)
+
+
+@pytest.fixture
+def nodes_small(fake):
+    """Nodes whose workers get exactly ``credit_pages`` of credit at once."""
+    started = []
+
+    def make(credit_pages: int, total_pages: int = 8, **options):
+        sockdir = short_tmpdir()
+        budgets = {
+            "credit_max_bytes": credit_pages * PAGE,
+            "credit_total_max_bytes": total_pages * PAGE,
+            "credit_refill_low": credit_pages * PAGE,
+            "credit_refill_high": credit_pages * PAGE,
+            "commit_pending_max_bytes": total_pages * PAGE,
+        }
+        service = start_node(
+            node_config(fake.url, f"{sockdir}/node.sock", pages=128, budgets=budgets),
+            **options,
+        )
+        started.append((service, sockdir))
+        return service
+
+    yield make
+    for service, sockdir in started:
+        service.stop()
+        remove_tree(sockdir)
+
+
+def layerwise_writer(node):
+    writer = make_worker(
+        BLOCK,
+        CHUNK,
+        node_extra(node.config.socket, maru_use_layerwise=True),
+        head_size=HEAD_SIZE,
+    )
+    writer._num_layers = NUM_LAYERS
+    writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4
+    writer._take_node_handler(wait=True)
+    return writer
+
+
+def test_layerwise_steps_store_every_chunk_on_the_credit_they_free(fake, nodes_small):
+    """Each step takes all the credit a worker gets; its WRITE_DONEs free it
+    for the next step at once."""
+    writer = layerwise_writer(nodes_small(credit_pages=16, total_pages=32))
+    client = writer._handler._cpu
+    kv = rank_kv(1, 2)
+    per_step = 2  # requests: 2 x 2 chunks x (3 layers + marker) = 16 pages
+    try:
+        for step in range(4):
+            wait_until(lambda: client.credits.unused_bytes >= 16 * PAGE, timeout=2.0)
+            save_step(
+                writer,
+                kv,
+                [
+                    store_meta(f"r{step}{i}", 1000 * (step * per_step + i))
+                    for i in range(per_step)
+                ],
+            )
+        drain(writer)
+        stored = stored_keys(fake)
+        for n in range(4 * per_step):
+            for key in chunk_keys_of(1000 * n):
+                layers = {f"{key}_L{i}" for i in range(NUM_LAYERS)}
+                assert layers | {f"{key}_DONE"} <= stored
+        assert client.stats["store_skipped_no_credit"] == 0
+        assert not writer._pending_layer_objects
+    finally:
+        writer.shutdown()
+
+
+def test_a_chunk_short_of_credit_is_dropped_whole(fake, nodes_small, caplog):
+    """3 layers and a marker need 4 pages; the worker holds 3."""
+    writer = layerwise_writer(nodes_small(credit_pages=3))
+    client = writer._handler._cpu
+    try:
+        wait_until(lambda: client.credits.unused_bytes >= 3 * PAGE)
+        save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
+        drain(writer)
+        assert fake.keys() == set()  # no layer of a dropped chunk
+        assert not writer._pending_layer_objects
+        assert client.local_stats()["allocations"] == 0  # every page back
+        assert client.credits.unused_bytes == 3 * PAGE
+        assert client.stats["store_skipped_no_credit"] >= 1
+        assert "Maru store skipped" in caplog.text
+    finally:
+        writer.shutdown()
+
+
+def test_an_unfinished_layerwise_chunk_is_dropped_at_the_step_boundary(
+    fake, node, workers
+):
+    writer = workers(maru_use_layerwise=True)
+    client = writer._handler._cpu
+    kv = rank_kv(1, 2)
+    metadata = MaruConnectorMetadata(requests=[store_meta("r1", 0)])
+    attn = make_flash_attn_metadata()
+    for name, layer in list(zip(LAYER_NAMES, kv, strict=True))[:2]:
+        writer.save_kv_layer(name, layer, attn, metadata)
+    assert len(writer._pending_layer_objects) == 2
+    writer._reclaim_stale_pending_slabs()
+    assert not writer._pending_layer_objects and not writer._skipped_slabs
+    assert client.local_stats()["allocations"] == 0
+    drain(writer)
+    assert fake.keys() == set()
+
+
+def test_store_steps_do_not_wait_for_maruserver_commits(fake, nodes_small):
+    """Every chunk's WRITE_DONE is in flight at once: draining takes two
+    commit rounds (layers, then markers), not one per layer."""
+    from maru_common.protocol import MessageType
+
+    node = nodes_small(credit_pages=16, total_pages=32, rpc_timeout_s=3.0)
+    writer = layerwise_writer(node)
+    try:
+        wait_until(lambda: writer._handler._cpu.credits.unused_bytes >= 8 * PAGE)
+        fake.delay(MessageType.COMMIT, 0.5)
+        t0 = time.monotonic()
+        save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
+        assert time.monotonic() - t0 < 0.2
+        drain(writer)
+        assert time.monotonic() - t0 < 1.6  # one round per layer: 2 s
+        assert len(fake.keys()) == 2 * (NUM_LAYERS + 1)
+    finally:
+        writer.shutdown()
+
+
+def test_write_behind_releases_requests_once_their_blocks_are_read():
+    worker = pinning_worker()
+    worker._write_behind = True
+    future = Future()  # MaruServer has not answered
+    worker._handler.store_async.return_value = future
+    worker._store_key_waiters["k"] = {"r1"}
+    worker._request_pending_store_keys["r1"] = {"k"}
+    worker._pending_store_keys.add("k")
+    worker._handler.has_local.return_value = False
+    worker._finish_write_behind_store(None, ["k"], ["handle"], [])
+    assert worker.get_finished_saving({"r1"}) == {"r1"}
+    assert worker._store_pending("k")  # not stored again meanwhile
+    future.set_result([True])
+    assert not worker._store_pending("k")
+
+
+def test_shutdown_waits_a_bounded_time_for_maruserver(fake, node, workers, monkeypatch):
+    monkeypatch.setattr(connector_module, "_NODE_STORE_DRAIN_S", 0.5)
+    writer = workers()
+    kv = rank_kv(1, 2)
+    fake.pause(hold=True)
+    try:
+        save_step(writer, kv, [store_meta("r1", 0)])
+        assert writer._node_store_futures
+        t0 = time.monotonic()
+        writer.shutdown()
+        assert time.monotonic() - t0 < 6.0
+    finally:
+        fake.resume()
+
+
+def test_no_kernel_refusal_is_cached_before_the_handler_connects():
+    worker = make_worker(BLOCK, CHUNK, node_extra())
+    worker._num_layers = NUM_LAYERS
+    worker._kv_caches = dict(zip(LAYER_NAMES, rank_kv(1, 2), strict=True))
+    assert worker._handler is None
+    assert worker._packed_store_kernel_ctx(None) is None
+    assert not worker._store_kernel_unusable
+    layers = [(name, kv, i) for i, (name, kv) in enumerate(worker._kv_caches.items())]
+    assert worker._loader_kernel_ctx(layers, None, None) is None
+    assert worker._loader_kernel_cache is None
+
+
+# =============================================================================
+# Loads: the external range only, failures reported once
+# =============================================================================
+
+
+SENTINEL = -7.0
+
+
+def sentinel_kv(heads: int = 2) -> list[torch.Tensor]:
+    return [torch.full_like(layer, SENTINEL) for layer in rank_kv(0, heads)]
+
+
+def forward_of(dst) -> SimpleNamespace:
+    return SimpleNamespace(
+        no_compile_layers={
+            name: SimpleNamespace(kv_cache=layer)
+            for name, layer in zip(LAYER_NAMES, dst, strict=True)
+        },
+        attn_metadata=make_flash_attn_metadata(),
+    )
+
+
+def external_meta(parked: bool, **kwargs) -> MaruReqMeta:
+    """vLLM's prefix cache holds block 0; the prompt ends on a chunk, so the
+    last block is computed, not loaded, and was not allocated for the load."""
+    return MaruReqMeta(
+        req_id="r1",
+        token_ids=list(range(PROMPT)),
+        block_ids=list(range(NUM_BLOCKS - 1)),
+        is_store=False,
+        num_matched_chunks=2,
+        load_start_token=BLOCK,
+        load_end_token=PROMPT - BLOCK,
+        deferred_load=parked,
+        **kwargs,
+    )
+
+
+def assert_only_external_blocks(dst, kv) -> None:
+    for got, want in zip(dst, kv, strict=True):
+        assert torch.equal(got[1:3], want[1:3])
+        assert bool((got[0] == SENTINEL).all()) and bool((got[3] == SENTINEL).all())
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+@pytest.mark.parametrize("parked", [False, True])
+def test_a_load_writes_only_the_external_range(fake, node, workers, layerwise, parked):
+    extra = {"maru_use_layerwise": True} if layerwise else {}
+    writer, reader = workers(**extra), workers(**extra)
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    dst = sentinel_kv()
+    reader.start_load_kv(
+        forward_of(dst), MaruConnectorMetadata(requests=[external_meta(parked)])
+    )
+    if parked:
+        assert reader.get_finished_loading() == {"r1"}
+    assert reader.take_failed_load_blocks() == set()
+    assert_only_external_blocks(dst, kv)
+    assert reads_held(reader) == 0
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_an_overlap_activation_writes_only_the_external_range(
+    fake, node, workers, layerwise
+):
+    extra = {"maru_use_layerwise": True} if layerwise else {}
+    writer, reader = workers(**extra), workers(**extra)
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    meta = external_meta(True, layerwise_load=True)
+    ct = CHUNK
+    chunk_keys = reader._slice_chunk_keys(meta)
+    plan = reader._node_load_plan(meta, chunk_keys[:2])
+    assert plan is not None
+    keys, slots = plan
+    dst = sentinel_kv()
+    layers = [
+        (name, layer, i)
+        for i, (name, layer) in enumerate(zip(LAYER_NAMES, dst, strict=True))
+    ]
+    infos = reader._batch_retrieve_all(
+        connector_module._load_keys(keys, len(keys), layers, layerwise)
+    )
+    payload = (
+        {i: infos[i * len(keys) : (i + 1) * len(keys)] for i in range(NUM_LAYERS)}
+        if layerwise
+        else infos
+    )
+    reader._deferred_layerwise_loads["r1"] = (meta, len(keys), slots, payload)
+    reader._schedule_deferred_layerwise_loads(
+        layers, {"r1"}, make_flash_attn_metadata()
+    )
+    assert reader.take_failed_load_blocks() == set()
+    assert_only_external_blocks(dst, kv)
+    assert reads_held(reader) == 0
+    assert ct == CHUNK
+
+
+def test_a_failed_overlap_activation_reports_its_external_blocks_once(
+    fake, node, workers, monkeypatch
+):
+    writer, reader = workers(), workers()
+    store(writer, rank_kv(1, 2))
+    meta = external_meta(True, layerwise_load=True)
+    plan = reader._node_load_plan(meta, reader._slice_chunk_keys(meta)[:2])
+    keys, slots = plan
+    dst = sentinel_kv()
+    layers = [
+        (name, layer, i)
+        for i, (name, layer) in enumerate(zip(LAYER_NAMES, dst, strict=True))
+    ]
+    infos = reader._batch_retrieve_all(keys)
+    reader._deferred_layerwise_loads["r1"] = (meta, len(keys), slots, infos)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("inject failed")
+
+    monkeypatch.setattr(reader, "_inject_kv_into_layer", boom)
+    reader._schedule_deferred_layerwise_loads(
+        layers, {"r1"}, make_flash_attn_metadata()
+    )
+    # The external blocks only, and no second load-finished report
+    assert reader.take_failed_load_blocks() == {1, 2}
+    assert reader.get_finished_loading() is None
+    assert "r1" in reader._unsound_kv_req_ids
+    assert reads_held(reader) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_failed_overlap_activation_on_cuda_reports_its_external_blocks_once(
+    monkeypatch,
+):
+    worker = pinning_worker()
+    device = torch.device("cuda")
+    dst = [layer.to(device) for layer in sentinel_kv()]
+    layers = [
+        (name, layer, i)
+        for i, (name, layer) in enumerate(zip(LAYER_NAMES, dst, strict=True))
+    ]
+    meta = external_meta(True, layerwise_load=True)
+    slots = worker._build_slot_mapping(meta.block_ids, PROMPT - BLOCK)
+    worker._deferred_layerwise_loads["r1"] = (meta, 2, slots, [lease("a"), lease("b")])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(worker, "_copy_chunkwise_layer_to_device", boom)
+    worker._num_layers = NUM_LAYERS
+    worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+    assert worker.take_failed_load_blocks() == {1, 2}
+    with worker._deferred_lock:
+        assert "r1" not in worker._deferred_done
+    assert "r1" in worker._unsound_kv_req_ids
+
+
+def test_a_node_load_retrieves_its_keys_in_one_call():
+    worker = pinning_worker()
+    worker._handler.batch_retrieve.side_effect = lambda keys, **_: [None] * len(keys)
+    keys = [f"k{i}" for i in range(2000)]
+    assert len(worker._batch_retrieve_all(keys)) == 2000
+    assert worker._handler.batch_retrieve.call_count == 1
+
+
+def test_finished_loads_release_the_reads_of_completed_copies():
+    worker = pinning_worker()
+    read = lease("a")
+    worker._active_load_refs = [(Done(), [[read]])]
+    worker.get_finished_loading()
+    assert released(worker) == [read]
+    assert worker._active_load_refs == []
+
+
+# =============================================================================
+# Handshake: the workers' transfer modes
+# =============================================================================
+
+
+def handshake(**modes) -> dict:
+    return {0: MaruHandshakeMetadata("ns", **modes)}
+
+
+def test_workers_that_transfer_otherwise_are_refused():
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(maru_async_load=True))
+    scheduler.take_worker_namespace(handshake(async_load=True, async_store=False))
+    scheduler.take_worker_namespace(handshake())  # says nothing: taken
+    with pytest.raises(ValueError, match="maru_async_load=False"):
+        scheduler.take_worker_namespace(handshake(async_load=False))
+    with pytest.raises(ValueError, match="maru_async_store=True"):
+        scheduler.take_worker_namespace(handshake(async_store=True))
+
+
+def test_a_worker_sends_its_transfer_modes():
+    worker = make_worker(BLOCK, CHUNK, node_extra(maru_async_load=True))
+    meta = worker.handshake_metadata()
+    assert (meta.async_load, meta.async_store) == (True, False)
+
+
+# =============================================================================
+# The scheduler connects at startup; no lookup waits
+# =============================================================================
+
+
+def test_the_first_scheduler_lookup_does_not_wait_for_an_absent_node():
+    sockdir = short_tmpdir()
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(f"{sockdir}/node.sock"))
+    try:
+        for _ in range(3):
+            t0 = time.monotonic()
+            assert scheduler._count_matched_chunks(list(range(PROMPT))) == 0
+            assert time.monotonic() - t0 < 0.5
+        assert scheduler._node_handler is not None  # made once, connecting
+    finally:
+        scheduler.shutdown()
+        remove_tree(sockdir)
+
+
+def test_the_first_scheduler_lookup_does_not_wait_for_maruserver(fake, node):
+    fake.pause(hold=False)
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
+    try:
+        t0 = time.monotonic()
+        assert scheduler._count_matched_chunks(list(range(PROMPT))) == 0
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        fake.resume()
+        scheduler.shutdown()
+
+
+def test_the_scheduler_connects_when_vllm_starts(fake, node):
+    config = node_vllm_config()
+    # Both modes set: nothing else asks the node at startup
+    config.kv_transfer_config.kv_connector_extra_config = node_extra(
+        node.config.socket, maru_async_load=True, maru_async_store=True
+    )
+    connector = MaruKVConnector(config, KVConnectorRole.SCHEDULER)
+    try:
+        assert connector._scheduler._handler is not None
+        assert connector._scheduler._handler.connected
+    finally:
+        connector.shutdown()
+
+
+def test_a_namespace_from_the_workers_reopens_the_scheduler_at_startup(fake, node):
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
+    scheduler.connect_node()
+    old = scheduler._handler
+    try:
+        assert old is not None
+        scheduler.take_worker_namespace({0: MaruHandshakeMetadata("other")})
+        new = scheduler._handler
+        assert new is not None and new is not old and not old.connected
+        assert new._cpu.identity.namespace == "other"
+    finally:
+        scheduler.shutdown()
+
+
+# =============================================================================
+# Shutdown with layerwise stores in flight or unfinished
+# =============================================================================
+
+
+def test_shutdown_waits_for_the_markers_of_chunks_in_flight(fake, nodes_small):
+    from maru_common.protocol import MessageType
+
+    node = nodes_small(credit_pages=16, total_pages=32, rpc_timeout_s=3.0)
+    writer = layerwise_writer(node)
+    client = writer._handler._cpu
+    wait_until(lambda: client.credits.unused_bytes >= 8 * PAGE)
+    fake.delay(MessageType.COMMIT, 0.3)
+    save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
+    writer.shutdown()
+    stored = stored_keys(fake)
+    for key in chunk_keys_of(0):
+        assert {f"{key}_L{i}" for i in range(NUM_LAYERS)} | {f"{key}_DONE"} <= stored
+    # No page was left being written: the session ended with WORKER_CLOSE
+    assert fake.worker_session_of(client.identity.incarnation) is None
+
+
+def test_shutdown_gives_back_the_pages_of_unfinished_chunks(fake, node, workers):
+    writer = workers(maru_use_layerwise=True)
+    incarnation = writer._handler._cpu.identity.incarnation
+    metadata = MaruConnectorMetadata(requests=[store_meta("r1", 0)])
+    attn = make_flash_attn_metadata()
+    for name, layer in list(zip(LAYER_NAMES, rank_kv(1, 2), strict=True))[:2]:
+        writer.save_kv_layer(name, layer, attn, metadata)
+    assert writer._pending_layer_objects
+    writer.shutdown()
+    assert not writer._pending_layer_objects
+    assert fake.keys() == set()
+    assert fake.worker_session_of(incarnation) is None  # nothing left allocated
+
+
+# =============================================================================
+# Loads on CUDA: the external range only
+# =============================================================================
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def cuda_reader(workers, layerwise: bool):
+    reader = workers(**({"maru_use_layerwise": True} if layerwise else {}))
+    dst = [layer.cuda() for layer in sentinel_kv()]
+    reader._kv_caches = dict(zip(LAYER_NAMES, dst, strict=True))
+    return reader, dst
+
+
+def finished(reader, req_id: str = "r1") -> None:
+    seen: set[str] = set()
+
+    def done() -> bool:
+        seen.update(reader.get_finished_loading() or ())
+        return req_id in seen
+
+    wait_until(done, what=f"{req_id} loaded")
+    torch.cuda.synchronize()
+
+
+def assert_external_on_cuda(reader, dst, kv) -> None:
+    torch.cuda.synchronize()
+    assert reader.take_failed_load_blocks() == set()
+    assert_only_external_blocks([layer.cpu() for layer in dst], kv)
+    reader._release_completed_load_refs()
+    wait_until(lambda: reads_held(reader) == 0, what="reads released")
+
+
+@needs_cuda
+@pytest.mark.parametrize("layerwise", [False, True])
+@pytest.mark.parametrize("parked", [False, True])
+def test_a_cuda_load_writes_only_the_external_range(
+    fake, node, workers, layerwise, parked
+):
+    writer = workers(**({"maru_use_layerwise": True} if layerwise else {}))
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    reader, dst = cuda_reader(workers, layerwise)
+    reader.start_load_kv(
+        forward_of(dst), MaruConnectorMetadata(requests=[external_meta(parked)])
+    )
+    if parked:
+        finished(reader)
+    assert_external_on_cuda(reader, dst, kv)
+
+
+@needs_cuda
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_overlap_copies_queued_while_parked_write_only_the_external_range(
+    fake, node, workers, layerwise
+):
+    writer = workers(**({"maru_use_layerwise": True} if layerwise else {}))
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    reader, dst = cuda_reader(workers, layerwise)
+    meta = external_meta(True, layerwise_load=True)
+    reader.start_load_kv(forward_of(dst), MaruConnectorMetadata(requests=[meta]))
+    finished(reader)
+    assert reader._deferred_layerwise_events.get("r1")  # queued off-thread
+    assert_external_on_cuda(reader, dst, kv)
+
+
+@needs_cuda
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_a_cuda_overlap_activation_writes_only_the_external_range(
+    fake, node, workers, layerwise
+):
+    writer = workers(**({"maru_use_layerwise": True} if layerwise else {}))
+    kv = rank_kv(1, 2)
+    store(writer, kv)
+    reader, dst = cuda_reader(workers, layerwise)
+    meta = external_meta(True, layerwise_load=True)
+    keys, slots = reader._node_load_plan(meta, reader._slice_chunk_keys(meta)[:2])
+    layers = [
+        (name, layer, i) for i, (name, layer) in enumerate(reader._kv_caches.items())
+    ]
+    infos = reader._batch_retrieve_all(
+        connector_module._load_keys(keys, len(keys), layers, layerwise)
+    )
+    payload = (
+        {i: infos[i * len(keys) : (i + 1) * len(keys)] for i in range(NUM_LAYERS)}
+        if layerwise
+        else infos
+    )
+    reader._deferred_layerwise_loads["r1"] = (meta, len(keys), slots, payload)
+    reader._schedule_deferred_layerwise_loads(
+        layers, {"r1"}, make_flash_attn_metadata()
+    )
+    assert set(reader._layer_load_events) == set(LAYER_NAMES)
+    assert_external_on_cuda(reader, dst, kv)
+
+
+@needs_cuda
+def test_overlap_copies_that_cannot_be_queued_fail_the_parked_load(
+    fake, node, workers, monkeypatch
+):
+    writer = workers()
+    store(writer, rank_kv(1, 2))
+    reader, dst = cuda_reader(workers, False)
+    monkeypatch.setattr(reader, "_issue_layerwise_copies_offthread", lambda *a: None)
+    meta = external_meta(True, layerwise_load=True)
+    reader.start_load_kv(forward_of(dst), MaruConnectorMetadata(requests=[meta]))
+    finished(reader)
+    # Failed while parked, never kept for the step that computes it
+    assert reader.take_failed_load_blocks() == {1, 2}
+    assert "r1" not in reader._deferred_layerwise_loads
+    assert "r1" not in reader._unsound_kv_req_ids
+    wait_until(lambda: reads_held(reader) == 0, what="reads released")
+
+
+# =============================================================================
+# Credit for one step: what a rank says it may store
+# =============================================================================
+
+
+def test_the_step_chunk_bound_holds_for_any_schedule():
+    """Random steps: each request's completed chunks per _step_chunks."""
+    import random
+
+    from maru_vllm.connector import _step_chunk_bound, _step_chunks
+
+    rng = random.Random(0)
+    for _ in range(2000):
+        ct = rng.choice([1, 2, 4, 8, 16])
+        tokens, seqs = rng.randint(1, 64), rng.randint(1, 12)
+        budget, completed = tokens, 0
+        for _ in range(seqs):
+            if budget == 0:
+                break
+            scheduled = rng.randint(1, budget)
+            budget -= scheduled
+            computed = rng.randint(0, 40)
+            meta = MaruReqMeta(
+                "r",
+                [0] * (computed + scheduled),
+                [],
+                True,
+                num_scheduled_tokens=scheduled,
+                num_computed_tokens=computed,
+            )
+            completed += len(_step_chunks(meta, ct, (computed + scheduled) // ct))
+        assert completed <= _step_chunk_bound(tokens, seqs, ct)
+    assert _step_chunk_bound(8192, 256, 256) == 287
+    assert _step_chunk_bound(8192, 1, 256) == 32
+    assert _step_chunk_bound(0, 256, 256) == 0  # unknown
+
+
+def step_worker(shard=WHOLE_MODEL, **extra):
+    worker = make_worker(
+        BLOCK,
+        CHUNK,
+        node_extra(_maru_step_tokens=64, _maru_step_seqs=4, **extra),
+        head_size=HEAD_SIZE,
+        kv_shard=shard,
+    )
+    worker._num_layers = NUM_LAYERS
+    return worker
+
+
+def test_a_rank_says_how_many_objects_one_step_may_store():
+    chunks = (64 + 4 * (CHUNK - 1)) // CHUNK  # 11
+    assert step_worker()._step_objects() == chunks
+    # A layer each, and the _DONE marker
+    assert step_worker(maru_use_layerwise=True)._step_objects() == chunks * (
+        NUM_LAYERS + 1
+    )
+    # Every rank stores its own slice; a rank holding a copy stores nothing
+    writer, replica = (tp_kv_shard(rank, 2, 1) for rank in (0, 1))
+    assert step_worker(writer)._step_objects() == chunks
+    assert step_worker(replica)._step_objects() == 0
+    unknown = make_worker(BLOCK, CHUNK, node_extra())
+    unknown._num_layers = NUM_LAYERS
+    assert unknown._step_objects() == 0
+
+
+@pytest.mark.parametrize("config", [gpt_oss_config, tiny_config])
+def test_several_groups_store_an_object_per_attention_group_and_a_state(config):
+    groups = describe_kv_groups(config())
+    worker = make_worker(
+        16,
+        16,
+        node_extra(_maru_step_tokens=64, _maru_step_seqs=4),
+        kv_groups=groups,
+    )
+    chunks = (64 + 4 * 15) // 16
+    attention = sum(g.kind != connector_module.GROUP_MAMBA for g in groups)
+    mamba = len(groups) - attention
+    assert worker._step_objects() == chunks * attention + 4 * mamba
+
+
+def test_the_worker_sends_its_step_with_attach(fake, node):
+    worker = step_worker()
+    worker._extra_config["maru_node"] = node.config.socket
+    worker._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
+    try:
+        worker._take_node_handler(wait=True)
+        assert worker._handler._cpu.config.step_objects == worker._step_objects() > 0
+    finally:
+        worker.shutdown()
+
+
+def test_vllm_scheduler_limits_reach_the_worker(monkeypatch):
+    advise(monkeypatch, TransferDefaults(False, False))
+    config = node_vllm_config()
+    config.scheduler_config.max_num_batched_tokens = 8192
+    config.scheduler_config.max_num_seqs = 256
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER)._worker
+    extra = worker._extra_config
+    assert (extra["_maru_step_tokens"], extra["_maru_step_seqs"]) == (8192, 256)
+
+
+def test_one_step_of_32_chunks_is_stored_on_its_own_credit(fake, monkeypatch):
+    """The default (16 pages, as at 32 MiB pages) holds half the step; the
+    credit the worker asks for at ATTACH holds all of it."""
+    import maru_storage_service.config as node_config_module
+    from maru_storage_service.config import parse_node_config
+
+    monkeypatch.setattr(node_config_module, "CREDIT_MAX_MIN_BYTES", 0)
+    requests = [store_meta(f"r{i}", 1000 * i) for i in range(16)]  # 32 chunks
+    stored = {}
+    for hint in (True, False):
+        sockdir = short_tmpdir()
+        config = parse_node_config(
+            {
+                "node_id": "gpu-step",
+                "socket": f"{sockdir}/node.sock",
+                "server": fake.url,
+                "page_size": PAGE,
+                "tiers": [{"store": "dram", "size": 256 * PAGE, "hugepage": False}],
+                "budgets": {
+                    "credit_total_max_bytes": 64 * PAGE,
+                    "commit_pending_max_bytes": 64 * PAGE,
+                    "transfer_reserve_bytes": PAGE,
+                },
+            }
+        )
+        service = start_node(config)
+        extra = (
+            {"_maru_step_tokens": 16 * PROMPT, "_maru_step_seqs": 16} if hint else {}
+        )
+        writer = make_worker(
+            BLOCK, CHUNK, node_extra(config.socket, **extra), head_size=HEAD_SIZE
+        )
+        writer._num_layers = NUM_LAYERS
+        writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
+        try:
+            writer._take_node_handler(wait=True)
+            client = writer._handler._cpu
+            want = (46 if hint else 16) * PAGE
+            wait_until(
+                lambda c=client, w=want: c.credits.unused_bytes == w, what="credit"
+            )
+            save_step(writer, rank_kv(1, 2), requests)
+            drain(writer)
+            stored[hint] = (len(fake.keys()), client.stats["store_skipped_no_credit"])
+        finally:
+            writer.shutdown()
+            service.stop()
+            remove_tree(sockdir)
+        with fake._lock:
+            fake.catalog.clear()
+            fake.by_loc.clear()
+    assert stored[True] == (32, 0)
+    assert stored[False][0] < 32 and stored[False][1] > 0
+
+
+# =============================================================================
+# Write-behind waits for credit off the engine thread
+# =============================================================================
+
+
+class FakeCredit:
+    """Credit of a write-behind worker's node: the engine thread finds some
+    while ``at_hand`` is set; a wait for it gets some once ``comes`` is."""
+
+    def __init__(self):
+        self.at_hand = threading.Event()
+        self.comes = threading.Event()
+        self.stopped = threading.Event()  # stop_credit_waits()
+        self.pages = []
+
+    def alloc(self, nbytes, route_key=None, wait_s=0.0, retry_later=False):
+        deadline = time.monotonic() + wait_s
+        while not (self.at_hand.is_set() or self.comes.is_set()):
+            if self.stopped.is_set() or time.monotonic() >= deadline:
+                raise CreditUnavailableError("no credit at hand")
+            time.sleep(0.005)
+        page = SimpleNamespace(buf=memoryview(bytearray(nbytes)))
+        self.pages.append(page)
+        return page
+
+
+def wait_worker(monkeypatch, blocks: int = 6):
+    """A write-behind worker on a CPU stand-in for CUDA, with FakeCredit."""
+    from tests.unit.test_vllm_remote_cxl_transfers import _cpu_cuda
+
+    _cpu_cuda(monkeypatch)
+    worker = make_worker(
+        4, 8, node_extra(maru_async_store=True), num_kv_heads=1, head_size=1
+    )
+    cache = torch.arange(blocks * 2 * 4, dtype=torch.float32).reshape(
+        blocks, 2, 4, 1, 1
+    )
+    worker._kv_caches = {"model.layers.0.self_attn": cache}
+    worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+    worker._num_layers = 1
+    credit = FakeCredit()
+    published = []
+
+    def store_async(keys, handles):
+        published.extend(keys)
+        future = Future()
+        future.set_result([True] * len(keys))
+        return future
+
+    worker._handler = MagicMock()
+    worker._handler.has_local.return_value = False
+    worker._handler.alloc.side_effect = credit.alloc
+    worker._handler.store_async.side_effect = store_async
+    worker._handler.stop_credit_waits.side_effect = credit.stopped.set
+
+    def fill(dst, *args, **kwargs):
+        dst.fill_(7.0)
+
+    ops = SimpleNamespace(
+        multi_layer_kv_transfer=fill, TransferDirection=SimpleNamespace(D2H="D2H")
+    )
+    kernel = (ops, torch.zeros(1, dtype=torch.int64), 16, 4, 1, "FMT")
+    return worker, kernel, credit, published
+
+
+def behind_meta(req_id: str, offset: int = 0, tokens: int = 16, computed: int = 0):
+    return MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                req_id,
+                list(range(offset, offset + tokens)),
+                list(range(tokens // 4)),
+                True,
+                num_scheduled_tokens=tokens - computed,
+                num_computed_tokens=computed,
+            )
+        ]
+    )
+
+
+def drain_behind(worker) -> None:
+    """Wait for the write-behind jobs, then for the credit waits they began."""
+    for name in ("_store_executor", "_credit_executor"):
+        executor = getattr(worker, name)
+        if executor is not None:
+            executor.submit(lambda: None).result(10)
+
+
+def test_write_behind_waits_for_credit_off_the_engine_thread(monkeypatch):
+    worker, kernel, credit, published = wait_worker(monkeypatch)
+    t0 = time.monotonic()
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    assert time.monotonic() - t0 < 0.1  # the engine thread never waits
+    assert worker._deferred_bytes > 0
+    threading.Timer(0.2, credit.comes.set).start()
+    drain_behind(worker)
+    keys = _chunk_keys(list(range(16)), 8)
+    assert published == keys  # stored once credit came, none skipped
+    for page in credit.pages:
+        assert set(torch.frombuffer(page.buf, dtype=torch.float32).tolist()) == {7.0}
+    assert not any(worker._store_pending(k) for k in keys)
+    assert not worker._credit_drought and worker._deferred_bytes == 0
+    worker.shutdown()
+
+
+def test_a_write_behind_wait_for_credit_is_bounded(monkeypatch):
+    worker, kernel, _, published = wait_worker(monkeypatch)
+    t0 = time.monotonic()
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    drain_behind(worker)
+    assert time.monotonic() - t0 < connector_module._STORE_CREDIT_WAIT_S + 0.5
+    keys = _chunk_keys(list(range(16)), 8)
+    assert published == [] and not any(worker._store_pending(k) for k in keys)
+    assert worker._credit_drought and worker._deferred_bytes == 0
+    # Until credit comes again chunks without it are skipped at once
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r2", 100))
+    assert worker._deferred_bytes == 0
+    assert not any(worker._store_pending(k) for k in _chunk_keys(range(100, 116), 8))
+    worker.shutdown()
+
+
+def test_later_batches_do_not_wait_behind_a_credit_wait(monkeypatch):
+    worker, kernel, credit, published = wait_worker(monkeypatch)
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))  # waits
+    credit.at_hand.set()
+    t0 = time.monotonic()
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r2", 100))
+    worker._store_executor.submit(lambda: None).result(10)
+    assert worker.get_finished_saving({"r1", "r2"}) == {"r1", "r2"}
+    assert set(_chunk_keys(list(range(100, 116)), 8)) <= set(published)
+    assert time.monotonic() - t0 < 0.5  # not behind r1's wait for credit
+    worker.shutdown()
+
+
+def test_shutdown_is_not_held_by_credit_waits(monkeypatch):
+    worker, kernel, _, _ = wait_worker(monkeypatch)
+    for i in range(5):
+        worker._store_packed_slabs_write_behind(kernel, behind_meta(f"r{i}", 100 * i))
+    worker._store_executor.submit(lambda: None).result(10)
+    time.sleep(0.1)  # the first wait is under way
+    t0 = time.monotonic()
+    worker.shutdown()
+    # Neither the wait under way nor the queued ones hold it
+    assert time.monotonic() - t0 < 0.5
+    assert worker._deferred_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        StorageUnavailableError("closing"),
+        ValueError("larger than an object"),
+        RuntimeError("bug"),
+    ],
+)
+def test_a_reservation_is_given_back_whatever_alloc_raises(monkeypatch, error):
+    worker, kernel, _, published = wait_worker(monkeypatch)
+    worker._handler.alloc.side_effect = error
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    assert worker._deferred_bytes == 0
+    assert published == []
+    assert not any(worker._store_pending(k) for k in _chunk_keys(range(16), 8))
+    worker.shutdown()
+
+
+def test_chunks_waiting_for_credit_are_given_up_if_their_copies_cannot_be_tracked(
+    monkeypatch,
+):
+    worker, kernel, credit, _ = wait_worker(monkeypatch)
+
+    class Broken:
+        def record(self, stream=None):
+            raise RuntimeError("no event")
+
+    monkeypatch.setattr(torch.cuda, "Event", Broken)
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    assert worker._deferred_bytes == 0
+    assert worker.get_finished_saving({"r1"}) == {"r1"}
+    assert not any(worker._store_pending(k) for k in _chunk_keys(range(16), 8))
+    worker.shutdown()
+
+
+def test_chunks_waiting_for_credit_are_bounded_in_all(monkeypatch):
+    worker, kernel, credit, _ = wait_worker(monkeypatch)
+    slab = 2 * 1 * 8 * 1 * 4  # 2 planes x 1 layer x 8 tokens x 1 x float32
+    monkeypatch.setattr(connector_module, "_DEFERRED_STORE_MAX_BYTES", 3 * slab)
+    seen = []
+    for i in range(4):  # 2 chunks each; the first wait has not timed out yet
+        worker._store_packed_slabs_write_behind(kernel, behind_meta(f"r{i}", 100 * i))
+        seen.append(worker._deferred_bytes)
+    assert max(seen) <= 3 * slab
+    credit.comes.set()
+    drain_behind(worker)
+    assert worker._deferred_bytes == 0
+    worker.shutdown()
+
+
+def test_a_write_behind_step_completing_a_long_prompt_fits_its_credit(monkeypatch):
+    """A chunked prefill of 8 chunks completes in a step of 8 tokens."""
+    worker, kernel, credit, published = wait_worker(monkeypatch, blocks=16)
+    worker._extra_config.update(
+        _maru_step_tokens=8, _maru_step_seqs=1, _maru_max_model_len=64
+    )
+    assert connector_module._step_chunk_bound(8, 1, 8) == 1
+    assert worker._step_objects() == 8
+    credit.at_hand.set()
+    worker._store_packed_slabs_write_behind(
+        kernel, behind_meta("r1", tokens=64, computed=56)
+    )
+    drain_behind(worker)
+    assert len(published) == 8 <= worker._step_objects()
+    worker.shutdown()
+
+
+def test_write_behind_counts_one_whole_prompt_a_step():
+    worker = step_worker(maru_async_store=True, _maru_max_model_len=32 * CHUNK)
+    chunks = (64 + 4 * (CHUNK - 1)) // CHUNK  # 11
+    assert worker._step_objects() == max(chunks, 32)
+    layerwise = step_worker(
+        maru_async_store=True, maru_use_layerwise=True, _maru_max_model_len=32 * CHUNK
+    )
+    assert layerwise._step_objects() == chunks * (NUM_LAYERS + 1)  # never behind
+
+
+@needs_cuda
+def test_chunks_wait_for_credit_on_the_device(monkeypatch):
+    """The device-slab path on CUDA: gathered on the store stream, copied to
+    its page on the credit-wait thread."""
+    worker = make_worker(
+        4, 8, node_extra(maru_async_store=True), num_kv_heads=1, head_size=1
+    )
+    cache = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4, 1, 1)
+    worker._kv_caches = {"model.layers.0.self_attn": cache.cuda()}
+    worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+    worker._num_layers = 1
+    credit = FakeCredit()
+    published = []
+
+    def store_async(keys, handles):
+        published.extend(keys)
+        future = Future()
+        future.set_result([True] * len(keys))
+        return future
+
+    worker._handler = MagicMock()
+    worker._handler.has_local.return_value = False
+    worker._handler.alloc.side_effect = credit.alloc
+    worker._handler.store_async.side_effect = store_async
+
+    def gather(dst, ptrs, slots, dev, *args, **kwargs):
+        dst.copy_(slots.float().view(1, 1, -1, 1).expand(dst.shape))
+
+    ops = SimpleNamespace(
+        multi_layer_kv_transfer=gather, TransferDirection=SimpleNamespace(D2H="D2H")
+    )
+    kernel = (ops, torch.zeros(1, dtype=torch.int64, device="cuda"), 24, 4, 1, "FMT")
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    assert worker._deferred_bytes > 0
+    credit.comes.set()
+    drain_behind(worker)
+    assert published == _chunk_keys(list(range(16)), 8)
+    first = torch.frombuffer(credit.pages[0].buf, dtype=torch.float32).view(2, 1, 8)
+    assert first[0, 0].tolist() == list(range(8))  # the chunk's own slots
+    assert worker._deferred_bytes == 0
+    worker.shutdown()
+
+
+# =============================================================================
+# Old nodes and shared credit
+# =============================================================================
+
+
+def test_a_worker_works_with_a_node_that_ignores_its_step(fake, node, monkeypatch):
+    """An older node sizes no credit from ATTACH: the worker gets the node's
+    budgets and stores on them."""
+    import maru_storage_service.local_server as local_server
+
+    monkeypatch.setattr(local_server, "worker_budgets", lambda budgets, *_: budgets)
+    writer = step_worker()
+    writer._extra_config["maru_node"] = node.config.socket
+    writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
+    try:
+        writer._take_node_handler(wait=True)
+        client = writer._handler._cpu
+        assert client.config.step_objects > 0
+        assert client.attach_info.budgets == node.config.budgets
+        wait_until(lambda: client.credits.unused_bytes >= 2 * PAGE)
+        store(writer, rank_kv(1, 2))
+        assert len(fake.keys()) == 2
+    finally:
+        writer.shutdown()
+
+
+def test_an_older_node_decodes_an_attach_with_step_objects():
+    import dataclasses as dc
+
+    from maru_common.node_protocol import NODE_MESSAGE_CLASSES, AttachRequest
+    from maru_common.node_protocol import NodeMessageType as Code
+    from maru_common.serializer import Serializer
+
+    old_fields = [
+        (f.name, f.type, f)
+        for f in dc.fields(AttachRequest)
+        if f.name != "step_objects"
+    ]
+    old_attach = dc.make_dataclass("OldAttach", old_fields)
+    table = dict(NODE_MESSAGE_CLASSES)
+    table[Code.ATTACH] = (old_attach, table[Code.ATTACH][1])
+    new = AttachRequest(
+        engine_id="e",
+        dp_index=0,
+        tp_rank=0,
+        pid=1,
+        pid_start=2,
+        incarnation="i",
+        namespace="ns",
+        groups=[],
+        protocol="p",
+        step_objects=7,
+    )
+    sender, old_node = Serializer(NODE_MESSAGE_CLASSES), Serializer(table)
+    _, decoded = old_node.decode_request(sender.encode(Code.ATTACH, new))
+    assert decoded.incarnation == "i" and not hasattr(decoded, "step_objects")

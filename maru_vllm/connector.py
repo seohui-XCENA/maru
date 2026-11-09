@@ -27,8 +27,8 @@ import re
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +53,8 @@ from maru_common.kv_shard import (
     tp_part_shards,
 )
 from maru_common.storage_types import StorageError, StorageUnavailableError
+from maru_handler.client import CreditUnavailableError
+from maru_handler.storage.cpu import CpuReadLease
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
@@ -514,8 +516,60 @@ def _session_pool_key(extra: dict[str, Any]) -> str:
     return "maru_cpu_pool_size"
 
 
+# Keys a maru_node config must leave out: the StorageService owns them now
+_NODE_KEYS_ELSEWHERE = {
+    "maru_pool_size": "the node config sizes each tier",
+    "maru_cpu_pool_size": "the node config sizes each tier",
+    "maru_cxl_pool_size": "the node config sizes each tier",
+    "maru_write_order": "the node config orders the tiers",
+    "maru_read_order": "the node config orders the tiers",
+    "maru_chunk_size": "the node config sets the page size",
+    "maru_rdma_device": "the node config holds the RDMA settings",
+    "maru_rdma_timeout_s": "the node config holds the RDMA settings",
+    "maru_remote_cxl_agent_key_file": "the node config holds the RDMA settings",
+    "maru_rdma_staging_size": "the StorageService fetches remote KV, without staging",
+    "maru_server_url": "the StorageService names MaruServer at ATTACH",
+    "maru_node_id": "the StorageService names the node",
+    "maru_instance_id": "the StorageService names the node",
+    "maru_storage_backend": "maru_node selects the StorageService path",
+    "maru_pin_pools": "node pools are always page-locked",
+    "maru_eager_map": "it is not used on the maru_node path",
+}
+
+
+def _is_node(extra: dict[str, Any]) -> bool:
+    """Whether the config takes the StorageService path (maru_node)."""
+    return "maru_node" in extra
+
+
+def _validate_node_config(extra: dict[str, Any]) -> None:
+    """Refuse maru_node configs with keys of the old storage backends."""
+    node = extra.get("maru_node")
+    if not isinstance(node, str) or not node:
+        raise ValueError("maru_node must be the path of the StorageService socket")
+    for key, why in _NODE_KEYS_ELSEWHERE.items():
+        if key in extra:
+            raise ValueError(f"{key} does not go with maru_node: {why}")
+    for name in ("maru_engine_id", "maru_cache_namespace"):
+        if not extra.get(name):
+            raise ValueError(f"maru_node requires {name}")
+    knob = next((name for name in _RDMA_KNOBS if name in extra), None)
+    if knob is not None:
+        raise ValueError(
+            f"{knob} is a remote_cxl setting; it does not go with maru_node"
+        )
+
+
 def _validate_storage_config(extra: dict[str, Any]) -> bool:
-    """Validate M1's opt-in boundary before any cache data can be used."""
+    """Validate M1's opt-in boundary before any cache data can be used.
+
+    Returns:
+        Whether a storage-session backend (cpu, mixed, remote_cxl) is used;
+        False for cxl and for maru_node, which is checked here too.
+    """
+    if _is_node(extra):
+        _validate_node_config(extra)
+        return False
     backend = extra.get("maru_storage_backend", "cxl")
     if backend not in {"cxl", "cpu", "mixed", "remote_cxl"}:
         raise ValueError(
@@ -652,8 +706,8 @@ def _cpu_engine_config(
     backend enters it: a CPU or mixed engine cannot load a remote CXL
     engine's keys, so engines of different backends never share a namespace.
     So does the quantization vLLM runs the weights with, when there is one.
-    So do the TP size above TP=1 and several KV cache groups (remote_cxl
-    only): a rank's objects hold its own slice and its page is sized by it,
+    So do the TP size above TP=1 and several KV cache groups (remote_cxl and
+    maru_node): a rank's objects hold its own slice and its page is sized by it,
     and a model stored by group holds other objects than the same model
     stored as one group. MaruServer refuses a session whose objects differ
     from those of its namespace, so such engines must not share one. A
@@ -708,7 +762,6 @@ def _cpu_engine_config(
             if remote_cxl
             else "CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1"
         )
-    tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
     model = config.model_config
     if not getattr(model, "enforce_eager", False):
         raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
@@ -733,6 +786,28 @@ def _cpu_engine_config(
             if remote_cxl
             else "CPU M1 supports text-only models without LoRA or MLA"
         )
+    digest = _namespace_digest(
+        extra, config, kv_groups, extra.get("maru_storage_backend")
+    )
+    out = {**extra, "maru_cache_namespace": digest}
+    max_model_len = getattr(model, "max_model_len", None)
+    if isinstance(max_model_len, int) and max_model_len > 0:
+        out["_maru_max_model_len"] = max_model_len
+    return out
+
+
+def _namespace_digest(
+    extra: dict[str, Any],
+    config: Any,
+    kv_groups: Sequence[KVGroup],
+    storage: str | None,
+) -> str:
+    """The namespace engines share KV under: the caller's namespace bound to
+    the engine geometry, the storage it goes to (a backend, or maru_node),
+    the quantization vLLM runs, and above TP=1 or with several KV cache
+    groups those too (see ``_cpu_engine_config``)."""
+    model = config.model_config
+    tp_size = int(getattr(config.parallel_config, "tensor_parallel_size", 1) or 1)
     model_config = {
         k: v
         for k, v in model.hf_config.to_dict().items()
@@ -740,7 +815,7 @@ def _cpu_engine_config(
     }
     identity = {
         "namespace": extra["maru_cache_namespace"],
-        "storage_backend": extra.get("maru_storage_backend"),
+        "storage_backend": storage,
         "revision": getattr(model, "revision", None),
         "model_config": model_config,
         "dtype": str(model.dtype),
@@ -775,10 +850,121 @@ def _cpu_engine_config(
         digest[:16],
         extra["maru_cache_namespace"],
     )
-    out = {**extra, "maru_cache_namespace": digest}
-    max_model_len = getattr(model, "max_model_len", None)
-    if isinstance(max_model_len, int) and max_model_len > 0:
-        out["_maru_max_model_len"] = max_model_len
+    return digest
+
+
+def _node_engine_config(
+    extra: dict[str, Any], config: Any, kv_groups: Sequence[KVGroup] = ()
+) -> dict[str, Any]:
+    """Check a maru_node engine and bind its namespace to the engine geometry.
+
+    Workers copy between the GPU and a page-locked node pool as the cxl
+    backend copies to CXL, so the cxl combinations hold (asynchronous loads
+    and stores, overlap, layerwise, CUDA graphs, TP, DP). Every rank shares
+    ``maru_engine_id``; MaruServer tells ranks apart by their tp_rank.
+
+    Raises:
+        ValueError: If vLLM would not recompute a failed load, or for
+            pipeline or context parallelism.
+    """
+    if (
+        getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
+        != "recompute"
+    ):
+        raise ValueError(
+            "maru_node requires kv_load_failure_policy='recompute': a load whose "
+            "KV is unavailable or gone is computed again"
+        )
+    # No key names a pipeline stage's layers or a context-parallel rank's tokens
+    _validate_cxl_parallelism(getattr(config, "parallel_config", None))
+    digest = _namespace_digest(extra, config, kv_groups, "maru_node")
+    return {**extra, "maru_cache_namespace": digest}
+
+
+_TRANSFER_KNOBS = ("maru_async_load", "maru_async_store")
+# Transfer defaults of each node socket, asked once per process
+_node_transfer_cache: dict[str, dict[str, bool | None]] = {}
+
+
+def _node_transfer_defaults(
+    extra: dict[str, Any], async_scheduling: bool = False
+) -> dict[str, Any]:
+    """Take the transfer modes the node advises unless the config sets them.
+
+    The node derives them from its tiers (a memory-only node advises the cxl
+    defaults). They are asked once per process with a probe ATTACH and
+    logged once; an explicit value, either name, wins. Under vLLM's async
+    scheduling loads are parked whatever the node advises: a failed inline
+    load is reported only after vLLM has scheduled the request's next step.
+
+    Raises:
+        ValueError: If ``maru_async_load`` is false under async scheduling,
+            or a mode is unset and the node cannot be reached: the scheduler
+            and the workers must decide alike.
+    """
+    knob = "maru_async_load"
+    parked = False
+    if async_scheduling:
+        if knob in extra or _RENAMED_KNOBS[knob] in extra:
+            if not _get_knob(extra, knob):
+                raise ValueError(
+                    "maru_node with maru_async_load=false requires vLLM async "
+                    "scheduling off (--no-async-scheduling): a failed inline "
+                    "load is reported after vLLM has scheduled the request's "
+                    "next step"
+                )
+        else:
+            extra = {**extra, knob: True}
+            parked = True
+    unset = [
+        k for k in _TRANSFER_KNOBS if k not in extra and _RENAMED_KNOBS[k] not in extra
+    ]
+    if not unset:
+        if parked:
+            logger.info("Maru: async scheduling is on, so loads are parked")
+        return extra
+    socket = extra["maru_node"]
+    defaults = _node_transfer_cache.get(socket)
+    first = defaults is None
+    if defaults is None:
+        from maru_common.config import MaruConfig
+        from maru_handler.client import probe_node
+
+        try:
+            reply = probe_node(
+                MaruConfig(
+                    maru_node=socket,
+                    engine_id=extra["maru_engine_id"],
+                    cache_namespace=extra["maru_cache_namespace"],
+                    auto_connect=False,
+                )
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Maru: cannot ask the StorageService at {socket} for its "
+                f"transfer defaults ({e}); start it before vLLM, or set "
+                "maru_async_load and maru_async_store"
+            ) from e
+        advised = reply.transfer_defaults
+        defaults = {
+            "maru_async_load": advised.async_load,
+            "maru_async_store": advised.async_store,
+        }
+        _node_transfer_cache[socket] = defaults
+    taken = {k: defaults[k] for k in unset if defaults[k] is not None}
+    out = {**extra, **taken}
+    if first or parked:
+        sources = {k: "node" if k in taken else "config" for k in _TRANSFER_KNOBS}
+        if parked:
+            sources[knob] = "async scheduling"
+            if defaults[knob] is False:
+                sources[knob] += ", overriding the node's advice"
+        logger.info(
+            "Maru: transfer modes: %s",
+            ", ".join(
+                f"{k}={bool(_get_knob(out, k))} ({sources[k]})" for k in _TRANSFER_KNOBS
+            ),
+        )
     return out
 
 
@@ -1043,11 +1229,27 @@ def _uncacheable_request(request: Any) -> str | None:
     return None
 
 
+def _log_node_counters(handler: Any, role: str) -> None:
+    """Log a maru_node handler's outcome counters (unavailable, not_found and
+    fetch apart)."""
+    try:
+        counters = handler.get_stats()["maru_node"]["counters"]
+    except Exception:
+        return
+    if counters:
+        logger.info(
+            "Maru %s counters: %s",
+            role,
+            ", ".join(f"{k}={v}" for k, v in sorted(counters.items())),
+        )
+
+
 def _create_maru_handler(
     extra_config: dict[str, Any],
     *,
     pool_size_override: int | None = None,
     metadata_only: bool = False,
+    load_only: bool = False,
 ):
     """Create and connect a MaruHandler from extra_config.
 
@@ -1056,9 +1258,12 @@ def _create_maru_handler(
         pool_size_override: If set, use this pool size instead of the
             configured value (on a storage-session backend, its region or
             pool size). A TP rank that stores nothing takes one page.
+        load_only: maru_node: the worker never stores and asks no credit.
     """
     from maru import MaruConfig, MaruHandler
 
+    if _is_node(extra_config):
+        return _create_node_handler(extra_config, metadata_only, load_only)
     cpu_mode = _validate_storage_config(extra_config)
     server_url = extra_config.get("maru_server_url", "tcp://localhost:5555")
     pool_size = (
@@ -1140,6 +1345,84 @@ def _create_maru_handler(
         return None
     logger.info("Connected to MaruServer at %s (pool=%d)", server_url, pool_size)
     return handler
+
+
+def _create_node_handler(
+    extra_config: dict[str, Any], metadata_only: bool, load_only: bool
+):
+    """A MaruHandler on the node's StorageService: a probe for the scheduler,
+    a worker client (pool, credit, pins) for a worker.
+
+    It connects in the background and keeps trying until closed, so no
+    caller waits for the node or MaruServer; ``_wait_node_handler`` waits.
+    """
+    from maru import MaruConfig, MaruHandler
+
+    _validate_node_config(extra_config)
+    cfg = MaruConfig(
+        maru_node=extra_config["maru_node"],
+        chunk_size_bytes=int(extra_config.get("_maru_object_bytes", 4 * 1024 * 1024)),
+        auto_connect=False,
+        metadata_only=metadata_only,
+        load_only=load_only,
+        engine_id=extra_config["maru_engine_id"],
+        cache_namespace=extra_config["maru_cache_namespace"],
+        storage_schema=extra_config.get("_maru_storage_schema", "opaque-bytes-v1"),
+        dp_index=int(extra_config.get("_maru_dp_index", 0)),
+        tp_rank=int(extra_config.get("_maru_tp_rank", 0)),
+        step_objects=0
+        if metadata_only
+        else int(extra_config.get("_maru_step_objects", 0)),
+    )
+    handler = MaruHandler(cfg)
+    handler.connect(wait=False)
+    logger.info(
+        "Maru: %s connecting to the StorageService at %s (dp %d, tp %d%s)",
+        "scheduler probe" if metadata_only else "worker",
+        cfg.maru_node,
+        cfg.dp_index,
+        cfg.tp_rank,
+        ", loads only" if load_only else "",
+    )
+    return handler
+
+
+# How long startup waits for MaruServer once the node is attached
+_NODE_SESSION_WAIT_S = 5.0
+# How long a worker's shutdown waits for MaruServer to answer its stores
+_NODE_STORE_DRAIN_S = 5.0
+# Write-behind on maru_node: how long a batch's chunks the engine thread found
+# no credit for wait for some, and how many bytes of such chunks the worker
+# keeps on the device in all meanwhile
+_STORE_CREDIT_WAIT_S = 1.0
+_DEFERRED_STORE_MAX_BYTES = 256 << 20
+
+
+def _wait_node_handler(
+    handler: Any, role: str, attach_timeout_s: float | None = None
+) -> None:
+    """Wait at startup for a node handler: its ATTACH up to
+    ``attach_timeout_s`` (default the node connect timeout), then its
+    MaruServer session briefly. A handler not connected by then keeps
+    connecting in the background.
+
+    Raises:
+        ValueError: If the node refuses the ATTACH (a config error, such as
+            an object larger than the node's page).
+    """
+    from maru_handler.client import AttachRefusedError
+
+    try:
+        if handler.wait_attached(attach_timeout_s):
+            handler.wait_connected(_NODE_SESSION_WAIT_S)
+    except AttachRefusedError as e:
+        raise ValueError(f"Maru: the StorageService refused this {role}: {e}") from e
+    if not handler.connected:
+        logger.warning(
+            "Maru: the %s is not connected to the StorageService and MaruServer "
+            "yet; it serves without the cache until it is",
+            role,
+        )
 
 
 # ============================================================================
@@ -1274,6 +1557,17 @@ class _SlabTarget:
         return [0] * freed + ids[freed:]
 
 
+def _step_chunk_bound(step_tokens: int, step_seqs: int, chunk_tokens: int) -> int:
+    """Most chunks one engine step completes (``_step_chunks``): a request
+    scheduled t tokens completes at most ceil(t / C) of them, so n requests
+    sharing B tokens complete at most floor((B + n (C - 1)) / C), where n is
+    at most max_num_seqs and B. 0 when B is unknown."""
+    if step_tokens <= 0 or chunk_tokens <= 0:
+        return 0
+    n = min(step_seqs, step_tokens) if step_seqs > 0 else step_tokens
+    return (step_tokens + n * (chunk_tokens - 1)) // chunk_tokens
+
+
 def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> range:
     """Chunks of the prompt that ``req_meta``'s step completes and stores.
 
@@ -1404,14 +1698,20 @@ class MaruHandshakeMetadata(KVConnectorHandshakeMetadata):
     """What a worker tells the scheduler once its KV caches are registered.
 
     Attributes:
-        cache_namespace: The storage-session namespace the worker stores in
-            (``_cpu_engine_config``). A model can change its hf_config where
+        cache_namespace: The namespace the worker stores in
+            (``_namespace_digest``). A model can change its hf_config where
             a worker loads it (vLLM's Transformers backend writes the dtype
             it runs), and under TP the scheduler's process loads none, so the
             scheduler looks keys up in this namespace rather than its own.
+        async_load, async_store: The transfer modes the worker runs with;
+            None from a worker that does not say. On maru_node each process
+            asks the node for its defaults, so the scheduler checks that the
+            workers decided as it did.
     """
 
     cache_namespace: str
+    async_load: bool | None = None
+    async_store: bool | None = None
 
 
 # ============================================================================
@@ -1479,6 +1779,10 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
     Configuration via kv_connector_extra_config.
 
     Deployment wiring:
+        maru_node: str          - Socket of the node's StorageService. Set, the
+            node owns the pool and MaruServer the directory: the storage
+            keys below (pool sizes, page size, MaruServer address, instance
+            id) go in the node config and are refused here
         maru_server_url: str    - MaruServer address (default: tcp://localhost:5555)
         maru_pool_size: str|int - CXL pool size (default: 1G, supports '4G', '500M')
         maru_instance_id: str   - Unique instance ID (default: auto-generated)
@@ -1603,6 +1907,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 "--disable-hybrid-kv-cache-manager or pass the KV cache config."
             )
         extra = self._kv_transfer_config.kv_connector_extra_config
+        node = _is_node(extra)
         if _validate_storage_config(extra):
             extra = _cpu_engine_config(extra, vllm_config, self._kv_groups)
             if (
@@ -1618,16 +1923,18 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         else ""
                     )
                 )
+        elif node:
+            extra = _node_engine_config(extra, vllm_config, self._kv_groups)
         else:
             _validate_cxl_parallelism(getattr(vllm_config, "parallel_config", None))
         tp_size, total_kv_heads = _tp_geometry(vllm_config)
         if tp_size > 1:
             extra = _tensor_parallel_defaults(extra, tp_size)
-        # Only a storage session above TP=1, which remote_cxl alone runs, has
-        # a scheduler in another process than the model (take_worker_namespace).
+        # Only a namespace-bound backend above TP=1 has a scheduler in another
+        # process than the model (take_worker_namespace).
         self._namespace_handshake = (
-            extra.get("maru_storage_backend") == "remote_cxl" and tp_size > 1
-        )
+            extra.get("maru_storage_backend") == "remote_cxl" or node
+        ) and tp_size > 1
         attention_by_rank = _names_attention_by_rank(
             self._kv_groups, tp_size, total_kv_heads
         )
@@ -1653,6 +1960,19 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         check_one_group_support(self._kv_groups)
         if len(self._kv_groups) > 1:
             extra = _several_group_defaults(extra, self._kv_groups)
+        if node:
+            # After the TP and group defaults, which the node must not undo
+            extra = _node_transfer_defaults(
+                extra,
+                bool(
+                    getattr(
+                        getattr(vllm_config, "scheduler_config", None),
+                        "async_scheduling",
+                        False,
+                    )
+                ),
+            )
+        if len(self._kv_groups) > 1:
             check_multi_group_support(
                 self._kv_groups,
                 block_size=self._block_size,
@@ -1679,8 +1999,10 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             self._scheduler = MaruSchedulerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
-                extra_config=_scheduler_scoped_extra(
-                    extra, tp_size, _dp_index(vllm_config)
+                extra_config=(
+                    {**extra, "_maru_dp_index": _dp_index(vllm_config)}
+                    if node
+                    else _scheduler_scoped_extra(extra, tp_size, _dp_index(vllm_config))
                 ),
                 num_gpu_blocks=_async_load_budget(
                     kv_cache_config, vllm_config, lookahead
@@ -1698,6 +2020,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 ],
                 state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
             )
+            # The first request's lookup finds the node handler connected
+            self._scheduler.connect_node()
             self._worker = None
         elif role == KVConnectorRole.WORKER:
             self._scheduler = None
@@ -1765,7 +2089,33 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     if any(g.kind == GROUP_MAMBA for g in self._kv_groups)
                     else "",
                 )
-            extra = _rank_scoped_extra(extra, tp_rank, tp_size, _dp_index(vllm_config))
+            if node:
+                # Every rank keeps the engine id; ATTACH names its ranks and
+                # what one step may store
+                scheduler_config = getattr(vllm_config, "scheduler_config", None)
+                extra = {
+                    **extra,
+                    "_maru_tp_rank": tp_rank,
+                    "_maru_dp_index": _dp_index(vllm_config),
+                    "_maru_step_tokens": int(
+                        getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+                    ),
+                    "_maru_step_seqs": int(
+                        getattr(scheduler_config, "max_num_seqs", 0) or 0
+                    ),
+                    "_maru_max_model_len": int(
+                        getattr(
+                            getattr(vllm_config, "model_config", None),
+                            "max_model_len",
+                            0,
+                        )
+                        or 0
+                    ),
+                }
+            else:
+                extra = _rank_scoped_extra(
+                    extra, tp_rank, tp_size, _dp_index(vllm_config)
+                )
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
@@ -1942,8 +2292,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         return self._worker.take_failed_load_blocks()
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
-        """The worker's storage-session namespace, for the scheduler, on the
-        remote_cxl backend above TP=1; None elsewhere.
+        """The worker's namespace and transfer modes, for the scheduler, on
+        remote_cxl and maru_node above TP=1; None elsewhere.
 
         vLLM collects it from every worker after their KV caches are
         registered and hands it to ``set_xfer_handshake_metadata`` before the
@@ -1959,8 +2309,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
     ) -> None:
-        """Look keys up in the namespace the workers store in (remote_cxl
-        above TP=1)."""
+        """Look keys up in the namespace the workers store in, and check
+        their transfer modes (remote_cxl and maru_node above TP=1)."""
         if self._scheduler is not None and self._namespace_handshake:
             self._scheduler.take_worker_namespace(metadata)
 
@@ -2051,6 +2401,7 @@ class MaruSchedulerConnector:
     """Scheduler-side: checks chunk-by-chunk which prefix is cached in Maru."""
 
     _cpu_mode = False
+    _node_mode = False
     _shard_suffixes: tuple[str, ...] = ("",)
     _state_suffixes: tuple[str, ...] = ("",)
 
@@ -2072,6 +2423,9 @@ class MaruSchedulerConnector:
         self._kv_groups = list(kv_groups or ())
         self._multi_group = len(self._kv_groups) > 1
         self._cpu_mode = _validate_storage_config(extra_config)
+        # maru_node: lookups PROBE MaruServer, the directory of record, every
+        # time, and a load fills only the externally allocated tokens
+        self._node_mode = _is_node(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
         self._max_model_len = max_model_len
@@ -2090,6 +2444,10 @@ class MaruSchedulerConnector:
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
+        # maru_node: the handler, created once, until it is connected; and
+        # whether the node refused it
+        self._node_handler: Any = None
+        self._node_refused = False
         # Read hints (MaruHandler.hint_read): storage hears which keys a
         # request will load once the scheduler finds them, or as soon as the
         # request arrives with maru_read_hint_on_arrival. One hint per load,
@@ -2232,7 +2590,8 @@ class MaruSchedulerConnector:
         self._timing = bool(extra_config.get("maru_log_timing", False))
 
     def take_worker_namespace(self, metadata: dict[int, Any]) -> None:
-        """Look keys up in the namespace the workers store in.
+        """Look keys up in the namespace the workers store in, and check
+        that they transfer as the scheduler expects.
 
         Every process computes the namespace from its own config, and a
         model can change its hf_config where a worker loads it. At TP=1 the
@@ -2243,14 +2602,28 @@ class MaruSchedulerConnector:
             metadata: ``MaruHandshakeMetadata`` by TP rank, from vLLM.
 
         Raises:
-            ValueError: If the ranks store in different namespaces.
+            ValueError: If the ranks store in different namespaces, or a
+                rank's transfer modes differ from the scheduler's.
         """
+        ours = {"async_load": self._deferred_loading, "async_store": self._write_behind}
+        for rank, m in sorted(metadata.items()):
+            if not isinstance(m, MaruHandshakeMetadata):
+                continue
+            for mode, expected in ours.items():
+                theirs = getattr(m, mode)
+                if theirs is not None and theirs != expected:
+                    raise ValueError(
+                        f"Maru: TP rank {rank} runs with maru_{mode}={theirs} but "
+                        f"the scheduler with {expected}; set maru_async_load and "
+                        "maru_async_store in the config so every process "
+                        "decides alike"
+                    )
         namespaces = {
             m.cache_namespace
             for m in metadata.values()
             if isinstance(m, MaruHandshakeMetadata)
         }
-        if not self._cpu_mode:
+        if not (self._cpu_mode or self._node_mode):
             return
         if not namespaces:
             if metadata:
@@ -2277,15 +2650,25 @@ class MaruSchedulerConnector:
             namespace[:16],
             str(self._extra_config.get("maru_cache_namespace"))[:16],
         )
-        self._extra_config = {**self._extra_config, "maru_cache_namespace": namespace}
-        self._known_keys.clear()
-        if self._handler is not None:
-            # Opened under the other namespace; the next lookup reopens it.
+        # Under the lock: an arrival hint creating a handler sees either the
+        # old namespace and handler, which go here, or the new namespace
+        with self._handler_lock:
+            self._extra_config = {
+                **self._extra_config,
+                "maru_cache_namespace": namespace,
+            }
+            self._known_keys.clear()
+            handler = self._handler or self._node_handler
+            self._handler = self._node_handler = None
+        if handler is not None:
+            # Opened under the other namespace; reopened below or by the next
+            # lookup
             try:
-                self._handler.close()
+                handler.close()
             except Exception as e:
                 logger.warning("Maru: could not close the scheduler handler: %s", e)
-            self._handler = None
+        # Still starting up: the node answered moments ago
+        self.connect_node(_NODE_SESSION_WAIT_S)
 
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
@@ -2311,8 +2694,11 @@ class MaruSchedulerConnector:
             # An arrival hint under way may still use the handler.
             pool.shutdown(wait=True, cancel_futures=True)
         with self._handler_lock:
-            handler, self._handler = self._handler, None
+            handler = self._handler or self._node_handler
+            self._handler = self._node_handler = None
         if handler is not None:
+            if self._node_mode:
+                _log_node_counters(handler, "scheduler")
             try:
                 handler.close()
             except Exception as e:
@@ -2329,6 +2715,9 @@ class MaruSchedulerConnector:
                 return
             # A scheduler never allocates or maps a data pool.
             try:
+                if self._node_mode:
+                    self._take_node_handler()
+                    return
                 self._handler = _create_maru_handler(
                     self._extra_config, metadata_only=True
                 )
@@ -2339,6 +2728,45 @@ class MaruSchedulerConnector:
                 logger.warning(
                     "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
                 )
+
+    def connect_node(self, attach_timeout_s: float | None = None) -> None:
+        """maru_node: create the handler now and wait for it (startup), so no
+        lookup waits for the node or MaruServer.
+
+        Raises:
+            ValueError: If the node refuses the scheduler.
+        """
+        if not self._node_mode:
+            return
+        with self._handler_lock:
+            if self._shut_down or self._node_handler is not None:
+                return
+            handler = _create_maru_handler(self._extra_config, metadata_only=True)
+            self._node_handler = handler
+        _wait_node_handler(handler, "scheduler", attach_timeout_s)
+        with self._handler_lock:
+            if handler is self._node_handler and handler.connected:
+                self._handler = handler
+
+    def _take_node_handler(self) -> None:
+        """Look keys up with the node handler once it is connected; never
+        wait for it. One not made at startup (``connect_node``) is made here
+        and connects in the background. Caller holds ``_handler_lock``."""
+        from maru_handler.client import AttachRefusedError
+
+        handler = self._node_handler
+        if handler is None:
+            handler = _create_maru_handler(self._extra_config, metadata_only=True)
+            self._node_handler = handler
+        try:
+            handler.wait_attached(0)
+        except AttachRefusedError as e:
+            if not self._node_refused:
+                self._node_refused = True
+                logger.error("Maru: the StorageService refused the scheduler: %s", e)
+            return
+        if handler.connected:
+            self._handler = handler
 
     def request_arrived(self, request: Request) -> None:
         """vLLM received ``request``: hint its reads off the caller's thread.
@@ -2530,7 +2958,9 @@ class MaruSchedulerConnector:
         is tied to a live worker session, so it re-probes, in the pool
         ``route`` picks (``_session_route``).
         """
-        known: set[str] = set() if self._cpu_mode else self._known_keys
+        known: set[str] = (
+            set() if self._cpu_mode or self._node_mode else self._known_keys
+        )
         unknown = [k for k in keys if k not in known]
         if unknown:
             self._ensure_handler()
@@ -2591,7 +3021,9 @@ class MaruSchedulerConnector:
                 lambda i, g: all(key in stored for key in object_keys(i, g)),
             )
 
-        hit, prefix = hit_among(set() if self._cpu_mode else self._known_keys)
+        hit, prefix = hit_among(
+            set() if self._cpu_mode or self._node_mode else self._known_keys
+        )
         if hit < len(chunk_keys):
             hit, prefix = hit_among(
                 self._stored_keys(
@@ -2793,7 +3225,7 @@ class MaruSchedulerConnector:
         # Cache the result so update_state_after_alloc can reuse it
         # without a redundant _count_matched_chunks call.
         self._last_match_result[request.request_id] = num_matched_chunks
-        if self._cpu_mode or self._multi_group:
+        if self._cpu_mode or self._node_mode or self._multi_group:
             # What vLLM's own prefix cache already holds: the load starts
             # there, and a failed load reports nothing before it.
             self._load_starts[request.request_id] = num_computed_tokens
@@ -2834,7 +3266,7 @@ class MaruSchedulerConnector:
         self._load_preemptions[request.request_id] = getattr(
             request, "num_preemptions", 0
         )
-        if self._cpu_mode or self._multi_group:
+        if self._cpu_mode or self._node_mode or self._multi_group:
             start = self._load_starts.pop(request.request_id, 0)
             self._load_ranges[request.request_id] = (start, start + num_external_tokens)
         if self._deferred_loading:
@@ -3189,6 +3621,9 @@ class MaruWorkerConnector:
 
     _cpu_mode = False
     _remote_cxl_mode = False
+    _node_mode = False
+    _leased_mode = False
+    _async_load = False
     # Read by the layout paths; a worker built with __new__ knows no layout
     # and no block count.
     _cache_config: Any = None
@@ -3233,6 +3668,10 @@ class MaruWorkerConnector:
         self._remote_cxl_mode = (
             self._cpu_mode and extra_config.get("maru_storage_backend") == "remote_cxl"
         )
+        # maru_node: reads are pinned in MaruServer and must be released, as
+        # remote_cxl leases are, from a page-locked pool with no slot bound
+        self._node_mode = _is_node(extra_config)
+        self._leased_mode = self._remote_cxl_mode or self._node_mode
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
@@ -3374,6 +3813,7 @@ class MaruWorkerConnector:
         # objects. The overlap path below works under either format.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
         async_load = bool(_get_knob(extra_config, "maru_async_load"))
+        self._async_load = async_load
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
@@ -3415,6 +3855,7 @@ class MaruWorkerConnector:
         # allocating a slab that can never complete. Cleared every step.
         self._skipped_slabs: set[str] = set()
         self._last_skip_warning = 0.0
+        self._last_drop_warning = 0.0
         # Coalesced packed store: multi_layer_kv_transfer ctx built from the
         # registered KV caches, cached because the pointer table is static.
         # None = unresolved, False = kernel unusable (per-layer fallback).
@@ -3443,6 +3884,24 @@ class MaruWorkerConnector:
         self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._store_executor: ThreadPoolExecutor | None = None
         self._store_lock = threading.Lock()
+        # maru_node write-behind: device bytes of chunks waiting for credit
+        # (on the maru-credit-wait thread); whether a wait timed out, so
+        # chunks without credit are skipped until some comes again; and
+        # whether shutdown started, so nothing waits any more
+        self._credit_wait_lock = threading.Lock()
+        self._deferred_bytes = 0
+        self._credit_drought = False
+        self._stores_closing = False
+        self._credit_executor: ThreadPoolExecutor | None = None
+        # maru_node: stores MaruServer has not answered yet, each until its
+        # answer is handled (a chunk's marker is sent from there)
+        self._node_store_futures: set[Future] = set()
+        self._node_stores_done = threading.Condition(self._store_lock)
+        # maru_node layerwise: a step's chunks whose layers are coming in,
+        # base_key -> (reserved _DONE marker page, {layer: (key, handle)})
+        self._pending_layer_objects: dict[
+            str, tuple[Any, dict[int, tuple[str, Any]]]
+        ] = {}
         self._pending_store_keys: set[str] = set()
         self._store_key_waiters: dict[str, set[str]] = {}
         self._request_pending_store_keys: dict[str, set[str]] = {}
@@ -3462,12 +3921,19 @@ class MaruWorkerConnector:
         # Backoff timer to avoid reconnect storms when server is down.
         self._handler_retry_after: float = 0.0
         self._handler_failures = 0
+        # maru_node: the handler, created once, until it is connected; and
+        # whether the node refused it after startup
+        self._node_handler: Any = None
+        self._node_refused = False
 
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
 
     def _ensure_handler(self):
         if self._handler is not None:
+            return
+        if self._node_mode:
+            self._take_node_handler()
             return
         if time.monotonic() < self._handler_retry_after:
             return
@@ -3508,7 +3974,7 @@ class MaruWorkerConnector:
         except Exception as exc:
             if self._cpu_mode and isinstance(exc, StorageError):
                 raise ValueError(f"CPU cache setup rejected: {exc}") from exc
-            if self._cpu_mode and isinstance(exc, ValueError):
+            if (self._cpu_mode or self._node_mode) and isinstance(exc, ValueError):
                 raise  # a configuration error does not heal on retry
             self._handler_retry_after = time.monotonic() + 5.0
             self._handler_failures += 1
@@ -3526,6 +3992,87 @@ class MaruWorkerConnector:
                 logger.warning(
                     "Worker MaruHandler creation failed, backing off 5s: %s", exc
                 )
+
+    def _take_node_handler(self, wait: bool = False) -> None:
+        """Create the node handler once and use it once connected.
+
+        It connects in the background, so no load or store waits for the
+        node or MaruServer: until it is connected loads fail and stores are
+        skipped. ``wait`` (startup) waits for it and raises the node's
+        refusal; a later refusal turns the cache off for this worker.
+        """
+        from maru_handler.client import AttachRefusedError
+
+        if self._node_refused:
+            return
+        handler = self._node_handler
+        if handler is None:
+            handler = self._node_handler = self._create_node_worker_handler()
+        if wait:
+            _wait_node_handler(handler, "worker")
+        else:
+            try:
+                handler.wait_attached(0)
+            except AttachRefusedError as e:
+                self._node_refused = True
+                logger.error(
+                    "Maru: the StorageService refused this worker (%s); it "
+                    "serves without the cache",
+                    e,
+                )
+                return
+        if handler.connected:
+            self._handler = handler
+
+    def _create_node_worker_handler(self) -> Any:
+        """The worker's MaruHandler on the node: it attaches with the object
+        size (the node refuses one larger than its page) and asks no credit
+        when this rank stores nothing."""
+        object_bytes = self._page_size_bytes or 4 * 1024 * 1024
+        self._effective_page_size_bytes = object_bytes
+        if self._multi_group:
+            layout = "KV_GROUPS-v1"
+        else:
+            layout = "KV_LAYER-v1" if self._use_layerwise else "KV_2LTD-v1"
+        return _create_maru_handler(
+            {
+                **self._extra_config,
+                "_maru_object_bytes": object_bytes,
+                "_maru_storage_schema": layout,
+                "_maru_step_objects": self._step_objects(),
+            },
+            load_only=not self._stores_anything(),
+        )
+
+    def _step_objects(self) -> int:
+        """Objects this rank may store in one step, each one credit page; 0
+        when unknown or when it stores nothing. Per completed chunk: one
+        object, or one per layer and its _DONE marker (layerwise), or one per
+        attention group it stores (several groups), which also store one
+        state per request and Mamba group. Write-behind stores a chunked
+        prefill's chunks in the step that completes its prompt, so such a
+        step may hold a whole max_model_len prompt; several long prompts
+        completing in one step can still pass the count (their chunks wait
+        for credit or are skipped)."""
+        tokens = int(self._extra_config.get("_maru_step_tokens", 0))
+        seqs = int(self._extra_config.get("_maru_step_seqs", 0))
+        chunks = _step_chunk_bound(tokens, seqs, self._kv_chunk_tokens)
+        if not chunks or not self._stores_anything():
+            return 0
+        prompt = int(self._extra_config.get("_maru_max_model_len", 0))
+        behind = max(chunks, prompt // self._kv_chunk_tokens)
+        if self._multi_group:
+            objects = 0
+            for g in self._kv_groups:
+                if g.kind == GROUP_MAMBA:
+                    objects += min(seqs, tokens) if seqs > 0 else tokens
+                elif self._stores(g):
+                    full = self._write_behind and g.kind == GROUP_FULL
+                    objects += behind if full else chunks
+            return objects
+        if self._use_layerwise:
+            return chunks * (self._num_layers + 1)
+        return behind if self._write_behind else chunks
 
     def register_kv_caches(
         self,
@@ -3669,7 +4216,9 @@ class MaruWorkerConnector:
             if cache.group.kind == GROUP_MAMBA:
                 continue
             backend = _attention_backend(layers, cache.group.layer_names[0])
-            if backend is None or (self._cpu_mode and self._handler is None):
+            if backend is None or (
+                (self._cpu_mode or self._node_mode) and self._handler is None
+            ):
                 # Decided at first use, from the attention metadata; on a
                 # storage-session backend also once the handler says whether
                 # its buffers are page-locked for the kernel.
@@ -3704,7 +4253,9 @@ class MaruWorkerConnector:
         # _ensure_handler remains best-effort. If this eager attempt fails,
         # clear its backoff so the first real load/store keeps the pre-existing
         # immediate retry behavior once MaruServer becomes ready.
-        if kv_caches:
+        if kv_caches and self._node_mode:
+            self._take_node_handler(wait=True)
+        elif kv_caches:
             self._ensure_handler()
             if self._handler is None:
                 self._handler_retry_after = 0.0
@@ -3768,6 +4319,7 @@ class MaruWorkerConnector:
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is not None:
             self._last_attn_metadata = attn_metadata
+        self._release_completed_load_refs()
         if self._multi_group:
             self._start_group_loads(metadata)
             return
@@ -3796,7 +4348,6 @@ class MaruWorkerConnector:
 
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]] = []
         self._layer_load_events.clear()
-        self._release_completed_load_refs()
         if metadata.layerwise_load_req_ids:
             # Requests whose copies the loader thread already queued hand over
             # their per-layer events; the rest are issued here as before.
@@ -3844,7 +4395,7 @@ class MaruWorkerConnector:
                 and self._try_submit_deferred_load(req_meta)
             ):
                 continue
-            if self._remote_cxl_mode:
+            if self._leased_mode and not self._use_layerwise:
                 self._load_leased_request(layers, req_meta, attn_metadata)
                 continue
 
@@ -3868,6 +4419,13 @@ class MaruWorkerConnector:
                     continue
                 chunk_keys = chunk_keys[first_chunk:last_chunk]
                 num_chunks = len(chunk_keys)
+            elif self._node_mode:
+                plan = self._node_load_plan(req_meta, chunk_keys[:num_chunks])
+                if plan is None:
+                    self._fail_deferred_load(req_meta)
+                    continue
+                chunk_keys, slot_mapping = plan
+                num_chunks = len(chunk_keys)
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
@@ -3885,7 +4443,7 @@ class MaruWorkerConnector:
                 continue
 
             if len(infos) != len(keys):
-                if self._cpu_mode:
+                if self._cpu_mode or self._node_mode:
                     self._handler.release_retrieved(infos)
                 # A truncated response would otherwise shift every later
                 # layer's objects by one position — silent wrong KV.
@@ -3904,7 +4462,7 @@ class MaruWorkerConnector:
             # inject a partially-populated (corrupt) KV cache — vLLM recomputes.
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
             if miss >= 0:
-                if self._cpu_mode:
+                if self._cpu_mode or self._node_mode:
                     self._handler.release_retrieved(infos)
                 logger.warning(
                     "Maru load miss: %s — aborting load for req %s (recompute)",
@@ -3957,9 +4515,12 @@ class MaruWorkerConnector:
             )
             for req_meta, *_ in inline:
                 self._note_failed_inline_load(req_meta)
+            self._release_held([infos for *_, infos in inline])
             return
 
         self._load_sync(layers, inline, attn_metadata)
+        # Its copies are synchronous: the pins can go
+        self._release_held([infos for *_, infos in inline])
 
         for req_meta, num_chunks, _, _ in inline:
             logger.info(
@@ -4010,7 +4571,7 @@ class MaruWorkerConnector:
         try:
             with stream_ctx:
                 for req_meta in inline:
-                    if self._cpu_mode:
+                    if self._cpu_mode or self._node_mode:
                         loaded = self._load_group_leased(
                             req_meta, device, stream, offthread=False
                         )
@@ -4084,7 +4645,7 @@ class MaruWorkerConnector:
         """
         try:
             objects = None
-            if not self._cpu_mode:
+            if not (self._cpu_mode or self._node_mode):
                 objects = self._retrieve_group_objects(req_meta)
                 if objects is None:
                     return
@@ -4443,7 +5004,7 @@ class MaruWorkerConnector:
         # that window is recorded against this id instead.
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
-            if self._remote_cxl_mode:
+            if self._leased_load(req_meta):
                 self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
         self._deferred_executor.submit(
             self._deferred_load_job, req_meta, layers, device
@@ -4467,9 +5028,10 @@ class MaruWorkerConnector:
         the request's blocks through ``take_failed_load_blocks`` so vLLM
         recomputes instead of consuming unloaded KV.
         """
+        infos: list[Any] = []
         try:
             handler = self._handler
-            if self._remote_cxl_mode:
+            if self._leased_load(req_meta):
                 # Batches of leased staging slots: each batch is released once
                 # its copies are done; the request unparks after the last one.
                 if handler is None:
@@ -4512,6 +5074,14 @@ class MaruWorkerConnector:
                 return
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+            if self._node_mode:
+                plan = self._node_load_plan(req_meta, chunk_keys[:num_chunks])
+                if plan is None:
+                    self._fail_deferred_load(req_meta)
+                    return
+                chunk_keys, slot_mapping = plan
+                num_chunks = len(chunk_keys)
+                total_tokens = num_chunks * self._kv_chunk_tokens
             # Layerwise keys come back layer-major in this job's own layer
             # order — consumers index the retained dict by true layer index,
             # never by list position.
@@ -4534,6 +5104,7 @@ class MaruWorkerConnector:
                     len(keys),
                     req_meta.req_id,
                 )
+                self._release_held(infos)
                 self._fail_deferred_load(req_meta)
                 return
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
@@ -4543,6 +5114,7 @@ class MaruWorkerConnector:
                     keys[miss],
                     req_meta.req_id,
                 )
+                self._release_held(infos)
                 self._fail_deferred_load(req_meta)
                 return
 
@@ -4564,19 +5136,22 @@ class MaruWorkerConnector:
                 events = self._issue_layerwise_copies_offthread(
                     req_meta, num_chunks, slot_mapping, payload, layers, device
                 )
-                if events is None and self._state_shard.parts > 1:
+                if events is None and (self._state_shard.parts > 1 or self._node_mode):
                     # The resumed forward would issue the copies in the step
                     # that computes the request, where a rank whose copies
-                    # failed is the only one that knows (xcena-dev/maru#135).
-                    # Under TP the load fails while parked instead, so vLLM
-                    # merges the failure with the other ranks' results and
-                    # recomputes the request on all of them.
+                    # failed is the only one that knows (xcena-dev/maru#135),
+                    # and under async scheduling vLLM has already scheduled
+                    # the request's next step. Under TP, and on maru_node, the
+                    # load fails while parked instead, so vLLM merges the
+                    # failure with the other ranks' results and recomputes the
+                    # request on all of them.
                     logger.warning(
-                        "Maru: TP rank %d could not queue the layerwise-overlap "
-                        "copies of req %s; failing its load for recompute",
-                        self._state_shard.part,
+                        "Maru: could not queue the layerwise-overlap copies of "
+                        "req %s (TP rank %d); failing its load for recompute",
                         req_meta.req_id,
+                        self._state_shard.part,
                     )
+                    self._release_held(infos)
                     self._fail_deferred_load(req_meta)
                     return
                 gate = (
@@ -4618,6 +5193,10 @@ class MaruWorkerConnector:
                         req_meta.req_id,
                     )
                     _drain_events(events.values() if events else ())
+                    if events is None:
+                        # Never queued: nothing reads them (queued copies hold
+                        # theirs until their own event, _active_load_refs)
+                        self._release_held(infos)
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
                     return
@@ -4714,11 +5293,19 @@ class MaruWorkerConnector:
             logger.error("Maru deferred load failed for req %s: %s", req_meta.req_id, e)
             # Copies may already be queued referencing the CXL views; drain
             # the stream before dropping them so no kernel reads freed memory.
-            if self._deferred_stream is not None:
-                try:
-                    self._deferred_stream.synchronize()
-                except Exception:
-                    pass
+            streams = [self._deferred_stream]
+            if self._node_mode:
+                streams += self._layerwise_streams
+            drained = True
+            for stream in streams:
+                if stream is not None:
+                    try:
+                        stream.synchronize()
+                    except Exception:
+                        drained = False
+            if drained:
+                # Releasing twice does nothing, so refs held elsewhere are fine
+                self._release_held(infos)
             self._fail_deferred_load(req_meta)
         finally:
             # This load is accounted for now, however it ended. An abort
@@ -4851,7 +5438,7 @@ class MaruWorkerConnector:
             stream = self._layerwise_stream_for(device)
             pinned = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             attn = self._last_attn_metadata
-            tokens = num_chunks * self._kv_chunk_tokens
+            a, b = self._rows(req_meta, 0, num_chunks * self._kv_chunk_tokens)
             _t0 = time.monotonic()
             events: dict[str, torch.cuda.Event] = {}
             with torch.cuda.stream(stream):
@@ -4868,10 +5455,11 @@ class MaruWorkerConnector:
                     self._inject_kv_into_layer(
                         kv_cache_layer,
                         layer_dev,
-                        slot_gpu[:tokens],
+                        slot_gpu[a:b],
                         attn,
                         layer_name,
                         num_chunks=num_chunks,
+                        rows=(a, b) if self._node_mode else None,
                     )
                     event = torch.cuda.Event()
                     event.record(stream)
@@ -4963,19 +5551,26 @@ class MaruWorkerConnector:
                                     -1,
                                 )[:, true_idx]
                             chunk_start = ci * self._kv_chunk_tokens
-                            chunk_slots = slot_mapping[
-                                chunk_start : chunk_start + self._kv_chunk_tokens
-                            ]
+                            a, b = self._rows(
+                                req_meta, chunk_start, self._kv_chunk_tokens
+                            )
+                            if a == b:
+                                continue
                             self._inject_kv_into_layer(
                                 kv_cache_layer,
                                 layer_host.to(kv_cache_layer.device),
-                                chunk_slots.to(kv_cache_layer.device),
+                                slot_mapping[chunk_start + a : chunk_start + b].to(
+                                    kv_cache_layer.device
+                                ),
                                 attn_metadata,
                                 layer_name,
+                                rows=(a, b) if self._node_mode else None,
                             )
                 except Exception as e:
-                    self._fail_load(req_meta, e)
+                    # Resumed already: not reported finished a second time
+                    self._fail_load(replace(req_meta, deferred_load=False), e)
                     self._unsound_kv_req_ids.add(req_meta.req_id)
+            self._release_held([infos for *_, infos in entries])
             return
 
         if self._load_stream is None or self._load_stream_device != device:
@@ -5007,7 +5602,7 @@ class MaruWorkerConnector:
                     for _, _, slot_mapping, _ in entries
                 ]
                 for layer_name, kv_cache_layer, true_idx in layers:
-                    for (_, num_chunks, _, infos), slot_gpu in zip(
+                    for (req_meta, num_chunks, _, infos), slot_gpu in zip(
                         entries, slot_mappings_gpu, strict=True
                     ):
                         if self._use_layerwise:
@@ -5022,13 +5617,17 @@ class MaruWorkerConnector:
                                 kv_cache_layer,
                                 load_stream,
                             )
+                        a, b = self._rows(
+                            req_meta, 0, num_chunks * self._kv_chunk_tokens
+                        )
                         self._inject_kv_into_layer(
                             kv_cache_layer,
                             layer_dev,
-                            slot_gpu[: num_chunks * self._kv_chunk_tokens],
+                            slot_gpu[a:b],
                             attn_metadata,
                             layer_name,
                             num_chunks=num_chunks,
+                            rows=(a, b) if self._node_mode else None,
                         )
                     event = torch.cuda.Event()
                     event.record(load_stream)
@@ -5039,9 +5638,11 @@ class MaruWorkerConnector:
                 load_stream.synchronize()
             except Exception:
                 pass
-            with self._deferred_lock:
-                for req_meta, *_ in entries:
-                    self._failed_load_blocks.update(req_meta.block_ids)
+            else:
+                self._release_held([infos for *_, infos in entries])
+            for req_meta, *_ in entries:
+                # Resumed already: not reported finished a second time
+                self._fail_load(replace(req_meta, deferred_load=False), e)
             self._unsound_kv_req_ids.update(req_meta.req_id for req_meta, *_ in entries)
             return
 
@@ -5491,10 +6092,9 @@ class MaruWorkerConnector:
         but only for their externally allocated blocks.
         """
         self._note_failed_inline_load(req_meta)
-        if self._cpu_mode and not req_meta.is_store:
-            self._fail_load(
-                req_meta, RuntimeError("CPU replica unavailable during load")
-            )
+        if (self._cpu_mode or self._node_mode) and not req_meta.is_store:
+            what = "KV not readable" if self._node_mode else "CPU replica unavailable"
+            self._fail_load(req_meta, RuntimeError(f"{what} during load"))
             return
         if not req_meta.deferred_load:
             return
@@ -5560,7 +6160,7 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             blocks = self._loaded_blocks(req_meta)
             # Several groups' blocks are already those of the load range.
-            if self._cpu_mode and not req_meta.group_block_ids:
+            if (self._cpu_mode or self._node_mode) and not req_meta.group_block_ids:
                 start, end = self._cpu_load_range(req_meta)
                 blocks = blocks[
                     start // self._block_size : (end + self._block_size - 1)
@@ -5641,6 +6241,7 @@ class MaruWorkerConnector:
         device = next(iter(devices)) if len(devices) == 1 else None
         if device is None or device.type != "cuda" or not torch.cuda.is_available():
             self._load_sync(layers, entries, attn_metadata)
+            self._release_held([infos for *_, infos in entries])  # copied
             with self._deferred_lock:
                 for req_meta, *_ in entries:
                     self._deferred_done.add(req_meta.req_id)
@@ -5666,20 +6267,27 @@ class MaruWorkerConnector:
                                 run_view, dtype=kv_cache_layer.dtype
                             )
                             token_start = chunk_start * self._kv_chunk_tokens
-                            token_end = (
-                                chunk_start + run_chunks
-                            ) * self._kv_chunk_tokens
+                            a, b = self._rows(
+                                req_meta,
+                                token_start,
+                                run_chunks * self._kv_chunk_tokens,
+                            )
+                            if a == b:
+                                continue
                             self._inject_kv_into_layer(
                                 kv_cache_layer,
                                 chunk_tensor.to(device, non_blocking=True),
-                                slot_mapping_gpu[token_start:token_end],
+                                slot_mapping_gpu[token_start + a : token_start + b],
                                 attn_metadata,
                                 layer_name,
                                 num_chunks=run_chunks,
+                                rows=(a, b) if self._node_mode else None,
                             )
                     event = torch.cuda.Event()
                     event.record(load_stream)
             except Exception as e:
+                if self._node_mode and self._drain_load_stream(load_stream):
+                    self._release_held(infos)
                 self._fail_load(req_meta, e)
                 continue
             with self._deferred_lock:
@@ -5700,6 +6308,9 @@ class MaruWorkerConnector:
 
     def get_finished_loading(self) -> set[str] | None:
         """Return req ids whose deferred loads completed since the last call."""
+        # Also when no step loads: a pin is released once its copies end
+        self._release_completed_load_refs()
+        released = []
         with self._deferred_lock:
             done = set(self._deferred_done)
             self._deferred_done.clear()
@@ -5707,7 +6318,8 @@ class MaruWorkerConnector:
                 if event.query():
                     done.add(req_id)
                     del self._deferred_events[req_id]
-                    self._deferred_refs.pop(req_id, None)
+                    released.append(self._deferred_refs.pop(req_id, None))
+        self._release_held(released)
         return done or None
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
@@ -5816,9 +6428,11 @@ class MaruWorkerConnector:
         """
         drain: list[torch.cuda.Event] = []
         owed: set[str] = set()
+        released: list[Any] = []
         with self._deferred_lock:
             for req_id in req_ids:
-                self._deferred_layerwise_loads.pop(req_id, None)
+                # Retained but never issued: nothing reads them
+                released.append(self._deferred_layerwise_loads.pop(req_id, None))
                 pre_issued = self._deferred_layerwise_events.pop(req_id, None)
                 if not pre_issued:
                     if report and req_id in self._inflight_deferred_req_ids:
@@ -5826,9 +6440,10 @@ class MaruWorkerConnector:
                     continue
                 drain.extend(pre_issued.values())
                 if report and self._deferred_events.pop(req_id, None) is not None:
-                    self._deferred_refs.pop(req_id, None)
+                    released.append(self._deferred_refs.pop(req_id, None))
                     owed.add(req_id)
         _drain_events(drain)
+        self._release_held(released)
         if owed:
             with self._deferred_lock:
                 self._deferred_done |= owed
@@ -5854,13 +6469,18 @@ class MaruWorkerConnector:
         return failed
 
     def handshake_metadata(self) -> MaruHandshakeMetadata | None:
-        """The namespace this worker stores in, on a storage-session backend.
+        """The namespace this worker stores in and its transfer modes, on a
+        storage-session backend or maru_node.
 
         The cxl backend has no namespace, and sends nothing.
         """
-        if not self._cpu_mode:
+        if not (self._cpu_mode or self._node_mode):
             return None
-        return MaruHandshakeMetadata(self._extra_config["maru_cache_namespace"])
+        return MaruHandshakeMetadata(
+            self._extra_config["maru_cache_namespace"],
+            async_load=self._async_load,
+            async_store=self._write_behind,
+        )
 
     def _load_sync(
         self,
@@ -5879,15 +6499,18 @@ class MaruWorkerConnector:
                             info.view, dtype=kv_cache_layer.dtype
                         )
                         chunk_start = ci * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping[
-                            chunk_start : chunk_start + self._kv_chunk_tokens
-                        ]
+                        a, b = self._rows(req_meta, chunk_start, self._kv_chunk_tokens)
+                        if a == b:
+                            continue
                         self._inject_kv_into_layer(
                             kv_cache_layer,
                             chunk_tensor.to(kv_cache_layer.device),
-                            chunk_slots.to(kv_cache_layer.device),
+                            slot_mapping[chunk_start + a : chunk_start + b].to(
+                                kv_cache_layer.device
+                            ),
                             attn_metadata,
                             layer_name,
+                            rows=(a, b) if self._node_mode else None,
                         )
             except Exception as e:
                 self._fail_load(req_meta, e)
@@ -5985,7 +6608,8 @@ class MaruWorkerConnector:
                     for ci in range(num_chunks):
                         slab_view = slab_infos[ci].view
                         chunk_index = ci
-                        if self._cpu_mode:
+                        ranged = self._cpu_mode or self._node_mode
+                        if ranged:
                             start, end = self._cpu_load_range(req_meta)
                             chunk_index += start // ct
                         chunk_slots = slot_gpu[
@@ -5997,7 +6621,7 @@ class MaruWorkerConnector:
                             self._kv_planes, num_layers, ct, -1
                         )
                         whole_chunk = True
-                        if self._cpu_mode:
+                        if ranged:
                             lo = max(start - chunk_index * ct, 0)
                             hi = min(end - chunk_index * ct, ct)
                             whole_chunk = lo == 0 and hi == ct
@@ -6216,6 +6840,8 @@ class MaruWorkerConnector:
             return cached[1]
         with torch.cuda.stream(stream):
             ctx = self._packed_load_kernel_ctx(layers, attn_metadata)
+        if self._leased_mode and self._handler is None:
+            return ctx  # page-locking unknown until connected: decide again
         self._loader_kernel_cache = (key, ctx)
         return ctx
 
@@ -6240,9 +6866,11 @@ class MaruWorkerConnector:
         page has no ``EngineKVFormat``; its format is the pages' strides
         (``maru_kv_ops.LogicalPageFormat``), which the same entry point takes.
         """
-        if self._cpu_mode and not self._lease_buffers_gpu_accessible():
-            # CPU pools are pageable; the remote_cxl staging buffer is page-locked
-            # unless its CUDA registration failed.
+        if (
+            self._cpu_mode or self._node_mode
+        ) and not self._lease_buffers_gpu_accessible():
+            # CPU pools are pageable; the remote_cxl staging buffer and node
+            # pools are page-locked unless their CUDA registration failed.
             return None
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
@@ -6337,7 +6965,12 @@ class MaruWorkerConnector:
         while start < len(infos):
             first = infos[start]
             run_end = start + 1
-            if page_size is not None and first.view.nbytes == page_size:
+            # Only CXL page views name their page; others go one by one
+            if (
+                page_size is not None
+                and first.view.nbytes == page_size
+                and getattr(first, "page_index", None) is not None
+            ):
                 while run_end < len(infos):
                     prev = infos[run_end - 1]
                     current = infos[run_end]
@@ -6398,16 +7031,78 @@ class MaruWorkerConnector:
         queued, and the pinned slot mappings and CXL mmap views must outlive
         those copies.
         """
+        done: list[Any] = []
         with self._deferred_lock:
             if not self._active_load_refs:
                 return
-            self._active_load_refs = [
-                entry for entry in self._active_load_refs if not entry[0].query()
-            ]
+            keep: list[tuple[torch.cuda.Event, list[Any]]] = []
+            for entry in self._active_load_refs:
+                (done if entry[0].query() else keep).append(entry)
+            self._active_load_refs = keep
+        self._release_held([refs for _, refs in done])
+
+    def _release_held(self, refs: Any) -> None:
+        """Give back the read pins in ``refs`` (nested lists, tuples and dicts
+        of retrieved objects) once nothing reads their bytes. Only maru_node
+        reads hold pins here; releasing one twice does nothing."""
+        if not self._node_mode or self._handler is None:
+            return
+        reads: list[Any] = []
+
+        def walk(item: Any) -> None:
+            if isinstance(item, CpuReadLease):
+                reads.append(item)
+            elif isinstance(item, list | tuple):
+                for each in item:
+                    walk(each)
+            elif isinstance(item, dict):
+                for each in item.values():
+                    walk(each)
+
+        walk(refs)
+        if reads:
+            try:
+                self._handler.release_retrieved(reads)
+            except Exception as e:
+                logger.warning("Maru: releasing %d read pins failed: %s", len(reads), e)
+
+    def _leased_load(self, req_meta: MaruReqMeta) -> bool:
+        """Whether a request loads in leased batches (_load_leased_request):
+        a chunkwise load that is not a layerwise overlap."""
+        return self._leased_mode and not (
+            self._use_layerwise or req_meta.layerwise_load
+        )
+
+    def _node_load_plan(
+        self, req_meta: MaruReqMeta, chunk_keys: list[str]
+    ) -> tuple[list[str], torch.Tensor] | None:
+        """The chunks holding the external tokens ``[start, end)``, and the
+        slots from the first one's start to ``end``; None if there are none.
+        Only rows ``_rows`` gives are written: vLLM's prefix cache holds the
+        tokens before, and nothing was allocated after."""
+        ct = self._kv_chunk_tokens
+        start, end = self._cpu_load_range(req_meta)
+        first, last = start // ct, -(-end // ct)
+        if end <= start or last > len(chunk_keys):
+            return None
+        slots = self._build_slot_mapping(req_meta.block_ids, end)
+        return chunk_keys[first:last], slots[first * ct :]
+
+    def _rows(self, req_meta: MaruReqMeta, offset: int, count: int) -> tuple[int, int]:
+        """Rows ``[a, b)`` of ``count`` loaded tokens at ``offset`` from the
+        first loaded chunk that a load writes: all on cxl, only the external
+        range on maru_node (``_node_load_plan``). Their slots are at the same
+        offsets of the plan's slot mapping."""
+        if not self._node_mode:
+            return 0, count
+        start, end = self._cpu_load_range(req_meta)
+        base = start - start % self._kv_chunk_tokens + offset
+        a = min(max(start - base, 0), count)
+        return a, max(min(end - base, count), a)
 
     def _lease_buffers_gpu_accessible(self) -> bool:
         """Whether storage-session buffers are page-locked for GPU kernels."""
-        if not self._remote_cxl_mode or self._handler is None:
+        if not self._leased_mode or self._handler is None:
             return False
         return bool(self._handler.storage_gpu_accessible())
 
@@ -6422,7 +7117,8 @@ class MaruWorkerConnector:
         """
         handler = self._handler
         assert handler is not None
-        if self._cpu_mode or len(keys) <= batch_size:
+        # maru_node batches by itself and gives back every pin if one fails
+        if self._cpu_mode or self._node_mode or len(keys) <= batch_size:
             route = {"route_key": route_key} if route_key else {}
             return list(handler.batch_retrieve(keys, **route))
         out: list[Any] = []
@@ -6455,6 +7151,9 @@ class MaruWorkerConnector:
 
         if not self._use_layerwise:
             self._save_kv_layer_packed(layer_name, kv_layer, attn_metadata, metadata)
+            return
+        if self._node_mode:
+            self._save_layer_on_node(layer_name, kv_layer, attn_metadata, metadata)
             return
 
         layer_idx = self._get_layer_index(layer_name)
@@ -6563,6 +7262,180 @@ class MaruWorkerConnector:
                 if self._num_layers > 0 and len(progress) >= self._num_layers:
                     self._write_done_marker(base_key)
                     del self._chunk_layer_progress[base_key]
+
+    def _save_layer_on_node(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        metadata: MaruConnectorMetadata,
+    ) -> None:
+        """Layerwise store on maru_node, a chunk at a time.
+
+        A chunk's layers come in over the step's ``save_kv_layer`` calls. It
+        is published once all are written, and its ``_DONE`` marker after
+        them on a page reserved with its first layer. A chunk with a layer
+        that cannot be written is dropped for the rest of the step and its
+        pages go back, so no part of a chunk is ever published.
+        """
+        handler = self._handler
+        assert handler is not None
+        if self._num_layers <= 0:
+            return
+        layer_idx = self._get_layer_index(layer_name)
+        ct = self._kv_chunk_tokens
+        for req_meta in self._store_entries(metadata):
+            chunk_keys = self._slice_chunk_keys(req_meta)
+            chunks = _step_chunks(req_meta, ct, len(chunk_keys)) if chunk_keys else None
+            if not chunks:
+                continue
+            slot_mapping = self._build_slot_mapping(
+                req_meta.block_ids, chunks.stop * ct
+            )
+            if slot_mapping.shape[0] < chunks.stop * ct:
+                logger.error(
+                    "Maru store: block_ids cover %d tokens but chunks up to %d "
+                    "need %d for req %s; skipping",
+                    slot_mapping.shape[0],
+                    chunks.stop,
+                    chunks.stop * ct,
+                    req_meta.req_id,
+                )
+                continue
+            route = self._route(req_meta)
+            for ci in chunks:
+                base_key = chunk_keys[ci]
+                if base_key in self._skipped_slabs:
+                    continue
+                entry = self._pending_layer_objects.get(base_key)
+                if entry is None:
+                    if self._store_pending(f"{base_key}_DONE"):
+                        continue  # stored by an earlier step, or on its way
+                    try:
+                        marker = handler.alloc(1, **route)
+                    except Exception as e:
+                        self._note_store_skip(base_key, e, "layerwise save")
+                        self._skipped_slabs.add(base_key)
+                        continue
+                    entry = self._pending_layer_objects[base_key] = (marker, {})
+                layers = entry[1]
+                if layer_idx in layers:
+                    continue  # another request of this step shares the chunk
+                handle = None
+                try:
+                    kv = (
+                        self._extract_kv_from_layer(
+                            kv_layer,
+                            slot_mapping[ci * ct : (ci + 1) * ct].to(kv_layer.device),
+                            attn_metadata,
+                            layer_name,
+                        )
+                        .detach()
+                        .contiguous()
+                    )
+                    nbytes = kv.nelement() * kv.element_size()
+                    handle = handler.alloc(nbytes, **route)
+                    torch.frombuffer(handle.buf[:nbytes], dtype=kv.dtype).reshape(
+                        kv.shape
+                    ).copy_(kv)
+                except Exception as e:
+                    self._note_store_skip(base_key, e, "layerwise save")
+                    if handle is not None:
+                        self._free_handles_best_effort([handle])
+                    self._drop_layer_objects(base_key)
+                    continue
+                layers[layer_idx] = (_chunk_layer_key(base_key, layer_idx), handle)
+                if len(layers) >= self._num_layers:
+                    del self._pending_layer_objects[base_key]
+                    self._publish_chunk_layers(base_key, *entry)
+
+    def _drop_layer_objects(self, base_key: str) -> None:
+        """Give back a chunk's marker and layer pages; skip it this step."""
+        self._skipped_slabs.add(base_key)
+        entry = self._pending_layer_objects.pop(base_key, None)
+        if entry is not None:
+            marker, layers = entry
+            self._free_handles_best_effort(
+                [marker, *(handle for _, handle in layers.values())]
+            )
+
+    def _publish_chunk_layers(
+        self, base_key: str, marker: Any, layers: dict[int, tuple[str, Any]]
+    ) -> None:
+        """Publish a chunk's layers, then its ``_DONE`` marker on its page."""
+        done_key = f"{base_key}_DONE"
+        with self._store_lock:
+            self._pending_store_keys.add(done_key)
+
+        def write_marker(_keys: list[str], results: list[bool]) -> None:
+            if all(results):
+                self._publish_on_node([done_key], [marker])
+            else:
+                # Layers already accepted stay without _DONE: no lookup finds
+                # them and eviction takes them back
+                self._free_handles_best_effort([marker])
+                self._complete_write_behind_keys([done_key], [False], reported=True)
+
+        ordered = [layers[i] for i in sorted(layers)]
+        self._publish_on_node(
+            [key for key, _ in ordered], [handle for _, handle in ordered], write_marker
+        )
+
+    def _publish_on_node(
+        self,
+        keys: list[str],
+        handles: list,
+        on_done: Callable[[list[str], list[bool]], None] | None = None,
+    ) -> None:
+        """Publish written objects on maru_node without waiting (WRITE_DONE).
+
+        The keys stay pending until MaruServer answers. That answer completes
+        them on a client thread and calls ``on_done(keys, results)`` there,
+        which must not block.
+        """
+        if not keys:
+            return
+        handler = self._handler
+        with self._store_lock:
+            self._pending_store_keys.update(keys)
+        try:
+            if handler is None:
+                raise StorageUnavailableError("the worker handler is closed")
+            future = handler.store_async(keys, handles)
+        except Exception as e:
+            logger.error("Maru store of %d objects failed: %s", len(keys), e)
+            self._free_handles_best_effort(handles)
+            self._finish_node_store(keys, [False] * len(keys), on_done)
+            return
+        with self._store_lock:
+            self._node_store_futures.add(future)
+
+        def done(f: Future) -> None:
+            try:
+                results = list(f.result())
+            except Exception as e:
+                logger.error("Maru store of %d objects failed: %s", len(keys), e)
+                results = []
+            results = (results + [False] * len(keys))[: len(keys)]
+            self._finish_node_store(keys, results, on_done)
+            with self._node_stores_done:
+                self._node_store_futures.discard(f)
+                self._node_stores_done.notify_all()
+
+        future.add_done_callback(done)
+
+    def _finish_node_store(
+        self,
+        keys: list[str],
+        results: list[bool],
+        on_done: Callable[[list[str], list[bool]], None] | None,
+    ) -> None:
+        self._complete_write_behind_keys(keys, results)
+        if on_done is not None:
+            try:
+                on_done(keys, results)
+            except Exception:
+                logger.exception("Maru: after a store on the node")
 
     def _save_kv_layer_packed(
         self,
@@ -6707,6 +7580,9 @@ class MaruWorkerConnector:
 
             if not ready_keys:
                 continue
+            if self._node_mode:
+                self._register_objects_behind(ready_keys, ready_handles)
+                continue
             try:
                 results = handler.batch_store(ready_keys, ready_handles)
             except Exception as e:
@@ -6772,17 +7648,27 @@ class MaruWorkerConnector:
         else:
             self._register_objects(keys, handles, "group")
 
-    def _register_objects_behind(self, keys: list[str], handles: list) -> None:
+    def _register_objects_behind(
+        self,
+        keys: list[str],
+        handles: list,
+        on_done: Callable[[list[str], list[bool]], None] | None = None,
+    ) -> None:
         """Register objects already copied to staging on the write-behind thread.
 
         A remote_cxl ``batch_store`` places their pages and writes them by
         RDMA on the calling thread, where one transfer may wait up to
-        ``maru_rdma_timeout_s``. No request waits for these objects: their
-        blocks may go back to vLLM once the copies to staging are done.
-        Until registered they count as pending, so a later step does not
-        store them again (``_store_pending``).
+        ``maru_rdma_timeout_s``. maru_node publishes them without waiting
+        (``_publish_on_node``). No request waits for these objects: their
+        blocks may go back to vLLM once the copies to staging are done. Until
+        registered they count as pending, so a later step does not store them
+        again (``_store_pending``). ``on_done(keys, results)`` runs after the
+        store.
         """
         if not keys:
+            return
+        if self._node_mode:
+            self._publish_on_node(keys, handles, on_done)
             return
         with self._store_lock:
             self._pending_store_keys.update(keys)
@@ -6792,7 +7678,7 @@ class MaruWorkerConnector:
             )
         try:
             self._store_executor.submit(
-                self._finish_write_behind_store, None, keys, handles, []
+                self._finish_write_behind_store, None, keys, handles, [], on_done
             )
         except Exception as e:
             logger.error("Maru write-behind submit failed: %s", e)
@@ -6879,6 +7765,8 @@ class MaruWorkerConnector:
             return self._group_kernels[gid]
         if self._last_attn_metadata is None:
             return None
+        if self._leased_mode and self._handler is None:
+            return None  # page-locking unknown until connected
         ctx = self._build_group_kernel(cache, self._last_attn_metadata)
         self._group_kernels[gid] = ctx
         return ctx
@@ -7043,8 +7931,9 @@ class MaruWorkerConnector:
             return self._store_kernel_ctx
         if not self._kv_caches or self._num_layers <= 0:
             return None  # not registered yet; resolve on a later call
-        if self._remote_cxl_mode and self._handler is None:
-            return None  # staging unknown until connected; resolve later
+        if self._leased_mode and self._handler is None:
+            # Page-locking of staging or node pools unknown until connected
+            return None
         layers = [
             (name, kv_cache, self._get_layer_index(name))
             for name, kv_cache in self._kv_caches.items()
@@ -7093,8 +7982,13 @@ class MaruWorkerConnector:
             self._register_objects(keys, handles, "packed")
 
     def _register_objects(self, keys: list[str], handles: list, what: str) -> None:
-        """Register gathered objects with one ``batch_store``."""
+        """Register gathered objects with one ``batch_store``; on maru_node
+        without waiting (``_publish_on_node``), as the engine thread must not
+        wait for MaruServer's commit."""
         if not keys:
+            return
+        if self._node_mode:
+            self._register_objects_behind(keys, handles)
             return
         handler = self._handler
         assert handler is not None
@@ -7302,7 +8196,7 @@ class MaruWorkerConnector:
                 continue
 
             loaded_keys: frozenset[str] = frozenset()
-            if self._remote_cxl_mode:
+            if self._leased_mode:
                 with self._deferred_lock:
                     loaded = self._loaded_request_keys.get(req_meta.req_id)
                     if loaded is not None:
@@ -7370,11 +8264,54 @@ class MaruWorkerConnector:
         ready_keys: list[str] = []
         ready_handles: list[Any] = []
         slot_refs: list[torch.Tensor] = []
+        # maru_node: chunks without credit wait on the device for the
+        # write-behind thread to find some (_store_after_credit)
+        deferred: list[tuple[str, torch.Tensor, dict[str, str]]] = []
         with torch.cuda.stream(store_stream):
             for base_key, chunk_slots, route in to_schedule:
                 handle = None
                 try:
-                    handle = handler.alloc(slab_bytes, **route)
+                    chunk_slots_dev = chunk_slots.to(dev, non_blocking=True)
+                    slot_refs.append(chunk_slots_dev)
+                    # Room to wait for credit, if none is at hand
+                    reserved = self._node_mode and self._reserve_deferred(slab_bytes)
+                    try:
+                        handle = handler.alloc(
+                            slab_bytes,
+                            **route,
+                            **({"retry_later": True} if reserved else {}),
+                        )
+                    except CreditUnavailableError:
+                        if not reserved:
+                            raise
+                        try:
+                            slab_dev = torch.empty(
+                                slab_bytes // dtype.itemsize, dtype=dtype, device=dev
+                            ).view(2, num_layers, ct, -1)
+                            ops.multi_layer_kv_transfer(
+                                slab_dev,
+                                ptrs,
+                                chunk_slots_dev,
+                                dev,
+                                pbs,
+                                ops.TransferDirection.D2H,
+                                fmt,
+                                block_size=block_size,
+                                head_size=head_size,
+                            )
+                        except BaseException:
+                            self._release_deferred(slab_bytes)
+                            raise
+                        deferred.append((base_key, slab_dev, route))
+                        continue
+                    except BaseException:
+                        if reserved:
+                            self._release_deferred(slab_bytes)
+                        raise
+                    if reserved:
+                        self._release_deferred(slab_bytes)
+                    if self._credit_drought:
+                        self._set_credit_drought(False)
                     slab_host = torch.frombuffer(
                         handle.buf[:slab_bytes], dtype=dtype
                     ).view(2, num_layers, ct, -1)
@@ -7385,8 +8322,6 @@ class MaruWorkerConnector:
                         or self._store_staging.device != dev
                     ):
                         self._store_staging = torch.empty_like(slab_host, device=dev)
-                    chunk_slots_dev = chunk_slots.to(dev, non_blocking=True)
-                    slot_refs.append(chunk_slots_dev)
                     ops.multi_layer_kv_transfer(
                         self._store_staging,
                         ptrs,
@@ -7402,9 +8337,7 @@ class MaruWorkerConnector:
                     # copy engine rather than keeping SMs busy for the D2H.
                     slab_host.copy_(self._store_staging, non_blocking=True)
                 except Exception as e:
-                    if self._remote_cxl_mode and isinstance(
-                        e, MemoryError | StorageUnavailableError
-                    ):
+                    if self._expected_store_skip(e):
                         self._note_store_skip(base_key, e)  # rate-limited
                     else:
                         logger.error(
@@ -7420,10 +8353,21 @@ class MaruWorkerConnector:
                 ready_keys.append(base_key)
                 ready_handles.append(handle)
 
-            if not ready_keys:
+            if not ready_keys and not deferred:
                 return
-            event = torch.cuda.Event()
-            event.record(store_stream)
+            try:
+                event = torch.cuda.Event()
+                event.record(store_stream)
+            except Exception as e:
+                logger.error("Maru write-behind cannot track its copies: %s", e)
+                keys = ready_keys + self._drop_deferred(deferred)
+                try:
+                    store_stream.synchronize()  # before the pages go back
+                    self._free_handles_best_effort(ready_handles)
+                except Exception:
+                    pass  # pages a copy may still write are kept
+                self._complete_write_behind_keys(keys, [False] * len(keys))
+                return
 
         if self._store_executor is None:
             self._store_executor = ThreadPoolExecutor(
@@ -7436,6 +8380,8 @@ class MaruWorkerConnector:
                 ready_keys,
                 ready_handles,
                 slot_refs,
+                None,
+                deferred,
             )
         except Exception as e:
             # Executor creation/submission failures are exceptional. Drain the
@@ -7443,7 +8389,8 @@ class MaruWorkerConnector:
             logger.error("Maru write-behind submit failed: %s", e)
             event.synchronize()
             self._free_handles_best_effort(ready_handles)
-            self._complete_write_behind_keys(ready_keys, [False] * len(ready_keys))
+            keys = ready_keys + self._drop_deferred(deferred)
+            self._complete_write_behind_keys(keys, [False] * len(keys))
 
     def _finish_write_behind_store(
         self,
@@ -7451,14 +8398,20 @@ class MaruWorkerConnector:
         keys: list[str],
         handles: list[Any],
         refs: list[Any],
+        on_done: Callable[[list[str], list[bool]], None] | None = None,
+        deferred: list[tuple[str, torch.Tensor, dict[str, str]]] | None = None,
     ) -> None:
         """Wait for D2H and register a write-behind batch off-thread.
 
         ``event`` is None for objects the engine thread already copied.
+        ``deferred``: chunks gathered to the device for want of credit.
         """
         handler = self._handler
+        deferred = deferred or []
+        later = [key for key, *_ in deferred]
         if handler is None:
             logger.error("Maru write-behind completion: handler unavailable")
+            keys = keys + self._drop_deferred(deferred)
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
         try:
@@ -7467,9 +8420,29 @@ class MaruWorkerConnector:
         except Exception as e:
             logger.error("Maru write-behind D2H failed: %s", e)
             self._free_handles_best_effort(handles)
+            keys = keys + self._drop_deferred(deferred)
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
         refs.clear()  # safe to release stream inputs after the event
+        if self._node_mode:
+            # The blocks are read: their requests need not wait for MaruServer
+            with self._store_lock:
+                self._release_store_waiters(keys + later)
+            self._publish_on_node(keys, handles, on_done)
+            if deferred:
+                # Waits for credit on a thread of its own: later batches'
+                # blocks and WRITE_DONEs do not wait behind it
+                if self._credit_executor is None:
+                    self._credit_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="maru-credit-wait"
+                    )
+                try:
+                    self._credit_executor.submit(
+                        self._store_after_credit, handler, deferred
+                    )
+                except RuntimeError:  # shut down: store what has credit now
+                    self._store_after_credit(handler, deferred)
+            return
 
         try:
             results = list(handler.batch_store(keys, handles))
@@ -7484,8 +8457,97 @@ class MaruWorkerConnector:
         if len(results) < len(keys):
             results.extend([False] * (len(keys) - len(results)))
         self._complete_write_behind_keys(keys, results[: len(keys)])
+        if on_done is not None:
+            try:
+                on_done(keys, results[: len(keys)])
+            except Exception:
+                logger.exception("Maru: after a write-behind store")
         if self._timing:
             _emit_timing(f"write-behind packed-store {len(keys)}c")
+
+    def _store_after_credit(
+        self, handler: Any, deferred: list[tuple[str, torch.Tensor, dict[str, str]]]
+    ) -> None:
+        """Store chunks the engine thread found no credit for (maru-credit-wait
+        thread): wait up to ``_STORE_CREDIT_WAIT_S`` in all for credit, copy
+        each from the device to its page and publish them; skip the rest. A
+        wait that times out skips such chunks until credit comes again, and
+        nothing waits once shutdown started."""
+        deadline = time.monotonic() + _STORE_CREDIT_WAIT_S
+        keys: list[str] = []
+        handles: list[Any] = []
+        while deferred:
+            base_key, slab, route = deferred.pop(0)
+            nbytes = slab.numel() * slab.element_size()
+            with self._credit_wait_lock:
+                hurry = self._credit_drought or self._stores_closing
+            handle = None
+            try:
+                handle = handler.alloc(
+                    nbytes,
+                    wait_s=0.0 if hurry else max(0.0, deadline - time.monotonic()),
+                    **route,
+                )
+                torch.frombuffer(handle.buf[:nbytes], dtype=slab.dtype).view(
+                    slab.shape
+                ).copy_(slab)
+            except Exception as e:
+                if isinstance(e, CreditUnavailableError):
+                    self._set_credit_drought(True)
+                self._log_store_skip(e)
+                if handle is not None:
+                    self._free_handles_best_effort([handle])
+                self._complete_write_behind_keys([base_key], [False], reported=True)
+            else:
+                self._set_credit_drought(False)
+                keys.append(base_key)
+                handles.append(handle)
+            finally:
+                del slab  # its device memory goes now
+                self._release_deferred(nbytes)
+        self._publish_on_node(keys, handles)
+
+    def _reserve_deferred(self, nbytes: int) -> bool:
+        """Room on the device for a chunk to wait for credit; none while
+        credit is scarce, past the cap, or once shutdown started."""
+        with self._credit_wait_lock:
+            if (
+                self._credit_drought
+                or self._stores_closing
+                or self._deferred_bytes + nbytes > _DEFERRED_STORE_MAX_BYTES
+            ):
+                return False
+            self._deferred_bytes += nbytes
+            return True
+
+    def _release_deferred(self, nbytes: int) -> None:
+        with self._credit_wait_lock:
+            self._deferred_bytes -= nbytes
+
+    def _drop_deferred(
+        self, deferred: list[tuple[str, torch.Tensor, dict[str, str]]]
+    ) -> list[str]:
+        """Give up chunks waiting for credit; their keys."""
+        keys = [key for key, *_ in deferred]
+        nbytes = sum(slab.numel() * slab.element_size() for _, slab, _ in deferred)
+        deferred.clear()
+        self._release_deferred(nbytes)
+        return keys
+
+    def _set_credit_drought(self, drought: bool) -> None:
+        with self._credit_wait_lock:
+            self._credit_drought = drought
+
+    def _log_store_skip(self, exc: Exception) -> None:
+        """Log a skipped store at most once a minute, from any thread."""
+        now = time.monotonic()
+        with self._credit_wait_lock:
+            if now - self._last_skip_warning < 60.0:
+                return
+            self._last_skip_warning = now
+        logger.warning(
+            "Maru store skipped (%s); further skips are not logged for 60 s", exc
+        )
 
     def _complete_write_behind_keys(
         self, keys: list[str], results: list[bool], *, reported: bool = False
@@ -7501,13 +8563,19 @@ class MaruWorkerConnector:
                 elif not reported:
                     logger.warning("Maru write-behind store failed: %s", base_key)
                 self._pending_store_keys.discard(base_key)
-                for req_id in self._store_key_waiters.pop(base_key, set()):
-                    pending = self._request_pending_store_keys.get(req_id)
-                    if pending is None:
-                        continue
-                    pending.discard(base_key)
-                    if not pending:
-                        del self._request_pending_store_keys[req_id]
+            self._release_store_waiters(keys)
+
+    def _release_store_waiters(self, keys: list[str]) -> None:
+        """Let the requests waiting for ``keys`` finish; caller holds
+        ``_store_lock``."""
+        for base_key in keys:
+            for req_id in self._store_key_waiters.pop(base_key, set()):
+                pending = self._request_pending_store_keys.get(req_id)
+                if pending is None:
+                    continue
+                pending.discard(base_key)
+                if not pending:
+                    del self._request_pending_store_keys[req_id]
 
     def _note_store_skip(
         self, base_key: str, exc: Exception, what: str = "packed save"
@@ -7515,24 +8583,24 @@ class MaruWorkerConnector:
         """Report a chunk whose store fails in this step.
 
         On the remote_cxl backend a full staging buffer or an unavailable pool is
-        expected while loads hold the slots or the pool recovers: the chunk
-        is skipped for the rest of the step and logged at most once a
-        minute. Other errors, and other backends, log every chunk, as a
-        ``what`` error.
+        expected while loads hold the slots or the pool recovers, and on
+        maru_node no credit at hand: the chunk is skipped for the rest of the
+        step and logged at most once a minute. Other errors, and other
+        backends, log every chunk, as a ``what`` error.
         """
-        if self._remote_cxl_mode and isinstance(
-            exc, MemoryError | StorageUnavailableError
-        ):
+        if self._expected_store_skip(exc):
             self._skipped_slabs.add(base_key)
-            now = time.monotonic()
-            if now - self._last_skip_warning >= 60.0:
-                self._last_skip_warning = now
-                logger.warning(
-                    "Maru store skipped (%s); further skips are not logged for 60 s",
-                    exc,
-                )
+            self._log_store_skip(exc)
             return
         logger.error("Maru %s error: %s: %s", what, base_key, exc)
+
+    def _expected_store_skip(self, exc: Exception) -> bool:
+        """A store the backend skips in normal operation (no room now)."""
+        if self._remote_cxl_mode:
+            return isinstance(exc, MemoryError | StorageUnavailableError)
+        if self._node_mode:
+            return isinstance(exc, CreditUnavailableError | StorageUnavailableError)
+        return False
 
     def _discard_pending_slab(self, base_key: str) -> None:
         """Drop a half-filled slab entry after an error and free its handle.
@@ -7576,6 +8644,19 @@ class MaruWorkerConnector:
         retried here first.
         """
         self._skipped_slabs.clear()
+        if self._pending_layer_objects:
+            stale_chunks = list(self._pending_layer_objects)
+            for base_key in stale_chunks:
+                self._drop_layer_objects(base_key)
+            self._skipped_slabs.clear()
+            now = time.monotonic()
+            if now - self._last_drop_warning >= 60.0:
+                self._last_drop_warning = now
+                logger.warning(
+                    "Maru layerwise store: dropped %d incomplete chunk(s) at a "
+                    "step boundary; further drops are not logged for 60 s",
+                    len(stale_chunks),
+                )
         if self._orphan_slab_handles and self._handler is not None:
             orphans = self._orphan_slab_handles
             self._orphan_slab_handles = []
@@ -7592,13 +8673,15 @@ class MaruWorkerConnector:
         )
 
     def _free_handles_best_effort(self, handles: list) -> None:
-        """Free alloc handles after a ``batch_store`` call raised.
+        """Free alloc handles no store took: after a ``batch_store`` or
+        ``store_async`` call raised, or of a chunk that is dropped.
 
         ``batch_store`` owns the handles once it runs (it frees duplicates and
-        failures internally); every exception it lets escape is raised before
-        any handle is consumed (connection/closing/length checks), so freeing
-        them here cannot double-free. Without this, a single RPC hiccup during
-        a store step would leak every not-yet-registered CXL page.
+        failures internally); every exception it or ``store_async`` lets
+        escape is raised before any handle is consumed, so freeing them here
+        cannot double-free, and freeing a stored handle does nothing. Without
+        this, a single RPC hiccup during a store step would leak every
+        not-yet-registered page.
         """
         handler = self._handler
         if handler is None:
@@ -7610,12 +8693,13 @@ class MaruWorkerConnector:
                 pass
 
     def _is_stored(self, key: str) -> bool:
-        if self._cpu_mode:
+        # A session or node pool may drop a key: ask, never remember
+        if self._cpu_mode or self._node_mode:
             return self._handler is not None and self._handler.has_local(key)
         return key in self._stored_keys
 
     def _record_stored(self, key: str) -> None:
-        if not self._cpu_mode:
+        if not (self._cpu_mode or self._node_mode):
             self._stored_keys.add(key)
 
     def _write_done_marker(self, base_key: str) -> None:
@@ -7652,10 +8736,22 @@ class MaruWorkerConnector:
         for kernel, metadata in queued:
             self._store_packed_slabs_write_behind(kernel, metadata)
         # Write-behind jobs own CXL handles and use the handler. Drain them
-        # before closing either the CUDA stream or MaruHandler.
+        # before closing either the CUDA stream or MaruHandler; chunks still
+        # waiting for credit take what is at hand and skip the rest.
+        with self._credit_wait_lock:
+            self._stores_closing = True
+        if self._node_mode and self._handler is not None:
+            self._handler.stop_credit_waits()  # also one under way
         if self._store_executor is not None:
             self._store_executor.shutdown(wait=True)
             self._store_executor = None
+        if self._credit_executor is not None:
+            self._credit_executor.shutdown(wait=True)
+            self._credit_executor = None
+        # Chunks whose layers never all came: their pages go back
+        for base_key in list(self._pending_layer_objects):
+            self._drop_layer_objects(base_key)
+        self._wait_node_stores(_NODE_STORE_DRAIN_S)
         if self._store_stream is not None:
             try:
                 self._store_stream.synchronize()
@@ -7698,6 +8794,14 @@ class MaruWorkerConnector:
         self._layerwise_streams = []
         self._layerwise_stream_device = None
         self._layer_load_events.clear()
+        # Every stream is drained: no copy reads the pinned objects any more
+        self._release_held(
+            [
+                self._active_load_refs,
+                self._deferred_refs,
+                self._deferred_layerwise_loads,
+            ]
+        )
         self._active_load_refs.clear()
         with self._deferred_lock:
             self._deferred_layerwise_loads.clear()
@@ -7709,12 +8813,30 @@ class MaruWorkerConnector:
             self._inflight_deferred_req_ids.clear()
             self._abandoned_req_ids.clear()
             self._loaded_request_keys.clear()
-        if self._handler is not None:
+        handler = self._handler or self._node_handler
+        self._handler = self._node_handler = None
+        if handler is not None:
+            if self._node_mode:
+                _log_node_counters(handler, "worker")
             try:
-                self._handler.close()
+                handler.close()
             except Exception as e:
                 logger.error("Error closing MaruHandler: %s", e)
-            self._handler = None
+
+    def _wait_node_stores(self, timeout_s: float) -> None:
+        """Wait up to ``timeout_s`` in all for MaruServer to answer the stores
+        in flight, a chunk's marker included (sent once its layers are)."""
+        deadline = time.monotonic() + timeout_s
+        with self._node_stores_done:
+            while self._node_store_futures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Maru: %d stores not answered by MaruServer at shutdown",
+                        len(self._node_store_futures),
+                    )
+                    return
+                self._node_stores_done.wait(remaining)
 
     # ==============================
     # Helper methods
@@ -7743,8 +8865,13 @@ class MaruWorkerConnector:
         attn_metadata: AttentionMetadata | None,
         layer_name: str,
         num_chunks: int = 1,
+        rows: tuple[int, int] | None = None,
     ) -> None:
         """Inject loaded KV cache data into the paged GPU buffer.
+
+        ``rows``: write only these token rows of ``src_kv_data``, which then
+        holds ``num_chunks`` whole chunks, into ``slot_mapping`` (one slot
+        per row).
 
         The exact inverse of ``_extract_kv_from_layer``, branch for branch:
         - MLA: [num_blocks, block_size, ...], for an MLA model also when no
@@ -7767,10 +8894,16 @@ class MaruWorkerConnector:
             else attn_metadata
         )
 
+        ntok = (
+            slot_mapping.shape[0]
+            if rows is None
+            else num_chunks * self._kv_chunk_tokens
+        )
+        a, b = rows or (0, ntok)
         if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
-            src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
+            src = src_kv_data.reshape(ntok, *pages.shape[2:])[a:b]
             pages[slot_mapping // page_size, slot_mapping % page_size] = src
         elif (
             isinstance(layer_meta, TritonAttentionMetadata)
@@ -7782,7 +8915,7 @@ class MaruWorkerConnector:
             # axis and would misplace rank-5's K/V axis.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
-            src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
+            src = src_kv_data.reshape(ntok, dst_kv_cache.shape[1], -1)[a:b]
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
             layout = self._layout_for(dst_kv_cache)
@@ -7792,7 +8925,6 @@ class MaruWorkerConnector:
                     "Maru: cannot inject KV for layout "
                     f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
                 )
-            ntok = slot_mapping.shape[0]
             # Slab ordering, independent of the paged axis order.
             if num_chunks == 1:
                 src = src_kv_data.reshape(2, ntok, -1)
@@ -7803,7 +8935,7 @@ class MaruWorkerConnector:
                     .permute(1, 0, 2, 3)
                     .reshape(2, ntok, -1)
                 )
-            _scatter_kv(dst_kv_cache, layout, slot_mapping, src)
+            _scatter_kv(dst_kv_cache, layout, slot_mapping, src[:, a:b])
 
     def _extract_kv_from_layer(
         self,

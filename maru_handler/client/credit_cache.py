@@ -5,14 +5,19 @@ ended StorageService run is dropped, never written."""
 
 import collections
 import threading
+import time
 
 from maru_common.storage_types import Location
 
 
 class CreditCache:
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._added = threading.Condition(self._lock)
         self._credits: collections.deque[Location] = collections.deque()
+        # Bytes of _credits, kept as it changes: read on every allocation
+        self._bytes: int = 0
+        self._closed = False
         self.node_epoch: str | None = None
 
     def reset(self, node_epoch: str) -> list[Location]:
@@ -21,6 +26,7 @@ class CreditCache:
             dropped = list(self._credits) if node_epoch != self.node_epoch else []
             if dropped:
                 self._credits.clear()
+                self._bytes = 0
             self.node_epoch = node_epoch
             return dropped
 
@@ -35,14 +41,23 @@ class CreditCache:
                 if _page(credit) not in held:
                     held.add(_page(credit))
                     self._credits.append(credit)
+                    self._bytes += credit.length
+            self._added.notify_all()
             return True
 
-    def take(self) -> tuple[Location, str] | None:
-        """One unused credit and the node epoch it belongs to."""
+    def take(self, wait_s: float = 0.0) -> tuple[Location, str] | None:
+        """One unused credit and the node epoch it belongs to, waiting up to
+        ``wait_s`` for some to come (not once closed)."""
+        deadline = time.monotonic() + wait_s
         with self._lock:
-            if not self._credits or self.node_epoch is None:
-                return None
-            return self._credits.popleft(), self.node_epoch
+            while not self._credits or self.node_epoch is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._closed:
+                    return None
+                self._added.wait(remaining)
+            credit = self._credits.popleft()
+            self._bytes -= credit.length
+            return credit, self.node_epoch
 
     def take_bytes(self, nbytes: int) -> list[Location]:
         """Unused credit worth up to ``nbytes``, for CREDIT_RETURN."""
@@ -53,12 +68,14 @@ class CreditCache:
                 credit = self._credits.popleft()
                 total += credit.length
                 out.append(credit)
+            self._bytes -= total
             return out
 
     def take_all(self) -> list[Location]:
         with self._lock:
             out = list(self._credits)
             self._credits.clear()
+            self._bytes = 0
             return out
 
     def remove_pool(self, pool_id: str) -> list[Location]:
@@ -67,12 +84,19 @@ class CreditCache:
             self._credits = collections.deque(
                 c for c in self._credits if c.pool_id != pool_id
             )
+            self._bytes -= sum(c.length for c in out)
             return out
+
+    def close(self) -> None:
+        """Wake every waiting take(); later ones do not wait."""
+        with self._lock:
+            self._closed = True
+            self._added.notify_all()
 
     @property
     def unused_bytes(self) -> int:
         with self._lock:
-            return sum(c.length for c in self._credits)
+            return self._bytes
 
     def __len__(self) -> int:
         with self._lock:

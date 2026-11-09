@@ -108,6 +108,13 @@ class MaruConfig:
     store_timeout_s: float = 10.0
     # maru_node: how long the first connect waits for the node to listen
     node_connect_timeout_s: float = 30.0
+    # maru_node: this worker's data-parallel index and tensor-parallel rank
+    dp_index: int = 0
+    tp_rank: int = 0
+    # maru_node: a worker that never stores asks no credit
+    load_only: bool = False
+    # maru_node: objects this worker may store in one engine step (0: unknown)
+    step_objects: int = 0
 
     @property
     def server_urls(self) -> list[str]:
@@ -177,10 +184,10 @@ class MaruConfig:
                 raise ValueError("maru_node must be the path of the node socket")
             if not self.engine_id or not self.cache_namespace:
                 raise ValueError("maru_node requires engine_id and cache_namespace")
-            if self.metadata_only:
-                raise ValueError(
-                    "a metadata-only handler on maru_node is not supported yet"
-                )
+            for name in ("dp_index", "tp_rank", "step_objects"):
+                value = getattr(self, name)
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"{name} must be an integer >= 0")
             if not 0 < self.store_timeout_s < float("inf"):
                 raise ValueError("store_timeout_s must be a positive number")
             if not 0 <= self.node_connect_timeout_s < float("inf"):
@@ -219,7 +226,12 @@ class MaruConfig:
             raise ValueError("RDMA settings require the remote_cxl storage backend")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
-        if not self.metadata_only and self.pool_size < self.chunk_size_bytes:
+        # maru_node: the StorageService sizes the pool
+        if (
+            not self.metadata_only
+            and self.maru_node is None
+            and self.pool_size < self.chunk_size_bytes
+        ):
             raise ValueError(
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"

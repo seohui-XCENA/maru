@@ -10,11 +10,11 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from maru_common.node_protocol import DEFAULT_NODE_SOCKET, Budgets
+from maru_common.node_protocol import DEFAULT_NODE_SOCKET, Budgets, TransferDefaults
 from maru_common.storage_types import Visibility
 
 
@@ -39,6 +39,9 @@ DEFAULT_RDMA_TIMEOUT_S = 30.0  # the same as maru_rdma_timeout_s today
 
 # Budget defaults (all provisional until measured)
 CREDIT_MAX_PAGES = 16
+# A worker's credit cap is at least this much: one vLLM step of an 8B model
+# stores about 512 MiB, which small pages must not split into credit waits
+CREDIT_MAX_MIN_BYTES = 512 << 20
 CREDIT_TOTAL_FRACTION = 0.10
 CREDIT_REFILL_LOW_FRACTION = 0.25
 COMMIT_PENDING_FRACTION = 0.05
@@ -152,6 +155,8 @@ class NodeConfig:
     tiers: tuple[TierConfig, ...]
     budgets: Budgets
     remote_server: RemoteServerConfig | None = None
+    # Budget keys the config sets; the others are defaults
+    budget_keys: frozenset[str] = field(default=frozenset(), compare=False)
     # Group the socket is given to (mode 0660); None keeps the service's group
     socket_group: str | None = None
     source: str = field(default="", compare=False)
@@ -162,6 +167,12 @@ class NodeConfig:
 
     def tier(self, store: str) -> TierConfig | None:
         return next((t for t in self.tiers if t.store == store), None)
+
+    def transfer_defaults(self) -> TransferDefaults:
+        """Workers park loads when a tier can only be fetched from; a store
+        ends in the top tier, so it needs no write-behind."""
+        fetched = any(t.store not in MEMORY_STORES for t in self.tiers)
+        return TransferDefaults(async_load=fetched, async_store=False)
 
 
 def _require_keys(obj: Any, allowed: set[str], what: str) -> dict:
@@ -315,6 +326,34 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
     return TierConfig(**tier)
 
 
+def worker_budgets(
+    budgets: Budgets, budget_keys: frozenset[str], page_size: int, step_objects: int
+) -> Budgets:
+    """A worker's budgets: its credit holds the ``step_objects`` pages it may
+    store in one step, if more than the default, within the node total and
+    in whole pages; refill marks follow it. A ``credit_max_bytes`` the config
+    sets applies to every worker, and refill marks it sets stay."""
+    if "credit_max_bytes" in budget_keys:
+        return budgets
+    want = max(budgets.credit_max_bytes, step_objects * page_size)
+    credit_max = max(
+        page_size,
+        min(want, budgets.credit_total_max_bytes) // page_size * page_size,
+    )
+    if credit_max == budgets.credit_max_bytes:
+        return budgets
+    return replace(
+        budgets,
+        credit_max_bytes=credit_max,
+        credit_refill_low=budgets.credit_refill_low
+        if "credit_refill_low" in budget_keys
+        else int(credit_max * CREDIT_REFILL_LOW_FRACTION),
+        credit_refill_high=budgets.credit_refill_high
+        if "credit_refill_high" in budget_keys
+        else credit_max,
+    )
+
+
 def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> Budgets:
     raw = _require_keys(raw if raw is not None else {}, _BUDGET_KEYS, "budgets")
     top = tiers[0]
@@ -333,10 +372,13 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
     credit_total = size_or(
         "credit_total_max_bytes", share(top, CREDIT_TOTAL_FRACTION), no_size
     )
-    # Default: 16 pages, but within the node total so small tiers still start
+    # Default: 16 pages or 512 MiB, whichever is more, in whole pages and
+    # within the node total so small tiers still start
     default_credit_max = max(
         page_size,
-        min(CREDIT_MAX_PAGES * page_size, credit_total) // page_size * page_size,
+        min(max(CREDIT_MAX_PAGES * page_size, CREDIT_MAX_MIN_BYTES), credit_total)
+        // page_size
+        * page_size,
     )
     credit_max = size_or("credit_max_bytes", default_credit_max)
     refill_low = size_or(
@@ -484,7 +526,9 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         )
 
     budgets = _parse_budgets(raw.get("budgets"), page_size, tiers)
+    budget_keys = raw.get("budgets")
     return NodeConfig(
+        budget_keys=frozenset(budget_keys or ()),
         node_id=node_id,
         role=role,
         socket=socket_path,

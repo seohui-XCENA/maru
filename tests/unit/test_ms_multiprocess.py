@@ -92,6 +92,23 @@ def test_two_processes_share_one_pool(fake, sockdir, agents):
         node.stop()
 
 
+def test_pins_a_closed_worker_holds_are_released_when_it_exits(fake, sockdir, agents):
+    config = node_config(fake.url, f"{sockdir}/node.sock")
+    node = start_node(config)
+    try:
+        w = agents(config.socket, "holder")
+        w.connect()
+        store(w, "h0")
+        assert w.call("retrieve", key="h0") == value("h0")  # held
+        assert w.call("close_holding")
+        assert fake.pin_count(w.incarnation) == 1
+        assert node.manager.workers.get(w.incarnation) is not None  # no DETACH
+        w.stop()
+        wait_until(lambda: fake.pin_count(w.incarnation) == 0, what="WORKER_EXIT")
+    finally:
+        node.stop()
+
+
 def test_kill_9_of_a_writer(fake, sockdir, agents):
     config = node_config(fake.url, f"{sockdir}/node.sock")
     node = start_node(config, gpu_drain_grace_s=1.0)

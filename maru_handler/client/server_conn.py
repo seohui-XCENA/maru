@@ -38,6 +38,8 @@ from maru_common.storage_types import (
 logger = logging.getLogger(__name__)
 
 MAX_UNRESOLVED_LOOKUPS = 32
+# Heartbeat interval while MaruServer does not answer
+DOWN_POLL_S = 0.5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,14 +62,17 @@ class ServerConn:
         pid: int,
         pid_start: int,
         timeout_s: float,
+        role: SessionRole = SessionRole.WORKER,
     ):
         self.url = url
         self.identity = identity
+        # A probe session (a scheduler) may only PROBE
+        self.role = role
         self.node_id = node_id
         self.node_epoch = node_epoch
         self.pid = pid
         self.pid_start = pid_start
-        self._rpc = MsRpcClient(url, timeout_s=timeout_s, name="maru-worker-rpc")
+        self._rpc = MsRpcClient(url, timeout_s=timeout_s, name=f"maru-{role.value}-rpc")
         self._lock = threading.RLock()
         self.session: str | None = None
         self.server_epoch: str | None = None
@@ -83,6 +88,9 @@ class ServerConn:
         self._thread: threading.Thread | None = None
         self._resolver: threading.Thread | None = None
         self._wake = threading.Event()
+        # MaruServer left an RPC unanswered: lookups and probes report it
+        # unavailable at once until a heartbeat is answered again
+        self._down = False
         self.on_server_epoch: list = []
         # Called with the node epoch MaruServer no longer accepts
         self.on_stale_node: list = []
@@ -102,14 +110,16 @@ class ServerConn:
             pid_start=self.pid_start,
             incarnation=self.identity.incarnation,
             namespace=self.identity.namespace,
-            role=SessionRole.WORKER,
+            role=self.role,
             protocol=MS_PROTOCOL,
             capabilities=[],
         )
         try:
             response = self._rpc.call(MessageType.WORKER_OPEN, request)
         except RpcUnknownError as e:
+            self._set_down(True, e)
             raise StorageUnavailableError(f"WORKER_OPEN: {e}") from e
+        self._set_down(False)
         if response.status == Status.EPOCH:
             # Refused for this node epoch: the stale-node callback may reopen
             # on the run the UDS is attached to
@@ -167,42 +177,61 @@ class ServerConn:
         self._thread.start()
         self._resolver.start()
 
-    def close(self, goodbye: bool = True) -> None:
+    def close(self, goodbye: bool = True) -> bool:
         """Flush UNPINs and stop; with ``goodbye`` also WORKER_CLOSE (only after
-        every GPU copy ended)."""
+        every GPU copy ended). Neither waits on a MaruServer that is down.
+
+        Returns:
+            Whether MaruServer holds nothing of the session: WORKER_CLOSE was
+            answered OK, or no session was opened.
+        """
         self._stop.set()
         self._wake.set()
         for thread in (self._thread, self._resolver):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=5.0)
-        if self.session is not None:
-            self._flush_unpins()
         session, epoch = self.session, self.server_epoch
+        if self._down:
+            self._rpc.close()
+            return session is None
+        if session is not None:
+            self._flush_unpins()
+        ended = session is None
         if goodbye and session is not None and epoch is not None:
             try:
-                self._rpc.call(
+                response = self._rpc.call(
                     MessageType.WORKER_CLOSE,
                     WorkerCloseRequest(session=session, server_epoch=epoch),
                 )
+                ended = response.status == Status.OK
             except RpcUnknownError as e:
                 logger.warning("WORKER_CLOSE unanswered: %s", e)
         self._rpc.close()
+        return ended
 
     def _loop(self) -> None:
         """Heartbeat only; lookups and UNPINs are resolved on their own thread."""
-        while not self._stop.wait(self.heartbeat_s or 1.0):
+        while not self._stop.wait(
+            DOWN_POLL_S if self._down else self.heartbeat_s or 1.0
+        ):
             try:
                 if self._reopen:
                     self.open()
                 session, epoch = self._ids()
-                response = self._rpc.call(
-                    MessageType.WORKER_HEARTBEAT,
-                    WorkerHeartbeatRequest(session=session, server_epoch=epoch),
-                )
+                try:
+                    response = self._rpc.call(
+                        MessageType.WORKER_HEARTBEAT,
+                        WorkerHeartbeatRequest(session=session, server_epoch=epoch),
+                    )
+                except RpcUnknownError as e:
+                    self._set_down(True, e)
+                    continue
+                self._set_down(False)
                 if response.status == Status.EPOCH:
                     self.open()  # expired, or MaruServer restarted
             except (RpcUnknownError, StorageUnavailableError) as e:
-                logger.warning("worker heartbeat: %s", e)
+                if not self._down:
+                    logger.warning("worker heartbeat: %s", e)
 
     def heartbeat_once(self) -> bool:
         """One WORKER_HEARTBEAT; whether it was answered OK."""
@@ -212,9 +241,29 @@ class ServerConn:
                 MessageType.WORKER_HEARTBEAT,
                 WorkerHeartbeatRequest(session=session, server_epoch=epoch),
             )
-        except (RpcUnknownError, StorageUnavailableError):
+        except RpcUnknownError as e:
+            self._set_down(True, e)
             return False
+        except StorageUnavailableError:
+            return False
+        self._set_down(False)
         return response.status == Status.OK
+
+    @property
+    def down(self) -> bool:
+        """Whether MaruServer left the last RPC unanswered."""
+        return self._down
+
+    def _set_down(self, down: bool, error: Exception | None = None) -> None:
+        with self._lock:
+            changed, self._down = self._down != down, down
+        if changed and down:
+            logger.warning(
+                "MaruServer does not answer (%s); lookups miss until it does", error
+            )
+        elif changed:
+            logger.info("MaruServer answers again")
+            self._wake.set()  # resolve and unpin what waited
 
     def _ids(self) -> tuple[str, str]:
         """(session, server_epoch) of the open session."""
@@ -230,6 +279,8 @@ class ServerConn:
             self._wake.clear()
             if self._stop.is_set():
                 return
+            if self._down:
+                continue  # the heartbeat finds out when to go on
             try:
                 self._resolve_lookups()
                 self._flush_unpins()
@@ -249,6 +300,8 @@ class ServerConn:
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a lookup carries 1..{MAX_BATCH}")
         with self._lock:
+            if self._down:
+                return None
             if len(self._unresolved) >= MAX_UNRESOLVED_LOOKUPS:
                 # MaruServer is not answering: no new ops until these resolve
                 return None
@@ -279,6 +332,7 @@ class ServerConn:
                 with self._lock:
                     if origin is self._origin:
                         self._unresolved[seq] = request
+                self._set_down(True, e)
                 return None
             if response.status == Status.EPOCH:
                 try:
@@ -367,13 +421,18 @@ class ServerConn:
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a probe carries 1..{MAX_BATCH}")
         for _ in range(2):
+            if self._down:
+                return None
             try:
                 session, epoch = self._ids()
                 response: ProbeResponse = self._rpc.call(
                     MessageType.PROBE,
                     ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
                 )
-            except (RpcUnknownError, StorageUnavailableError) as e:
+            except RpcUnknownError as e:
+                self._set_down(True, e)
+                return None
+            except StorageUnavailableError as e:
                 logger.warning("PROBE: %s", e)
                 return None
             if response.status == Status.EPOCH:

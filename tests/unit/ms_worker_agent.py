@@ -114,6 +114,9 @@ def main() -> int:
                 reads.clear()
                 handler.close()
                 result = True
+            elif op == "close_holding":
+                handler.close()  # reads stay held
+                result = True
             elif op == "exit":
                 print(json.dumps({"ok": True, "result": True}), flush=True)
                 return 0

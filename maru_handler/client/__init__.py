@@ -8,6 +8,7 @@ write_done, fetch). MaruClient hides both behind the MaruHandler methods, so
 the vLLM connector does not change with them.
 """
 
-from .maru_client import CreditUnavailableError, MaruClient
+from .maru_client import CreditUnavailableError, MaruClient, probe_node
+from .storage_conn import AttachRefusedError
 
-__all__ = ["CreditUnavailableError", "MaruClient"]
+__all__ = ["AttachRefusedError", "CreditUnavailableError", "MaruClient", "probe_node"]

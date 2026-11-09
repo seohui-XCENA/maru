@@ -38,6 +38,7 @@ def config_to_dict(config: NodeConfig) -> dict[str, Any]:
 
     out: dict[str, Any] = plain(dataclasses.asdict(config))
     out.pop("source", None)
+    out.pop("budget_keys", None)
     return out
 
 

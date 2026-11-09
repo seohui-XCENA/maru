@@ -22,6 +22,8 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
+from typing import cast
 
 from maru_common import MaruConfig
 from maru_shm import MaruHandle
@@ -271,12 +273,21 @@ class MaruHandler:
     # Connection Management
     # =========================================================================
 
-    def connect(self) -> bool:
+    def connect(self, wait: bool = True) -> bool:
         """Connect to the server and request a memory allocation.
 
+        Args:
+            wait: maru_node only: False connects in the background, retrying
+                until ``close()``; ``connected`` turns True once done.
+
         Returns:
-            True if successful
+            True if successful (False while a background connect runs)
         """
+        if not wait and self._config.maru_node:
+            client = self._cpu
+            assert client is not None
+            client.connect_background()
+            return client.connected
         if self._cpu is not None:
             self._connected = self._cpu.connect()
             return self._connected
@@ -500,7 +511,11 @@ class MaruHandler:
     # =========================================================================
 
     def alloc(
-        self, size: int, route_key: str | None = None
+        self,
+        size: int,
+        route_key: str | None = None,
+        wait_s: float = 0.0,
+        retry_later: bool = False,
     ) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
@@ -511,6 +526,10 @@ class MaruHandler:
             size: Required bytes (must be <= chunk_size)
             route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
+            wait_s: maru_node: how long to wait for credit when none is at
+                hand (never on the engine thread); others ignore it.
+            retry_later: maru_node: the caller retries a miss later, so it
+                counts as deferred, not skipped; others ignore it.
 
         Returns:
             AllocHandle with writable memoryview and allocation metadata
@@ -519,6 +538,13 @@ class MaruHandler:
             RuntimeError: If not connected or closing
             ValueError: If size exceeds chunk_size or allocation fails
         """
+        if self._cpu is not None and self._config.maru_node:
+            return cast(
+                "AllocHandle | CpuAllocation",
+                self._cpu.alloc(
+                    size, route_key=route_key, wait_s=wait_s, retry_later=retry_later
+                ),
+            )
         if self._cpu is not None:
             return self._cpu.alloc(size, route_key=route_key)
         if self._config.metadata_only:
@@ -1274,6 +1300,48 @@ class MaruHandler:
             result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return batch_resp.results
+
+    def store_async(self, keys: list[str], handles: list) -> Future:
+        """maru_node: ``batch_store`` that never waits; a future of one bool
+        per key, completed on a client thread.
+
+        Raises:
+            RuntimeError: If the handler is not on maru_node.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            raise RuntimeError("store_async needs maru_node")
+        return client.store_async(keys, handles)
+
+    def stop_credit_waits(self) -> None:
+        """maru_node: end every wait for credit (``alloc(wait_s=...)``), now
+        and later; allocations that find credit go on."""
+        stop = getattr(self._cpu, "stop_credit_waits", None)
+        if stop is not None:
+            stop()
+
+    def wait_attached(self, timeout_s: float | None = None) -> bool:
+        """maru_node: wait until a background connect mapped the node's pools
+        (by default up to ``node_connect_timeout_s``).
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            return self.connected
+        return client.wait_attached(timeout_s)
+
+    def wait_connected(self, timeout_s: float) -> bool:
+        """maru_node: wait until a background connect is done.
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            return self.connected
+        return client.wait_connected(timeout_s)
 
     def read_hints_enabled(self) -> bool:
         """Whether storage sends read hints (:meth:`hint_read` does anything)."""

@@ -433,11 +433,16 @@ class FakeMaruServer:
             worker.last_seen = now
             actor = worker
             origin = worker.incarnation
-            if worker.role == SessionRole.PROBE and code != MessageType.PROBE:
+            if worker.role == SessionRole.PROBE and code in (
+                MessageType.LOOKUP_AND_PIN,
+                MessageType.UNPIN,
+            ):
                 return response_cls(status=Status.REJECTED, error="probe session")
             node = self.nodes.get(worker.node_id)
-            if code in (MessageType.PROBE, MessageType.LOOKUP_AND_PIN) and (
-                node is None or node.node_epoch != worker.node_epoch
+            if (
+                code in (MessageType.PROBE, MessageType.LOOKUP_AND_PIN)
+                and worker.role == SessionRole.WORKER
+                and (node is None or node.node_epoch != worker.node_epoch)
             ):
                 # Opened on an older node run: attach again and reopen
                 return response_cls(status=Status.EPOCH, error="stale node epoch")
@@ -703,7 +708,10 @@ class FakeMaruServer:
         if req.protocol != MS_PROTOCOL:
             return WorkerOpenResponse(status=Status.REJECTED, error="protocol")
         node = self.nodes.get(req.node_id)
-        if node is None or node.node_epoch != req.node_epoch:
+        # A probe answers for its node, whichever run it attached to
+        if req.role == SessionRole.WORKER and (
+            node is None or node.node_epoch != req.node_epoch
+        ):
             return WorkerOpenResponse(status=Status.EPOCH, error="node epoch")
         old = self.by_incarnation.get(req.incarnation)
         if old is not None:
@@ -774,7 +782,9 @@ class FakeMaruServer:
         mappable = (
             entry.node_id == worker.node_id
             and node is not None
-            and worker.node_epoch == node.node_epoch
+            and (
+                worker.role == SessionRole.PROBE or worker.node_epoch == node.node_epoch
+            )
             and entry.location.kind in (PoolKind.DRAM, PoolKind.CXL)
         )
         if mappable:

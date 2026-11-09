@@ -15,6 +15,7 @@ from maru_storage_service.config import (
     load_node_config,
     parse_node_config,
     parse_size,
+    worker_budgets,
 )
 
 M = 1 << 20
@@ -129,6 +130,54 @@ class TestExamples:
             b.fetch_max_inflight_bytes,
             b.fetch_max_batch_bytes,
         ) == (G, 4 * G, 256 * M)
+
+    @pytest.mark.parametrize(
+        "page, pages",
+        [("1M", 512), ("3M", 170), ("32M", 16), ("64M", 16)],
+    )
+    def test_credit_max_default_is_16_pages_or_512m(self, page, pages):
+        raw = edit(GPU_NODE, page_size=page)
+        raw["tiers"][1]["region_size"] = "192M"  # a multiple of every page
+        b = parse_node_config(raw).budgets
+        size = parse_size(page, "page")
+        assert b.credit_max_bytes == pages * size
+        assert b.credit_refill_low == int(pages * size * 0.25)
+        assert b.credit_refill_high == pages * size
+
+    @pytest.mark.parametrize(
+        "step_objects, pages",
+        [(0, 512), (100, 512), (600, 600), (5000, 3276)],
+    )
+    def test_a_worker_gets_credit_for_one_step(self, step_objects, pages):
+        """Default 512 pages at 1 MiB pages; a 32 GiB tier's 3276-page total."""
+        raw = edit(GPU_NODE, page_size="1M", tiers=[{"store": "dram", "size": "32G"}])
+        config = parse_node_config(raw)
+        b = worker_budgets(config.budgets, config.budget_keys, M, step_objects)
+        assert b.credit_max_bytes == pages * M
+        assert b.credit_refill_low == int(pages * M * 0.25)
+        assert b.credit_refill_high == pages * M
+        assert b.credit_total_max_bytes == config.budgets.credit_total_max_bytes
+
+    def test_explicit_budgets_win_over_the_step(self):
+        raw = edit(
+            GPU_NODE,
+            page_size="1M",
+            tiers=[{"store": "dram", "size": "32G"}],
+            budgets={"credit_max_bytes": "64M"},
+        )
+        config = parse_node_config(raw)
+        b = worker_budgets(config.budgets, config.budget_keys, M, 600)
+        assert b.credit_max_bytes == 64 * M
+        raw["budgets"] = {"credit_refill_low": "8M", "credit_refill_high": "100M"}
+        config = parse_node_config(raw)
+        b = worker_budgets(config.budgets, config.budget_keys, M, 600)
+        assert b.credit_max_bytes == 600 * M
+        assert (b.credit_refill_low, b.credit_refill_high) == (8 * M, 100 * M)
+
+    def test_explicit_credit_max_wins_over_the_default(self):
+        raw = edit(GPU_NODE, page_size="1M", budgets={"credit_max_bytes": "8M"})
+        raw["tiers"][1]["region_size"] = "192M"
+        assert parse_node_config(raw).budgets.credit_max_bytes == 8 * M
 
     def test_remote_tier(self):
         raw = copy.deepcopy(GPU_NODE)
@@ -296,6 +345,18 @@ class TestFileAndCli:
         assert out["page_size"] == 32 * M
         assert out["tiers"][1]["visibility"] == "coherent"
         assert out["budgets"]["transfer_reserve_bytes"]["dram"] == int(64 * G * 0.05)
+        assert out["budgets"]["credit_max_bytes"] == 512 * M
+
+    def test_check_prints_the_credit_default_of_small_pages(self, tmp_path, capsys):
+        raw = edit(GPU_NODE, page_size="1M")
+        raw["tiers"][1]["region_size"] = "192M"
+        path = tmp_path / "node.json"
+        path.write_text(json.dumps(raw))
+        assert main(["--config", str(path), "--check"]) == 0
+        budgets = json.loads(capsys.readouterr().out)["budgets"]
+        assert budgets["credit_max_bytes"] == 512 * M
+        assert budgets["credit_refill_low"] == 128 * M
+        assert budgets["credit_refill_high"] == 512 * M
 
     def test_bad_config_exit_code(self, tmp_path, capsys):
         path = tmp_path / "node.json"
