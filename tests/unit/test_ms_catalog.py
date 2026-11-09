@@ -509,6 +509,37 @@ class TestFetch:
         assert other.lookup(k).items[0].location == copy
         worker.unpin(done.items[0].pin_id)
 
+    def test_copy_for_a_replaced_run_or_orphan_session_is_only_cache(self, env):
+        from maru_common.storage_types import CloseMode
+
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        # the worker's session belongs to a replaced run of node a
+        a.restart()
+        assert a.open(pools=[a.dram(), a.ssd()]).status == Status.OK
+        pin = a.source_pin((k, source)).items[0].pin_id
+        copy = a.loc(a.dram(), 1)
+        done = a.fetch_complete(worker.token, (k, pin, copy))
+        assert results(done) == ["ADDED"] and done.items[0].pin_id is None
+        assert not service.pins.held_by(worker.token)
+        assert copy in [e.location for e in service.catalog.locations(k)]
+        # an orphan: it reads node a's CXL, and node a leaves and comes back
+        service.register_region(a.cxl())
+        a.commit((key("c"), a.loc(a.cxl(), 1)))
+        reader = FakeWorker(wire, a)
+        reader.open()
+        reader.lookup(key("c"))
+        a.close(CloseMode.LEAVE)
+        assert service.registry.known_worker(reader.token).orphan
+        a.restart()
+        assert a.open(pools=[a.dram(), a.ssd()]).status == Status.OK
+        k2, source2 = key("k2"), b.loc(b.ssd(), 2)
+        b.commit((k2, source2))
+        pin = a.source_pin((k2, source2)).items[0].pin_id
+        done = a.fetch_complete(reader.token, (k2, pin, a.loc(a.dram(), 2)))
+        assert results(done) == ["ADDED"] and done.items[0].pin_id is None
+        assert all(p.location.kind == "cxl" for p in service.pins.held_by(reader.token))
+
     def test_existing_copy_in_node_dram_is_pinned_instead(self, env):
         _, service, wire = env
         a, b, worker, k, source = self._setup(wire)

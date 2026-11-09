@@ -9,6 +9,7 @@ the restart drain and unmaps the old pool once unused (spec 7.2).
 """
 
 import collections
+import functools
 import logging
 import os
 import threading
@@ -47,6 +48,7 @@ from maru_common.storage_types import (
     Location,
     NotifyKind,
     Status,
+    StorageLocation,
     StorageUnavailableError,
     WaitLevel,
 )
@@ -115,7 +117,10 @@ class MaruClient:
     ):
         if not config.maru_node:
             raise ValueError("MaruClient needs maru_node (the StorageService socket)")
+        if not config.engine_id or not config.cache_namespace:
+            raise ValueError("maru_node needs engine_id and cache_namespace")
         self.config = config
+        self._socket_path: str = config.maru_node
         # Per client: one process may hold two (TP=1 scheduler and worker)
         self.identity = WorkerIdentity(
             engine_id=config.engine_id,
@@ -135,6 +140,7 @@ class MaruClient:
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
         self._storage: StorageConn | None = None
+        self._connecting: StorageConn | None = None  # an ATTACH under way
         self._server: ServerConn | None = None
         self._ops: OpTracker | None = None
         self.attach_info: AttachResponse | None = None
@@ -152,7 +158,7 @@ class MaruClient:
         self._sends: collections.deque = collections.deque()
         self._sends_cv = threading.Condition()
         # Unavailable and absent are counted apart (design 5.2)
-        self.stats = collections.Counter()
+        self.stats: collections.Counter[str] = collections.Counter()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -190,7 +196,7 @@ class MaruClient:
             self._refill_once()
         except BaseException:
             if server is not None and self._server is not server:
-                server.close(goodbye=False)
+                server.close()  # no allocation yet: WORKER_CLOSE is safe
             try:
                 self._teardown()
             except Exception:
@@ -233,7 +239,9 @@ class MaruClient:
         pause = 0.05
         while True:
             try:
-                return self._attach()
+                return self._attach(
+                    max(deadline - time.monotonic(), self.rpc_timeout_s)
+                )
             except NodeNotListeningError as e:
                 if time.monotonic() + pause > deadline:
                     raise
@@ -243,18 +251,33 @@ class MaruClient:
                     ) from e
                 pause = min(pause * 2, 0.5)
 
-    def _attach(self) -> tuple[StorageConn, AttachResponse, list[int]]:
+    def _attach(
+        self, timeout_s: float
+    ) -> tuple[StorageConn, AttachResponse, list[int]]:
+        """One ATTACH within ``timeout_s``; close() cancels it."""
         conn = StorageConn(
-            self.config.maru_node, on_notify=self._on_notify, on_lost=self._on_lost
+            self._socket_path, on_notify=self._on_notify, on_lost=self._on_lost
         )
-        response, fds = conn.connect(self._attach_request())
+        with self._lock:
+            if self._closing.is_set():
+                raise StorageUnavailableError("the client is closed")
+            self._connecting = conn
+        try:
+            response, fds = conn.connect(self._attach_request(), timeout_s)
+        finally:
+            with self._lock:
+                self._connecting = None
         return conn, response, fds
 
     def _take_attach(
         self, conn: StorageConn, response: AttachResponse, fds: list[int], first: bool
     ) -> None:
-        """Take in an ATTACH reply (pools, credit and ops of its run)."""
+        """Take in an ATTACH reply (pools, credit and ops of its run); after
+        close() nothing is installed (a re-attach close() gave up waiting on)."""
+        added: list[str] = []
         try:
+            if self._closing.is_set():
+                raise StorageUnavailableError("the client is closed")
             if response.page_size < self.config.chunk_size_bytes:
                 raise StorageUnavailableError(
                     f"the node page ({response.page_size} bytes) is smaller than "
@@ -272,28 +295,39 @@ class MaruClient:
                     # pools.add closes the fd, also on failure
                     fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
                     self.pools.add(descriptor, fd, response.node_epoch)
+                    added.append(descriptor.pool.pool_id)
         except BaseException:
             close_fds(fds)
             conn.close()
             raise
         with self._lock:
-            if not same_run:
-                if self.node_epoch is not None:
-                    self._old_epochs.append(self.node_epoch)
-                    logger.warning(
-                        "the StorageService restarted (node epoch %s -> %s); old "
-                        "credit and unresolved writes are dropped",
-                        self.node_epoch,
-                        response.node_epoch,
+            # close() sets _closing under this lock: it sees what is installed
+            closed = self._closing.is_set()
+            if not closed:
+                if not same_run:
+                    if self.node_epoch is not None:
+                        self._old_epochs.append(self.node_epoch)
+                        logger.warning(
+                            "the StorageService restarted (node epoch %s -> %s); "
+                            "old credit and unresolved writes are dropped",
+                            self.node_epoch,
+                            response.node_epoch,
+                        )
+                    self.node_epoch = response.node_epoch
+                    self._ops = OpTracker(
+                        self.identity.incarnation, response.node_epoch
                     )
-                self.node_epoch = response.node_epoch
-                self._ops = OpTracker(self.identity.incarnation, response.node_epoch)
-                self._returns.clear()
-                self.credits.reset(response.node_epoch)
-            self.attach_info = response
-            self._storage = conn
-            self.stats["attach"] += 1
-            self._cv.notify_all()
+                    self._returns.clear()
+                    self.credits.reset(response.node_epoch)
+                self.attach_info = response
+                self._storage = conn
+                self.stats["attach"] += 1
+                self._cv.notify_all()
+        if closed:
+            conn.close()
+            for pool_id in added:
+                self.pools.remove(pool_id)
+            raise StorageUnavailableError("the client is closed")
         if not first:
             if same_run:
                 self._resend_unresolved()
@@ -306,6 +340,9 @@ class MaruClient:
             self._unmap_unused_old_pools()
 
     def close(self) -> None:
+        """Return unused credit, DETACH, WORKER_CLOSE and unmap the pools.
+        Pools of allocations a copy may still write stay mapped and
+        registered until the process ends, so each such close() keeps them."""
         with self._lock:
             if self._reads:
                 raise RuntimeError("Release read pins before closing the handler")
@@ -313,9 +350,13 @@ class MaruClient:
                 return
             self._closing.set()
             handles = [h for h in self._handles if h.state == "writing"]
+            connecting = self._connecting
+        if connecting is not None:
+            connecting.close()
         if handles:
-            # Copies into them may still run: no DETACH and no WORKER_CLOSE
-            # (spec 3.2, 4.1); the node cleans up when this process ends
+            # Copies into them may still run: no DETACH, no WORKER_CLOSE, and
+            # their pools stay mapped and registered; the node cleans up when
+            # this process ends (spec 3.2, 4.1)
             logger.warning(
                 "closing with %d allocations not stored or freed; their credit "
                 "stays with the StorageService until this process ends",
@@ -343,9 +384,14 @@ class MaruClient:
                     )
             except Exception as e:
                 logger.warning("returning credit before closing failed: %s", e)
-        self._teardown(goodbye=not handles)
+        self._teardown(goodbye=not handles, writing=handles)
 
-    def _teardown(self, goodbye: bool = True) -> None:
+    def _teardown(
+        self, goodbye: bool = True, writing: list[CreditHandle] | None = None
+    ) -> None:
+        """``writing``: handles a copy may still write; their views and pools
+        are left as they are."""
+        kept = set(writing or ())
         with self._lock:
             storage, self._storage = self._storage, None
             server, self._server = self._server, None
@@ -355,14 +401,15 @@ class MaruClient:
             self._ops = None
             self.attach_info = None
             for handle in self._handles:
-                _release_view(handle.buf)
+                if handle not in kept:
+                    _release_view(handle.buf)
             self._handles.clear()
             self._cv.notify_all()
         if storage is not None:
             storage.close()
         if server is not None:
             server.close(goodbye=goodbye)
-        self.pools.close()
+        self.pools.close(keep={h.location.pool_id for h in kept})
 
     @property
     def connected(self) -> bool:
@@ -439,8 +486,12 @@ class MaruClient:
         )
         with self._lock:
             self._handles.add(handle)
-        budgets = self.attach_info.budgets
-        if self.credits.unused_bytes < budgets.credit_refill_low:
+            info = self.attach_info
+        if (
+            info is not None
+            and info.budgets is not None
+            and self.credits.unused_bytes < info.budgets.credit_refill_low
+        ):
             self._refill_wake.set()
         return handle
 
@@ -549,7 +600,7 @@ class MaruClient:
 
         self._post(send)
 
-    def _post(self, task: Callable[[], None]) -> None:
+    def _post(self, task: Callable[[], object]) -> None:
         """Run ``task`` on the sender thread (never on the receive thread)."""
         with self._sends_cv:
             self._sends.append(task)
@@ -587,6 +638,7 @@ class MaruClient:
         if not live:
             future.set_result(results)
             return
+        assert ops is not None  # set and cleared with the storage connection
         request = ops.origin.stamp(
             WriteDoneRequest(
                 op=PLACEHOLDER_OP,
@@ -733,7 +785,15 @@ class MaruClient:
                 self._server,
                 self.attach_info,
             )
-        if storage is None or storage.closed or server is None or not server.session:
+        if (
+            storage is None
+            or storage.closed
+            or ops is None
+            or server is None
+            or not server.session
+            or info is None
+            or info.budgets is None
+        ):
             return False
         with self._lock:
             pending = self._credit_op
@@ -833,6 +893,9 @@ class MaruClient:
         if not keys:
             return []
         server = self._server
+        if server is None:
+            self.stats["retrieve_unavailable"] += len(keys)
+            return [None] * len(keys)
         outcomes = server.lookup_and_pin(
             [Key(self.identity.namespace, k) for k in keys]
         )
@@ -843,7 +906,7 @@ class MaruClient:
         out: list[PinnedRead | None] = []
         try:
             for key, outcome in zip(keys, outcomes, strict=True):
-                out.append(self._take_outcome(key, outcome, epoch))
+                out.append(self._take_outcome(server, key, outcome, epoch))
         except BaseException:
             self.release_retrieved(out)
             for outcome in outcomes[len(out) :]:
@@ -853,17 +916,21 @@ class MaruClient:
         return out
 
     def _take_outcome(
-        self, key: str, outcome: ItemOutcome, server_epoch: str
+        self,
+        server: ServerConn,
+        key: str,
+        outcome: ItemOutcome,
+        server_epoch: str | None,
     ) -> PinnedRead | None:
         if outcome.result != ItemResult.HIT:
             self.stats[f"retrieve_{outcome.result.value.lower()}"] += 1
             if outcome.pin_id is not None:
-                self._server.unpin([outcome.pin_id])
+                server.unpin([outcome.pin_id])
             return None
         if outcome.location is None or outcome.pin_id is None:
             logger.error("a HIT without location or pin for %s", key)
             if outcome.pin_id is not None:
-                self._server.unpin([outcome.pin_id])
+                server.unpin([outcome.pin_id])
             return None
         if self.pins.holds(outcome.pin_id):
             # Never unpin it: it belongs to a read already handed out
@@ -875,7 +942,10 @@ class MaruClient:
             # #59: never touch bytes outside a mapped pool
             logger.error("MaruServer gave %s for %s: %s", outcome.location, key, e)
             self.stats["retrieve_bad_location"] += 1
-            self._server.unpin([outcome.pin_id])
+            server.unpin([outcome.pin_id])
+            return None
+        if server_epoch is None:  # not open any more
+            server.unpin([outcome.pin_id])
             return None
         self.pins.add(
             outcome.pin_id,
@@ -883,15 +953,23 @@ class MaruClient:
             outcome.location,
             server_epoch,
         )
+        loc = outcome.location
         read = PinnedRead(
             view=view,
-            location=outcome.location,
+            location=StorageLocation(
+                loc.pool_id,
+                loc.allocation_id,
+                loc.generation,
+                loc.offset,
+                loc.length,
+                medium=loc.kind.value,
+            ),
             _release=lambda: None,
             key=key,
             pin_id=outcome.pin_id,
             server_epoch=server_epoch,
         )
-        read._release = lambda read=read: self._release_reads([read])
+        read._release = functools.partial(self._release_reads, [read])
         with self._lock:
             self._reads.add(read)
         self.stats["retrieve_hit"] += 1
@@ -929,8 +1007,11 @@ class MaruClient:
         out: list[bool] = []
         for i in range(0, len(keys), MAX_BATCH):
             batch = keys[i : i + MAX_BATCH]
-            outcomes = self._server.probe(
-                [Key(self.identity.namespace, k) for k in batch]
+            server = self._server
+            outcomes = (
+                None
+                if server is None
+                else server.probe([Key(self.identity.namespace, k) for k in batch])
             )
             if outcomes is None:
                 out.extend([False] * len(batch))
@@ -969,7 +1050,9 @@ class MaruClient:
             if self._closing.is_set() or (storage is not None and not storage.closed):
                 continue
             try:
-                conn, response, fds = self._attach()
+                conn, response, fds = self._attach(
+                    max(self.config.node_connect_timeout_s, self.rpc_timeout_s)
+                )
                 self._take_attach(conn, response, fds, first=False)
             except Exception as e:
                 now = time.monotonic()
@@ -991,14 +1074,15 @@ class MaruClient:
         run breaks it anyway)."""
         server = self._server
         with self._lock:
-            info = self.attach_info
-            current = info.node_epoch if self._storage is not None and info else None
-        if server is None or current is None or current == node_epoch:
+            info = self.attach_info if self._storage is not None else None
+        if server is None or info is None or info.node_epoch == node_epoch:
             return  # MaruServer does not know this run yet: nothing to gain
         logger.warning(
-            "worker session on node epoch %s; reopening on %s", node_epoch, current
+            "worker session on node epoch %s; reopening on %s",
+            node_epoch,
+            info.node_epoch,
         )
-        server.move_to(current, info.pid, info.pid_start)
+        server.move_to(info.node_epoch, info.pid, info.pid_start)
 
     def _unmap_unused_old_pools(self) -> None:
         """Unmap pools of ended runs once unused."""
@@ -1050,7 +1134,11 @@ class MaruClient:
     def _drain(self, notify: Notify) -> None:
         """DRAIN_ACK once the ended epoch's accesses finish; never on a timeout
         (spec 4.1)."""
-        if notify.drain_kind == DrainKind.NODE:
+        kind = notify.drain_kind
+        if kind is None:
+            logger.warning("NOTIFY drain without drain_kind; ignored")
+            return
+        if kind == DrainKind.NODE:
             with self._lock:
                 ack_epoch = notify.epoch or (
                     self._old_epochs[-1] if self._old_epochs else ""
@@ -1081,12 +1169,15 @@ class MaruClient:
             return  # the StorageService asks again after the next ATTACH
         storage.submit(
             NodeMessageType.DRAIN_ACK,
-            DrainAckRequest(kind=notify.drain_kind, epoch=ack_epoch),
+            DrainAckRequest(kind=kind, epoch=ack_epoch),
         )
-        logger.info("drained %s epoch %r", notify.drain_kind.value, ack_epoch)
+        logger.info("drained %s epoch %r", kind.value, ack_epoch)
 
     def _pool_remove(self, notify: Notify) -> None:
-        pool_id = notify.pool_id
+        pool_id, generation = notify.pool_id, notify.pool_generation
+        if pool_id is None or generation is None:
+            logger.warning("NOTIFY pool_remove without pool_id or generation; ignored")
+            return
         with self._lock:
             self._cv.wait_for(
                 lambda: (
@@ -1110,7 +1201,5 @@ class MaruClient:
         if storage is not None and not storage.closed:
             storage.submit(
                 NodeMessageType.UNMAP_ACK,
-                UnmapAckRequest(
-                    pool_id=pool_id, pool_generation=notify.pool_generation
-                ),
+                UnmapAckRequest(pool_id=pool_id, pool_generation=generation),
             )

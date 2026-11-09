@@ -151,7 +151,9 @@ class RawWorker:
         return AttachRequest(**fields)
 
     def attach(self, **overrides):
-        self.response, self.fds = self.conn.connect(self.attach_request(**overrides))
+        self.response, self.fds = self.conn.connect(
+            self.attach_request(**overrides), 10.0
+        )
         self.conn.start_notifications()
         return self.response
 

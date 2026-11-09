@@ -17,6 +17,9 @@ from maru_handler.storage.cpu import CpuPool
 
 logger = logging.getLogger(__name__)
 
+# Pools a GPU copy may still write: mapped and registered until the process ends
+_KEPT_UNTIL_EXIT: list["MappedPool"] = []
+
 
 class LocationError(ValueError):
     """A location that does not fall inside a mapped pool (#59)."""
@@ -31,6 +34,8 @@ class MappedPool:
     # Views handed out and not yet released (PEP 688 export count)
     views: int = 0
     removing: bool = False
+    # Replaced while views were held: the last released view unmaps it
+    retired: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -52,8 +57,14 @@ class _PoolSlice:
 
     def __release_buffer__(self, view: memoryview) -> None:
         view.release()
-        with self._mapped.lock:
-            self._mapped.views -= 1
+        mapped = self._mapped
+        with mapped.lock:
+            mapped.views -= 1
+            close = mapped.retired and mapped.views == 0
+            if close:
+                mapped.retired = False
+        if close:
+            mapped.pool.close()
 
 
 class PoolMaps:
@@ -105,7 +116,7 @@ class PoolMaps:
             old = self._pools.get(info.pool_id)
             self._pools[info.pool_id] = mapped
         if old is not None:
-            self._close(old)
+            _retire(old)
         logger.info(
             "mapped %s (%d MiB, page-locked: %s)",
             info.pool_id,
@@ -171,11 +182,15 @@ class PoolMaps:
         mapped.pool.close()
         return True
 
-    def close(self) -> None:
-        """Unmap every pool; raises RuntimeError if views are still held."""
+    def close(self, keep: set[str] | frozenset[str] = frozenset()) -> None:
+        """Unmap every pool but ``keep``, which stay mapped and registered
+        until the process ends; RuntimeError if views are still held."""
         errors = []
         for pool_id in self.pool_ids():
-            if not self.remove(pool_id):
+            if pool_id in keep:
+                with self._lock:
+                    _KEPT_UNTIL_EXIT.append(self._pools.pop(pool_id))
+            elif not self.remove(pool_id):
                 errors.append(pool_id)
         if errors:
             raise RuntimeError(
@@ -185,3 +200,13 @@ class PoolMaps:
     def views(self, pool_id: str) -> int:
         mapped = self.get(pool_id)
         return mapped.views if mapped else 0
+
+
+def _retire(mapped: MappedPool) -> None:
+    """Unmap a replaced mapping now, or when its last view is released."""
+    with mapped.lock:
+        mapped.removing = True
+        if mapped.views:
+            mapped.retired = True
+            return
+    mapped.pool.close()

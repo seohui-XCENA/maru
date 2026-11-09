@@ -89,9 +89,9 @@ class MaruServer:
                 self.replica_directory, self._remote_cxl_agents, remote_cxl_agent_key
             )
             self._region_keeper.start()
-        # TODO: Add PinMonitor daemon thread when eviction is implemented.
-        # Periodically force-unpin entries that exceed a TTL to prevent
-        # pin leaks from crashed clients.
+        # TODO (legacy KVManager path only): a PinMonitor that force-unpins
+        # entries past a TTL, against pin leaks from crashed clients. The
+        # multi-storage pins (MsService) never expire by time.
 
         if self._dax_paths:
             self._validate_dax_paths()

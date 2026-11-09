@@ -485,9 +485,18 @@ class FakeMaruServer:
             if now - node.last_seen > self.session_ttl_s:
                 del self.node_sessions[token]
                 node.online = False
-        for worker in self.workers.values():
-            if worker.open and now - worker.last_seen > self.session_ttl_s:
-                worker.open = False  # pins stay (spec 3.2)
+        held = {p.owner for p in self.pins.values()}
+        for worker in list(self.workers.values()):
+            if now - worker.last_seen <= self.session_ttl_s:
+                continue
+            worker.open = False  # pins stay (spec 3.2)
+            if f"worker:{worker.incarnation}" not in held:
+                # S1 maintenance: expired and pinless, it goes with its ops
+                del self.workers[worker.token]
+                if self.by_incarnation.get(worker.incarnation) == worker.token:
+                    del self.by_incarnation[worker.incarnation]
+                    if worker.role == SessionRole.WORKER:
+                        self.ledgers.pop(worker.incarnation, None)
 
     # --------------------------------------------------------- node session
 

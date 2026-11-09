@@ -343,6 +343,61 @@ class TestPoolMaps:
             maps.close()
             pool.close()
 
+    def test_mapping_again_releases_the_old_one_after_its_views(self):
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import PoolMaps
+
+        torch = pytest.importorskip("torch")
+        pool = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        descriptor = PoolDescriptor(pool=pool.info(), memfd=0)
+        maps = PoolMaps(pin_pools=True)
+        try:
+            first = maps.add(descriptor, os.dup(pool.fd), "e")
+            view = maps.view(Location(pool.pool_id, "a", 1, 0, 8, PoolKind.DRAM))
+            second = maps.add(descriptor, os.dup(pool.fd), "e")
+            assert maps.get(pool.pool_id) is second
+            # a view of the old mapping is held: it stays mapped and registered
+            assert not first.pool._closed
+            assert first.pool.cuda_registered == torch.cuda.is_available()
+            view[:2] = b"ok"
+            view.release()  # the last view unmaps it
+            assert first.pool._closed and not first.pool.cuda_registered
+            # no view held: the old mapping goes at once
+            third = maps.add(descriptor, os.dup(pool.fd), "e")
+            assert second.pool._closed and maps.get(pool.pool_id) is third
+            assert maps.views(pool.pool_id) == 0
+        finally:
+            maps.close()
+            pool.close()
+
+    def test_close_keeps_the_pools_asked_for(self):
+        from maru_common.storage_types import PoolDescriptor
+        from maru_handler.client import pool_maps
+
+        torch = pytest.importorskip("torch")
+        kept_pool = dram.create_dram_pool("n", "e1", 2 * M, M, hugepage=False)
+        other_pool = dram.create_dram_pool("n", "e2", 2 * M, M, hugepage=False)
+        maps = pool_maps.PoolMaps(pin_pools=True)
+        kept = maps.add(
+            PoolDescriptor(pool=kept_pool.info(), memfd=0), os.dup(kept_pool.fd), "e1"
+        )
+        other = maps.add(
+            PoolDescriptor(pool=other_pool.info(), memfd=0),
+            os.dup(other_pool.fd),
+            "e2",
+        )
+        try:
+            maps.close(keep={kept_pool.pool_id})
+            assert maps.pool_ids() == []
+            assert kept in pool_maps._KEPT_UNTIL_EXIT and not kept.pool._closed
+            assert kept.pool.cuda_registered == torch.cuda.is_available()
+            assert other.pool._closed and not other.pool.cuda_registered
+        finally:
+            pool_maps._KEPT_UNTIL_EXIT.remove(kept)
+            kept.pool.close()
+            kept_pool.close()
+            other_pool.close()
+
     def test_shared_prefault_never_writes(self, monkeypatch):
         import errno
 

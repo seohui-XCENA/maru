@@ -22,6 +22,7 @@ from maru_common.protocol import (
     HandshakeRequest,
     MessageType,
     NodeCloseRequest,
+    NodeCloseResponse,
     NodeHeartbeatRequest,
     NodeHeartbeatResponse,
     NodeOpenRequest,
@@ -135,7 +136,9 @@ class ServerClient:
             if self._stop.is_set():
                 raise ServerStopped("stopped before the node session opened")
             try:
-                response = self._rpc.call(MessageType.NODE_OPEN, request)
+                response: NodeOpenResponse = self._rpc.call(
+                    MessageType.NODE_OPEN, request
+                )
             except RpcUnknownError as e:
                 logger.warning("NODE_OPEN to %s: %s; trying again", self.url, e)
                 self._stop.wait(pause)
@@ -177,10 +180,10 @@ class ServerClient:
 
     def close_session(self, mode: CloseMode) -> bool:
         """NODE_CLOSE, one attempt; whether it was answered OK."""
-        if self.session is None or self.epoch_lost:
+        if self.session is None or self.server_epoch is None or self.epoch_lost:
             return False
         try:
-            response = self._rpc.call(
+            response: NodeCloseResponse = self._rpc.call(
                 MessageType.NODE_CLOSE,
                 NodeCloseRequest(
                     session=self.session, server_epoch=self.server_epoch, mode=mode
@@ -249,12 +252,19 @@ class ServerClient:
 
     def heartbeat(self, usage: list[PoolUsage]) -> NodeHeartbeatResponse:
         """One NODE_HEARTBEAT."""
-        return self._rpc.call(
+        session, epoch = self._ids()
+        response: NodeHeartbeatResponse = self._rpc.call(
             MessageType.NODE_HEARTBEAT,
-            NodeHeartbeatRequest(
-                session=self.session, server_epoch=self.server_epoch, usage=usage
-            ),
+            NodeHeartbeatRequest(session=session, server_epoch=epoch, usage=usage),
         )
+        return response
+
+    def _ids(self) -> tuple[str, str]:
+        """(session, server_epoch) of the open session."""
+        session, epoch = self.session, self.server_epoch
+        if session is None or epoch is None:
+            raise RuntimeError("the node session is not open")
+        return session, epoch
 
     def _renew(self, failed_session: str | None) -> bool | None:
         """After EPOCH: True if the session is usable again (renewed, or
@@ -316,11 +326,12 @@ class ServerClient:
 
     def commit(self, items: list[CommitItem]):
         """COMMIT until its result is known."""
+        session, epoch = self._ids()
         return self._call_op(
             MessageType.COMMIT,
             CommitRequest(
-                session=self.session,
-                server_epoch=self.server_epoch,
+                session=session,
+                server_epoch=epoch,
                 op=PLACEHOLDER_OP,
                 items=items,
             ),
@@ -329,11 +340,12 @@ class ServerClient:
 
     def retire(self, items: list[KeyLocation]):
         """RETIRE until its result is known."""
+        session, epoch = self._ids()
         return self._call_op(
             MessageType.RETIRE,
             RetireRequest(
-                session=self.session,
-                server_epoch=self.server_epoch,
+                session=session,
+                server_epoch=epoch,
                 op=PLACEHOLDER_OP,
                 items=items,
             ),
@@ -342,11 +354,12 @@ class ServerClient:
 
     def worker_exit(self, workers: list[WorkerRef], cause: ExitCause):
         """WORKER_EXIT until its result is known."""
+        session, epoch = self._ids()
         return self._call_op(
             MessageType.WORKER_EXIT,
             WorkerExitRequest(
-                session=self.session,
-                server_epoch=self.server_epoch,
+                session=session,
+                server_epoch=epoch,
                 op=PLACEHOLDER_OP,
                 workers=workers,
                 cause=cause,
@@ -362,13 +375,13 @@ class ServerClient:
         while True:
             if self._stop.is_set():
                 raise ServerStopped("stopped while listing an adopted pool")
-            session = self.session
+            session, epoch = self._ids()
             try:
                 response = self._rpc.call(
                     MessageType.NODE_RECOVER_LIST,
                     NodeRecoverListRequest(
-                        session=self.session,
-                        server_epoch=self.server_epoch,
+                        session=session,
+                        server_epoch=epoch,
                         pool_id=pool_id,
                         cursor=cursor,
                     ),

@@ -14,7 +14,13 @@ import pytest
 
 from maru_common.config import MaruConfig
 from maru_common.ms_rpc import PLACEHOLDER_OP, MsRpcClient
-from maru_common.node_protocol import CreditRequest, NodeMessageType, Notify
+from maru_common.node_protocol import (
+    CreditRequest,
+    CreditReturnRequest,
+    DetachRequest,
+    NodeMessageType,
+    Notify,
+)
 from maru_common.protocol import MessageType, RecoverItem, WorkerOpenRequest
 from maru_common.storage_types import (
     BlockRequest,
@@ -90,7 +96,7 @@ def nodes(fake, sockdir):
 def handlers(nodes):
     made = []
 
-    def make(node, engine="eng", store_timeout_s=10.0, timeout_ms=300):
+    def make(node, engine="eng", store_timeout_s=10.0, timeout_ms=300, pin_pools=False):
         handler = MaruHandler(
             MaruConfig(
                 maru_node=node.config.socket,
@@ -98,7 +104,7 @@ def handlers(nodes):
                 cache_namespace=NS,
                 chunk_size_bytes=PAGE,
                 pool_size=PAGE,
-                pin_pools=False,
+                pin_pools=pin_pools,
                 timeout_ms=timeout_ms,
                 auto_connect=False,
                 store_timeout_s=store_timeout_s,
@@ -807,6 +813,30 @@ class TestClientRobustness:
         assert closed == [r]
 
 
+class TestCreditReturn:
+    def test_idle_credit_is_asked_back_for_a_waiting_worker(self, nodes, handlers):
+        node = nodes(
+            budgets={
+                "credit_max_bytes": 2 * PAGE,
+                "credit_total_max_bytes": 2 * PAGE,
+                "credit_refill_low": PAGE,
+                "credit_refill_high": 2 * PAGE,
+                "commit_pending_max_bytes": 2 * PAGE,
+            }
+        )
+        a = handlers(node, engine="a")
+        wait_credit(a, 2)  # all of the node-total budget
+        b = handlers(node, engine="b")
+        # the node asks A to return its idle credit, and B gets it
+        wait_credit(b, 1)
+        handle = b.alloc(4)
+        handle.buf[:] = b"bbbb"
+        assert b.store("b", handle)
+        assert node.pools.held_bytes(a._cpu.identity.incarnation) == PAGE
+        assert a._cpu.credits.unused_bytes == PAGE  # its fair share stays
+        node.pools.check()
+
+
 class TestClientNotify:
     def test_credit_return_and_pool_remove(self, nodes, handlers):
         node = nodes()
@@ -1246,6 +1276,176 @@ class TestClientLifecycle:
         assert not node.manager.worker(incarnation).detached  # no DETACH
         del held
 
+    def test_close_keeps_the_pools_of_writing_handles(self, nodes, handlers):
+        from maru_handler.client import pool_maps
+
+        torch = pytest.importorskip("torch")
+        node = nodes()
+        writer = handlers(node, engine="w", pin_pools=True)
+        idle = handlers(node, engine="i", pin_pools=True)
+        wait_credit(writer)
+        held = writer.alloc(4)  # a GPU copy may still write into it
+        kept = writer._cpu.pools.get(held.location.pool_id)
+        released = idle._cpu.pools.get(held.location.pool_id)
+        assert kept is not None and released is not None
+        registered = torch.cuda.is_available()
+        assert kept.pool.cuda_registered == released.pool.cuda_registered == registered
+        writer.close()
+        idle.close()
+        try:
+            # mapped and registered until the process ends; the view works
+            assert kept in pool_maps._KEPT_UNTIL_EXIT
+            assert not kept.pool._closed and kept.pool.cuda_registered == registered
+            held.buf[:2] = b"ok"
+            # a pool without a writing handle is released
+            assert released.pool._closed and not released.pool.cuda_registered
+            assert writer._cpu.pools.pool_ids() == idle._cpu.pools.pool_ids() == []
+        finally:
+            pool_maps._KEPT_UNTIL_EXIT.remove(kept)
+            held.buf.release()
+            kept.pool.close()
+
+    def test_clean_closes_leave_no_records_or_fds(self, nodes, handlers):
+        node = nodes()
+        manager = node.manager
+
+        def left() -> tuple:
+            return (
+                len(manager._workers),
+                len(manager.peer_watcher._fds),
+                manager.ledger.origins(),
+                len(node.pools._held),
+            )
+
+        def cycle(engine: str) -> None:
+            h = handlers(node, engine=engine)
+            wait_credit(h)
+            assert put(h, engine)
+            h.close()
+
+        cycle("warm-up")
+        wait_until(lambda: left() == (0, 0, 0, 0), what="first forgotten")
+        fds = len(os.listdir("/proc/self/fd"))
+        for i in range(20):
+            cycle(f"e{i}")
+        wait_until(lambda: left() == (0, 0, 0, 0), what="all forgotten")
+        assert len(os.listdir("/proc/self/fd")) <= fds + 2
+
+    def test_detach_holding_credit_waits_for_the_exit(self, nodes):
+        node = nodes()
+        raw = RawWorker(node.config.socket)
+        try:
+            raw.attach()
+            assert raw.credit(PAGE).credits
+            assert raw.request(NodeMessageType.DETACH, DetachRequest()).status == (
+                Status.OK
+            )
+            rec = node.manager.worker(raw.incarnation)
+            assert rec is not None and rec.detached
+            assert node.manager.peer_watcher.watching(f"worker:{raw.incarnation}")
+            # a detached record gets no credit
+            assert raw.credit(PAGE).status == Status.REJECTED
+        finally:
+            raw.close()
+
+    def test_reattach_while_a_detach_is_forgotten_keeps_its_watch(
+        self, nodes, monkeypatch
+    ):
+        node = nodes()
+        manager = node.manager
+        first = RawWorker(node.config.socket)
+        first.attach()
+        key = f"worker:{first.incarnation}"
+        second = RawWorker(node.config.socket, incarnation=first.incarnation)
+        attached = threading.Event()
+        unwatch = manager.peer_watcher.unwatch
+
+        def reattach_meanwhile(watched: str) -> None:
+            if watched == key and not attached.is_set():
+                # the same incarnation attaches again while it is forgotten
+                threading.Thread(
+                    target=lambda: (second.attach(), attached.set()), daemon=True
+                ).start()
+                attached.wait(0.5)
+            unwatch(watched)
+
+        monkeypatch.setattr(manager.peer_watcher, "unwatch", reattach_meanwhile)
+        try:
+            assert first.request(NodeMessageType.DETACH, DetachRequest()).status == (
+                Status.OK
+            )
+            wait_until(attached.is_set, what="attached again")
+            rec = manager.worker(first.incarnation)
+            assert rec is not None and not rec.detached
+            assert manager.peer_watcher.watching(key)
+        finally:
+            first.close()
+            second.close()
+
+    def test_late_reattach_after_close_installs_nothing(self, nodes, handlers):
+        node = nodes()
+        h = handlers(node)
+        client = h._cpu
+        # a re-attach that close() gave up waiting for
+        conn, response, fds = client._attach(5.0)
+        h.close()
+        with pytest.raises(StorageUnavailableError, match="closed"):
+            client._take_attach(conn, response, fds, first=False)
+        assert conn.closed and client._storage is None
+        assert client.pools.pool_ids() == []
+
+    def test_close_while_a_reattach_maps_pools_unmaps_them(
+        self, nodes, handlers, monkeypatch
+    ):
+        node = nodes()
+        h = handlers(node)
+        client = h._cpu
+        conn, response, fds = client._attach(5.0)
+        h.close()
+        client._closing.clear()  # close() lands while the pools are mapped
+        add = client.pools.add
+
+        def add_then_close(*args):
+            mapped = add(*args)
+            client._closing.set()
+            return mapped
+
+        monkeypatch.setattr(client.pools, "add", add_then_close)
+        with pytest.raises(StorageUnavailableError, match="closed"):
+            client._take_attach(conn, response, fds, first=False)
+        assert conn.closed and client._storage is None
+        assert client.pools.pool_ids() == []
+
+    def test_op_sent_again_after_a_clean_detach(self, nodes):
+        node = nodes()
+        raw = RawWorker(node.config.socket)
+        again = RawWorker(node.config.socket, incarnation=raw.incarnation)
+        try:
+            raw.attach()
+            request = raw.stamp(
+                CreditRequest(op=PLACEHOLDER_OP, worker_session="s", want_bytes=PAGE)
+            )
+            got = raw.request(NodeMessageType.CREDIT, request)
+            assert got.status == Status.OK and got.credits
+            returned = CreditReturnRequest(credits=got.credits)
+            assert raw.request(NodeMessageType.CREDIT_RETURN, returned).status == (
+                Status.OK
+            )
+            assert raw.request(NodeMessageType.DETACH, DetachRequest()).status == (
+                Status.OK
+            )
+            wait_until(lambda: node.manager.worker(raw.incarnation) is None)
+            # on the detached connection: not attached
+            late = raw.request(NodeMessageType.CREDIT, request)
+            assert late.status == Status.REJECTED and late.error == "not attached"
+            # attached again: a fresh record and op ledger run it as new
+            again.attach()
+            fresh = again.request(NodeMessageType.CREDIT, request)
+            assert fresh.status == Status.OK and fresh.credits
+        finally:
+            raw.close()
+            again.close()
+
     def test_healthcheck_and_stats(self, fake, nodes, handlers):
         node = nodes()
         h = handlers(node)
@@ -1634,6 +1834,9 @@ class TestFirstConnect:
                 handler.connect()
             assert not handler._cpu.connected
             assert not handler._cpu.storage_connected
+            # no allocation was made: the session is closed, not left to expire
+            assert fake.worker_session_of(handler._cpu.identity.incarnation) is None
+            assert fake.requests(MessageType.WORKER_CLOSE)
         finally:
             node.stop()
 
@@ -1667,3 +1870,52 @@ class TestFirstConnect:
             assert time.monotonic() - t0 < 3.0
         finally:
             node.stop()
+
+    def _silent_node(self, path):
+        """Accepts (the backlog does) and never answers."""
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen()
+        return listener
+
+    def test_unanswered_attach_fails_at_the_deadline(self, sockdir):
+        path = f"{sockdir}/silent.sock"
+        listener = self._silent_node(path)
+        handler = self._handler(path, 0.6)
+        t0 = time.monotonic()
+        try:
+            with pytest.raises(StorageUnavailableError, match="timed out"):
+                handler.connect()
+        finally:
+            listener.close()
+        assert 0.4 < time.monotonic() - t0 < 3.0
+
+    def test_close_cancels_an_attach_in_progress(self, sockdir):
+        path = f"{sockdir}/silent.sock"
+        listener = self._silent_node(path)
+        handler = self._handler(path, 30.0)
+        before = set(threading.enumerate())
+        errors = []
+
+        def connect():
+            try:
+                handler.connect()
+            except Exception as e:
+                errors.append(e)
+
+        t = threading.Thread(target=connect)
+        try:
+            t.start()
+            wait_until(lambda: handler._cpu._connecting is not None, what="attaching")
+            time.sleep(0.1)  # waiting for the reply
+            t0 = time.monotonic()
+            handler.close()
+            t.join(5)
+            assert not t.is_alive() and time.monotonic() - t0 < 3.0
+        finally:
+            listener.close()
+        (error,) = errors
+        assert isinstance(error, StorageUnavailableError)
+        assert "closed while attaching" in str(error)
+        assert not handler._cpu.connected
+        assert set(threading.enumerate()) <= before  # no thread is left

@@ -40,7 +40,7 @@ class CreditCache:
     def take(self) -> tuple[Location, str] | None:
         """One unused credit and the node epoch it belongs to."""
         with self._lock:
-            if not self._credits:
+            if not self._credits or self.node_epoch is None:
                 return None
             return self._credits.popleft(), self.node_epoch
 

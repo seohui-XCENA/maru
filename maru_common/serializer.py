@@ -183,7 +183,7 @@ class Serializer:
 
     def encode(
         self,
-        msg_type: MessageType,
+        msg_type: int,
         data: Any,
         flags: int = MessageFlags.NONE,
         seq: int | None = None,

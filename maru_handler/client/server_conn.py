@@ -14,11 +14,14 @@ import threading
 from maru_common.ms_rpc import PLACEHOLDER_OP, MsRpcClient, OpOrigin, RpcUnknownError
 from maru_common.protocol import (
     LookupAndPinRequest,
+    LookupAndPinResponse,
     MessageType,
     ProbeRequest,
+    ProbeResponse,
     UnpinRequest,
     WorkerCloseRequest,
     WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse,
     WorkerOpenRequest,
 )
 from maru_common.storage_types import (
@@ -174,13 +177,12 @@ class ServerConn:
                 thread.join(timeout=5.0)
         if self.session is not None:
             self._flush_unpins()
-        if goodbye and self.session is not None:
+        session, epoch = self.session, self.server_epoch
+        if goodbye and session is not None and epoch is not None:
             try:
                 self._rpc.call(
                     MessageType.WORKER_CLOSE,
-                    WorkerCloseRequest(
-                        session=self.session, server_epoch=self.server_epoch
-                    ),
+                    WorkerCloseRequest(session=session, server_epoch=epoch),
                 )
             except RpcUnknownError as e:
                 logger.warning("WORKER_CLOSE unanswered: %s", e)
@@ -192,11 +194,10 @@ class ServerConn:
             try:
                 if self._reopen:
                     self.open()
+                session, epoch = self._ids()
                 response = self._rpc.call(
                     MessageType.WORKER_HEARTBEAT,
-                    WorkerHeartbeatRequest(
-                        session=self.session, server_epoch=self.server_epoch
-                    ),
+                    WorkerHeartbeatRequest(session=session, server_epoch=epoch),
                 )
                 if response.status == Status.EPOCH:
                     self.open()  # expired, or MaruServer restarted
@@ -206,15 +207,22 @@ class ServerConn:
     def heartbeat_once(self) -> bool:
         """One WORKER_HEARTBEAT; whether it was answered OK."""
         try:
-            response = self._rpc.call(
+            session, epoch = self._ids()
+            response: WorkerHeartbeatResponse = self._rpc.call(
                 MessageType.WORKER_HEARTBEAT,
-                WorkerHeartbeatRequest(
-                    session=self.session, server_epoch=self.server_epoch
-                ),
+                WorkerHeartbeatRequest(session=session, server_epoch=epoch),
             )
-        except RpcUnknownError:
+        except (RpcUnknownError, StorageUnavailableError):
             return False
         return response.status == Status.OK
+
+    def _ids(self) -> tuple[str, str]:
+        """(session, server_epoch) of the open session."""
+        with self._lock:
+            session, epoch = self.session, self.server_epoch
+        if session is None or epoch is None:
+            raise StorageUnavailableError("the worker session is not open")
+        return session, epoch
 
     def _resolve_loop(self) -> None:
         while not self._stop.is_set():
@@ -245,6 +253,8 @@ class ServerConn:
                 # MaruServer is not answering: no new ops until these resolve
                 return None
             origin = self._origin
+            if origin is None or self.session is None or self.server_epoch is None:
+                return None  # not open
             request = origin.stamp(
                 LookupAndPinRequest(
                     session=self.session,
@@ -261,7 +271,9 @@ class ServerConn:
         seq = request.op.seq
         for _ in range(2):
             try:
-                response = self._rpc.call(MessageType.LOOKUP_AND_PIN, request)
+                response: LookupAndPinResponse = self._rpc.call(
+                    MessageType.LOOKUP_AND_PIN, request
+                )
             except RpcUnknownError as e:
                 logger.warning("LOOKUP_AND_PIN op %d: result unknown (%s)", seq, e)
                 with self._lock:
@@ -280,8 +292,9 @@ class ServerConn:
                 if not same:
                     return None  # the op and its pins are gone with the server
                 # The digest leaves out the session (spec 1)
+                session, epoch = self._ids()
                 request = dataclasses.replace(
-                    request, session=self.session, server_epoch=self.server_epoch
+                    request, session=session, server_epoch=epoch
                 )
                 continue
             if response.status == Status.BUSY:
@@ -323,13 +336,14 @@ class ServerConn:
         while not self._stop.is_set():
             with self._lock:
                 origin = self._origin
-                if not self._unresolved:
+                if not self._unresolved or origin is None:
                     return
+                session, epoch = self._ids()
                 request = origin.refresh(
                     dataclasses.replace(
                         next(iter(self._unresolved.values())),
-                        session=self.session,
-                        server_epoch=self.server_epoch,
+                        session=session,
+                        server_epoch=epoch,
                     )
                 )
             items = self._send_lookup(origin, request)
@@ -354,15 +368,12 @@ class ServerConn:
             raise ValueError(f"{len(keys)} keys; a probe carries 1..{MAX_BATCH}")
         for _ in range(2):
             try:
-                response = self._rpc.call(
+                session, epoch = self._ids()
+                response: ProbeResponse = self._rpc.call(
                     MessageType.PROBE,
-                    ProbeRequest(
-                        session=self.session,
-                        server_epoch=self.server_epoch,
-                        items=list(keys),
-                    ),
+                    ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
                 )
-            except RpcUnknownError as e:
+            except (RpcUnknownError, StorageUnavailableError) as e:
                 logger.warning("PROBE: %s", e)
                 return None
             if response.status == Status.EPOCH:
@@ -390,17 +401,17 @@ class ServerConn:
     def _flush_unpins(self) -> bool:
         with self._lock:
             pins = list(self._unpins)
-            epoch = self.server_epoch
+            session, epoch = self.session, self.server_epoch
         if not pins:
             return True
+        if session is None or epoch is None:
+            return False  # not open: sent once it is
         for i in range(0, len(pins), MAX_BATCH):
             batch = pins[i : i + MAX_BATCH]
             try:
                 response = self._rpc.call(
                     MessageType.UNPIN,
-                    UnpinRequest(
-                        session=self.session, server_epoch=epoch, pin_ids=batch
-                    ),
+                    UnpinRequest(session=session, server_epoch=epoch, pin_ids=batch),
                 )
             except RpcUnknownError as e:
                 logger.warning("UNPIN: %s; sent again later", e)

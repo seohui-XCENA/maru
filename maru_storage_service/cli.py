@@ -36,7 +36,7 @@ def config_to_dict(config: NodeConfig) -> dict[str, Any]:
             return [plain(v) for v in value]
         return value
 
-    out = plain(dataclasses.asdict(config))
+    out: dict[str, Any] = plain(dataclasses.asdict(config))
     out.pop("source", None)
     return out
 

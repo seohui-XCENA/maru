@@ -13,7 +13,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 from maru_common.protocol import (
@@ -50,7 +50,7 @@ from maru_common.storage_types import (
 
 from .catalog import MAPPABLE_KINDS, Catalog, Entry, PoolRecord, PoolState, Requester
 from .op_ledger import OpLedger, OriginKey
-from .pin_manager import Pin, PinManager
+from .pin_manager import PinManager
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +65,14 @@ BLOCK_ITEMS = 256
 BLOCKS_PER_HEARTBEAT = 4
 # pins released inline by a request; the rest by the maintenance thread
 PINS_INLINE = MAX_BATCH
-
-
-def _on_cxl(pin: Pin) -> bool:
-    return pin.location.kind == PoolKind.CXL
+# Entries of an ended run's maps, sets and listings freed per unit of
+# maintenance work, measured so a unit costs about what the other units do
+# (~1.5 us): one maintain() hold at the default budget stays under ~1 ms
+ACCESS_FREES_PER_UNIT = 4
+LISTING_FREES_PER_UNIT = 8
+BLOCKED_FREES_PER_UNIT = 3  # each frees its key and location too
+BLOCK_ITEM_FREES_PER_UNIT = 16  # their keys and locations go with blocked
+BLOCK_FREES_PER_UNIT = 1  # its items are queued (copied) and freed next
 
 
 def node_origin(node_epoch: str) -> OriginKey:
@@ -139,6 +143,8 @@ class NodeRecord:
     usage: dict[str, PoolUsage] = field(default_factory=dict)
     blocks: OrderedDict[str, _Block] = field(default_factory=OrderedDict)
     blocked: set[tuple[Key, Location]] = field(default_factory=set)
+    # worker sessions of a left or given up run, still to drop (maintain)
+    dropping: set[str] = field(default_factory=set)
 
 
 @dataclass(eq=False)
@@ -200,11 +206,15 @@ class NodeRegistry:
         self._workers: dict[str, WorkerSession] = {}
         self._incarnations: dict[tuple[str, SessionRole], str] = {}
         self._workers_by_node: dict[str, set[str]] = {}
-        # (deadline, token) of probe and orphan sessions, checked on expiry
+        # (deadline, token) of every worker session, checked when due
         self._expiry: list[tuple[float, str]] = []
         self._access: dict[str, OrderedDict[tuple[str, str, int], list]] = {}
-        # holders whose pins are still to release (but those ``keep`` accepts)
-        self._pin_releases: deque[tuple[str, Callable[[Pin], bool] | None]] = deque()
+        # holders whose pins are still to release (keeping CXL ones if True)
+        self._pin_releases: deque[tuple[str, bool]] = deque()
+        # nodes with worker sessions still to drop
+        self._dropping: deque[NodeRecord] = deque()
+        # maps, sets and listings of ended runs, emptied in maintain() steps
+        self._freeing: deque[tuple[dict | set | list, int]] = deque()
         self.policy_version = 0
 
     # ================================================================ lookup
@@ -214,13 +224,25 @@ class NodeRegistry:
         return session if session is not None and session.valid(now) else None
 
     def worker_session(self, token: str, now: float) -> WorkerSession | None:
-        session = self._workers.get(token)
+        session = self._current(token)
         return session if session is not None and session.valid(now) else None
 
     def known_worker(self, token: str) -> WorkerSession | None:
         """Not closed; may be expired."""
-        session = self._workers.get(token)
+        session = self._current(token)
         return session if session is not None and not session.closed else None
+
+    def _current(self, token: str) -> WorkerSession | None:
+        """The session; one of a dropped run is dropped first (as maintain
+        would), so a request never sees it half done."""
+        session = self._workers.get(token)
+        if session is not None:
+            node = self.nodes.get(session.node_id)
+            if node is not None and token in node.dropping:
+                node.dropping.discard(token)
+                self._drop_worker(session)
+                session = self._workers.get(token)
+        return session
 
     def node_online(self, node_id: str, now: float) -> bool:
         node = self.nodes.get(node_id)
@@ -481,7 +503,9 @@ class NodeRegistry:
         self._release_pins(session.token, inline)
         self.ledger.drop_origin(node_origin(session.node_epoch))
         node.retired_epochs.append(session.node_epoch)
-        node.listings.clear()
+        for listing in node.listings.values():  # snapshots of whole pools
+            self._free(listing.entries, LISTING_FREES_PER_UNIT)
+        node.listings = {}
         node.usage.clear()
 
     @staticmethod
@@ -498,16 +522,17 @@ class NodeRegistry:
             (i.key, i.location) for b in node.blocks.values() for i in b.items
         }
 
-    def _release_pins(
-        self, holder: str, inline: int, keep: Callable[[Pin], bool] | None = None
-    ) -> None:
-        if self.pins.release_holder(holder, inline, keep) >= inline:
-            self._pin_releases.append((holder, keep))  # maybe more left
+    def _release_pins(self, holder: str, inline: int, keep_cxl: bool = False) -> None:
+        self.pins.release_holder(holder, inline, keep_cxl)
+        if self.pins.holds(holder, cxl=not keep_cxl):
+            self._pin_releases.append((holder, keep_cxl))  # the rest in steps
 
     def _node_workers(self, node_id: str) -> list[WorkerSession]:
-        return [
-            self._workers[t] for t in sorted(self._workers_by_node.get(node_id, ()))
-        ]
+        tokens = set(self._workers_by_node.get(node_id, ()))
+        node = self.nodes.get(node_id)
+        if node is not None:
+            tokens |= node.dropping
+        return [w for t in sorted(tokens) if (w := self._workers.get(t)) is not None]
 
     # ===================================================== node session ops
 
@@ -540,8 +565,9 @@ class NodeRegistry:
         self._drop_node(self.nodes[session.node_id], "left", inline=PINS_INLINE)
 
     def _drop_node(self, node: NodeRecord, why: str, inline: int) -> None:
-        """Left or given up: the run ends, its locations go, and so do its
-        worker sessions (with their pins and op records)."""
+        """Left or given up: the run ends and its locations go. Its worker
+        sessions (with their pins and op records) go in maintain() steps, or
+        when a request names one."""
         if node.session is not None and not node.session.ended:
             self._end_run(node, node.session, inline)
         elif node.node_epoch is not None and node.node_epoch not in node.retired_epochs:
@@ -549,23 +575,27 @@ class NodeRegistry:
         node.session = None
         for pool in self.catalog.pools_of(node.node_id):
             self.catalog.remove_pool(pool, force=True)
-        for worker in self._node_workers(node.node_id):
-            self.ledger.drop_origin(worker_origin(worker.incarnation), node.node_id)
-            if any(_on_cxl(p) for p in self.pins.held_by(worker.token)):
-                # a live worker may still read mapped CXL: keep those pins
-                # (never released by time) so the region is not returned
-                worker.orphan = True
-                self._release_pins(worker.token, 0, keep=_on_cxl)
-                heapq.heappush(self._expiry, (worker.deadline, worker.token))
-            else:
-                self._release_pins(worker.token, 0)
-                self._forget_worker(worker)
+        tokens = self._workers_by_node.pop(node.node_id, set())
+        if len(tokens) < len(node.dropping):
+            node.dropping.update(tokens)
+        else:
+            tokens.update(node.dropping)
+            node.dropping = tokens
+        if node.dropping:
+            self._dropping.append(node)
         node.gone = True
         node.adopted = []
-        node.blocks.clear()
-        node.blocked.clear()
-        self._access.pop(node.node_id, None)
+        self._free(node.blocks, BLOCK_FREES_PER_UNIT)
+        node.blocks = OrderedDict()
+        self._free(node.blocked, BLOCKED_FREES_PER_UNIT)
+        node.blocked = set()
+        self._free(self._access.pop(node.node_id, None), ACCESS_FREES_PER_UNIT)
         logger.info("node %s %s: its locations are removed", node.node_id, why)
+
+    def _free(self, container: dict | set | list | None, per_unit: int) -> None:
+        """Empty ``container`` in maintain() steps, not in one go."""
+        if container:
+            self._freeing.append((container, per_unit))
 
     def recover_list(
         self, session: NodeSession, pool_id: str, cursor: str | None
@@ -651,7 +681,7 @@ class NodeRegistry:
                     f"node {req.node_id}; attach to its StorageService again",
                 )
             node_epoch_seq = node.epoch_seq
-        previous = self._workers.get(
+        previous = self._current(
             self._incarnations.get((req.incarnation, req.role), "")
         )
         identity = (
@@ -697,8 +727,7 @@ class NodeRegistry:
         self._workers[session.token] = session
         self._incarnations[(session.incarnation, session.role)] = session.token
         self._workers_by_node.setdefault(session.node_id, set()).add(session.token)
-        if session.role == SessionRole.PROBE:
-            heapq.heappush(self._expiry, (session.deadline, session.token))
+        heapq.heappush(self._expiry, (session.deadline, session.token))
         return WorkerOpenResponse(
             status=Status.OK,
             server_epoch=self.server_epoch,
@@ -716,6 +745,19 @@ class NodeRegistry:
         self._forget_worker(session)
         if session.role == SessionRole.WORKER:  # a probe has no op records
             self.ledger.drop_origin(worker_origin(session.incarnation), session.node_id)
+
+    def _drop_worker(self, worker: WorkerSession) -> None:
+        """A worker session of a run that left or was given up."""
+        self.ledger.drop_origin(worker_origin(worker.incarnation), worker.node_id)
+        if self.pins.holds_cxl(worker.token):
+            # a live worker may still read mapped CXL: keep those pins
+            # (never released by time) so the region is not returned
+            worker.orphan = True
+            self._workers_by_node.setdefault(worker.node_id, set()).add(worker.token)
+            self._release_pins(worker.token, 0, keep_cxl=True)
+        else:
+            self._release_pins(worker.token, 0)
+            self._forget_worker(worker)
 
     def _forget_worker(self, session: WorkerSession) -> None:
         session.closed = True
@@ -737,7 +779,7 @@ class NodeRegistry:
         outcomes = []
         for ref in workers:
             token = self._incarnations.get((ref.incarnation, SessionRole.WORKER))
-            worker = self._workers.get(token) if token else None
+            worker = self._current(token) if token else None
             if worker is not None and (
                 worker.node_id != session.node_id
                 or (worker.pid, worker.pid_start) != (ref.pid, ref.pid_start)
@@ -867,13 +909,18 @@ class NodeRegistry:
                 due.append(node)
         return due
 
-    def give_up(self, now: float) -> None:
-        for node in self.give_up_due(now):
+    def give_up(self, now: float, limit: int) -> int:
+        """Drop at most ``limit`` nodes due; returns how many."""
+        due = self.give_up_due(now)[:limit]
+        for node in due:
             self._drop_node(node, f"stayed away over {self.node_give_up_s}s", 0)
+        return len(due)
 
     def maintain(self, now: float, budget: int) -> int:
-        """One bounded step: expired probe sessions and queued pin releases;
-        returns the work done."""
+        """At most ``budget`` work: due worker sessions (expired ones without
+        pins go), worker sessions of dropped runs, pin releases and op
+        records, one unit each, and entries of an ended run's maps, sets and
+        listings, *_FREES_PER_UNIT a unit; returns the work done."""
         work = 0
         while self._expiry and work < budget:
             deadline, token = self._expiry[0]
@@ -886,20 +933,52 @@ class NodeRegistry:
                 continue
             if session.valid(now):
                 heapq.heappush(self._expiry, (session.deadline, token))
-            elif session.orphan and any(_on_cxl(p) for p in self.pins.held_by(token)):
-                # pins never go by time: WORKER_EXIT or a reopen frees them
-                continue
-            else:
-                # a probe holds nothing; an orphan without CXL pins can go
+            elif not self.pins.holds(token):
+                # expired holding no pins: it goes, with its op records; the
+                # incarnation may open afresh. Pins never go by time (an
+                # orphan's queued releases finish first)
                 self._release_pins(token, 0)
                 self._forget_worker(session)
+                if session.role == SessionRole.WORKER:
+                    self.ledger.drop_origin(
+                        worker_origin(session.incarnation), session.node_id
+                    )
+            else:
+                # WORKER_EXIT, WORKER_CLOSE, UNPIN or a reopen frees them
+                heapq.heappush(self._expiry, (now + self.session_ttl_s, token))
+        while self._dropping and work < budget:
+            node = self._dropping[0]
+            while node.dropping and work < budget:
+                session = self._workers.get(node.dropping.pop())
+                work += 1
+                if session is not None and not session.closed:
+                    self._drop_worker(session)
+            if not node.dropping:
+                self._dropping.popleft()
         while self._pin_releases and work < budget:
-            holder, keep = self._pin_releases[0]
-            limit = budget - work
-            released = self.pins.release_holder(holder, limit, keep)
+            holder, keep_cxl = self._pin_releases[0]
+            released = self.pins.release_holder(holder, budget - work, keep_cxl)
             work += max(released, 1)
-            if released < limit:
+            if not self.pins.holds(holder, cxl=not keep_cxl):
                 self._pin_releases.popleft()
+        while self._freeing and work < budget:
+            container, per_unit = self._freeing[0]
+            if not container:
+                self._freeing.popleft()
+                continue
+            for _ in range(min(per_unit, len(container))):
+                if not isinstance(container, dict):
+                    container.pop()
+                    continue
+                value = container.popitem()[1]
+                if isinstance(value, _Block) and value.items:
+                    # up to BLOCK_ITEMS locations: freed next, in steps too
+                    self._freeing.appendleft(
+                        (list(value.items), BLOCK_ITEM_FREES_PER_UNIT)
+                    )
+                    break
+            work += 1
+        work += self.ledger.sweep(budget - work)
         return work
 
     def worker_sessions(self) -> list[WorkerSession]:

@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Any, Protocol, TypeVar
 
 from maru_common.node_protocol import (
     AbortRequest,
@@ -63,6 +64,8 @@ from .server_client import EpochChanged, ReplyError, ServerClient, ServerStopped
 
 logger = logging.getLogger(__name__)
 
+R = TypeVar("R")
+
 # spec 9, op_window
 OP_WINDOW = 65536
 DEFAULT_GPU_DRAIN_GRACE_S = 5.0
@@ -95,7 +98,7 @@ class LedgerEntry:
         self.seq = seq
         self.digest = digest
         self.done = threading.Event()
-        self.response = None
+        self.response: Any = None
         # Waiters per connection; dropped when it closes
         self.waiters: dict[object, list[Callable]] = {}
 
@@ -196,6 +199,18 @@ class OpLedger:
             log = self._origins.get(origin)
             return len(log.entries) if log else 0
 
+    def running(self, origin: str) -> bool:
+        """An op of ``origin`` has not finished."""
+        with self._lock:
+            log = self._origins.get(origin)
+            return log is not None and not all(
+                e.done.is_set() for e in log.entries.values()
+            )
+
+    def origins(self) -> int:
+        with self._lock:
+            return len(self._origins)
+
     def _drop_if_idle(self, origin: str, log: _OriginLog) -> None:
         if all(e.done.is_set() for e in log.entries.values()):
             del self._origins[origin]
@@ -219,10 +234,18 @@ class AttachIdentity:
     namespace: str
 
 
+class WorkerConn(Protocol):
+    """What the manager uses of a LocalServer connection."""
+
+    def close(self) -> None: ...
+
+    def post_notify(self, notify: Notify) -> None: ...
+
+
 @dataclass(eq=False)
 class WorkerRecord:
     ident: AttachIdentity
-    conn: object | None = None
+    conn: WorkerConn | None = None
     worker_session: str | None = None
     detached: bool = False
     exited: bool = False
@@ -383,7 +406,9 @@ class StorageManager:
 
     # --------------------------------------------------------------- workers
 
-    def attach(self, conn, ident: AttachIdentity) -> tuple[WorkerRecord | None, str]:
+    def attach(
+        self, conn: WorkerConn, ident: AttachIdentity
+    ) -> tuple[WorkerRecord | None, str]:
         """Register or re-bind an attaching worker; (None, reason) to refuse."""
         with self._lock:
             rec = self._workers.get(ident.incarnation)
@@ -409,9 +434,10 @@ class StorageManager:
             rec = WorkerRecord(ident=ident, conn=conn)
             self._workers[ident.incarnation] = rec
             old = self._old.get(ident.incarnation)
-            unwatch_old = old is not None and old.state == OldState.WAITING
-            if unwatch_old:
+            unwatch_old = False
+            if old is not None and old.state == OldState.WAITING:
                 old.state = OldState.DRAINING
+                unwatch_old = True
         if unwatch_old:
             self.peer_watcher.unwatch(_old_key(ident.incarnation))
         if not self.peer_watcher.watching(key):
@@ -420,7 +446,9 @@ class StorageManager:
             return None, "the process has ended"
         return rec, ""
 
-    def _rebind(self, rec: WorkerRecord, conn, ident: AttachIdentity):
+    def _rebind(
+        self, rec: WorkerRecord, conn: WorkerConn, ident: AttachIdentity
+    ) -> tuple[WorkerRecord | None, str]:
         """Caller holds the lock. The same incarnation attaches again."""
         if rec.exited:
             return None, "this incarnation has ended"
@@ -467,6 +495,30 @@ class StorageManager:
                 held,
             )
         return DetachResponse(status=Status.OK)
+
+    def after_detach_reply(self, rec: WorkerRecord) -> None:
+        """Forget a worker that detached holding nothing: its record, pidfd
+        and op records go. One with credit, an op running or an old run to
+        drain waits for its exit (spec 7.3)."""
+        incarnation = rec.incarnation
+        with self._lock:
+            old = self._old.get(incarnation)
+            if (
+                not rec.detached
+                or rec.exited
+                or self._workers.get(incarnation) is not rec
+                or (old is not None and old.state != OldState.CONFIRMED)
+                or self.ledger.running(incarnation)
+                or not self.pools.forget_holder(incarnation)
+            ):
+                return
+            del self._workers[incarnation]
+            # Under the lock, so a re-attach of the incarnation (which takes
+            # it) never loses its new watch or op records; neither the
+            # watcher nor the ledger calls back while holding its own lock
+            self.peer_watcher.unwatch(_worker_key(incarnation))
+            self.ledger.drop(incarnation)
+        logger.info("worker %s detached and is forgotten", incarnation)
 
     def worker(self, incarnation: str) -> WorkerRecord | None:
         with self._lock:
@@ -598,28 +650,34 @@ class StorageManager:
             return None, "the op digest does not match the request"
         return digest, ""
 
-    def _begin_sync(self, rec, op, decoded, response_cls, stale):
-        """Op rules for a synchronous request: (entry, None) to run it, or
-        (None, response) to answer now."""
+    def _begin_sync(
+        self,
+        rec: WorkerRecord,
+        op: OpRef,
+        decoded: DecodedRequest,
+        response_cls: Callable[..., R],
+        stale: Callable[[], R],
+    ) -> LedgerEntry | R:
+        """Op rules for a synchronous request: a new LedgerEntry to run it,
+        or the response to answer now."""
         digest, reason = self._check_op(rec, op, decoded)
         if digest is None:
-            return None, response_cls(status=Status.REJECTED, error=reason)
+            return response_cls(status=Status.REJECTED, error=reason)
         verdict, entry = self.ledger.begin(rec.incarnation, op, digest)
-        if verdict == Verdict.NEW:
-            return entry, None
-        if verdict == Verdict.REPLAY:
+        if verdict == Verdict.NEW and entry is not None:
+            return entry
+        if verdict == Verdict.REPLAY and entry is not None:
             entry.done.wait()
-            return None, entry.response
+            replay: R = entry.response
+            return replay
         if verdict == Verdict.STALE:
-            return None, stale()
+            return stale()
         if verdict == Verdict.CONFLICT:
-            return None, response_cls(
+            return response_cls(
                 status=Status.REJECTED,
                 error=f"op {op.seq} was sent before with another digest",
             )
-        return None, response_cls(
-            status=Status.BUSY, error="too many unacknowledged ops"
-        )
+        return response_cls(status=Status.BUSY, error="too many unacknowledged ops")
 
     def credit(self, rec: WorkerRecord, decoded: DecodedRequest) -> CreditResponse:
         req: CreditRequest = decoded.request
@@ -636,7 +694,7 @@ class StorageManager:
             return CreditResponse(
                 status=Status.REJECTED, error="want_bytes must be positive"
             )
-        entry, answer = self._begin_sync(
+        entry = self._begin_sync(
             rec,
             req.op,
             decoded,
@@ -645,13 +703,15 @@ class StorageManager:
                 status=Status.REJECTED, error="stale op: seq is at or below its ack"
             ),
         )
-        if entry is None:
-            return answer
+        if not isinstance(entry, LedgerEntry):
+            return entry
+        asks: list[tuple[WorkerConn, int]] = []
         try:
             with self._lock:
                 # Under the lock _worker_exited sets ``exited`` before it
-                # quarantines, so no credit goes to a holder that ended
-                if rec.exited:
+                # quarantines, so no credit goes to a holder that ended; a
+                # detached record may be forgotten (after_detach_reply)
+                if rec.exited or rec.detached:
                     response = CreditResponse(status=Status.REJECTED, error="ended")
                 else:
                     rec.worker_session = req.worker_session
@@ -659,10 +719,20 @@ class StorageManager:
                         rec.incarnation, req.want_bytes, req.kind
                     )
                     response = CreditResponse(status=Status.OK, credits=credits)
+                    asks = [
+                        (other.conn, nbytes)
+                        for incarnation, nbytes in self.pools.credit_asks(
+                            rec.incarnation
+                        )
+                        if (other := self._workers.get(incarnation)) is not None
+                        and other.conn is not None
+                    ]
         except Exception as e:
             logger.exception("CREDIT failed")
             response = CreditResponse(status=Status.REJECTED, error=f"internal: {e}")
         self.ledger.finish(rec.incarnation, entry, response)
+        for conn, nbytes in asks:  # idle credit of others, for this waiting worker
+            conn.post_notify(Notify(kind=NotifyKind.CREDIT_RETURN, bytes=nbytes))
         return response
 
     def credit_return(
@@ -686,7 +756,7 @@ class StorageManager:
             return AbortResponse(
                 status=Status.REJECTED, error=f"an ABORT carries 1..{MAX_BATCH} items"
             )
-        entry, answer = self._begin_sync(
+        entry = self._begin_sync(
             rec,
             req.op,
             decoded,
@@ -696,8 +766,8 @@ class StorageManager:
                 items=[ItemOutcome(ItemResult.STALE)] * len(req.credits),
             ),
         )
-        if entry is None:
-            return answer
+        if not isinstance(entry, LedgerEntry):
+            return entry
         items = []
         for credit in req.credits:
             try:
@@ -757,6 +827,7 @@ class StorageManager:
                 )
             )
             return
+        assert entry is not None  # NEW and REPLAY carry one
         key = reply if waiter is None else waiter
         if verdict == Verdict.REPLAY:
             waiting, displaced = self.ledger.attach(entry, reply, key)
@@ -786,7 +857,7 @@ class StorageManager:
             except Exception as e:
                 logger.exception("WRITE_DONE item failed")
                 ref, location, why = None, None, str(e)
-            if ref is None:
+            if ref is None or location is None:
                 logger.debug("WRITE_DONE item %d refused: %s", i, why)
                 wd.outcomes[i] = ItemOutcome(ItemResult.REJECTED)
                 wd.remaining -= 1
@@ -812,7 +883,9 @@ class StorageManager:
             self._cv.notify_all()
 
     def _finish_write_done(self, wd: _WriteDone) -> None:
-        response = WriteDoneResponse(status=Status.OK, items=list(wd.outcomes))
+        items = [o for o in wd.outcomes if o is not None]
+        assert len(items) == len(wd.outcomes)  # every item has its outcome
+        response = WriteDoneResponse(status=Status.OK, items=items)
         for reply in self.ledger.finish(wd.origin, wd.entry, response):
             try:
                 reply(response)
@@ -827,8 +900,9 @@ class StorageManager:
                 )
             with self._lock:
                 old = self._old.get(rec.incarnation)
-                draining = old is not None and old.state == OldState.DRAINING
-            if draining:
+                if old is not None and old.state != OldState.DRAINING:
+                    old = None
+            if old is not None:
                 self._confirm_old(old, f"drained node epoch {req.epoch}")
         return DrainAckResponse(status=Status.OK)
 
@@ -881,6 +955,7 @@ class StorageManager:
             self._apply_commit(batch, response)
 
     def _apply_commit(self, batch: list[_Ticket], response) -> None:
+        outcomes: list[ItemOutcome | None]
         if response is None:
             outcomes = [None] * len(batch)
         elif response.status == Status.OK:
@@ -980,7 +1055,12 @@ class StorageManager:
         refs, items = [], []
         for ref in candidates:
             page = self.pools.page(ref)
-            if page is None or page.state != PageState.READY:
+            if (
+                page is None
+                or page.state != PageState.READY
+                or page.key is None
+                or page.location is None
+            ):
                 self.placement.on_gone(ref)
                 self._forget_queued(ref)
                 continue
@@ -1163,12 +1243,13 @@ class StorageManager:
     def _block(self, block: BlockRequest) -> None:
         """A central delete: block new local pins, then RETIRE the items. It is
         sent again until done, so pages already taken are skipped."""
-        refs = []
+        refs: list[PageRef] = []
         for item in block.items:
             ref = self.pools.find(item.location)
             page = self.pools.page(ref) if ref is not None else None
             if (
-                page is not None
+                ref is not None
+                and page is not None
                 and page.state == PageState.READY
                 and page.key == item.key
             ):

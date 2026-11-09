@@ -13,7 +13,7 @@ import uuid
 
 from maru_common.storage_types import CloseMode, PoolDescriptor
 
-from .config import NodeConfig
+from .config import NodeConfig, NodeConfigError
 from .drivers.dram import DramPool, create_dram_pool
 from .local_pin import LocalPins
 from .local_server import LocalServer
@@ -91,6 +91,9 @@ class StorageService:
     def _start(self) -> None:
         config = self.config
         top = config.top
+        size, high, low = top.size, top.high_watermark, top.low_watermark
+        if size is None or high is None or low is None:  # parsing sets them
+            raise NodeConfigError(f"the {top.store} tier needs size and watermarks")
         # Claim the socket first: a second start must fail before NODE_OPEN
         self.local = LocalServer(
             config.socket,
@@ -107,7 +110,7 @@ class StorageService:
         self.dram = create_dram_pool(
             config.node_id,
             self.node_epoch,
-            top.size,
+            size,
             config.page_size,
             bool(top.hugepage),
         )
@@ -120,9 +123,7 @@ class StorageService:
             rpc_timeout_s=self.rpc_timeout_s,
             host_boot_id=self.host_boot_id,
         )
-        placement = PlacementPolicy(
-            top.high_watermark, top.low_watermark, kept_backoff_s=self.kept_backoff_s
-        )
+        placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,

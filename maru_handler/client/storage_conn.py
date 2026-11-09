@@ -78,11 +78,20 @@ class StorageConn:
 
     # ------------------------------------------------------------- lifecycle
 
-    def connect(self, request: AttachRequest) -> tuple[AttachResponse, list[int]]:
-        """Connect and ATTACH; returns the reply and its memfds (caller owns them).
-        StorageUnavailableError if unreachable, refused or malformed."""
+    def connect(
+        self, request: AttachRequest, timeout_s: float
+    ) -> tuple[AttachResponse, list[int]]:
+        """Connect and ATTACH within ``timeout_s``; returns the reply and its
+        memfds (caller owns them). StorageUnavailableError if unreachable,
+        refused, malformed, timed out or closed meanwhile."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        with self._lock:
+            if self._closed.is_set():
+                sock.close()
+                raise StorageUnavailableError("the connection was closed")
+            self._sock = sock  # close() shuts it down
         try:
+            sock.settimeout(timeout_s)
             sock.connect(self.path)
         except OSError as e:
             sock.close()
@@ -118,9 +127,17 @@ class StorageConn:
                     f"the ATTACH reply carried {len(fds)} descriptors for memfd "
                     f"indexes {wanted}"
                 )
+            sock.settimeout(None)
+            with self._lock:
+                if self._closed.is_set():
+                    raise StorageUnavailableError("closed")
+                self.attach_response = response
         except (OSError, ValueError, MessageDecodeError) as e:
+            # A timeout leaves the stream out of step: the socket goes too
             close_fds(fds)
             sock.close()
+            if self._closed.is_set():
+                raise StorageUnavailableError("closed while attaching") from e
             if isinstance(e, StorageUnavailableError):
                 raise
             raise StorageUnavailableError(f"ATTACH failed: {e}") from e
@@ -128,8 +145,6 @@ class StorageConn:
             close_fds(fds)
             sock.close()
             raise
-        self._sock = sock
-        self.attach_response = response
         self._receiver = threading.Thread(
             target=self._receive_loop, name="maru-storage-recv", daemon=True
         )
@@ -183,9 +198,10 @@ class StorageConn:
 
     def _receive_loop(self) -> None:
         reason = "the StorageService closed the connection"
+        sock = self._sock
         try:
-            while not self._closed.is_set():
-                got = recv_frame(self._sock, max_fds=0)
+            while sock is not None and not self._closed.is_set():
+                got = recv_frame(sock, max_fds=0)
                 if got is None:
                     break
                 frame, _ = got

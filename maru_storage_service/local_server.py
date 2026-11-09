@@ -250,6 +250,8 @@ class LocalServer:
 
     def start(self) -> None:
         """Listen and accept; claim() came first."""
+        if self._sock is None or self.manager is None:
+            raise LocalServerError("start() needs claim() and the StorageManager")
         try:
             self._sock.listen(_LISTEN_BACKLOG)
         except OSError as e:
@@ -313,13 +315,14 @@ class LocalServer:
     def forget(self, conn: Connection) -> None:
         with self._lock:
             self._conns.discard(conn)
-        if conn.worker is not None:
+        if conn.worker is not None and self.manager is not None:
             self.manager.connection_lost(conn.worker, conn)
 
     def _accept_loop(self) -> None:
-        while True:
+        listener = self._sock
+        while listener is not None:
             try:
-                sock, _ = self._sock.accept()
+                sock, _ = listener.accept()
             except OSError:
                 return
             sock.set_inheritable(False)
@@ -337,9 +340,15 @@ class LocalServer:
 
     # -------------------------------------------------------------- requests
 
+    def _manager(self) -> StorageManager:
+        """Requests come after start(), which checked it is set."""
+        if self.manager is None:
+            raise LocalServerError("the StorageService is still starting")
+        return self.manager
+
     def dispatch(self, conn: Connection, decoded: DecodedRequest) -> None:
         header = decoded.header
-        code = header.msg_type
+        code = NodeMessageType(header.msg_type)  # decoding checked the code
         _, response_cls = NODE_MESSAGE_CLASSES[code]
         if code == NodeMessageType.NOTIFY:
             conn.respond(
@@ -362,25 +371,27 @@ class LocalServer:
             )
             return
         request = decoded.request
+        manager = self._manager()
         if code == NodeMessageType.CREDIT:
-            conn.respond(header, self.manager.credit(rec, decoded))
+            conn.respond(header, manager.credit(rec, decoded))
         elif code == NodeMessageType.CREDIT_RETURN:
-            conn.respond(header, self.manager.credit_return(rec, request))
+            conn.respond(header, manager.credit_return(rec, request))
         elif code == NodeMessageType.WRITE_DONE:
-            self.manager.write_done(
+            manager.write_done(
                 rec,
                 decoded,
                 lambda response: conn.post_response(header, response),
                 waiter=conn,
             )
         elif code == NodeMessageType.ABORT:
-            conn.respond(header, self.manager.abort(rec, decoded))
+            conn.respond(header, manager.abort(rec, decoded))
         elif code == NodeMessageType.DRAIN_ACK:
-            conn.respond(header, self.manager.drain_ack(rec, request))
+            conn.respond(header, manager.drain_ack(rec, request))
         elif code == NodeMessageType.UNMAP_ACK:
-            conn.respond(header, self.manager.unmap_ack(rec, request))
+            conn.respond(header, manager.unmap_ack(rec, request))
         elif code == NodeMessageType.DETACH:
-            conn.respond(header, self.manager.detach(rec))
+            conn.respond(header, manager.detach(rec))
+            manager.after_detach_reply(rec)
         else:  # every code of the table is handled above
             conn.respond(header, response_cls(status=Status.REJECTED, error="unknown"))
 
@@ -427,7 +438,8 @@ class LocalServer:
             pid_start=pid_start,
             namespace=req.namespace,
         )
-        rec, why = self.manager.attach(conn, ident)
+        manager = self._manager()
+        rec, why = manager.attach(conn, ident)
         if rec is None:
             return reject(why)
         conn.worker = rec
@@ -454,4 +466,4 @@ class LocalServer:
             req.tp_rank,
             node_pid,
         )
-        self.manager.after_attach_reply(rec)
+        manager.after_attach_reply(rec)

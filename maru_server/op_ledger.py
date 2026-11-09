@@ -7,6 +7,7 @@ Not thread safe: callers hold the service lock.
 
 import heapq
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -59,6 +60,8 @@ class OpLedger:
         self.op_window = op_window
         self.op_bytes_max = op_bytes_max
         self._origins: dict[OriginKey, _Origin] = {}
+        # dropped origins whose records sweep() still has to free
+        self._dropped: deque[_Origin] = deque()
 
     def begin(
         self, origin: OriginKey, op: OpRef, owner: str = ""
@@ -103,14 +106,27 @@ class OpLedger:
         record.event.set()
 
     def drop_origin(self, origin: OriginKey, owner: str | None = None) -> bool:
-        """The run behind ``origin`` ended; with ``owner``, only if it owns it."""
+        """The run behind ``origin`` ended; with ``owner``, only if it owns it.
+        Its records are freed by sweep()."""
         state = self._origins.get(origin)
         if state is None or (owner is not None and state.owner != owner):
             return False
         del self._origins[origin]
-        for record in state.records.values():
-            record.event.set()
+        if state.records:
+            self._dropped.append(state)
         return True
+
+    def sweep(self, budget: int) -> int:
+        """Free at most ``budget`` records of dropped origins; returns how many."""
+        done = 0
+        while self._dropped and done < budget:
+            records = self._dropped[0].records
+            while records and done < budget:
+                records.popitem()[1].event.set()
+                done += 1
+            if not records:
+                self._dropped.popleft()
+        return done
 
     def pending(self, origin: OriginKey) -> int:
         state = self._origins.get(origin)

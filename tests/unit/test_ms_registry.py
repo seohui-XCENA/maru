@@ -448,6 +448,38 @@ class TestNodeClose:
             node.cxl().pool_id
         ]
 
+    def test_an_orphan_keeps_pins_it_took_after_its_node_left(self, env):
+        from maru_server.pin_manager import HolderKind
+
+        clock, service, wire = env
+        node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
+        node.open()
+        other.open()
+        service.register_region(node.cxl())
+        node.commit((key("c"), node.loc(node.cxl(), 1)))
+        k, loc = key("k"), other.loc(other.dram(), 1)
+        other.commit((k, loc))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        cxl_pin = worker.lookup(key("c")).items[0].pin_id
+        node.close(CloseMode.LEAVE)
+        drain(service)
+        assert service.registry.known_worker(worker.token).orphan
+        with service.lock:  # a pin taken after the node left, then no CXL pin
+            late = service.pins.pin(k, loc, worker.token, HolderKind.WORKER)
+            service.pins.unpin(cxl_pin)
+        clock.advance(31)  # expired: pins never go by time
+        other.heartbeat()
+        drain(service)
+        assert service.registry.known_worker(worker.token) is not None
+        assert service.pins.get(late) is not None
+        with service.lock:
+            service.pins.unpin(late)
+        clock.advance(31)  # pinless now: a later check purges it
+        other.heartbeat()
+        drain(service)
+        assert service.registry.known_worker(worker.token) is None
+
     def test_an_orphan_without_cxl_pins_goes_on_expiry(self, env):
         clock, service, wire = env
         node = FakeNode(wire, "n1")
@@ -683,6 +715,62 @@ class TestWorkerSessions:
         clock.advance(31)
         drain(service)
         assert service.registry.known_worker(probe.token) is None
+
+    def test_expired_worker_without_pins_is_purged(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        assert results(worker.lookup(key("absent"))) == ["MISS"]  # an op record
+        origin = ("worker", worker.incarnation)
+        assert origin in service.ledger
+        clock.advance(31)  # past the session TTL, no pins held
+        drain(service)
+        registry = service.registry
+        assert registry.known_worker(worker.token) is None
+        assert origin not in service.ledger
+        assert (worker.incarnation, SessionRole.WORKER) not in registry._incarnations
+        assert service.stats()["worker_sessions"] == 0
+
+    def test_expired_worker_with_pins_stays(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        node.commit((k, node.loc(node.dram(), 1)))
+        node.heartbeat()
+        worker = FakeWorker(wire, node)
+        worker.open()
+        assert results(worker.lookup(k)) == ["HIT"]
+        for _ in range(3):  # pins never go by time
+            clock.advance(31)
+            node.heartbeat()
+            drain(service)
+            assert service.registry.known_worker(worker.token) is not None
+            assert service.pins.held_by(worker.token)
+        assert ("worker", worker.incarnation) in service.ledger
+
+    def test_reopen_after_the_purge_is_a_fresh_open(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open()
+        k = key("k")
+        node.commit((k, node.loc(node.dram(), 1)))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        old = worker.token
+        assert results(worker.lookup(key("absent"))) == ["MISS"]
+        clock.advance(31)
+        node.heartbeat()
+        drain(service)
+        assert service.registry.known_worker(old) is None
+        # the same incarnation opens again: a new session, a new op ledger
+        assert worker.open().status == Status.OK and worker.token != old
+        hit = worker.lookup(k)
+        assert results(hit) == ["HIT"]
+        assert service.pins.held_by(worker.token)
+        assert results(worker.unpin(hit.items[0].pin_id)) == ["OK"]
 
 
 class TestEpochChecks:
@@ -945,6 +1033,118 @@ class TestMaintenanceThread:
         assert steps == 3
         assert all(not service.catalog.locations(key(f"k{i}")) for i in range(35))
 
+    def test_a_large_dropped_node_is_cleaned_in_bounded_steps(self):
+        import gc
+        import statistics
+        from collections import OrderedDict
+
+        from maru_common.protocol import WorkerOpenRequest
+        from maru_common.storage_types import MS_PROTOCOL, KeyLocation
+        from maru_server import node_registry as nr
+        from maru_server.node_registry import (
+            ACCESS_MAX_PER_NODE,
+            BLOCK_ITEMS,
+            _Block,
+            _Listing,
+            worker_origin,
+        )
+        from maru_server.pin_manager import HolderKind
+
+        clock = FakeClock()
+        budget = 256
+        service = make_service(clock, maintenance_budget=budget)
+        registry = service.registry
+        node = FakeNode(Wire(service), "big")
+        node.open()
+        service.register_region(node.cxl())
+        n = 25_000
+        target = (key("k"), node.loc(node.dram(), 1))
+        with service.lock:
+            for i in range(n):
+                token = registry.worker_open(
+                    WorkerOpenRequest(
+                        node_id="big",
+                        node_epoch=node.epoch,
+                        engine_id="e",
+                        dp_index=0,
+                        tp_rank=0,
+                        pid=1000 + i,
+                        pid_start=1,
+                        incarnation=f"w{i}",
+                        namespace="ns",
+                        role=SessionRole.WORKER,
+                        protocol=MS_PROTOCOL,
+                        capabilities=[],
+                    ),
+                    clock(),
+                ).worker_session
+                service.pins.pin(*target, token, HolderKind.WORKER)
+                origin = worker_origin(f"w{i}")
+                _, record = service.ledger.begin(
+                    origin, OpRef(f"w{i}", 1, b"d", 0), "big"
+                )
+                service.ledger.finish(origin, record, None, 1)
+                if i == 0:  # it still reads mapped CXL: an orphan
+                    orphan = token
+                    cxl = node.loc(node.cxl(), 1)
+                    service.pins.pin(key("c"), cxl, token, HolderKind.WORKER)
+            # a full access map, queued block requests and a pool listing
+            listed = 300_000
+            big = registry.nodes["big"]
+            big.listings["1"] = _Listing(
+                node.dram_id, [object() for _ in range(listed)]
+            )
+            registry._access["big"] = OrderedDict(
+                (("p", f"a{i}", i), [i]) for i in range(ACCESS_MAX_PER_NODE)
+            )
+            blocks = 200
+            for b in range(blocks):  # full ones
+                items = tuple(
+                    KeyLocation(key(f"b{b}-{j}"), node.loc(node.dram(), j))
+                    for j in range(BLOCK_ITEMS)
+                )
+                big.blocks[f"b{b}"] = _Block(f"b{b}", items, "delete")
+                big.blocked.update((i.key, i.location) for i in items)
+        clock.advance(631)  # past node_give_up_s
+        works, times = [], []
+        gc.disable()  # time our work, not a collection
+        try:
+            while not works or works[-1] >= budget:
+                # CPU time of this thread: preemption does not count
+                t0 = time.thread_time()
+                works.append(service.maintain())
+                times.append(time.thread_time() - t0)
+        finally:
+            gc.enable()
+        assert max(works) <= budget
+
+        # one unit per node given up, due session check, worker session
+        # dropped, pin and op record, and per *_FREES_PER_UNIT entries freed
+        def units(size: int, per_unit: int) -> int:
+            return -(-size // per_unit)
+
+        frees = (
+            units(ACCESS_MAX_PER_NODE, nr.ACCESS_FREES_PER_UNIT)
+            + units(listed, nr.LISTING_FREES_PER_UNIT)
+            + units(blocks * BLOCK_ITEMS, nr.BLOCKED_FREES_PER_UNIT)
+            + units(blocks, nr.BLOCK_FREES_PER_UNIT)
+            + blocks * units(BLOCK_ITEMS, nr.BLOCK_ITEM_FREES_PER_UNIT)
+        )
+        assert sum(works) == 1 + 4 * n + frees
+        assert registry.nodes["big"].gone and "big" not in registry._access
+        assert not registry._freeing and not big.blocks and not big.blocked
+        assert not big.listings
+        # the orphan keeps its CXL pin and only that
+        assert registry.worker_sessions() == [registry.known_worker(orphan)]
+        assert [p.location for p in service.pins.held_by(orphan)] == [cxl]
+        assert len(service.pins) == 1 and ("worker", "w0") not in service.ledger
+        # no step holds the lock much longer than a typical one
+        assert len(works) > 400
+        assert max(times) < 10 * statistics.median(times), (
+            max(times),
+            statistics.median(times),
+        )
+
     def test_large_forced_sweep_keeps_lookup_p99_low(self):
         service = make_service(clock=time.monotonic, maintenance_interval_s=0.01)
         wire = Wire(service)
@@ -990,3 +1190,26 @@ class TestMaintenanceThread:
             service.stop()
         assert not pool.entries
         assert p99(loaded) < p99(base) + 0.010, (p99(base), p99(loaded))
+
+
+def test_pin_manager_keeps_cxl_pins_apart():
+    from maru_common.storage_types import Location, PoolKind
+    from maru_server.pin_manager import HolderKind, PinManager
+
+    pins = PinManager()
+
+    def loc(kind: PoolKind, page: int) -> Location:
+        return Location(f"{kind.value}:p", f"a{page}", 1, page * PAGE, PAGE, kind)
+
+    for page in range(3):
+        pins.pin(key(f"d{page}"), loc(PoolKind.DRAM, page), "w", HolderKind.WORKER)
+    cxl = pins.pin(key("c"), loc(PoolKind.CXL, 0), "w", HolderKind.WORKER)
+    assert pins.holds_cxl("w") and pins.holds("w", cxl=False)
+    assert pins.move_holder("w", "v") == 4 and not pins.holds("w")
+    # keeping CXL pins releases only the others, at most ``limit`` a call
+    assert pins.release_holder("v", 2, keep_cxl=True) == 2
+    assert pins.release_holder("v", 5, keep_cxl=True) == 1
+    assert not pins.holds("v", cxl=False) and pins.holds_cxl("v")
+    assert [p.pin_id for p in pins.held_by("v")] == [cxl]
+    assert pins.unpin(cxl) is not None and not pins.holds("v")
+    assert len(pins) == 0

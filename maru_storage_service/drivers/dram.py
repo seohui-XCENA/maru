@@ -110,7 +110,11 @@ def create_dram_pool(
         try:
             os.posix_fallocate(fd, 0, capacity)
         except OSError as e:
-            if hugepage and e.errno in (errno.ENOSPC, errno.ENOMEM, errno.EINVAL):
+            if huge is not None and e.errno in (
+                errno.ENOSPC,
+                errno.ENOMEM,
+                errno.EINVAL,
+            ):
                 info = _meminfo()
                 raise DramPoolError(
                     f"cannot get {capacity // huge} huge pages of {huge} bytes for "

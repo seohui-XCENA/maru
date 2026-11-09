@@ -724,8 +724,16 @@ class MsService:
                     worker.role != SessionRole.WORKER
                     or worker.node_id != session.node_id
                 )
-                # a closed or unknown session: the copy stays as cache
-                holder = worker.token if worker is not None and not foreign else None
+                # a closed, unknown, orphaned or replaced-run session: the
+                # copy stays as cache, with no pin that only time would free
+                gone = (
+                    worker is None or worker.orphan or self.registry.stale_run(worker)
+                )
+                holder = (
+                    worker.token
+                    if worker is not None and not (foreign or gone)
+                    else None
+                )
                 errors = [
                     self.catalog.check_copy(session.node_id, session.epoch_seq, item)
                     for item in req.items
@@ -850,15 +858,15 @@ class MsService:
     # ========================================================= maintenance
 
     def maintain(self, give_up: bool = True) -> int:
-        """One bounded step (with the node give-up check, O(nodes), when
-        ``give_up``); returns the work done (>= budget: maybe more)."""
+        """One step of at most maintenance_budget work (plus, when
+        ``give_up``, the scan for nodes to give up, O(nodes)); returns the
+        work done, the budget when more may be left."""
         with self.lock:
             now = self._clock()
             budget = self.maintenance_budget
-            if give_up:
-                self.registry.give_up(now)
-            work = self.registry.maintain(now, budget)
-            work += self.catalog.sweep(max(budget - work, 0))
+            work = self.registry.give_up(now, budget) if give_up else 0
+            work += self.registry.maintain(now, budget - work)
+            work += self.catalog.sweep(budget - work)
             return work
 
     def ensure_started(self) -> None:

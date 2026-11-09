@@ -29,7 +29,7 @@ class PinTable:
                 raise ValueError(f"pin {pin_id} held twice")
             self._pins[pin_id] = PinEntry(pin_id, key, location, server_epoch)
 
-    def release(self, pin_ids: list[str], server_epoch: str) -> list[str]:
+    def release(self, pin_ids: list[str], server_epoch: str | None) -> list[str]:
         """Mark pins released; returns the ones of ``server_epoch`` to UNPIN."""
         with self._cv:
             out = []
@@ -74,11 +74,14 @@ class PinTable:
     ) -> bool:
         """Wait until no such pin is held."""
         with self._cv:
-            return self._cv.wait_for(
-                lambda: (
-                    self.outstanding(server_epoch=server_epoch, pool_id=pool_id) == 0
-                ),
-                timeout,
+            return bool(
+                self._cv.wait_for(
+                    lambda: (
+                        self.outstanding(server_epoch=server_epoch, pool_id=pool_id)
+                        == 0
+                    ),
+                    timeout,
+                )
             )
 
     def __len__(self) -> int:

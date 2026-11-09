@@ -209,7 +209,8 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
     if not isinstance(raw, dict):
         raise NodeConfigError(f"{what}: expected an object, got {type(raw).__name__}")
     store = raw.get("store")
-    store = STORE_ALIASES.get(store, store)
+    if isinstance(store, str):
+        store = STORE_ALIASES.get(store, store)
     if store not in STORES:
         raise NodeConfigError(f"{what}.store: one of {list(STORES)}, got {store!r}")
     what = f"{what} ({store})"

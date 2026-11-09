@@ -106,6 +106,46 @@ class TestCredit:
             assert len(pm.credit(worker, 4 * PS)) == 4
         assert pm.credit("c", PS) == []  # credit_total_max_bytes is 8 pages
 
+    def test_waiting_worker_gets_its_fair_share_back(self):
+        pm = manager(credit_max_bytes=2 * PS, credit_total_max_bytes=2 * PS)
+        a = pm.credit("a", 2 * PS)
+        assert len(a) == 2 and pm.credit_asks("a") == []
+        assert pm.credit("b", 2 * PS) == []  # the node-total budget is A's
+        assert pm.credit_asks("b") == [("a", PS)]  # A is above its fair share
+        assert pm.credit_asks("b") == []  # asked once per CREDIT_ASK_S
+        assert pm.credit_return("a", a[0])[0]
+        # the page returned is owed to B: A cannot take it back
+        assert pm.credit("a", PS) == [] and pm.credit_asks("a") == []
+        assert len(pm.credit("b", 2 * PS)) == 1
+        assert pm.credit_asks("b") == []  # B holds its fair share now
+        assert pm.held_bytes("a") == pm.held_bytes("b") == PS
+        pm.check()
+
+    def test_a_waiting_claim_ends(self, monkeypatch):
+        import types
+
+        from maru_storage_service import pool_manager
+
+        now = [1000.0]
+        monkeypatch.setattr(
+            pool_manager, "time", types.SimpleNamespace(monotonic=lambda: now[0])
+        )
+        pm = manager(credit_max_bytes=2 * PS, credit_total_max_bytes=2 * PS)
+        a = pm.credit("a", 2 * PS)
+        assert pm.credit("b", PS) == []
+        pm.credit_return("a", a[0])
+        assert pm.credit("a", PS) == []  # owed to B
+        now[0] += pool_manager.CREDIT_WAIT_S  # B stopped asking
+        assert len(pm.credit("a", PS)) == 1
+        # a holder that ends, or is forgotten, waits no more
+        assert pm.credit("b", PS) == [] and "b" in pm._waiting
+        pm.quarantine_holder("b")
+        assert "b" not in pm._waiting
+        assert pm.credit("b", PS) == [] and pm.credit_asks("b") == [("a", PS)]
+        assert pm.forget_holder("b") and "b" not in pm._waiting
+        assert not pm.forget_holder("a")  # it holds credit
+        pm.check()
+
     def test_transfer_reserve_is_not_credit(self):
         pm = manager(credit_max_bytes=16 * PS, credit_total_max_bytes=16 * PS)
         assert len(pm.credit("w", 16 * PS)) == PAGES - 2

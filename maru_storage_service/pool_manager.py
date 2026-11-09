@@ -11,6 +11,7 @@ import collections
 import logging
 import math
 import threading
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -29,6 +30,12 @@ from maru_common.storage_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A holder short of credit by the node-total budget keeps its claim this long
+# (it asks again meanwhile); a holder asked to return credit is asked again
+# only after CREDIT_ASK_S
+CREDIT_WAIT_S = 1.0
+CREDIT_ASK_S = 0.5
 
 
 @unique
@@ -114,6 +121,11 @@ class PoolManager:
         self._credit_stopped: str | None = None
         # Credited bytes per holder (worker incarnation)
         self._held: collections.Counter[str] = collections.Counter()
+        # Holders below their fair share, short by the node-total budget:
+        # bytes still owed and when they last asked
+        self._waiting: dict[str, tuple[int, float]] = {}
+        # When each holder was last asked to return credit
+        self._asked: dict[str, float] = {}
         # How many times each transition ran, for tests and metrics
         self.transitions: collections.Counter[tuple[PageState, PageState]] = (
             collections.Counter()
@@ -211,12 +223,29 @@ class PoolManager:
                 return []
             ps = pool.page_size
             reserve = self.budgets.transfer_reserve_bytes.get(pool.info.kind.value, 0)
-            count = min(
+            now = time.monotonic()
+            self._waiting = {
+                h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
+            }
+            # Room owed to other waiting holders is not given away
+            owed = sum(w[0] for h, w in self._waiting.items() if h != holder)
+            uncapped = min(
                 math.ceil(want_bytes / ps),
                 (self.budgets.credit_max_bytes - self._held[holder]) // ps,
-                (self.budgets.credit_total_max_bytes - self._bytes(PageState.CREDITED))
-                // ps,
                 (pool.bytes[PageState.FREE] - reserve) // ps,
+            )
+            count = min(
+                uncapped,
+                (
+                    self.budgets.credit_total_max_bytes
+                    - self._bytes(PageState.CREDITED)
+                    - owed
+                )
+                // ps,
+            )
+            granted = max(count, 0)
+            self._note_waiting(
+                holder, (uncapped - granted) * ps, self._held[holder] + granted * ps, ps
             )
             if count <= 0:
                 return []
@@ -240,6 +269,46 @@ class PoolManager:
                 out.append(self._credit_location(pool, page))
             return out
 
+    def _fair_share(self, holder: str, ps: int) -> int:
+        """The node-total budget split among holders and waiting holders."""
+        holders = {h for h, b in self._held.items() if b > 0}
+        holders.update(self._waiting, (holder,))
+        return max(ps, self.budgets.credit_total_max_bytes // len(holders) // ps * ps)
+
+    def _note_waiting(self, holder: str, short: int, held: int, ps: int) -> None:
+        """Caller holds the lock. ``holder``, holding ``held`` bytes, got
+        ``short`` bytes less than it asked for (beyond its own limits)."""
+        owed = min(short, self._fair_share(holder, ps) - held)
+        if owed > 0:
+            self._waiting[holder] = (owed, time.monotonic())
+        else:
+            self._waiting.pop(holder, None)
+
+    def credit_asks(self, holder: str) -> list[tuple[str, int]]:
+        """Holders above their fair share to ask for credit back while
+        ``holder`` waits, largest first; each is asked once per CREDIT_ASK_S.
+        Credit only comes back by their CREDIT_RETURN."""
+        with self._lock:
+            waiting = self._waiting.get(holder)
+            if waiting is None:
+                return []
+            need = waiting[0]
+            ps = self.page_size
+            fair = self._fair_share(holder, ps)
+            now = time.monotonic()
+            asks = []
+            for other, held in self._held.most_common():
+                if need <= 0 or held <= fair:
+                    break
+                if other == holder:
+                    continue
+                ask = min(held - fair, math.ceil(need / ps) * ps)
+                need -= ask
+                if now - self._asked.get(other, -CREDIT_ASK_S) >= CREDIT_ASK_S:
+                    self._asked[other] = now
+                    asks.append((other, ask))
+            return asks
+
     def _credit_pool(self, kind: PoolKind | None) -> _Pool | None:
         for pool in self._pools.values():
             if pool.creditable and (kind is None or pool.info.kind == kind):
@@ -257,6 +326,8 @@ class PoolManager:
         )
 
     def _leave_free(self, pool: _Pool, page: Page) -> None:
+        if self._epoch_seq is None:
+            raise InvalidTransitionError("no page leaves FREE before the epoch_seq")
         page.allocation_id = uuid.uuid4().hex
         page.generation = make_generation(self._epoch_seq, self._counter)
         self._counter += 1
@@ -265,6 +336,16 @@ class PoolManager:
     def held_bytes(self, holder: str) -> int:
         with self._lock:
             return self._held[holder]
+
+    def forget_holder(self, holder: str) -> bool:
+        """Drop a holder's records; False (nothing dropped) while it holds credit."""
+        with self._lock:
+            if self._held[holder]:
+                return False
+            del self._held[holder]
+            self._waiting.pop(holder, None)
+            self._asked.pop(holder, None)
+            return True
 
     # ------------------------------------------------- worker-named transitions
 
@@ -371,6 +452,8 @@ class PoolManager:
         """PENDING -> READY: MaruServer added the location."""
         with self._lock:
             pool, page = self._page(ref, PageState.PENDING)
+            if page.location is None:
+                raise InvalidTransitionError(f"PENDING page {ref} has no location")
             self._move(pool, page, PageState.PENDING, PageState.READY)
             return page.location
 
@@ -435,6 +518,8 @@ class PoolManager:
                         )
             if self._held[holder] == 0:
                 del self._held[holder]
+            self._waiting.pop(holder, None)
+            self._asked.pop(holder, None)
             return out
 
     def release_quarantine(self, tag: str, pool_id: str | None = None) -> int:
