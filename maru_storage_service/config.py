@@ -5,6 +5,7 @@
 Unknown keys are errors so a typo never falls back to a default.
 """
 
+import grp
 import json
 import math
 import os
@@ -50,6 +51,7 @@ _TOP_KEYS = {
     "node_id",
     "role",
     "socket",
+    "socket_group",
     "server",
     "page_size",
     "local_pin",
@@ -150,6 +152,8 @@ class NodeConfig:
     tiers: tuple[TierConfig, ...]
     budgets: Budgets
     remote_server: RemoteServerConfig | None = None
+    # Group the socket is given to (mode 0660); None keeps the service's group
+    socket_group: str | None = None
     source: str = field(default="", compare=False)
 
     @property
@@ -418,6 +422,15 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         )
     server = _str(raw, "server", "config")
     socket_path = _str(raw, "socket", "config", DEFAULT_NODE_SOCKET)
+    socket_group = None
+    if raw.get("socket_group") is not None:
+        socket_group = _str(raw, "socket_group", "config")
+        try:
+            grp.getgrnam(socket_group)
+        except KeyError:
+            raise NodeConfigError(
+                f"config.socket_group: no group named {socket_group!r}"
+            ) from None
     role = raw.get("role", "gpu")
     if role not in ROLES:
         raise NodeConfigError(f"config.role: one of {list(ROLES)}, got {role!r}")
@@ -474,6 +487,7 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         node_id=node_id,
         role=role,
         socket=socket_path,
+        socket_group=socket_group,
         server=server,
         page_size=page_size,
         local_pin=local_pin,

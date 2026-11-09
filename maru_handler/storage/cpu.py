@@ -128,12 +128,15 @@ class CpuPool:
         *,
         medium: str = "cpu",
         mapping: mmap.mmap | None = None,
+        shared: bool = False,
     ):
         if capacity < page_size or page_size <= 0 or capacity % page_size:
             raise ValueError(
                 "CPU pool capacity must be a positive multiple of page size"
             )
         self.pool_id = pool_id
+        # A mapping other processes write too (a node's memfd pool)
+        self._shared = shared
         self.capacity = capacity
         self.page_size = page_size
         self.medium = medium
@@ -270,7 +273,12 @@ class CpuPool:
                         )
                         return False
                     populate = False
-            if not populate:
+            if not populate and self._shared:
+                # Another process may write a byte between our read and write
+                # back; the pages are allocated already, so reads suffice
+                for page in range(offset, end, _PAGE_SIZE):
+                    self._mapping[page]
+            elif not populate:
                 # Kernels before 5.14. Writing each page's first byte back
                 # faults it in writable without changing what it holds; a
                 # read would map the shared zero page of an anonymous pool.

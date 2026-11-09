@@ -79,7 +79,12 @@ class MaruHandler:
         self._rpc = self._make_rpc(self._config.server_urls[0])
         self._mapper: DaxMapper | None = None
         self._cpu = None
-        if self._config.storage_backend in {"cpu", "mixed"}:
+        if self._config.maru_node:
+            # Same methods as the storage clients below (design 4.2)
+            from .client.maru_client import MaruClient
+
+            self._cpu = MaruClient(self._config)
+        elif self._config.storage_backend in {"cpu", "mixed"}:
             from .storage.client import CpuStorageClient
 
             self._cpu = CpuStorageClient(self._config, self._rpc)
@@ -812,9 +817,7 @@ class MaruHandler:
             True if exists (and was pinned)
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.pin_kv(key)
@@ -833,9 +836,7 @@ class MaruHandler:
             True if unpinned successfully
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.unpin(key)
@@ -857,9 +858,7 @@ class MaruHandler:
             True if deleted
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -897,6 +896,8 @@ class MaruHandler:
         """
         if not self._connected or self._closing.is_set():
             return False
+        if self._config.maru_node:
+            return self._cpu.healthcheck()
 
         try:
             return self._rpc.heartbeat()
@@ -907,6 +908,8 @@ class MaruHandler:
     def get_stats(self) -> dict:
         """Get server statistics."""
         self._ensure_connected()
+        if self._config.maru_node:
+            return {"maru_node": self._cpu.local_stats()}
 
         stats = self._rpc.get_stats()
         result = {
@@ -1328,9 +1331,7 @@ class MaruHandler:
             List of booleans — True if key exists (and was pinned).
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_pin_kv(keys).results
@@ -1353,9 +1354,7 @@ class MaruHandler:
             List of booleans — True if successfully unpinned.
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_unpin(keys).results
@@ -1541,10 +1540,22 @@ class MaruHandler:
 
     def release_retrieved(self, infos: list) -> None:
         """Release CPU read leases after the last read/GPU copy has completed."""
-        if self._cpu is not None:
+        release = getattr(self._cpu, "release_retrieved", None)
+        if release is not None:
+            # maru_node: one UNPIN for the whole list
+            release(infos)
+        elif self._cpu is not None:
             for info in infos:
                 if info is not None:
                     info.release()
+
+    def _no_pinning(self) -> str:
+        if self._config.maru_node:
+            return (
+                "maru_node handlers pin through retrieve and release_retrieved; "
+                "MaruServer decides eviction"
+            )
+        return "CPU M1 uses read leases and does not support eviction/pinning"
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""

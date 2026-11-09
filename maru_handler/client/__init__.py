@@ -7,3 +7,7 @@ pin, unpin) and StorageConn to the StorageService of its node (attach, credit,
 write_done, fetch). MaruClient hides both behind the MaruHandler methods, so
 the vLLM connector does not change with them (design 4.2).
 """
+
+from .maru_client import CreditUnavailableError, MaruClient
+
+__all__ = ["CreditUnavailableError", "MaruClient"]

@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
+"""StorageService: builds and runs the parts of one node.
+
+Start order (design 5.1, spec 7.2): claim the socket, DRAM pool, NODE_OPEN,
+adopted ledgers, old worker drain, heartbeat, then accept on the UDS. S2
+serves a GPU node with one dram tier only; other configs are refused.
+"""
+
+import logging
+import threading
+import uuid
+
+from maru_common.storage_types import CloseMode, PoolDescriptor
+
+from .config import NodeConfig
+from .drivers.dram import DramPool, create_dram_pool
+from .local_pin import LocalPins
+from .local_server import LocalServer
+from .placement import DEFAULT_KEPT_BACKOFF_S, PlacementPolicy
+from .pool_manager import PageState, PoolManager
+from .server_client import ServerClient
+from .storage_manager import (
+    DEFAULT_EVICT_INTERVAL_S,
+    DEFAULT_GPU_DRAIN_GRACE_S,
+    OP_WINDOW,
+    StorageManager,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class NotServableError(RuntimeError):
+    """The config asks for something S2 does not serve."""
+
+
+def check_servable(config: NodeConfig) -> None:
+    """Refuse configs S2 cannot serve in full."""
+    if config.role != "gpu":
+        raise NotServableError(
+            "serving a memory node is not implemented yet (stage S7)"
+        )
+    stores = [t.store for t in config.tiers]
+    if stores != ["dram"]:
+        later = {"cxl": "S5", "ssd": "S6", "remote": "S7"}
+        missing = ", ".join(f"{s} ({later[s]})" for s in stores if s in later)
+        raise NotServableError(
+            f"serving the tiers {stores} is not implemented yet: only a single "
+            f"dram tier is served in stage S2; {missing} come later"
+        )
+
+
+class StorageService:
+    def __init__(
+        self,
+        config: NodeConfig,
+        *,
+        rpc_timeout_s: float = 2.0,
+        gpu_drain_grace_s: float = DEFAULT_GPU_DRAIN_GRACE_S,
+        evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
+        kept_backoff_s: float = DEFAULT_KEPT_BACKOFF_S,
+        host_boot_id: str | None = None,
+        node_epoch: str | None = None,
+        op_window: int = OP_WINDOW,
+    ):
+        check_servable(config)
+        self.config = config
+        self.node_epoch = node_epoch or uuid.uuid4().hex
+        self.rpc_timeout_s = rpc_timeout_s
+        self.gpu_drain_grace_s = gpu_drain_grace_s
+        self.evict_interval_s = evict_interval_s
+        self.kept_backoff_s = kept_backoff_s
+        self.host_boot_id = host_boot_id
+        self.op_window = op_window
+        self.dram: DramPool | None = None
+        self.pools: PoolManager | None = None
+        self.server: ServerClient | None = None
+        self.manager: StorageManager | None = None
+        self.local: LocalServer | None = None
+        self.adopted: list[str] = []
+        self._stopped = threading.Event()
+
+    def start(self) -> None:
+        """Bring the node up; on failure everything started is undone."""
+        try:
+            self._start()
+        except BaseException:
+            self.stop(CloseMode.RESTART)
+            raise
+
+    def _start(self) -> None:
+        config = self.config
+        top = config.top
+        # Claim the socket first: a second start must fail before NODE_OPEN
+        self.local = LocalServer(
+            config.socket,
+            None,
+            node_id=config.node_id,
+            node_epoch=self.node_epoch,
+            server_address=config.server,
+            page_size=config.page_size,
+            budgets=config.budgets,
+            pools=[],
+            socket_group=config.socket_group,
+        )
+        self.local.claim()
+        self.dram = create_dram_pool(
+            config.node_id,
+            self.node_epoch,
+            top.size,
+            config.page_size,
+            bool(top.hugepage),
+        )
+        self.pools = PoolManager(config.budgets, config.page_size)
+        self.pools.add_pool(self.dram.info())
+        self.server = ServerClient(
+            config.server,
+            config.node_id,
+            self.node_epoch,
+            rpc_timeout_s=self.rpc_timeout_s,
+            host_boot_id=self.host_boot_id,
+        )
+        placement = PlacementPolicy(
+            top.high_watermark, top.low_watermark, kept_backoff_s=self.kept_backoff_s
+        )
+        self.manager = StorageManager(
+            node_epoch=self.node_epoch,
+            pool_manager=self.pools,
+            placement=placement,
+            local_pins=LocalPins(),
+            server=self.server,
+            gpu_drain_grace_s=self.gpu_drain_grace_s,
+            evict_interval_s=self.evict_interval_s,
+            op_window=self.op_window,
+        )
+        opened = self.server.open([self.dram.info()], rm_domains=[])
+        self.pools.set_epoch_seq(opened.epoch_seq)
+        for info in opened.adopted:
+            # S2 asks for no CXL/SSD pool, but rebuilds any adopted ledger; no
+            # credit from them (they cannot be mapped yet)
+            self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
+            items = self.server.recover_list(info.pool_id)
+            refs = self.pools.recovered(
+                info.pool_id, [(i.key, i.location) for i in items]
+            )
+            for ref in refs:
+                placement.on_ready(ref)
+            self.adopted.append(info.pool_id)
+            logger.info(
+                "adopted pool %s: %d committed pages, the rest quarantined until "
+                "the old workers are confirmed",
+                info.pool_id,
+                len(refs),
+            )
+        self.manager.start()
+        self.manager.start_restart_drain(
+            opened.old_workers, self.adopted, opened.previous_node_epoch
+        )
+        self.server.start_heartbeat(
+            self.pools.usage, self.manager.on_heartbeat, self.manager.enter_safe_state
+        )
+        self.local.manager = self.manager
+        self.local.pools = [
+            (PoolDescriptor(pool=self.dram.info(), memfd=0), self.dram.fd)
+        ]
+        self.local.start()
+        logger.info(
+            "StorageService %s serving node %s: dram pool %s (%d MiB, pages of %d KiB)",
+            self.node_epoch,
+            config.node_id,
+            self.dram.pool_id,
+            self.dram.capacity >> 20,
+            config.page_size >> 10,
+        )
+
+    def stop(self, mode: CloseMode = CloseMode.RESTART) -> None:
+        """Stop serving, then NODE_CLOSE (restart: back soon; leave: gone)."""
+        if self._stopped.is_set():
+            return
+        self._stopped.set()
+        if self.local is not None:
+            self.local.stop()
+        if self.server is not None:
+            self.server.stop()
+        if self.manager is not None:
+            self.manager.stop()
+        if self.server is not None:
+            if self.server.close_session(mode):
+                logger.info("node session closed (%s)", mode.value)
+            self.server.close()
+        if self.dram is not None:
+            self.dram.close()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._stopped.wait(timeout)

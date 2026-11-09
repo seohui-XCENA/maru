@@ -139,7 +139,7 @@ def load_policy(path: str) -> frozenset[Key]:
     return frozenset(keys)
 
 
-def _result_bytes(result: Any) -> int:
+def result_bytes(result: Any) -> int:
     """Rough size of a stored op result, for op_bytes_max."""
     size = 64
     for item in getattr(result, "items", ()):
@@ -322,14 +322,14 @@ class MsService:
                     error="internal error; items not applied are REJECTED",
                     items=batch.outcomes + [ItemOutcome(ItemResult.REJECTED)] * rest,
                 )
-                self.ledger.finish(origin, record, result, _result_bytes(result))
+                self.ledger.finish(origin, record, result, result_bytes(result))
                 if not isinstance(exc, Exception):
                     raise
                 logger.error(
                     "op %s/%d failed part way", op.origin, op.seq, exc_info=True
                 )
                 return result
-            self.ledger.finish(origin, record, result, _result_bytes(result))
+            self.ledger.finish(origin, record, result, result_bytes(result))
             return result
         if verdict == Verdict.REPLAY:
             assert record is not None

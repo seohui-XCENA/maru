@@ -102,6 +102,12 @@ class MaruConfig:
     # hinted), the remote CXL agents whose region extension takes them hear
     # that this request is loading now.
     read_promotes: bool = False
+    # UDS of this node's StorageService; set, the handler uses MaruClient
+    maru_node: str | None = None
+    # maru_node: how long store/batch_store wait for publication
+    store_timeout_s: float = 10.0
+    # maru_node: how long the first connect waits for the node to listen
+    node_connect_timeout_s: float = 30.0
 
     @property
     def server_urls(self) -> list[str]:
@@ -166,6 +172,19 @@ class MaruConfig:
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.maru_node is not None:
+            if not isinstance(self.maru_node, str) or not self.maru_node:
+                raise ValueError("maru_node must be the path of the node socket")
+            if not self.engine_id or not self.cache_namespace:
+                raise ValueError("maru_node requires engine_id and cache_namespace")
+            if self.metadata_only:
+                raise ValueError(
+                    "a metadata-only handler on maru_node comes with stage S3"
+                )
+            if not 0 < self.store_timeout_s < float("inf"):
+                raise ValueError("store_timeout_s must be a positive number")
+            if not 0 <= self.node_connect_timeout_s < float("inf"):
+                raise ValueError("node_connect_timeout_s must be a number >= 0")
         if self.read_hints and self.storage_backend != "remote_cxl":
             raise ValueError("read_hints is supported by the remote_cxl backend")
         if self.write_hints and self.storage_backend != "remote_cxl":
