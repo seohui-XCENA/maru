@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Fully populated sample values for multi-storage message tests.
+"""Fully populated sample values for message round-trip tests.
 
-``sample(T)`` builds a value of type ``T`` from its type hints: every field of
-every nested dataclass is set (optional fields too), lists get two elements,
-and enums take their last member, so a round trip covers each field and type.
-``sample(T, minimal=True)`` takes the other branches: optional fields are
-None, lists and tuples have one element and enums take their first member.
+Default: every optional field set, two list items, last enum member.
+``minimal=True``: optional fields None, one item, first enum member.
 """
 
 import dataclasses

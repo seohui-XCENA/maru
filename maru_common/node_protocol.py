@@ -1,26 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService local protocol: messages between a worker and its node.
+"""StorageService local protocol (wire spec 2 and 4).
 
-Workers talk to the StorageService of their node over an AF_UNIX stream
-socket (default ``/run/maru/node.sock``). Messages use the same 16-byte header
-and MessagePack payload as MaruServer, split by the header's length field.
-ZeroMQ is not used here because it cannot pass file descriptors: the reply to
-ATTACH carries the memfd of every DRAM pool as SCM_RIGHTS on its first
-sendmsg, and no other message carries descriptors. The server reads the
-peer's pid with SO_PEERCRED; when the worker shares its pid namespace the pid
-must match the one in ATTACH. The reply tells the worker the pid and start
-time the node sees, which the worker then gives to MaruServer.
-
-A response's code is its request's code with the 0x80 bit set. NOTIFY is
-sent by the StorageService with sequence 0 and has no response.
-
-Sockets are blocking and have no timeout. Any exception from send_frame or
-recv_frame leaves the stream out of step, so the connection must be closed.
-Both ends may write from more than one thread (a response and a NOTIFY), so
-each connection serializes its send_frame calls with its own lock.
-
-See the multi-storage wire spec, chapters 2 and 4.
+Same header and MessagePack payload as MaruServer, over an AF_UNIX stream
+socket. Only the ATTACH reply carries descriptors (memfds, SCM_RIGHTS), which
+is why ZeroMQ is not used. Sockets are blocking without timeout; any framing
+error means the connection must be closed. Each connection serializes its
+sends with a lock (a reply and a NOTIFY may race).
 """
 
 import array
@@ -48,9 +34,7 @@ from .storage_types import (
 )
 
 DEFAULT_NODE_SOCKET = "/run/maru/node.sock"
-# A message larger than this is a protocol error, not something to buffer.
 MAX_NODE_PAYLOAD = 64 * 1024 * 1024
-# The most descriptors one message may carry (one per DRAM pool).
 MAX_NODE_FDS = 16
 NOTIFY_SEQUENCE = 0
 
@@ -131,10 +115,10 @@ class FetchItem:
 
 @dataclass
 class AttachRequest:
-    """ATTACH (0x01) - A worker joins the node and receives its pools.
+    """ATTACH (0x01).
 
-    ``pid`` and ``pid_start`` are the worker's own view of itself; they must
-    match SO_PEERCRED when the worker shares the node's pid namespace.
+    ``pid``/``pid_start`` are the worker's own view; checked against SO_PEERCRED
+    only when it shares the node's pid namespace.
     """
 
     engine_id: str
@@ -161,8 +145,7 @@ class AttachResponse:
     budgets: Budgets | None = None
     transfer_defaults: TransferDefaults = field(default_factory=TransferDefaults)
     local_pin: bool = False
-    # The worker as the node sees it (its pid namespace); the worker sends
-    # these in WORKER_OPEN
+    # Node-view identity of the worker, for WORKER_OPEN
     pid: int = 0
     pid_start: int = 0
 
@@ -330,11 +313,10 @@ class UnmapAckResponse:
 
 @dataclass
 class Notify:
-    """NOTIFY (0x30) - StorageService to worker, no response.
+    """NOTIFY (0x30), StorageService to worker, no response.
 
     Fields by kind: drain (drain_kind, epoch), credit_return (bytes),
-    pool_add (pool), pool_remove (pool_id, pool_generation),
-    epoch (node_epoch, server_epoch).
+    pool_add (pool), pool_remove (pool_id, pool_generation), epoch.
     """
 
     kind: NotifyKind
@@ -350,7 +332,7 @@ class Notify:
 
 @dataclass
 class NotifyAck:
-    """Placeholder response type; NOTIFY is never answered."""
+    """Placeholder; NOTIFY is never answered."""
 
     status: Status = Status.OK
 
@@ -378,8 +360,7 @@ NODE_MESSAGE_CLASSES = {
 
 
 class FrameError(ConnectionError):
-    """The stream broke or carried something that is not a message. The
-    connection is out of step and must be closed."""
+    """The stream broke or carried a non-message; close the connection."""
 
 
 def _check_frame(frame: bytes) -> None:
@@ -396,10 +377,7 @@ def _check_frame(frame: bytes) -> None:
 
 
 def send_frame(sock: socket.socket, frame: bytes, fds: Sequence[int] = ()) -> None:
-    """Send one encoded message; ``fds`` ride on its first byte.
-
-    The caller holds the connection's send lock.
-    """
+    """Send one encoded message; ``fds`` ride on its first byte. Hold the send lock."""
     _check_frame(frame)
     if len(fds) > MAX_NODE_FDS:
         raise ValueError(f"too many descriptors: {len(fds)} > {MAX_NODE_FDS}")
@@ -425,13 +403,10 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_frame(sock: socket.socket, max_fds: int = 0) -> tuple[bytes, list[int]] | None:
-    """Receive one message and the descriptors sent with it.
+    """Receive one message and its descriptors; None at a clean EOF.
 
-    ``max_fds`` is how many descriptors this message may bring: 0 for every
-    message except the reply to ATTACH. Descriptors beyond it are closed and
-    the message is refused, so a peer cannot pile descriptors on the
-    receiver. Returns None when the peer closed the connection between
-    messages. The caller owns the returned descriptors (close-on-exec).
+    More than ``max_fds`` descriptors are closed and refused (only the ATTACH
+    reply may bring any). The caller owns the returned descriptors.
     """
     if not 0 <= max_fds <= MAX_NODE_FDS:
         raise ValueError(f"max_fds must be within 0..{MAX_NODE_FDS}, got {max_fds}")
@@ -465,12 +440,7 @@ def recv_frame(sock: socket.socket, max_fds: int = 0) -> tuple[bytes, list[int]]
 
 
 def _recv_with_fds(sock: socket.socket, n: int) -> tuple[bytes, list[int], int]:
-    """recvmsg with descriptors marked close-on-exec as they arrive.
-
-    socket.recv_fds() accepts a flags argument but does not pass it on, so
-    MSG_CMSG_CLOEXEC would be lost there. Room is always made for
-    MAX_NODE_FDS so that unexpected descriptors arrive and can be closed.
-    """
+    """recvmsg with MSG_CMSG_CLOEXEC (socket.recv_fds drops its flags argument)."""
     fds = array.array("i")
     data, ancdata, flags, _ = sock.recvmsg(
         n, socket.CMSG_SPACE(MAX_NODE_FDS * fds.itemsize), socket.MSG_CMSG_CLOEXEC
@@ -493,19 +463,16 @@ _UCRED = struct.Struct("iII")
 
 
 def peer_credentials(sock: socket.socket) -> tuple[int, int, int]:
-    """(pid, uid, gid) of the process on the other end of a unix socket, in
-    this process's pid namespace."""
+    """(pid, uid, gid) of the peer, in this pid namespace."""
     raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
     return _UCRED.unpack(raw)
 
 
 def process_start_time(pid: int) -> int:
-    """Start time of ``pid`` in clock ticks since boot (/proc/<pid>/stat field
-    22), the ``pid_start`` that tells a reused pid apart."""
+    """Start time of ``pid`` in clock ticks (/proc/<pid>/stat field 22)."""
     with open(f"/proc/{pid}/stat", "rb") as f:
         stat = f.read()
-    # The command name is in parentheses and may hold spaces; fields after it
-    # start at field 3.
+    # comm may hold spaces and ')': fields resume after the last ')'
     rest = stat[stat.rindex(b")") + 2 :].split()
     return int(rest[19])
 

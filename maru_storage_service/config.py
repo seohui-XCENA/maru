@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Node config of a StorageService (multi-storage wire spec chapter 8).
+"""StorageService node config (wire spec 8): JSON, checked before anything starts.
 
-The config is a JSON file (``maru-storage --config node.json``). The order of
-``tiers`` is the tier order. Every rule of the spec is checked here, before
-the service creates anything, and a broken config stops the start with a
-message that names the field. Unknown keys are errors so that a typo does not
-silently fall back to a default.
+Unknown keys are errors so a typo never falls back to a default.
 """
 
 import json
@@ -102,10 +98,7 @@ _UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
 
 def parse_size(value: Any, what: str) -> int:
-    """Bytes from an integer or a string such as ``"32M"``, ``"1GiB"``.
-
-    Units are binary (K = 1024).
-    """
+    """Bytes from an int or a string like "32M" or "1GiB" (binary units)."""
     if isinstance(value, bool):
         raise NodeConfigError(f"{what}: expected a size, got {value!r}")
     if isinstance(value, int):
@@ -335,8 +328,7 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
     credit_total = size_or(
         "credit_total_max_bytes", share(top, CREDIT_TOTAL_FRACTION), no_size
     )
-    # A small top tier must still start with its defaults: the default per
-    # connection is 16 pages, but never more than the node total allows.
+    # Default: 16 pages, but within the node total so small tiers still start
     default_credit_max = max(
         page_size,
         min(CREDIT_MAX_PAGES * page_size, credit_total) // page_size * page_size,

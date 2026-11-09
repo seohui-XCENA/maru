@@ -33,22 +33,19 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
-# A response's msg_type is its request's code with this bit set, on every
-# endpoint (MaruServer and StorageService alike).
+# Response code = request code | RESPONSE_BIT, on both endpoints.
 RESPONSE_BIT = int(MessageType.RESPONSE)
 OP_DIGEST_SIZE = 16
-# Fields that say who sends and under which session, not what is asked; a
-# resend after reopening a session must give the same digest.
+# Left out of op digests so a resend after reopening a session still matches.
 ENVELOPE_FIELDS = ("op", "session", "server_epoch", "worker_session")
 # The header sequence is 32 bits; 0 is kept for NOTIFY.
 _SEQ_MOD = 1 << 32
 
 
 class MessageDecodeError(ValueError):
-    """A multi-storage message whose payload does not fit its type.
+    """A multi-storage payload that does not fit its type.
 
-    ``header`` is the parsed header, or None when the header itself was
-    broken, so that the receiver can answer REJECTED to the right request.
+    ``header`` is None when the header itself was unreadable.
     """
 
     def __init__(self, message: str, header: MessageHeader | None = None):
@@ -58,8 +55,7 @@ class MessageDecodeError(ValueError):
 
 @dataclass(frozen=True)
 class DecodedRequest:
-    """A request with its header and the raw payload it was decoded from;
-    the receiver computes op digests from ``payload`` (see op_digest)."""
+    """A decoded request with its raw payload (for op digests)."""
 
     header: MessageHeader
     request: Any
@@ -92,8 +88,7 @@ def _to_serializable(obj: Any) -> Any:
 
 
 def _canonical(obj: Any) -> Any:
-    """Plain values with dict keys sorted at every level, so that a payload
-    and its decoded copy encode to the same bytes."""
+    """Plain values with dict keys sorted at every level."""
     obj = _to_serializable(obj)
     if isinstance(obj, dict):
         return {k: _canonical(obj[k]) for k in sorted(obj)}
@@ -105,15 +100,10 @@ def _canonical(obj: Any) -> Any:
 
 
 def op_digest(request: Any) -> bytes:
-    """Digest of what a request asks (spec chapter 1, op).
+    """BLAKE2b-128 of the canonical request without ENVELOPE_FIELDS (spec 1).
 
-    BLAKE2b-128 of the MessagePack encoding of the request with the envelope
-    fields (op, session, server_epoch, worker_session) removed, dict keys
-    sorted at every level, enums as their values and tuples as lists. The
-    sender computes it from the request it builds. The receiver computes it
-    from the raw payload (DecodedRequest.payload), never from the decoded
-    dataclass: fields one side does not know, or defaults it filled in, would
-    make the two differ.
+    The receiver computes it from DecodedRequest.payload, not the dataclass,
+    so fields unknown to one side do not change it.
     """
     payload = _canonical(request)
     if not isinstance(payload, dict):
@@ -125,19 +115,11 @@ def op_digest(request: Any) -> bytes:
 
 
 class Serializer:
-    """
-    Binary message serializer using MessagePack.
+    """Binary message serializer: [16-byte header][MessagePack payload].
 
-    Message format::
-
-        [Header 16 bytes][MessagePack payload]
-
-    ``message_classes`` maps each request code of one endpoint to its request
-    and response dataclasses; the default is the MaruServer table.
-    ``strict_codes`` are the codes decoded with type checks (wrong types,
-    unknown enum values and non-map payloads raise MessageDecodeError). By
-    default these are the multi-storage codes of the MaruServer table, or
-    every code of a table passed in; legacy messages keep the lenient decode.
+    ``message_classes``: one endpoint's code -> (request, response) table.
+    ``strict_codes``: codes decoded with type checks (default: the multi-storage
+    codes, or every code of a given table); legacy codes stay lenient.
     """
 
     def __init__(
@@ -162,10 +144,8 @@ class Serializer:
                 MaruPoolInfo.from_dict(d) if isinstance(d, dict) else d
             ),
         }
-        # dacite config for nested dataclass conversion with type hooks for maru_shm types
         self._dacite_config = Config(check_types=False, type_hooks=maru_shm_hooks)
-        # Multi-storage messages: enums travel as their values and tuples as
-        # lists; every field is type checked, and an int is a valid float
+        # Enums travel as values and tuples as lists; an int is a valid float
         self._strict_config = Config(
             check_types=True,
             cast=[Enum, tuple],
@@ -177,7 +157,7 @@ class Serializer:
         )
 
     def _next_seq(self) -> int:
-        """Next header sequence: wraps at 32 bits and skips 0 (NOTIFY)."""
+        """Next header sequence: wraps at 32 bits, skips 0 (NOTIFY)."""
         with self._seq_lock:
             seq = next(self._seq_counter) % _SEQ_MOD
             if seq == 0:
@@ -300,11 +280,7 @@ class Serializer:
         return header, self._from_payload(header, request_cls, payload)
 
     def decode_request_payload(self, data: bytes) -> DecodedRequest:
-        """Decode a request and keep its raw payload, for op digests.
-
-        Raises MessageDecodeError (with the header when it was readable) for
-        anything that is not a valid request of this endpoint.
-        """
+        """Decode a request and keep its raw payload; raises MessageDecodeError."""
         try:
             header, payload = self.decode(data)
         except (ValueError, msgpack.UnpackException) as e:

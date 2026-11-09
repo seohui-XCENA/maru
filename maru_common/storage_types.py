@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Descriptors for the storage directory.
 
-The first half serves the session backends (cpu, mixed, remote_cxl) and stays
-until they are removed. The second half holds the identifiers and records of
-the multi-storage structure: a central MaruServer, one StorageService on every
-node, and workers that read and write the node pools directly. Their meaning
-and rules are in the multi-storage wire spec (chapters 1, 2 and 5).
+The session backends (cpu, mixed, remote_cxl) use StorageLocation; the rest is
+the multi-storage wire types (wire spec chapters 1, 2, 5).
 """
 
 from dataclasses import dataclass
@@ -50,9 +47,8 @@ class StorageUnavailableError(ConnectionError):
 MS_PROTOCOL = "ms1"
 # Items in one multi-storage request (spec 9, MAX_BATCH)
 MAX_BATCH = MAX_STORAGE_BATCH
-# A generation is epoch_seq << GENERATION_EPOCH_SHIFT | counter, so every
-# generation a new StorageService gives is above those of its earlier runs.
-# It travels as an unsigned 64-bit integer, which bounds epoch_seq.
+# generation = epoch_seq << 40 | counter: a new run always gives higher
+# generations. It travels as uint64, which bounds epoch_seq.
 GENERATION_EPOCH_SHIFT = 40
 GENERATION_COUNTER_MAX = (1 << GENERATION_EPOCH_SHIFT) - 1
 EPOCH_SEQ_MAX = (1 << (64 - GENERATION_EPOCH_SHIFT)) - 1
@@ -75,8 +71,7 @@ def generation_epoch_seq(generation: int) -> int:
 
 @unique
 class PoolKind(StrEnum):
-    """Physical medium of a pool. ``cpu`` is read as the old name of dram,
-    on the wire and in the node config."""
+    """Pool medium; ``cpu`` is the old name of dram."""
 
     DRAM = "dram"
     CXL = "cxl"
@@ -197,8 +192,7 @@ class Key:
 
 @dataclass(frozen=True)
 class Location:
-    """Where one copy of a KV lies. The session backends use StorageLocation,
-    which has the same fields with ``medium`` instead of ``kind``."""
+    """One copy of a KV (StorageLocation with ``kind`` instead of ``medium``)."""
 
     pool_id: str
     allocation_id: str
@@ -216,11 +210,9 @@ class KeyLocation:
 
 @dataclass(frozen=True)
 class OpRef:
-    """Identifies a state-changing request for resends (spec 1, op).
+    """Identifies a state-changing request for resends (spec 1).
 
-    ``digest`` is op_digest() of the request without its ``op`` field, and
-    ``ack`` is the highest seq whose result the sender already holds, along
-    with every seq below it.
+    ``ack``: highest seq whose result the sender holds, along with all below it.
     """
 
     origin: str
@@ -255,8 +247,7 @@ class DaxMapping:
 
 @dataclass(frozen=True)
 class PoolDescriptor:
-    """What a worker needs to map a pool. DRAM gives the index of the memfd
-    sent with the message, CXL gives the region; SSD has no descriptor."""
+    """How a worker maps a pool: memfd index (DRAM) or RM region (CXL)."""
 
     pool: PoolInfo
     memfd: int | None = None
@@ -301,8 +292,7 @@ class RmDomain:
 
 @dataclass(frozen=True)
 class PoolUsage:
-    """Bytes of one pool in each page state (spec 6.2); they add up to
-    ``capacity``."""
+    """Bytes per page state (spec 6.2); they add up to ``capacity``."""
 
     pool_id: str
     capacity: int

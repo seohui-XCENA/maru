@@ -619,11 +619,8 @@ class ShutdownResponse:
 # =============================================================================
 # Multi-storage Messages (0x40 - 0x5F)
 # =============================================================================
-#
-# Requests of an open session carry its token (``session``) and the
-# ``server_epoch`` it was opened under; a state-changing request also carries
-# ``op`` (spec chapter 1). Every response carries ``status`` and ``error``, and
-# a response to a request with ``items`` answers them in the same order.
+# Session requests carry ``session`` and ``server_epoch``; state changes carry
+# ``op`` (spec 1). Response ``items`` follow the request's order.
 
 
 @dataclass
@@ -791,12 +788,9 @@ class WorkerExitResponse:
 
 @dataclass
 class WorkerOpenRequest:
-    """WORKER_OPEN (0x48) - A worker or a scheduler opens its session.
+    """WORKER_OPEN (0x48).
 
-    ``pid`` and ``pid_start`` are the values the StorageService returned in
-    ATTACH, so they name the process in the node's pid namespace even when
-    the worker runs in a container; a new StorageService uses them after a
-    restart. A scheduler that does not attach sends its own.
+    ``pid``/``pid_start`` are the node-view values from the ATTACH reply.
     """
 
     node_id: str
