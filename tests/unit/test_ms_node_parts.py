@@ -113,7 +113,9 @@ class TestPlacement:
         for i in range(8):
             p.on_ready(ref(i))
         kw = {"capacity": 8, "retiring_bytes": 0, "page_size": 1, "limit": 100}
-        assert p.candidates("p", free_bytes=2, **kw) == []  # 6/8 = 0.75, not above
+        assert (
+            p.candidates("t", ["p"], free_bytes=2, **kw) == []
+        )  # 6/8 = 0.75, not above
 
     def test_lru_down_to_the_low_watermark(self):
         now = [0.0]
@@ -121,15 +123,49 @@ class TestPlacement:
         for i in range(8):
             p.on_ready(ref(i))
         kw = {"capacity": 8, "retiring_bytes": 0, "page_size": 1, "limit": 100}
-        assert p.candidates("p", free_bytes=1, **kw) == [ref(0), ref(1), ref(2)]
+        assert p.candidates("t", ["p"], free_bytes=1, **kw) == [ref(0), ref(1), ref(2)]
         # in flight pages count as leaving: nothing more until they resolve
-        assert p.candidates("p", free_bytes=1, **kw) == []
+        assert p.candidates("t", ["p"], free_bytes=1, **kw) == []
         for r in (ref(0), ref(1), ref(2)):
             p.retired(r)
         # 5/8 is below high but removal goes on until low (hysteresis)
-        assert p.candidates("p", free_bytes=3, **kw) == [ref(3)]
+        assert p.candidates("t", ["p"], free_bytes=3, **kw) == [ref(3)]
         p.retired(ref(3))
-        assert p.candidates("p", free_bytes=4, **kw) == []
+        assert p.candidates("t", ["p"], free_bytes=4, **kw) == []
+
+    def test_the_watermark_is_the_tiers_over_its_pools(self):
+        now = [0.0]
+        p = self.policy(now)
+        for i in range(4):
+            p.on_ready(ref(i, "a"))
+        kw = {"retiring_bytes": 0, "page_size": 1, "limit": 100}
+        # pool a is full but the tier (a and an empty b) is half used
+        assert p.candidates("t", ["a", "b"], capacity=8, free_bytes=4, **kw) == []
+        assert p.candidates("t", ["a"], capacity=4, free_bytes=0, **kw) == [
+            ref(0, "a"),
+            ref(1, "a"),
+        ]
+
+    def test_lru_runs_across_the_tiers_pools(self):
+        now = [0.0]
+        p = self.policy(now)
+        p.on_ready(ref(0, "a"))
+        p.on_ready(ref(0, "b"))
+        p.on_ready(ref(1, "a"))
+        p.on_ready(ref(1, "b"))
+        table = {"a0": ref(0, "a")}
+        infos = [AccessInfo("a", "a0", 100, hits=1, last_ts=1.0)]
+        assert p.on_access(infos, lambda info: table.get(info.allocation_id)) == 1
+        kw = {"retiring_bytes": 0, "page_size": 1, "limit": 100}
+        # order now b0, a1, b1, a0; 4 of 4 used, low 0.5 leaves 2
+        got = p.candidates("t", ["a", "b"], capacity=4, free_bytes=0, **kw)
+        assert got == [ref(0, "b"), ref(1, "a")]
+        # watermarks and hysteresis are per tier
+        p.set_watermarks("u", 0.9, 0.1)
+        assert p.candidates("u", ["a", "b"], capacity=4, free_bytes=0, **kw) == [
+            ref(1, "b"),
+            ref(0, "a"),
+        ]
 
     def test_access_moves_pages_to_the_recent_end(self):
         now = [0.0]
@@ -145,7 +181,7 @@ class TestPlacement:
         assert p.on_access(infos, lambda info: table.get(info.allocation_id)) == 2
         kw = {"capacity": 4, "retiring_bytes": 0, "page_size": 1, "limit": 100}
         # order now 2, 3, 0, 1
-        assert p.candidates("p", free_bytes=0, **kw) == [ref(2), ref(3)]
+        assert p.candidates("t", ["p"], free_bytes=0, **kw) == [ref(2), ref(3)]
 
     def test_kept_causes(self):
         now = [0.0]
@@ -153,19 +189,19 @@ class TestPlacement:
         for i in range(4):
             p.on_ready(ref(i))
         kw = {"capacity": 4, "retiring_bytes": 0, "page_size": 1, "limit": 1}
-        (first,) = p.candidates("p", free_bytes=0, **kw)
+        (first,) = p.candidates("t", ["p"], free_bytes=0, **kw)
         p.kept(first, KeptCause.PINNED)
-        (second,) = p.candidates("p", free_bytes=0, **kw)
+        (second,) = p.candidates("t", ["p"], free_bytes=0, **kw)
         p.kept(second, KeptCause.MOVED)
-        (third,) = p.candidates("p", free_bytes=0, **kw)
+        (third,) = p.candidates("t", ["p"], free_bytes=0, **kw)
         p.kept(third, KeptCause.INVALID)
         assert (first, second, third) == (ref(0), ref(1), ref(2))
         assert p.is_held(second) and p.is_held(third) and not p.is_held(first)
-        assert p.candidates("p", free_bytes=0, **kw) == [ref(3)]
+        assert p.candidates("t", ["p"], free_bytes=0, **kw) == [ref(3)]
         p.release([ref(3)])
-        assert p.candidates("p", free_bytes=0, **kw) == []
+        assert p.candidates("t", ["p"], free_bytes=0, **kw) == []
         now[0] = 1.5  # the PINNED one is tried again after the backoff
-        assert p.candidates("p", free_bytes=0, **kw) == [ref(0)]
+        assert p.candidates("t", ["p"], free_bytes=0, **kw) == [ref(0)]
 
 
 class TestLocalPins:

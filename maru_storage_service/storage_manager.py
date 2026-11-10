@@ -51,7 +51,6 @@ from maru_common.storage_types import (
     Location,
     NotifyKind,
     OpRef,
-    PoolInfo,
     PoolKind,
     Status,
     WorkerRef,
@@ -997,36 +996,30 @@ class StorageManager:
         finals += self._commit_queued(queued, recovering=False)
         self._finalize_queued(finals)
         # Lower tiers first: the room they make takes the pages from above
-        for pool_id in self._eviction_order():
+        for kind in reversed(list(self.traits)):
             if self._halted():  # the session went during this pass
                 return
-            info = self.pools.pool_info(pool_id)
-            traits = self.traits.get(info.kind) if info is not None else None
-            with self._lock:
-                invalid = pool_id in self._invalid_pools
-            if (
-                info is None
-                or traits is None
-                or not traits.evicts
-                or invalid
-                or self.workers.is_adopted(pool_id)
-                or (traits.credit and not self.pools.creditable(pool_id))
-            ):
+            traits = self.traits[kind]
+            if not traits.evicts:
                 continue
+            pools = self._evictable_pools(kind)
+            if not pools:
+                continue
+            capacity, free, retiring, page_size = self._tier_usage(pools)
             candidates = self.placement.candidates(
-                pool_id,
-                capacity=info.capacity,
-                free_bytes=self.pools.bytes_in(PageState.FREE, pool_id),
-                retiring_bytes=self.pools.bytes_in(PageState.RETIRING, pool_id),
-                page_size=info.page_size,
+                kind.value,
+                pools,
+                capacity=capacity,
+                free_bytes=free,
+                retiring_bytes=retiring,
+                page_size=page_size,
                 limit=MAX_BATCH,
             )
             refs, items = self._ready_items(candidates)
             if not refs:
                 continue
             if traits.demotes_to is not None and self.transfers is not None:
-                assert info is not None
-                self._demote(info, traits.demotes_to, refs, items)
+                self._demote(kind, pools, traits.demotes_to, refs, items)
             else:
                 self.retire(refs, items)
 
@@ -1036,14 +1029,38 @@ class StorageManager:
             paused = self._paused() or self._stopping
         return paused or self.metadata.epoch_lost
 
-    def _eviction_order(self) -> list[str]:
-        depth = {kind: i for i, kind in enumerate(self.traits)}
-
-        def key(pool_id: str) -> int:
+    def _evictable_pools(self, kind: PoolKind) -> list[str]:
+        """The tier's pools pressure is measured over and removed from: not
+        invalid, not adopted and (in the credit tier) creditable."""
+        traits = self.traits[kind]
+        with self._lock:
+            invalid = set(self._invalid_pools)
+        pools = []
+        for pool_id in self.pools.pool_ids():
             info = self.pools.pool_info(pool_id)
-            return -depth.get(info.kind, 0) if info is not None else 0
+            if (
+                info is None
+                or info.kind != kind
+                or pool_id in invalid
+                or self.workers.is_adopted(pool_id)
+                or (traits.credit and not self.pools.creditable(pool_id))
+            ):
+                continue
+            pools.append(pool_id)
+        return pools
 
-        return sorted(self.pools.pool_ids(), key=key)
+    def _tier_usage(self, pools: list[str]) -> tuple[int, int, int, int]:
+        """Capacity, FREE bytes, RETIRING bytes and page size over ``pools``."""
+        capacity = free = retiring = page_size = 0
+        for pool_id in pools:
+            info = self.pools.pool_info(pool_id)
+            if info is None:
+                continue
+            capacity += info.capacity
+            free += self.pools.bytes_in(PageState.FREE, pool_id)
+            retiring += self.pools.bytes_in(PageState.RETIRING, pool_id)
+            page_size = info.page_size
+        return capacity, free, retiring, page_size
 
     def _ready_items(self, candidates) -> tuple[list[PageRef], list[KeyLocation]]:
         refs, items = [], []
@@ -1066,7 +1083,8 @@ class StorageManager:
 
     def _demote(
         self,
-        info: PoolInfo,
+        kind: PoolKind,
+        pools: list[str],
         below: PoolKind,
         refs: list[PageRef],
         items: list[KeyLocation],
@@ -1075,8 +1093,8 @@ class StorageManager:
         with a finalizer, then FINALIZE_MOVE the sources. A source with a copy
         below already gets a finalizer on that copy instead. Pages that find no
         room wait for the tier below to evict (it ran first in this pass);
-        while this pool is past its high watermark they are dropped instead:
-        writes must not stall."""
+        while the tier (``pools``) is past its high watermark they are dropped
+        instead: writes must not stall."""
         moves: list[_Move] = []
         todo = []
         for ref, item in zip(refs, items, strict=True):
@@ -1102,14 +1120,11 @@ class StorageManager:
         rest = todo[len(dests) :]
         drop = []
         if rest:
+            capacity, free, _, _ = self._tier_usage(pools)
             if self.placement.above_high(
-                info.pool_id,
-                capacity=info.capacity,
-                free_bytes=self.pools.bytes_in(PageState.FREE, info.pool_id),
+                kind.value, capacity=capacity, free_bytes=free
             ):
-                logger.debug(
-                    "no room below %s: dropping %d pages", info.pool_id, len(rest)
-                )
+                logger.debug("no room below %s: dropping %d pages", kind, len(rest))
                 with self._lock:
                     self.move_results["DROPPED"] += len(rest)
                 drop = rest

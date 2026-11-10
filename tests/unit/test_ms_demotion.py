@@ -552,10 +552,9 @@ def test_the_budget_reaches_the_engine(nodes):
 def test_cxl_keeps_its_own_watermarks(nodes):
     node = nodes(high=0.5, low=0.25)  # the cxl tier's are 0.9 and 0.8
     placement = node.manager.placement
-    cxl = cxl_ids(node)[0]
-    assert not placement.above_high(cxl, capacity=100, free_bytes=15)
-    assert placement.above_high(cxl, capacity=100, free_bytes=5)
-    assert placement.above_high(node.dram.pool_id, capacity=100, free_bytes=45)
+    assert not placement.above_high("cxl", capacity=100, free_bytes=15)
+    assert placement.above_high("cxl", capacity=100, free_bytes=5)
+    assert placement.above_high("dram", capacity=100, free_bytes=45)
 
 
 def test_one_tier_nodes_have_no_engine(fake, sockdir):
@@ -760,7 +759,7 @@ def test_an_invalid_pool_is_not_evicted(fake, nodes, handlers):
         m._invalid_pools.add(cxl)
     # A pass that began before the mark may still retire: let it end first
     wait_until(lambda: not m._evict_busy and not m._retire_queue, what="pass ended")
-    m.placement.set_watermarks(cxl, 0.2, 0.1)  # it would evict now
+    m.placement.set_watermarks("cxl", 0.2, 0.1)  # it would evict now
     before = cxl_retires()
     time.sleep(0.5)
     assert cxl_retires() == before
@@ -777,9 +776,9 @@ def test_past_high_the_pages_without_room_are_dropped_while_others_move(
     passes: list[tuple[int, int]] = []
     real = m._demote
 
-    def demote(info, below, refs, items):
+    def demote(kind, pools, below, refs, items):
         added, dropped = m.move_results["COMMIT:ADDED"], m.move_results["DROPPED"]
-        real(info, below, refs, items)
+        real(kind, pools, below, refs, items)
         passes.append(
             (
                 m.move_results["COMMIT:ADDED"] - added,

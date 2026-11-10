@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""PlacementPolicy: LRU removal candidates per pool.
+"""PlacementPolicy: LRU removal candidates per tier.
 
 A candidate is not an approval: the policy sends no RPC. A tier that demotes
 moves its candidates to the tier below; one that does not drops them.
 """
 
 import collections
+import heapq
+import itertools
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -19,7 +21,8 @@ DEFAULT_KEPT_BACKOFF_S = 1.0
 
 
 class PlacementPolicy:
-    """LRU per pool and the watermark rule. Thread safe."""
+    """LRU per pool and the watermark rule per tier: a tier's pools are one
+    space (a full CXL region beside empty ones is no pressure). Thread safe."""
 
     def __init__(
         self,
@@ -36,34 +39,36 @@ class PlacementPolicy:
         self.kept_backoff_s = kept_backoff_s
         self._clock = clock
         self._lock = threading.Lock()
-        # Least recently used first
-        self._lru: dict[str, collections.OrderedDict[PageRef, None]] = {}
+        # Least recently used first; the value orders pages across pools
+        self._lru: dict[str, collections.OrderedDict[PageRef, int]] = {}
+        self._seq = itertools.count()
         self._inflight: set[PageRef] = set()
         self._backoff: dict[PageRef, float] = {}
         # Never offered again (KEPT MOVED/INVALID, unknown outcome)
         self._held: set[PageRef] = set()
         self._evicting: dict[str, bool] = {}
-        # (high, low) of pools whose tier is not the top one
+        # (high, low) of tiers other than the top one
         self._marks: dict[str, tuple[float, float]] = {}
 
-    def set_watermarks(self, pool_id: str, high: float, low: float) -> None:
-        """The watermarks of ``pool_id`` (its tier's) instead of the top tier's."""
+    def set_watermarks(self, tier: str, high: float, low: float) -> None:
+        """The watermarks of ``tier`` instead of the top tier's."""
         if not 0 < low < high <= 1:
             raise ValueError("need 0 < low_watermark < high_watermark <= 1")
         with self._lock:
-            self._marks[pool_id] = (high, low)
+            self._marks[tier] = (high, low)
 
-    def above_high(self, pool_id: str, *, capacity: int, free_bytes: int) -> bool:
-        """The pool uses more than its high watermark."""
+    def above_high(self, tier: str, *, capacity: int, free_bytes: int) -> bool:
+        """The tier (its pools' capacity and FREE bytes) uses more than its
+        high watermark."""
         with self._lock:
-            high, _ = self._marks.get(pool_id, (self.high, self.low))
+            high, _ = self._marks.get(tier, (self.high, self.low))
         return capacity - free_bytes > high * capacity
 
     def on_ready(self, ref: PageRef) -> None:
         """A page became READY: most recently used."""
         with self._lock:
             lru = self._lru.setdefault(ref.pool_id, collections.OrderedDict())
-            lru[ref] = None
+            lru[ref] = next(self._seq)
             lru.move_to_end(ref)
 
     def on_gone(self, ref: PageRef) -> None:
@@ -85,13 +90,15 @@ class PlacementPolicy:
             with self._lock:
                 lru = self._lru.get(ref.pool_id)
                 if lru is not None and ref in lru:
+                    lru[ref] = next(self._seq)
                     lru.move_to_end(ref)
                     moved += 1
         return moved
 
     def candidates(
         self,
-        pool_id: str,
+        tier: str,
+        pool_ids: Iterable[str],
         *,
         capacity: int,
         free_bytes: int,
@@ -99,24 +106,35 @@ class PlacementPolicy:
         page_size: int,
         limit: int,
     ) -> list[PageRef]:
-        """READY pages to retire, LRU first: from above ``high`` down to ``low``.
-        In-flight and RETIRING pages count as leaving."""
+        """READY pages of ``pool_ids`` to retire, LRU first across them: from
+        above the tier's ``high`` down to its ``low``. ``capacity`` and the
+        bytes are those pools' sums. In-flight and RETIRING pages count as
+        leaving."""
+        pools = set(pool_ids)
         with self._lock:
-            high, low = self._marks.get(pool_id, (self.high, self.low))
+            high, low = self._marks.get(tier, (self.high, self.low))
             used = capacity - free_bytes
-            evicting = self._evicting.get(pool_id, False)
+            evicting = self._evicting.get(tier, False)
             if not evicting and used > high * capacity:
                 evicting = True
             if used <= low * capacity:
                 evicting = False
-            self._evicting[pool_id] = evicting
+            self._evicting[tier] = evicting
             if not evicting:
                 return []
-            inflight = sum(1 for r in self._inflight if r.pool_id == pool_id)
+            inflight = sum(1 for r in self._inflight if r.pool_id in pools)
             need = used - retiring_bytes - inflight * page_size - low * capacity
             now = self._clock()
             out: list[PageRef] = []
-            for ref in self._lru.get(pool_id, ()):
+            oldest_first = heapq.merge(
+                *(
+                    ((seq, ref) for ref, seq in self._lru[p].items())
+                    for p in pools
+                    if p in self._lru
+                ),
+                key=lambda item: item[0],
+            )
+            for _, ref in oldest_first:
                 if need <= 0 or len(out) >= limit:
                     break
                 if ref in self._inflight or ref in self._held:

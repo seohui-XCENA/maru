@@ -4,6 +4,7 @@
 go, and the StorageService registering them."""
 
 import threading
+import time
 
 import pytest
 
@@ -581,6 +582,30 @@ def test_pressure_on_a_cxl_only_node_retires_its_pages(fake, sockdir):
                 break
         wait_until(lambda: node.manager.retire_results, what="a retire")
         assert written >= 8
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_a_full_region_is_no_pressure_while_the_tier_has_room(fake, sockdir):
+    from tests.unit.ms_node_helpers import RawWorker
+
+    rm = FakeRm()
+    config = cxl_only_config(fake, sockdir, pages=32, region_pages=4)
+    node = start_node(config, region_source=rm, cxl_renew_s=0.02)
+    try:
+        worker = RawWorker(f"{sockdir}/node.sock")
+        worker.attach()
+        credits = worker.credit(4 * PAGE).credits
+        # one region's every page: that region is full, the tier 1/8 used
+        assert len({c.pool_id for c in credits}) == 1 and len(credits) == 4
+        keys = [f"k{i}" for i in range(4)]
+        assert worker.write_done(credits, keys).status.value == "OK"
+        wait_until(
+            lambda: node.pools.bytes_in(PageState.READY) == 4 * PAGE, what="READY"
+        )
+        time.sleep(0.3)  # eviction passes run on every commit and on a timer
+        assert not node.manager.retire_results
         worker.close()
     finally:
         node.stop()

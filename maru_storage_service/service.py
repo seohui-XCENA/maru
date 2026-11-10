@@ -237,11 +237,9 @@ class StorageService:
             and cxl_tier.high_watermark is not None
             and cxl_tier.low_watermark is not None
         ):
-            assert self.cxl is not None
-            for pool in self.cxl.pools:
-                placement.set_watermarks(
-                    pool.pool_id, cxl_tier.high_watermark, cxl_tier.low_watermark
-                )
+            placement.set_watermarks(
+                PoolKind.CXL.value, cxl_tier.high_watermark, cxl_tier.low_watermark
+            )
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,
