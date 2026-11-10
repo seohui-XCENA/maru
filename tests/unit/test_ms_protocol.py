@@ -39,8 +39,10 @@ MS_CODES = sorted(MS_MESSAGE_CLASSES)
 
 
 def test_codes_are_in_the_multi_storage_range_and_unique():
-    assert len(set(MS_CODES)) == len(MS_CODES) == 20
+    assert len(set(MS_CODES)) == len(MS_CODES) == 18
     assert all(0x40 <= code <= 0x5F for code in MS_CODES)
+    # retired (REGION_REQUEST, REGION_RETURN): never reused
+    assert not {0x5E, 0x5F} & {int(code) for code in MessageType}
     # the response code keeps the request code below the response bit
     assert all(code & RESPONSE_BIT == 0 for code in MS_CODES)
 

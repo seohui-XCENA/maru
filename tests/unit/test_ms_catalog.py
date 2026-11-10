@@ -39,9 +39,9 @@ def env():
 def open_node(wire, node_id, ssd=False, cxl=False):
     node = FakeNode(wire, node_id)
     pools = [node.dram()] + ([node.ssd()] if ssd else [])
-    assert node.open(pools=pools).status == Status.OK
     if cxl:
-        wire.service.register_region(node.cxl(region_id=hash(node_id) % 1000))
+        pools.append(node.cxl(region_id=hash(node_id) % 1000))
+    assert node.open(pools=pools).status == Status.OK
     return node
 
 
@@ -516,7 +516,7 @@ class TestFetch:
         a, b, worker, k, source = self._setup(wire)
         # the worker's session belongs to a replaced run of node a
         a.restart()
-        assert a.open(pools=[a.dram(), a.ssd()]).status == Status.OK
+        assert a.open(pools=[a.dram(), a.ssd(), a.cxl()]).status == Status.OK
         pin = a.source_pin((k, source)).items[0].pin_id
         copy = a.loc(a.dram(), 1)
         done = a.fetch_complete(worker.token, (k, pin, copy))
@@ -524,7 +524,6 @@ class TestFetch:
         assert not service.pins.held_by(worker.token)
         assert copy in [e.location for e in service.catalog.locations(k)]
         # an orphan: it reads node a's CXL, and node a leaves and comes back
-        service.register_region(a.cxl())
         a.commit((key("c"), a.loc(a.cxl(), 1)))
         reader = FakeWorker(wire, a)
         reader.open()

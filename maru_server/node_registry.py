@@ -98,7 +98,7 @@ class NodeSession:
     node_epoch: str
     epoch_seq: int
     host_boot_id: str
-    rm_domains: frozenset[str]
+    rm_domains: dict[str, frozenset[str]]  # device_ids by rm_domain
     deadline: float
     capabilities: tuple[str, ...] = ()
     closed_at: float | None = None  # NODE_CLOSE restart
@@ -290,6 +290,7 @@ class NodeRegistry:
     def node_open(self, req: NodeOpenRequest, now: float) -> NodeOpenResponse:
         """Raises OpenError when refused."""
         self._check_node_open(req)
+        self._check_other_nodes(req)
         node = self.nodes.get(req.node_id)
         if node is not None and req.node_epoch in node.retired_epochs:
             raise OpenError(
@@ -324,9 +325,12 @@ class NodeRegistry:
             raise OpenError(Status.REJECTED, "node_epoch and host_boot_id are needed")
         if len(req.pools) > MAX_BATCH or len(req.rm_domains) > MAX_BATCH:
             raise OpenError(Status.REJECTED, f"more than {MAX_BATCH} pools or domains")
+        domains = {d.rm_domain for d in req.rm_domains}
+        if len(domains) < len(req.rm_domains):
+            raise OpenError(Status.REJECTED, "an rm_domain is listed twice")
         seen = set()
         for info in req.pools:
-            error = self._pool_error(req, info)
+            error = self._pool_error(req, info, domains)
             if error is None and info.pool_id in seen:
                 error = "listed twice"
             if error is not None:
@@ -334,9 +338,11 @@ class NodeRegistry:
             seen.add(info.pool_id)
 
     @staticmethod
-    def _pool_error(req: NodeOpenRequest, info: PoolInfo) -> str | None:
-        """Only this run's DRAM pool and its SSD pools; CXL regions
-        come from MaruServer."""
+    def _pool_error(
+        req: NodeOpenRequest, info: PoolInfo, domains: set[str]
+    ) -> str | None:
+        """This run's DRAM pool, its SSD pools and the CXL regions it
+        holds in its rm_domains."""
         if info.node_id != req.node_id:
             return f"belongs to node {info.node_id}"
         if info.pool_generation < 1:
@@ -350,10 +356,30 @@ class NodeRegistry:
                 return "an SSD pool needs its path"
             expected = f"ssd:{req.node_id}:{info.path}"
         else:
-            return "CXL regions are granted by MaruServer (REGION_REQUEST)"
+            if not info.rm_domain or info.region_id is None:
+                return "a CXL pool needs its rm_domain and region_id"
+            if info.rm_domain not in domains:
+                return f"rm_domain {info.rm_domain!r} is not in rm_domains"
+            expected = f"cxl:{info.rm_domain}:{info.region_id}"
         if info.pool_id != expected:
             return f"pool_id must be {expected!r}"
         return None
+
+    def _check_other_nodes(self, req: NodeOpenRequest) -> None:
+        """A region another node holds (not on its way out) is a
+        misconfiguration. The rm_domain is the RM's own id, so nodes sharing an
+        RM list it with whatever devices their regions are on."""
+        for info in req.pools:
+            pool = self.catalog.pool(info.pool_id)
+            if (
+                pool is not None
+                and pool.node_id != req.node_id
+                and pool.state != PoolState.REMOVING
+            ):
+                raise OpenError(
+                    Status.REJECTED,
+                    f"pool {info.pool_id} is registered by node {pool.node_id}",
+                )
 
     def _reopen_same_epoch(
         self, node: NodeRecord, req: NodeOpenRequest, now: float
@@ -459,6 +485,8 @@ class NodeRegistry:
             self._end_run(node, old)
         for pool in remove:
             self.catalog.remove_pool(pool)
+        for pool in adopt:
+            pool.info = listed[pool.pool_id]  # as this run describes it
         node.epoch_seq += 1
         node.node_epoch = req.node_epoch
         node.gone = False
@@ -487,17 +515,22 @@ class NodeRegistry:
         req: NodeOpenRequest,
         listed: dict[str, PoolInfo],
     ) -> bool:
-        """CXL if no reboot and the same rm_domain is listed; SSD
-        if listed unchanged (a changed one starts empty); never DRAM."""
-        if pool.kind == PoolKind.DRAM:
+        """Only a listed pool. CXL: the same region, with a run before
+        on the same boot; SSD: unchanged. A changed one starts empty; DRAM
+        never stays."""
+        info, was = listed.get(pool.pool_id), pool.info
+        if info is None or pool.kind == PoolKind.DRAM:
             return False
         if pool.kind == PoolKind.CXL:
             return (
                 old is not None
                 and old.host_boot_id == req.host_boot_id
-                and pool.info.rm_domain in {d.rm_domain for d in req.rm_domains}
+                and info.rm_domain == was.rm_domain
+                and info.region_id == was.region_id
+                and info.capacity == was.capacity
+                and info.page_size == was.page_size
             )
-        return listed.get(pool.pool_id) == pool.info
+        return info == was
 
     def _new_session(
         self, node: NodeRecord, req: NodeOpenRequest, now: float
@@ -508,7 +541,7 @@ class NodeRegistry:
             node_epoch=req.node_epoch,
             epoch_seq=node.epoch_seq,
             host_boot_id=req.host_boot_id,
-            rm_domains=frozenset(d.rm_domain for d in req.rm_domains),
+            rm_domains={d.rm_domain: frozenset(d.device_ids) for d in req.rm_domains},
             capabilities=tuple(req.capabilities),
             deadline=now + self.session_ttl_s,
         )

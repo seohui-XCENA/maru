@@ -74,8 +74,6 @@ OP_CODES = {
     MessageType.FETCH_COMPLETE,
     MessageType.NODE_REREGISTER,
     MessageType.WORKER_EXIT,
-    MessageType.REGION_REQUEST,
-    MessageType.REGION_RETURN,
 }
 NODE_CODES = {
     MessageType.NODE_HEARTBEAT,
@@ -88,8 +86,6 @@ NODE_CODES = {
     MessageType.RETIRE,
     MessageType.FINALIZE_MOVE,
     MessageType.FETCH_COMPLETE,
-    MessageType.REGION_REQUEST,
-    MessageType.REGION_RETURN,
 }
 WORKER_CODES = {
     MessageType.WORKER_HEARTBEAT,
@@ -527,10 +523,20 @@ class FakeMaruServer:
             or (known is not None and known.epoch_seq != req.resume)
         ):
             return NodeOpenResponse(status=Status.REJECTED, error="resume")
+        domains = {d.rm_domain for d in req.rm_domains}
         for pool in req.pools:
-            ok_id = pool.pool_id == f"dram:{req.node_id}:{req.node_epoch}" or (
-                pool.kind == PoolKind.SSD
-                and pool.pool_id.startswith(f"ssd:{req.node_id}:")
+            ok_id = (
+                pool.pool_id == f"dram:{req.node_id}:{req.node_epoch}"
+                or (
+                    pool.kind == PoolKind.SSD
+                    and pool.pool_id.startswith(f"ssd:{req.node_id}:")
+                )
+                or (
+                    pool.kind == PoolKind.CXL
+                    and pool.rm_domain in domains
+                    and pool.region_id is not None
+                    and pool.pool_id == f"cxl:{pool.rm_domain}:{pool.region_id}"
+                )
             )
             if (
                 not ok_id

@@ -16,10 +16,9 @@ from maru_common.protocol import (
     PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
     MessageType,
-    RegionRequestRequest,
     StorageRequest,
 )
-from maru_common.storage_types import OpRef, Status
+from maru_common.storage_types import Status
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.rpc_server import RpcServer
 from maru_server.server import MaruServer
@@ -132,20 +131,6 @@ def test_resume_and_reregister_round_trip(served):
     assert worker.open().recovering
     lookup = worker.lookup(k, key("absent"))
     assert [i.result.value for i in lookup.items] == ["HIT", "RECOVERING"]
-
-
-def test_stage_boundaries_answer_disabled(served):
-    server, wire = served
-    node = FakeNode(wire, "n1")
-    node.open()
-    op = OpRef(node.epoch, 1, b"\0" * 16, 0)
-    response = wire.call(
-        MessageType.REGION_REQUEST,
-        RegionRequestRequest(
-            **node.envelope(), op=op, rm_domain="rm1", size=1 << 30, count=1
-        ),
-    )
-    assert response.status == Status.DISABLED
 
 
 def test_legacy_requests_keep_their_path(served):

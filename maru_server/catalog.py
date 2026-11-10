@@ -134,9 +134,6 @@ class Catalog:
         self._preserved: frozenset[Key] = frozenset()
         self._removing: set[PoolRecord] = set()
         self._sweeps: dict[PoolRecord, None] = {}  # REMOVING pools to sweep
-        # CXL regions with no locations (so no pins) left; nothing returns
-        # them yet
-        self.pending_returns: dict[str, PoolInfo] = {}
 
     # ------------------------------------------------------------- registry
 
@@ -146,6 +143,10 @@ class Catalog:
             raise ValueError(f"pool {info.pool_id} is registered already")
         if info.page_size <= 0:
             raise ValueError("page_size must be positive")
+        if current is not None and current.node_id != info.node_id:
+            # a CXL region now with another node: the old record is swept
+            # on its own and no longer one of its node's pools
+            self._unindex(current)
         record = PoolRecord(info=info, since_epoch_seq=since_epoch_seq)
         self._pools[info.pool_id] = record
         self._node_pools.setdefault(info.node_id, set()).add(info.pool_id)
@@ -209,14 +210,14 @@ class Catalog:
         self._sweeps.pop(pool, None)
         if self._pools.get(pool.pool_id) is pool:
             del self._pools[pool.pool_id]
-            node_pools = self._node_pools.get(pool.node_id)
-            if node_pools is not None:
-                node_pools.discard(pool.pool_id)
-                if not node_pools:
-                    del self._node_pools[pool.node_id]
-        if pool.kind == PoolKind.CXL:
-            self.pending_returns[pool.pool_id] = pool.info
-            logger.info("CXL region %s has no locations; return pending", pool.pool_id)
+            self._unindex(pool)
+
+    def _unindex(self, pool: PoolRecord) -> None:
+        node_pools = self._node_pools.get(pool.node_id)
+        if node_pools is not None:
+            node_pools.discard(pool.pool_id)
+            if not node_pools:
+                del self._node_pools[pool.node_id]
 
     def _location_unpinned(self, key: Key, location: Location) -> None:
         candidates = [self._by_key.get(key, {}).get(location.pool_id)]

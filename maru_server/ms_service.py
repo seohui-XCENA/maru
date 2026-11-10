@@ -42,10 +42,6 @@ from maru_common.protocol import (
     NodeReregisterResponse,
     ProbeRequest,
     ProbeResponse,
-    RegionRequestRequest,
-    RegionRequestResponse,
-    RegionReturnRequest,
-    RegionReturnResponse,
     RetireRequest,
     RetireResponse,
     SourcePinRequest,
@@ -70,8 +66,6 @@ from maru_common.storage_types import (
     Key,
     MissReason,
     OpRef,
-    PoolInfo,
-    PoolKind,
     SessionRole,
     Status,
 )
@@ -884,24 +878,6 @@ class MsService:
         if pin is not None and pin.holder == session.token:
             self.pins.unpin(pin_id)
 
-    # ======================================================= CXL regions
-
-    def region_request(
-        self, req: RegionRequestRequest, payload: dict
-    ) -> RegionRequestResponse:
-        return RegionRequestResponse(
-            status=Status.DISABLED,
-            error="REGION_REQUEST: CXL regions are not supported yet",
-        )
-
-    def region_return(
-        self, req: RegionReturnRequest, payload: dict
-    ) -> RegionReturnResponse:
-        return RegionReturnResponse(
-            status=Status.DISABLED,
-            error="REGION_RETURN: CXL regions are not supported yet",
-        )
-
     # =========================================================== admin
 
     def check_policy(self) -> None:
@@ -932,23 +908,6 @@ class MsService:
             if self.catalog.set_preserved(preserved):
                 self.registry.policy_version += 1
                 logger.info("policy reloaded: %d preserved keys", len(preserved))
-
-    def register_region(self, info: PoolInfo) -> None:
-        """Register a granted CXL region (stands in for REGION_REQUEST)."""
-        with self.lock:
-            node = self.registry.nodes.get(info.node_id)
-            if node is None or node.session is None or node.session.ended:
-                raise ValueError(f"node {info.node_id} has no session")
-            if info.kind != PoolKind.CXL or info.rm_domain is None:
-                raise ValueError("a region is a CXL pool with its rm_domain")
-            if info.pool_id != f"cxl:{info.rm_domain}:{info.region_id}":
-                raise ValueError("pool_id must be cxl:{rm_domain}:{region_id}")
-            self.catalog.register_pool(info, node.epoch_seq)
-
-    def pending_region_returns(self) -> list[PoolInfo]:
-        """CXL regions with no locations left, to be returned."""
-        with self.lock:
-            return list(self.catalog.pending_returns.values())
 
     def stats(self) -> dict:
         with self.lock:

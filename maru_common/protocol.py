@@ -99,8 +99,7 @@ class MessageType(IntEnum):
     RETIRE = 0x59
     FINALIZE_MOVE = 0x5A
     FETCH_COMPLETE = 0x5B
-    REGION_REQUEST = 0x5E
-    REGION_RETURN = 0x5F
+    # 0x5E, 0x5F: retired (REGION_REQUEST, REGION_RETURN); never reuse them
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -664,12 +663,6 @@ class FetchCompleteItem:
 
 
 @dataclass
-class RegionGrant:
-    pool: PoolInfo
-    handle: MaruHandle
-
-
-@dataclass
 class NodeOpenRequest:
     """NODE_OPEN (0x40) - A StorageService opens its node session."""
 
@@ -1000,42 +993,6 @@ class FetchCompleteResponse:
     items: list[ItemOutcome] = field(default_factory=list)
 
 
-@dataclass
-class RegionRequestRequest:
-    """REGION_REQUEST (0x5E) - CXL regions from an RM domain."""
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    rm_domain: str
-    size: int
-    count: int
-
-
-@dataclass
-class RegionRequestResponse:
-    status: Status
-    error: str | None = None
-    regions: list[RegionGrant] = field(default_factory=list)
-
-
-@dataclass
-class RegionReturnRequest:
-    """REGION_RETURN (0x5F) - Sent only after every mapping of it is gone."""
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    pool_id: str
-    pool_generation: int
-
-
-@dataclass
-class RegionReturnResponse:
-    status: Status
-    error: str | None = None
-
-
 # =============================================================================
 # Message Type Mapping
 # =============================================================================
@@ -1092,8 +1049,6 @@ MS_MESSAGE_CLASSES = {
     MessageType.RETIRE: (RetireRequest, RetireResponse),
     MessageType.FINALIZE_MOVE: (FinalizeMoveRequest, FinalizeMoveResponse),
     MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
-    MessageType.REGION_REQUEST: (RegionRequestRequest, RegionRequestResponse),
-    MessageType.REGION_RETURN: (RegionReturnRequest, RegionReturnResponse),
 }
 _overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
 if _overlap:

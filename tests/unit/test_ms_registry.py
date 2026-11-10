@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Node and worker sessions, node restarts, give-up, access info, block
-requests and requests not supported yet, through MsService."""
+"""Node and worker sessions, CXL pools, node restarts, give-up, access info
+and block requests, through MsService."""
 
 import time
 from dataclasses import replace
 
 import pytest
 
-from maru_common.protocol import (
-    MessageType,
-    RegionRequestRequest,
-    RegionReturnRequest,
-)
+from maru_common.protocol import MessageType
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     CloseMode,
@@ -25,9 +21,10 @@ from maru_common.storage_types import (
     SessionRole,
     Status,
 )
-from maru_server.catalog import Entry
+from maru_server.catalog import Entry, PoolState
 from tests.unit.ms_fakes import (
     PAGE,
+    POOL_PAGES,
     FakeClock,
     FakeNode,
     FakeWorker,
@@ -89,7 +86,6 @@ class TestNodeOpen:
             [replace(node.dram(), pool_id="dram:n1:other")],
             [replace(node.dram(), node_id="n2")],
             [replace(node.dram(), pool_generation=0)],
-            [node.cxl()],
             [replace(node.ssd(), path=None)],
             [node.dram(), node.dram()],
         ):
@@ -172,13 +168,93 @@ class TestNodeOpen:
         assert node.open().status == Status.REJECTED
 
 
+class TestCxlPools:
+    """CXL regions the StorageService holds in its RMs, listed in NODE_OPEN."""
+
+    def test_open_registers_a_cxl_pool(self, env):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        assert node.open(pools=[node.dram(), node.cxl()]).status == Status.OK
+        pool = service.catalog.pool(node.cxl().pool_id)
+        assert pool.info == node.cxl() and pool.state == PoolState.ACTIVE
+        k, loc = key("c"), node.loc(node.cxl(), 1)
+        assert results(node.commit((k, loc))) == ["ADDED"]
+        worker = FakeWorker(wire, node)
+        worker.open()
+        hit = worker.lookup(k).items[0]
+        assert hit.result == "HIT" and hit.location == loc
+
+    @pytest.mark.parametrize(
+        "change, needle",
+        [
+            ({"pool_id": "cxl:rm1:8"}, "pool_id must be 'cxl:rm1:7'"),
+            ({"pool_id": "cxl:rm9:7", "rm_domain": "rm9"}, "not in rm_domains"),
+            ({"region_id": None}, "needs its rm_domain and region_id"),
+            ({"rm_domain": None}, "needs its rm_domain and region_id"),
+        ],
+        ids=["pool_id", "unknown-rm_domain", "no-region_id", "no-rm_domain"],
+    )
+    def test_bad_cxl_pool_is_rejected(self, env, change, needle):
+        _, service, wire = env
+        node = FakeNode(wire, "n1")
+        response = node.open(pools=[node.dram(), replace(node.cxl(), **change)])
+        assert response.status == Status.REJECTED and needle in response.error
+        assert "n1" not in service.registry.nodes
+
+    def test_rm_domain_listed_twice_is_rejected(self, env):
+        _, _, wire = env
+        node = FakeNode(wire, "n1")
+        twice = [RmDomain("rm1", ("dev0",)), RmDomain("rm1", ("dev0",))]
+        response = node.open(rm_domains=twice)
+        assert response.status == Status.REJECTED and "twice" in response.error
+
+    def test_nodes_sharing_an_rm_list_their_own_devices(self, env):
+        _, _, wire = env
+        a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
+        assert a.open().status == Status.OK  # rm1 with dev0
+        assert b.open(rm_domains=[RmDomain("rm1", ("dev1",))]).status == Status.OK
+        assert FakeNode(wire, "c").open(rm_domains=[RmDomain("rm1", ())]).status == (
+            Status.OK
+        )
+
+    def test_region_of_another_node_is_rejected(self, env):
+        _, service, wire = env
+        a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
+        a.open(pools=[a.dram(), a.cxl()])
+        k = key("c")
+        a.commit((k, a.loc(a.cxl(), 1)))
+        response = b.open(pools=[b.dram(), b.cxl()])
+        assert response.status == Status.REJECTED
+        assert "registered by node a" in response.error
+        # a left while a reader still pins its location: b may take the region
+        reader = FakeWorker(wire, a)
+        reader.open()
+        pin = reader.lookup(k).items[0].pin_id
+        a.close(CloseMode.LEAVE)
+        assert b.open(pools=[b.dram(), b.cxl()]).status == Status.OK
+        assert service.catalog.pool(b.cxl().pool_id).node_id == "b"
+        assert service.catalog.pools_of("a") == []
+        assert results(b.commit((key("b"), b.loc(b.cxl(), 1)))) == ["ADDED"]
+        # a's next run and the old location's last pin leave b's pool alone
+        a.restart()
+        assert a.open().status == Status.OK
+        reader.unpin(pin)
+        assert not service.catalog.locations(k)
+        pool = service.catalog.pool(b.cxl().pool_id)
+        assert pool.node_id == "b" and pool.state == PoolState.ACTIVE
+        assert len(pool.entries) == 1
+
+
 class TestEpochReplacement:
     """A StorageService restarts: NODE_OPEN with a new node_epoch."""
 
+    @staticmethod
+    def _pools(node):
+        return [node.dram(), node.ssd(), node.cxl()]
+
     def _node(self, wire, service):
         node = FakeNode(wire, "n1")
-        assert node.open(pools=[node.dram(), node.ssd()]).status == Status.OK
-        service.register_region(node.cxl())
+        assert node.open(pools=self._pools(node)).status == Status.OK
         worker = FakeWorker(wire, node)
         assert worker.open().status == Status.OK
         keys = {name: key(name) for name in ("d", "s", "c")}
@@ -198,7 +274,7 @@ class TestEpochReplacement:
         source_pin = node.source_pin((keys["s"], locs["s"])).items[0].pin_id
         old_epoch, old_token, old_dram = node.epoch, node.token, node.dram_id
         node.restart()
-        response = node.open(pools=[node.dram(), node.ssd()])
+        response = node.open(pools=self._pools(node))
         assert response.status == Status.OK
         assert response.epoch_seq == 2
         assert sorted(p.pool_id for p in response.adopted) == sorted(
@@ -279,7 +355,7 @@ class TestEpochReplacement:
         node, worker, keys, locs = self._node(wire, service)
         worker.lookup(keys["c"])
         node.restart()
-        node.open(pools=[node.dram(), node.ssd()])
+        node.open(pools=self._pools(node))
         listed = node.recover_list(node.cxl().pool_id)
         assert [(i.key, i.location, i.pinned) for i in listed.items] == [
             (keys["c"], locs["c"], True)
@@ -290,24 +366,28 @@ class TestEpochReplacement:
         node, worker, keys, locs = self._node(wire, service)
         pin = worker.lookup(keys["c"]).items[0].pin_id
         node.restart(boot="boot-2")
-        response = node.open(pools=[node.dram(), node.ssd()])
+        response = node.open(pools=self._pools(node))
         assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
-        # hidden at once, removed once unpinned, then its return is pending
+        # hidden at once, removed once unpinned
         worker.open()
         assert worker.lookup(keys["c"]).items[0].result == "MISS"
         drain(service)
-        assert service.pending_region_returns() == []
+        assert service.catalog.locations(keys["c"])
         worker.unpin(pin)
-        assert [p.pool_id for p in service.pending_region_returns()] == [
-            node.cxl().pool_id
-        ]
+        assert not service.catalog.locations(keys["c"])
+        # the region, listed again, starts empty in this run
+        pool = service.catalog.pool(node.cxl().pool_id)
+        assert pool.state == PoolState.ACTIVE and not pool.entries
+        assert pool.since_epoch_seq == 2
+        assert results(node.commit((keys["c"], node.loc(node.cxl(), 1)))) == ["ADDED"]
 
     def test_cxl_needs_the_same_rm_domain(self, env):
         _, service, wire = env
         node, _, keys, _ = self._node(wire, service)
         node.restart()
         response = node.open(
-            pools=[node.dram(), node.ssd()], rm_domains=[RmDomain("rm2", ())]
+            pools=[node.dram(), node.ssd(), node.cxl(rm_domain="rm2")],
+            rm_domains=[RmDomain("rm2", ())],
         )
         assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
         drain(service)
@@ -319,7 +399,7 @@ class TestEpochReplacement:
         node.restart()
         # the same path with a new pool_generation: its contents are gone
         changed = node.ssd(generation=2)
-        response = node.open(pools=[node.dram(), changed])
+        response = node.open(pools=[node.dram(), changed, node.cxl()])
         assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
         assert service.catalog.locations(keys["s"]) == [] or all(
             e.pool.state == "removing" for e in service.catalog.locations(keys["s"])
@@ -334,10 +414,72 @@ class TestEpochReplacement:
         _, service, wire = env
         node, _, keys, _ = self._node(wire, service)
         node.restart()
-        response = node.open(pools=[node.dram()])
+        response = node.open(pools=[node.dram(), node.cxl()])
         assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
         drain(service)
         assert not service.catalog.locations(keys["s"])
+
+    def test_cxl_not_listed_is_removed(self, env):
+        _, service, wire = env
+        node, worker, keys, _ = self._node(wire, service)
+        pin = worker.lookup(keys["c"]).items[0].pin_id
+        node.restart()
+        # the RM no longer holds the region for the node
+        response = node.open(pools=[node.dram(), node.ssd()])
+        assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
+        worker.open()
+        assert worker.lookup(keys["c"]).items[0].result == "MISS"
+        drain(service)
+        pool = service.catalog.pool(node.cxl().pool_id)
+        assert pool.state == PoolState.REMOVING
+        worker.unpin(pin)
+        assert not service.catalog.locations(keys["c"])
+        assert service.catalog.pool(node.cxl().pool_id) is None
+
+    @pytest.mark.parametrize(
+        "change",
+        [{"capacity": 2 * POOL_PAGES * PAGE}, {"page_size": 2 * PAGE}],
+        ids=["capacity", "page_size"],
+    )
+    def test_cxl_listed_with_another_size_starts_empty(self, env, change):
+        _, service, wire = env
+        node, _, keys, _ = self._node(wire, service)
+        node.restart()
+        changed = replace(node.cxl(), **change)
+        response = node.open(pools=[node.dram(), node.ssd(), changed])
+        assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
+        drain(service)
+        assert not service.catalog.locations(keys["c"])
+        pool = service.catalog.pool(changed.pool_id)
+        assert pool.info == changed and not pool.entries
+
+    def test_cxl_adopted_as_the_new_run_lists_it(self, env):
+        _, service, wire = env
+        node, _, keys, locs = self._node(wire, service)
+        node.restart()
+        listed = replace(node.cxl(), pool_generation=2)
+        pools = [node.dram(), node.ssd(), listed]
+        response = node.open(pools=pools)
+        assert listed in response.adopted
+        assert [e.location for e in service.catalog.locations(keys["c"])] == [locs["c"]]
+        # the same process opening again finds the pools it listed
+        assert node.open(pools=pools).adopted == response.adopted
+
+    def test_cxl_after_a_leave_starts_empty(self, env):
+        _, service, wire = env
+        node, worker, keys, _ = self._node(wire, service)
+        pin = worker.lookup(keys["c"]).items[0].pin_id
+        node.close(CloseMode.LEAVE)
+        node.restart()
+        response = node.open(pools=self._pools(node))
+        assert response.status == Status.OK and response.adopted == []
+        pool = service.catalog.pool(node.cxl().pool_id)
+        assert pool.state == PoolState.ACTIVE and not pool.entries
+        # the old location still goes only with its last pin
+        drain(service)
+        assert service.catalog.locations(keys["c"])
+        worker.unpin(pin)
+        assert not service.catalog.locations(keys["c"])
 
     def test_old_workers_are_those_not_confirmed_gone(self, env):
         clock, service, wire = env
@@ -386,8 +528,7 @@ class TestNodeClose:
     def test_leave_removes_every_location(self, env):
         _, service, wire = env
         node = FakeNode(wire, "n1")
-        node.open(pools=[node.dram(), node.ssd()])
-        service.register_region(node.cxl())
+        node.open(pools=[node.dram(), node.ssd(), node.cxl()])
         k = key("k")
         cxl = node.loc(node.cxl(), 1)
         node.commit(
@@ -411,19 +552,16 @@ class TestNodeClose:
         assert service.pins.held_by(reader.token)[0].location == cxl
         assert not service.catalog.locations(k)
         assert not service.catalog.locations(key("s"))
-        assert service.pending_region_returns() == []
-        # the region goes back once the reader is done
+        assert service.catalog.pool(node.cxl().pool_id) is not None
+        # the region's pool goes once the reader is done
         reader.close()
         assert not service.catalog.locations(key("c"))
-        assert [p.pool_id for p in service.pending_region_returns()] == [
-            node.cxl().pool_id
-        ]
+        assert service.catalog.pool(node.cxl().pool_id) is None
 
     def test_give_up_keeps_cxl_pins_past_expiry_until_worker_exit(self, env):
         clock, service, wire = env
         node = FakeNode(wire, "n1")
-        node.open()
-        service.register_region(node.cxl())
+        node.open(pools=[node.dram(), node.cxl()])
         node.commit((key("c"), node.loc(node.cxl(), 1)))
         worker = FakeWorker(wire, node)
         worker.open()
@@ -437,25 +575,22 @@ class TestNodeClose:
         clock.advance(600)  # the worker expires: pins never go by time
         drain(service)
         assert service.pins.held_by(worker.token)
-        assert service.pending_region_returns() == []
+        assert service.catalog.pool(node.cxl().pool_id) is not None
         # the node's next run lists it in old_workers and confirms its end
         node.restart()
         response = node.open()
         assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
         assert results(node.worker_exit(response.old_workers[0])) == ["OK"]
         assert service.stats()["orphan_sessions"] == 0
-        assert [p.pool_id for p in service.pending_region_returns()] == [
-            node.cxl().pool_id
-        ]
+        assert service.catalog.pool(node.cxl().pool_id) is None
 
     def test_an_orphan_keeps_pins_it_took_after_its_node_left(self, env):
         from maru_server.pin_manager import HolderKind
 
         clock, service, wire = env
         node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
-        node.open()
+        node.open(pools=[node.dram(), node.cxl()])
         other.open()
-        service.register_region(node.cxl())
         node.commit((key("c"), node.loc(node.cxl(), 1)))
         k, loc = key("k"), other.loc(other.dram(), 1)
         other.commit((k, loc))
@@ -483,8 +618,7 @@ class TestNodeClose:
     def test_an_orphan_without_cxl_pins_goes_on_expiry(self, env):
         clock, service, wire = env
         node = FakeNode(wire, "n1")
-        node.open()
-        service.register_region(node.cxl())
+        node.open(pools=[node.dram(), node.cxl()])
         node.commit((key("c"), node.loc(node.cxl(), 1)))
         worker = FakeWorker(wire, node)
         worker.open()
@@ -535,9 +669,8 @@ class TestNodeClose:
     def test_cxl_goes_back_only_once_unpinned_even_when_forced(self, env):
         _, service, wire = env
         a, b = FakeNode(wire, "a"), FakeNode(wire, "b")
-        a.open()
+        a.open(pools=[a.dram(), a.cxl()])
         b.open()
-        service.register_region(a.cxl())
         k = key("k")
         loc = a.loc(a.cxl(), 1)
         a.commit((k, loc))
@@ -545,11 +678,9 @@ class TestNodeClose:
         pin = b.source_pin((k, loc)).items[0].pin_id
         a.close(CloseMode.LEAVE)
         drain(service)
-        assert service.pending_region_returns() == []
+        assert service.catalog.pool(a.cxl().pool_id) is not None
         assert b.unpin(pin).items[0].result == "OK"
-        assert [p.pool_id for p in service.pending_region_returns()] == [
-            a.cxl().pool_id
-        ]
+        assert service.catalog.pool(a.cxl().pool_id) is None
         assert not service.catalog.locations(k)
 
     def test_give_up_also_after_a_restart_close(self, env):
@@ -821,29 +952,7 @@ class TestEpochChecks:
         assert worker.lookup(*keys[:1024]).status == Status.OK
 
 
-class TestNotSupportedYet:
-    def test_regions_are_disabled(self, env):
-        _, service, wire = env
-        node = FakeNode(wire, "n1")
-        node.open()
-        op = OpRef(node.epoch, 1, b"\0" * 16, 0)
-        request = wire.call(
-            MessageType.REGION_REQUEST,
-            RegionRequestRequest(
-                **node.envelope(), op=op, rm_domain="rm1", size=1 << 30, count=1
-            ),
-        )
-        assert request.status == Status.DISABLED
-        assert "CXL regions are not supported yet" in request.error
-        give_back = wire.call(
-            MessageType.REGION_RETURN,
-            RegionReturnRequest(
-                **node.envelope(), op=op, pool_id="cxl:rm1:7", pool_generation=1
-            ),
-        )
-        assert give_back.status == Status.DISABLED
-        assert "CXL regions are not supported yet" in give_back.error
-
+class TestRecoveryWindow:
     def test_no_recovery_window_never_recovers(self, env):
         _, _, wire = env
         node = FakeNode(wire, "n1")
@@ -1052,8 +1161,7 @@ class TestMaintenanceThread:
         service = make_service(clock, maintenance_budget=budget)
         registry = service.registry
         node = FakeNode(Wire(service), "big")
-        node.open()
-        service.register_region(node.cxl())
+        node.open(pools=[node.dram(), node.cxl()])
         n = 25_000
         target = (key("k"), node.loc(node.dram(), 1))
         with service.lock:
