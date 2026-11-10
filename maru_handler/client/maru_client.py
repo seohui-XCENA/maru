@@ -512,11 +512,23 @@ class MaruClient:
                 close_fds(fds)  # the pools of this run are mapped already
             else:
                 for descriptor in response.pools:
-                    if descriptor.memfd is None:
-                        continue  # only DRAM pools are mapped so far
-                    # pools.add closes the fd, also on failure
-                    fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
-                    self.pools.add(descriptor, fd, response.node_epoch)
+                    if descriptor.dax is not None:
+                        try:
+                            self.pools.add_dax(descriptor, response.node_epoch)
+                        except (OSError, RuntimeError, ValueError) as e:
+                            # Its locations fail to read and are recomputed
+                            logger.error(
+                                "cannot map CXL pool %s: %s",
+                                descriptor.pool.pool_id,
+                                e,
+                            )
+                            continue
+                    elif descriptor.memfd is not None:
+                        # pools.add closes the fd, also on failure
+                        fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
+                        self.pools.add(descriptor, fd, response.node_epoch)
+                    else:
+                        continue  # not mapped by workers (SSD)
                     added.append(descriptor.pool.pool_id)
         except BaseException:
             close_fds(fds)

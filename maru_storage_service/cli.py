@@ -20,6 +20,8 @@ from .config import NodeConfig, NodeConfigError, load_node_config
 EXIT_CONFIG = 2
 EXIT_NOT_SERVING = 3
 EXIT_START = 4
+# The run let go of its CXL regions (lease); a supervisor restarts it
+EXIT_LOST = 5
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     """Run the StorageService until SIGTERM or SIGINT."""
+    from .drivers.cxl import CxlTierError
     from .drivers.dram import DramPoolError
     from .local_server import LocalServerError
     from .ports import ServerStopped
@@ -90,9 +93,8 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     def on_signal(signum, _frame) -> None:
         logger.info("signal %d: stopping", signum)
         stop.set()
-        # Also stops a start still waiting for MaruServer
-        if service.server is not None:
-            service.server.stop()
+        # Also stops a start still waiting for the RM or MaruServer
+        service.interrupt()
 
     previous = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
@@ -101,12 +103,26 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
         try:
             service.start()
         except ServerStopped:
+            if service.lost is not None:  # the lease ran out during the start
+                service.wait_finished()
+                print(f"maru-storage: stopped: {service.lost}", file=sys.stderr)
+                return EXIT_LOST
             return 0
-        except (DramPoolError, LocalServerError, NodeOpenError, OSError) as e:
+        except (
+            CxlTierError,
+            DramPoolError,
+            LocalServerError,
+            NodeOpenError,
+            OSError,
+        ) as e:
             print(f"maru-storage: cannot start: {e}", file=sys.stderr)
             return EXIT_START
-        while not stop.wait(1.0):
+        while not stop.wait(1.0) and not service.wait(0):
             pass
+        if service.lost is not None:
+            service.wait_finished()
+            print(f"maru-storage: stopped: {service.lost}", file=sys.stderr)
+            return EXIT_LOST
         service.stop(CloseMode.RESTART)
         return 0
     finally:

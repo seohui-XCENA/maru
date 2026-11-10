@@ -74,6 +74,8 @@ def node_config(
     low: float = 0.8,
     budgets: dict | None = None,
     hugepage: bool = False,
+    cxl_pages: int | None = None,
+    region_pages: int = 4,
 ):
     default_budgets = {
         "credit_max_bytes": 4 * page_size,
@@ -98,7 +100,18 @@ def node_config(
                     "high_watermark": high,
                     "low_watermark": low,
                 }
-            ],
+            ]
+            + (
+                []
+                if cxl_pages is None
+                else [
+                    {
+                        "store": "cxl",
+                        "size": cxl_pages * page_size,
+                        "region_size": region_pages * page_size,
+                    }
+                ]
+            ),
             "budgets": default_budgets,
         }
     )

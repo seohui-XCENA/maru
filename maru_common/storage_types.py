@@ -240,10 +240,12 @@ class PoolInfo:
 
 @dataclass(frozen=True)
 class DaxMapping:
-    """A CXL region a worker maps: its RM domain and the RM handle."""
+    """A CXL region a worker maps: its RM domain, the RM handle, and the RM
+    address the worker asks for access (rm_domain is an id, not an address)."""
 
     rm_domain: str
     handle: MaruHandle
+    rm_address: str = ""
 
 
 @dataclass(frozen=True)

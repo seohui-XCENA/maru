@@ -517,6 +517,21 @@ class WorkerRegistry:
         self._finish_server_drains()
         return drain
 
+    def mapping(self) -> dict[str, WorkerEndpoint | None]:
+        """Workers of this run that may map its pools, with their connection
+        (None while it dropped): attached and neither detached nor ended."""
+        with self._lock:
+            return {
+                inc: rec.conn
+                for inc, rec in self._workers.items()
+                if not rec.exited and not rec.detached
+            }
+
+    def old_pending(self) -> bool:
+        """Some worker of the run before is neither back nor seen ending."""
+        with self._lock:
+            return any(o.state == OldState.WAITING for o in self._old.values())
+
     def notify_all(self, notify: Notify) -> None:
         """Post ``notify`` to every attached worker and probe."""
         with self._lock:

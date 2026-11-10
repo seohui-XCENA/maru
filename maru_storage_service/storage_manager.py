@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -727,10 +728,54 @@ class StorageManager:
                 logger.debug("could not answer a WRITE_DONE", exc_info=True)
 
     def unmap_ack(self, rec: WorkerRecord, req: UnmapAckRequest) -> UnmapAckResponse:
-        # Recorded only: no pool is removed yet
-        with self._lock:
+        with self._cv:
             self._unmapped.add((rec.incarnation, req.pool_id, req.pool_generation))
+            self._cv.notify_all()
         return UnmapAckResponse(status=Status.OK)
+
+    def unmap_pools(
+        self,
+        pools: list[tuple[str, int]],
+        timeout_s: float,
+        old_may_map: AbstractSet[str] = frozenset(),
+    ) -> set[str]:
+        """Ask every worker that may map ``pools`` (pool_id, generation) to
+        unmap them; the pool_ids each one unmapped (UNMAP_ACK), detached or
+        was seen ending within ``timeout_s``. A worker that reconnects is asked
+        again; one whose connection dropped counts only once it ends. Pools in
+        ``old_may_map`` also wait for every worker of the run before. A
+        timeout is no confirmation. The caller stops new ATTACHes from mapping
+        them first."""
+        asked: dict[str, WorkerEndpoint] = {}
+        deadline = time.monotonic() + timeout_s
+        with self._cv:
+            while True:
+                workers = self.workers.mapping()
+                for inc, conn in workers.items():
+                    if conn is not None and asked.get(inc) is not conn:
+                        asked[inc] = conn
+                        for pool_id, generation in pools:
+                            conn.post_notify(
+                                Notify(
+                                    kind=NotifyKind.POOL_REMOVE,
+                                    pool_id=pool_id,
+                                    pool_generation=generation,
+                                )
+                            )
+                old = self.workers.old_pending()
+                done = {
+                    pool_id
+                    for pool_id, generation in pools
+                    if not (old and pool_id in old_may_map)
+                    and all(
+                        (inc, pool_id, generation) in self._unmapped for inc in workers
+                    )
+                }
+                left = deadline - time.monotonic()
+                if len(done) == len(pools) or left <= 0:
+                    return done
+                # An exit or a reconnect does not notify: look again shortly
+                self._cv.wait(min(left, 0.05))
 
     # ---------------------------------------------------------------- commit
 

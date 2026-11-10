@@ -14,8 +14,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, PoolKind
+from maru_common.storage_types import (
+    DaxMapping,
+    Location,
+    PoolDescriptor,
+    PoolInfo,
+    PoolKind,
+)
 from maru_handler.storage.cpu import CpuPool
+from maru_shm.client import MaruShmClient
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +76,69 @@ def map_dram_memfd(info: PoolInfo, fd: int) -> PoolMapping:
     )
 
 
+# One RM client per address for the process: it only checks handles
+_rm_clients: dict[str, MaruShmClient] = {}
+_rm_clients_lock = threading.Lock()
+
+
+def _rm_client(address: str) -> MaruShmClient:
+    with _rm_clients_lock:
+        client = _rm_clients.get(address)
+        if client is None:
+            client = _rm_clients[address] = MaruShmClient(address=address or None)
+        return client
+
+
+class CxlRegionMapping:
+    """A CXL region mapped after its RM checked the handle's token (GET_ACCESS).
+    Page-locked like a DRAM pool; the mapping is this pool's own."""
+
+    def __init__(self, info: PoolInfo, dax: DaxMapping):
+        handle = dax.handle
+        if handle.length < info.capacity:
+            raise LocationError(
+                f"pool {info.pool_id}: the region has {handle.length} bytes, "
+                f"the pool {info.capacity}"
+            )
+        access = _rm_client(dax.rm_address).get_access(handle)
+        fd = os.open(access.dax_path, os.O_RDWR)
+        try:
+            mapping = mmap.mmap(
+                fd,
+                handle.length,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                offset=handle.offset,
+            )
+        finally:
+            os.close(fd)
+        try:
+            self._pool = CpuPool(
+                info.pool_id,
+                info.capacity,
+                info.page_size,
+                medium="cxl",
+                mapping=mapping,
+                shared=True,
+            )
+        except BaseException:
+            mapping.close()
+            raise
+
+    @property
+    def cuda_registered(self) -> bool:
+        return self._pool.cuda_registered
+
+    def view(self, offset: int, length: int) -> memoryview:
+        return self._pool.view(offset, length)
+
+    def page_lock(self) -> None:
+        self._pool.page_lock()
+
+    def close(self) -> None:
+        self._pool.close()
+
+
 @dataclass(eq=False)
 class MappedPool:
     info: PoolInfo
@@ -113,29 +183,37 @@ class PoolMaps:
         self,
         pin_pools: bool = True,
         map_memfd: Callable[[PoolInfo, int], PoolMapping] = map_dram_memfd,
+        map_dax: Callable[[PoolInfo, DaxMapping], PoolMapping] = CxlRegionMapping,
     ):
         self.pin_pools = pin_pools
         self._map_memfd = map_memfd
+        self._map_dax = map_dax
         self._lock = threading.Lock()
         self._pools: dict[str, MappedPool] = {}
 
     def add(self, descriptor: PoolDescriptor, fd: int, node_epoch: str) -> MappedPool:
-        """Map a DRAM pool from its memfd; the descriptor is closed here."""
+        """Map a DRAM pool from its memfd; the fd is closed here."""
         info = descriptor.pool
         try:
             if info.kind != PoolKind.DRAM:
-                raise LocationError(
-                    f"pool {info.pool_id}: mapping {info.kind} pools comes later"
-                )
-            if (
-                info.capacity <= 0
-                or info.page_size <= 0
-                or info.capacity % info.page_size
-            ):
-                raise LocationError(f"pool {info.pool_id}: bad capacity or page size")
+                raise LocationError(f"pool {info.pool_id}: a memfd maps DRAM only")
+            _check_shape(info)
             mapping = self._map_memfd(info, fd)
         finally:
             os.close(fd)
+        return self._install(info, mapping, node_epoch)
+
+    def add_dax(self, descriptor: PoolDescriptor, node_epoch: str) -> MappedPool:
+        """Map a CXL region through its RM."""
+        info, dax = descriptor.pool, descriptor.dax
+        if info.kind != PoolKind.CXL or dax is None:
+            raise LocationError(f"pool {info.pool_id}: not a CXL region")
+        _check_shape(info)
+        return self._install(info, self._map_dax(info, dax), node_epoch)
+
+    def _install(
+        self, info: PoolInfo, mapping: PoolMapping, node_epoch: str
+    ) -> MappedPool:
         if self.pin_pools:
             mapping.page_lock()
         mapped = MappedPool(info=info, node_epoch=node_epoch, mapping=mapping)
@@ -233,6 +311,11 @@ class PoolMaps:
     def views(self, pool_id: str) -> int:
         mapped = self.get(pool_id)
         return mapped.views if mapped else 0
+
+
+def _check_shape(info: PoolInfo) -> None:
+    if info.capacity <= 0 or info.page_size <= 0 or info.capacity % info.page_size:
+        raise LocationError(f"pool {info.pool_id}: bad capacity or page size")
 
 
 def _retire(mapped: MappedPool) -> None:

@@ -199,7 +199,7 @@ class LocalServer:
         server_address: str,
         page_size: int,
         budgets: Budgets,
-        pools: list[tuple[PoolDescriptor, int]],
+        pools: list[tuple[PoolDescriptor, int | None]],
         transfer_defaults: TransferDefaults | None = None,
         socket_group: str | None = None,
         budget_keys: frozenset[str] = frozenset(),
@@ -213,7 +213,7 @@ class LocalServer:
         self.page_size = page_size
         self.budgets = budgets
         self.budget_keys = budget_keys
-        # (descriptor, fd); memfd indexes the fds sent with the reply
+        # (descriptor, fd or None); memfd indexes the fds sent with the reply
         self.pools = pools
         self.transfer_defaults = transfer_defaults or TransferDefaults()
         self.serializer = Serializer(NODE_MESSAGE_CLASSES)
@@ -256,6 +256,11 @@ class LocalServer:
             sock.close()
             raise LocalServerError(f"cannot bind {self.path}: {e}") from e
         self._sock = sock
+
+    @property
+    def started(self) -> bool:
+        """Whether it accepted connections (workers may have attached)."""
+        return getattr(self, "_accept", None) is not None
 
     def start(self) -> None:
         """Listen and accept; claim() came first."""
@@ -485,7 +490,7 @@ class LocalServer:
             pid=node_pid,
             pid_start=pid_start,
         )
-        fds = [] if probe else [fd for _, fd in self.pools]
+        fds = [] if probe else [fd for _, fd in self.pools if fd is not None]
         if not conn.respond(header, response, fds):
             return
         logger.info(
