@@ -37,7 +37,8 @@ from .memory import (
 )
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
-from .storage.cpu import CpuAllocation, CpuReadLease
+from .storage.cpu import CpuAllocation
+from .storage.lease import ReadLease
 
 logger = logging.getLogger(__name__)
 
@@ -737,10 +738,10 @@ class MaruHandler:
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
 
-    def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
+    def retrieve(self, key: str) -> MemoryInfo | ReadLease | None:
         """Retrieve a zero-copy MemoryInfo from the KV cache.
 
-        CPU storage returns a CpuReadLease instead. Explicitly release it
+        CPU storage and maru_node return a ReadLease instead. Explicitly release it
         after the final read/copy, or use it as a context manager.
 
         Returns a MemoryInfo with a memoryview slice of the mmap region.
@@ -986,10 +987,10 @@ class MaruHandler:
 
     def batch_retrieve(
         self, keys: list[str], route_key: str | None = None
-    ) -> list[MemoryInfo | CpuReadLease | None]:
+    ) -> list[MemoryInfo | ReadLease | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
-        CPU results are CpuReadLease objects; release every non-None result
+        CPU and maru_node results are ReadLease objects; release every non-None result
         after the final read/copy (or call release_retrieved on the list).
 
         Uses a single batch RPC call for lookup, returns zero-copy

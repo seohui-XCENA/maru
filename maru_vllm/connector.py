@@ -54,7 +54,7 @@ from maru_common.kv_shard import (
 )
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_handler.client import CreditUnavailableError
-from maru_handler.storage.cpu import CpuReadLease
+from maru_handler.storage.lease import ReadLease
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
@@ -7060,7 +7060,7 @@ class MaruWorkerConnector:
         reads: list[Any] = []
 
         def walk(item: Any) -> None:
-            if isinstance(item, CpuReadLease):
+            if isinstance(item, ReadLease):
                 reads.append(item)
             elif isinstance(item, list | tuple):
                 for each in item:

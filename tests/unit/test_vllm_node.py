@@ -27,6 +27,7 @@ from maru_common.kv_shard import WHOLE_MODEL, tp_kv_shard
 from maru_common.node_protocol import AttachResponse, TransferDefaults
 from maru_common.storage_types import Key, Status, StorageUnavailableError
 from maru_handler.client import CreditUnavailableError
+from maru_handler.memory.types import MemoryInfo
 from maru_handler.storage.cpu import CpuReadLease
 from maru_vllm.connector import (
     _NODE_KEYS_ELSEWHERE,
@@ -642,6 +643,27 @@ def test_queued_reads_are_released_once_their_copies_end():
     worker._release_completed_load_refs()
     assert released(worker) == [done]
     assert len(worker._active_load_refs) == 1
+
+
+def test_any_read_lease_is_released_whatever_its_class():
+    """The connector keeps the read contract, not a class: a CXL read or a
+    future medium's read is released the same way; a legacy MemoryInfo is not."""
+
+    class OtherLease:
+        def __init__(self):
+            self.view = memoryview(bytearray(4))
+
+        def release(self) -> None:
+            pass
+
+    worker = pinning_worker()
+    other = OtherLease()
+    legacy = MemoryInfo(view=memoryview(bytearray(4)))
+    worker._release_held([[other, legacy], {"x": lease("a")}])
+    assert [type(r).__name__ for r in released(worker)] == [
+        "OtherLease",
+        "CpuReadLease",
+    ]
 
 
 def test_a_finished_parked_load_releases_its_reads():
