@@ -93,7 +93,11 @@ class WorkerEndpoint(Protocol):
 
     def close(self) -> None: ...
 
-    def post_notify(self, notify: Notify) -> None: ...
+    def post_notify(self, notify: Notify) -> None:
+        """Queue ``notify`` without blocking; any thread may call it. Notices
+        to one connection arrive in the order they were posted; those posted
+        while it is closed are dropped."""
+        ...
 
 
 class ProcessWatcher(Protocol):

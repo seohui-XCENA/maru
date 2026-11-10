@@ -4586,8 +4586,9 @@ class TestPackedStorage:
         assert worker._stored_keys == set()
 
     def test_kernel_store_registers_nothing_whose_copy_failed(self):
-        """A slab whose copy cannot be confirmed is freed, not registered:
-        another instance would read incomplete KV as a hit."""
+        """A slab whose copy cannot be confirmed is not registered (another
+        instance would read incomplete KV as a hit) and not freed (the copy
+        may still write it)."""
         if not torch.cuda.is_available():
             pytest.skip("needs CUDA")
         from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
@@ -4626,7 +4627,8 @@ class TestPackedStorage:
         worker._handler.batch_store.assert_not_called()
         assert store == {}
         assert worker._stored_keys == set()
-        assert freed == allocated
+        assert freed == []
+        assert [h for held in worker._unconfirmed for h in held[0]] == allocated
 
     def test_kernel_store_writes_kv2ltd_slab_roundtrip(self):
         """_store_packed_slabs: one kernel D2H per chunk, one key per chunk,

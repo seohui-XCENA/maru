@@ -3903,6 +3903,10 @@ class MaruWorkerConnector:
             str, tuple[Any, dict[int, tuple[str, Any]]]
         ] = {}
         self._pending_store_keys: set[str] = set()
+        # What a copy whose completion is unknown may still touch (pages,
+        # pinned reads, its inputs): never freed or released here, so the
+        # space is reused only after the process ends
+        self._unconfirmed: list[Any] = []
         self._store_key_waiters: dict[str, set[str]] = {}
         self._request_pending_store_keys: dict[str, set[str]] = {}
         self._finished_store_requests: set[str] = set()
@@ -8133,7 +8137,8 @@ class MaruWorkerConnector:
                 try:
                     stream.synchronize()
                 except Exception:
-                    self._free_handles_best_effort(handles[first_key:])
+                    # The copies may still be writing these pages
+                    self._keep_unconfirmed(handles[first_key:])
                     del keys[first_key:], handles[first_key:]
                     raise
         if self._timing and len(keys) > first_key:
@@ -8418,8 +8423,9 @@ class MaruWorkerConnector:
             if event is not None:
                 event.synchronize()
         except Exception as e:
-            logger.error("Maru write-behind D2H failed: %s", e)
-            self._free_handles_best_effort(handles)
+            # The copy may still be writing: its pages are not reused
+            logger.error("Maru write-behind D2H failed; its pages are kept: %s", e)
+            self._keep_unconfirmed(handles, list(refs))
             keys = keys + self._drop_deferred(deferred)
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
@@ -8692,6 +8698,10 @@ class MaruWorkerConnector:
             except Exception:
                 pass
 
+    def _keep_unconfirmed(self, *held: Any) -> None:
+        """Keep what a copy that could not be waited for may still use."""
+        self._unconfirmed.append(held)
+
     def _is_stored(self, key: str) -> bool:
         # A session or node pool may drop a key: ask, never remember
         if self._cpu_mode or self._node_mode:
@@ -8752,18 +8762,22 @@ class MaruWorkerConnector:
         for base_key in list(self._pending_layer_objects):
             self._drop_layer_objects(base_key)
         self._wait_node_stores(_NODE_STORE_DRAIN_S)
-        if self._store_stream is not None:
+
+        def drain(stream: Any, what: str) -> bool:
             try:
-                self._store_stream.synchronize()
+                stream.synchronize()
             except Exception as e:
-                logger.error("Error synchronizing Maru store stream: %s", e)
+                logger.error("Error synchronizing Maru %s stream: %s", what, e)
+                return False
+            return True
+
+        drained = True
+        if self._store_stream is not None:
+            drained &= drain(self._store_stream, "store")
             self._store_stream = None
             self._store_staging = None
         if self._sync_store_stream is not None:
-            try:
-                self._sync_store_stream.synchronize()
-            except Exception as e:
-                logger.error("Error synchronizing Maru sync store stream: %s", e)
+            drained &= drain(self._sync_store_stream, "sync store")
             self._sync_store_stream = None
         # Drain the loader thread before touching the handler or streams:
         # an in-flight job may still be retrieving/queueing copies.
@@ -8771,29 +8785,36 @@ class MaruWorkerConnector:
             self._deferred_executor.shutdown(wait=True)
             self._deferred_executor = None
         if self._deferred_stream is not None:
-            try:
-                self._deferred_stream.synchronize()
-            except Exception as e:
-                logger.error("Error synchronizing Maru deferred-load stream: %s", e)
+            drained &= drain(self._deferred_stream, "deferred-load")
             self._deferred_stream = None
         if self._load_stream is not None:
-            try:
-                self._load_stream.synchronize()
-            except Exception as e:
-                logger.error("Error synchronizing Maru load stream: %s", e)
+            drained &= drain(self._load_stream, "load")
             self._load_stream = None
         # Copies the loader thread queued read pinned buffers and CXL views
         # that the lines below drop and unmap. A run where every request took
         # the off-thread path never created _load_stream, so these streams are
         # the only thing still holding that memory.
         for stream in self._layerwise_streams:
-            try:
-                stream.synchronize()
-            except Exception as e:
-                logger.error("Error synchronizing Maru layerwise stream: %s", e)
+            drained &= drain(stream, "layerwise")
         self._layerwise_streams = []
         self._layerwise_stream_device = None
         self._layer_load_events.clear()
+        if not drained:
+            # A copy may still use the pinned objects or store pages: keep
+            # them, their pins and the mappings until the process ends
+            logger.error(
+                "Maru: queued copies did not finish; pins, pages and mappings "
+                "are left to the process exit"
+            )
+            self._keep_unconfirmed(
+                self._active_load_refs,
+                self._deferred_refs,
+                self._deferred_layerwise_loads,
+                self._handler,
+                self._node_handler,
+            )
+            self._handler = self._node_handler = None
+            return
         # Every stream is drained: no copy reads the pinned objects any more
         self._release_held(
             [

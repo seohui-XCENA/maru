@@ -678,6 +678,33 @@ def test_shutdown_releases_every_held_read_before_closing():
     }
 
 
+class FailedWait(Done):
+    def synchronize(self):
+        raise RuntimeError("copy completion unknown")
+
+
+def test_a_failed_write_wait_keeps_its_pages():
+    """The copy may still be writing: the page is not handed out again."""
+    worker = pinning_worker()
+    handle = SimpleNamespace(buf=memoryview(bytearray(4)))
+    worker._pending_store_keys.add("k")
+    worker._finish_write_behind_store(FailedWait(), ["k"], [handle], [])
+    worker._handler.free.assert_not_called()
+    assert "k" not in worker._pending_store_keys
+
+
+def test_a_failed_shutdown_wait_keeps_reads_and_mappings():
+    """A copy may still read the pinned objects: pins and mappings stay
+    until the process ends."""
+    worker = pinning_worker()
+    handler = worker._handler
+    worker._active_load_refs = [(Pending(), [[lease("read")]])]
+    worker._load_stream = FailedWait()
+    worker.shutdown()
+    handler.release_retrieved.assert_not_called()
+    handler.close.assert_not_called()
+
+
 def test_other_backends_hold_no_pins():
     worker = make_worker(BLOCK, CHUNK, {})
     worker._handler = MagicMock()

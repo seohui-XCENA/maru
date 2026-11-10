@@ -127,6 +127,16 @@ def _old_key(incarnation: str) -> str:
     return f"old:{incarnation}"
 
 
+def _post_server_drains(conn: WorkerEndpoint, epochs: list[str]) -> None:
+    """NOTIFY drain for each epoch, oldest first. A DRAIN_ACK also covers the
+    drains before it, so whichever thread posts, the worker hears of every
+    earlier epoch it may still read before the one it acknowledges."""
+    for epoch in epochs:
+        conn.post_notify(
+            Notify(kind=NotifyKind.DRAIN, drain_kind=DrainKind.SERVER, epoch=epoch)
+        )
+
+
 class WorkerRegistry:
     """Worker records and their lifecycle. Thread safe; ``on_exit`` is called
     without the lock held."""
@@ -266,7 +276,7 @@ class WorkerRegistry:
             old = self._old.get(rec.incarnation)
             draining = old is not None and old.state == OldState.DRAINING
             conn = rec.conn
-            server = [d for d in self._drains if rec.incarnation in d.waiting]
+            server = self._server_drain_epochs(rec.incarnation)
         if conn is None:
             return
         if draining:
@@ -277,14 +287,7 @@ class WorkerRegistry:
                     epoch=self.previous_node_epoch,
                 )
             )
-        for drain in server:  # oldest first: each epoch it may still read
-            conn.post_notify(
-                Notify(
-                    kind=NotifyKind.DRAIN,
-                    drain_kind=DrainKind.SERVER,
-                    epoch=drain.old_epoch,
-                )
-            )
+        _post_server_drains(conn, server)
 
     def connection_lost(self, rec: WorkerRecord, conn: WorkerEndpoint) -> None:
         """The UDS closed; the credit stays until the process exits. A probe
@@ -497,16 +500,13 @@ class WorkerRegistry:
             )
             drain.credit_tags = {h: f"server:{index}:{h}" for h in counts}
             self._drains.append(drain)
-            conns = [
-                r.conn
+            notices = [
+                (r.conn, self._server_drain_epochs(r.incarnation))
                 for r in self._workers.values()
                 if r.incarnation in drain.waiting and r.conn is not None
             ]
-        notify = Notify(
-            kind=NotifyKind.DRAIN, drain_kind=DrainKind.SERVER, epoch=old_epoch
-        )
-        for conn in conns:
-            conn.post_notify(notify)
+        for conn, epochs in notices:
+            _post_server_drains(conn, epochs)
         logger.warning(
             "MaruServer epoch %s ended: %d credited pages quarantined; eviction "
             "and space reclaim wait for %d workers to drain it",
@@ -524,6 +524,11 @@ class WorkerRegistry:
             conns = [r.conn for r in records if r.conn is not None]
         for conn in conns:
             conn.post_notify(notify)
+
+    def _server_drain_epochs(self, incarnation: str) -> list[str]:
+        """Caller holds the lock. Ended epochs of the open drains
+        ``incarnation`` is still in, oldest first."""
+        return [d.old_epoch for d in self._drains if incarnation in d.waiting]
 
     def server_drain_open(self) -> bool:
         with self._lock:

@@ -6,14 +6,25 @@ what waits for it."""
 
 import dataclasses
 import logging
+import os
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
 from maru_common.config import MaruConfig
-from maru_common.node_protocol import DrainAckRequest, NodeMessageType, Notify
-from maru_common.protocol import MessageType, NodeHeartbeatResponse
+from maru_common.node_protocol import (
+    Budgets,
+    DrainAckRequest,
+    NodeMessageType,
+    Notify,
+)
+from maru_common.protocol import (
+    MessageType,
+    NodeHeartbeatResponse,
+    WorkerOpenResponse,
+)
 from maru_common.storage_types import (
     BlockRequest,
     DrainKind,
@@ -24,14 +35,25 @@ from maru_common.storage_types import (
     KeyLocation,
     Location,
     NotifyKind,
+    PoolInfo,
     PoolKind,
+    SessionRole,
     Status,
+    StorageLocation,
     make_generation,
 )
 from maru_handler import MaruHandler
 from maru_handler.client import CreditUnavailableError
-from maru_storage_service.pool_manager import PageState
+from maru_handler.client.maru_client import MaruClient, PinnedRead
+from maru_handler.client.server_conn import ServerConn
+from maru_storage_service.op_ledger import OpLedger
+from maru_storage_service.pool_manager import PageState, PoolManager
 from maru_storage_service.ports import EpochChanged, StaleOp
+from maru_storage_service.worker_registry import (
+    AttachIdentity,
+    WorkerRecord,
+    WorkerRegistry,
+)
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -1259,6 +1281,165 @@ class TestDrainNotices:
         client._on_notify(drain)  # sent again after a re-attach
         assert client.credits.era == era
         assert client.credits.unused_bytes > 0
+
+    def test_a_drain_notice_follows_every_earlier_open_one(self, fake, nodes, raws):
+        node = nodes()
+        raw = raws(node)  # never acknowledges
+        first = restart(fake, node)
+        second = restart(fake, node)
+        wait_until(lambda: drain_notices(raw, second), what="notices")
+        epochs = [
+            n.epoch
+            for n in raw.notices
+            if n.kind == NotifyKind.DRAIN and n.drain_kind == DrainKind.SERVER
+        ]
+        assert epochs == [first, first, second]
+
+    def test_a_later_drain_does_not_overtake_an_earlier_notice(self):
+        """A re-attach posts the open drains; a drain started meanwhile must
+        not let the worker acknowledge before it hears of the earlier one,
+        or a page it still reads goes FREE."""
+        ps = 4096
+        pools = PoolManager(Budgets(ps * 4, ps * 4, ps, ps * 4, ps * 4), ps)
+        pools.add_pool(PoolInfo("dram:n:run", PoolKind.DRAM, "n", 1, ps * 4, ps))
+        pools.set_epoch_seq(1)
+        credit = pools.credit("writer", ps)[0]
+        ref, loc, _ = pools.write_done("writer", credit, Key(NS, "k"), 4)
+        pools.commit_added(ref)
+        client = MaruClient(
+            MaruConfig(
+                maru_node="/nonexistent/node.sock",
+                engine_id="e",
+                cache_namespace=NS,
+                auto_connect=False,
+                pin_pools=False,
+            )
+        )
+        registry = WorkerRegistry(
+            node_epoch="run",
+            pools=pools,
+            ledger=OpLedger(),
+            watcher=MagicMock(),
+            on_exit=lambda _: None,
+            gpu_drain_grace_s=0,
+        )
+        rec = WorkerRecord(
+            AttachIdentity(client.identity.incarnation, "e", 0, 0, 123, 1, NS)
+        )
+        registry._workers[rec.incarnation] = rec
+        client._reads.add(
+            PinnedRead(
+                view=memoryview(bytearray(4)),
+                location=StorageLocation(
+                    loc.pool_id, loc.allocation_id, loc.generation, 0, 4
+                ),
+                _release=lambda: None,
+                key="k",
+                pin_id="pin",
+                server_epoch="e0",
+            )
+        )
+        registry.start_server_drain("e0")  # the worker was away: not told
+        pools.drop_ready(ref)
+        assert pools.page(ref).state == PageState.QUARANTINED
+        blocked, resume = threading.Event(), threading.Event()
+        acks = []
+
+        class Endpoint:
+            def close(self):
+                pass
+
+            def post_notify(self, notify):
+                if notify.epoch == "e0" and threading.current_thread().name == "attach":
+                    blocked.set()
+                    assert resume.wait(5)
+                client._on_notify(notify)
+
+        class Link:
+            closed = False
+
+            def submit(self, code, request):
+                if code == NodeMessageType.DRAIN_ACK:
+                    acks.append(request.epoch)
+                    registry.drain_ack(rec, request)
+
+        client._storage = Link()
+        rec.conn = Endpoint()
+        attach = threading.Thread(
+            target=registry.after_attach_reply, args=(rec,), name="attach"
+        )
+        attach.start()
+        try:
+            assert blocked.wait(2)
+            registry.start_server_drain("e1")
+            time.sleep(0.3)
+            assert acks == []
+            assert pools.page(ref).state == PageState.QUARANTINED
+        finally:
+            resume.set()
+            attach.join(2)
+            client._closing.set()
+            with client._cv:
+                client._cv.notify_all()
+            registry.stop()
+
+
+def test_a_late_open_reply_never_takes_the_epoch_back():
+    """Opens run one at a time: the later one's server epoch stays and the
+    live epoch is never counted as ended."""
+    client = MaruClient(
+        MaruConfig(
+            maru_node="/nonexistent/node.sock",
+            engine_id="e",
+            cache_namespace=NS,
+            auto_connect=False,
+            pin_pools=False,
+        )
+    )
+    conn = ServerConn(
+        "tcp://127.0.0.1:1",
+        client.identity,
+        node_id="n",
+        node_epoch="node",
+        pid=os.getpid(),
+        pid_start=1,
+        timeout_s=0.1,
+        role=SessionRole.PROBE,
+    )
+    conn.server_epoch, conn.session = "old", "old-session"
+    conn.on_server_epoch.append(client._server_epoch_changed)
+    entered, release = threading.Event(), threading.Event()
+    answers = iter(["old", "new"])  # in the order the requests reach a server
+
+    def call(code, request):
+        epoch = next(answers)
+        if epoch == "old":
+            entered.set()
+            assert release.wait(5)
+        return WorkerOpenResponse(
+            status=Status.OK,
+            worker_session=f"{epoch}-session",
+            server_epoch=epoch,
+            heartbeat_s=1,
+            session_ttl_s=30,
+        )
+
+    conn._rpc.call = call
+    first = threading.Thread(target=conn.open)
+    second = threading.Thread(target=conn.open)
+    try:
+        first.start()
+        assert entered.wait(2)
+        second.start()
+        time.sleep(0.05)
+        release.set()
+        first.join(2)
+        second.join(2)
+        assert conn.server_epoch == "new"
+        assert client._ended_epochs == {"old"}
+    finally:
+        release.set()
+        conn._rpc.close()
 
 
 class TestOldWorkersAndTheServerDrain:

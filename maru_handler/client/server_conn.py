@@ -84,6 +84,9 @@ class ServerConn:
         self.pid_start = pid_start
         self._rpc = MsRpcClient(url, timeout_s=timeout_s, name=f"maru-{role.value}-rpc")
         self._lock = threading.RLock()
+        # One WORKER_OPEN at a time, from request to applied response; the
+        # stale-node callback may reopen from inside one (same thread)
+        self._open_lock = threading.RLock()
         self.session: str | None = None
         self.server_epoch: str | None = None
         self.heartbeat_s = 0.0
@@ -117,7 +120,13 @@ class ServerConn:
 
     def open(self) -> None:
         """WORKER_OPEN; StorageUnavailableError if unreachable or refused
-        (NodeResumingError while a restarted MaruServer waits for the node)."""
+        (NodeResumingError while a restarted MaruServer waits for the node).
+        Opens run one at a time, so a late answer never takes the server
+        epoch back."""
+        with self._open_lock:
+            self._open()
+
+    def _open(self) -> None:
         if self._no_reopen:
             raise StorageUnavailableError("the session is not opened again")
         request = WorkerOpenRequest(
