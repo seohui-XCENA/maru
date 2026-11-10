@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from maru_common.node_protocol import process_start_time
 from maru_common.storage_types import (
     DaxMapping,
     Location,
@@ -89,40 +90,133 @@ def _rm_client(address: str) -> MaruShmClient:
         return client
 
 
-class CxlRegionMapping:
-    """A CXL region mapped after its RM checked the handle's token (GET_ACCESS).
-    Page-locked like a DRAM pool; the mapping is this pool's own."""
+@dataclass(frozen=True)
+class RegionHolder:
+    """Who holds a CXL region in the RM: a worker incarnation and the process
+    the RM checks to reap the hold once it ends."""
 
-    def __init__(self, info: PoolInfo, dax: DaxMapping):
+    holder: str
+    boot_id: str
+    pid: int
+    pid_start: int
+    pid_ns: int
+
+    @classmethod
+    def this_process(cls, holder: str) -> "RegionHolder":
+        try:
+            with open("/proc/sys/kernel/random/boot_id") as f:
+                boot = f.read().strip()
+        except OSError:
+            boot = ""
+        try:
+            pid_ns = os.stat("/proc/self/ns/pid").st_ino
+        except OSError:
+            pid_ns = 0
+        pid = os.getpid()
+        return cls(holder, boot, pid, process_start_time(pid), pid_ns)
+
+
+class RegionHolds:
+    """One RM hold per region for the process while any mapping of it lives:
+    a region is mapped only after its hold is durable, and the hold is
+    dropped only once every mapping of it is unregistered and unmapped."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # (RM id, region, holder) as the RM keys holds: an RM written as
+        # another address is the same RM, and two clients of one process hold
+        # apart
+        self._count: dict[tuple[str, int, str], int] = {}
+
+    def acquire(self, dax: DaxMapping, who: RegionHolder):
+        """The region's device access, holding it; RuntimeError (stale run,
+        bad token) if the RM refuses."""
+        key = (dax.rm_domain, dax.handle.region_id, who.holder)
+        client = _rm_client(dax.rm_address)
+        with self._lock:
+            if self._count.get(key):
+                access = client.get_access(dax.handle)
+                self._count[key] += 1
+                return access
+            access = client.node_hold(
+                dax.node_id,
+                dax.node_epoch,
+                dax.handle,
+                who.holder,
+                boot_id=who.boot_id,
+                pid=who.pid,
+                pid_start=who.pid_start,
+                pid_ns=who.pid_ns,
+            )
+            self._count[key] = 1
+            return access
+
+    def release(self, dax: DaxMapping, who: RegionHolder) -> None:
+        key = (dax.rm_domain, dax.handle.region_id, who.holder)
+        with self._lock:
+            count = self._count.get(key, 0) - 1
+            if count > 0:
+                self._count[key] = count
+                return
+            self._count.pop(key, None)
+            try:
+                _rm_client(dax.rm_address).unhold(dax.handle, who.holder, who.holder)
+            except Exception as e:  # the RM reaps it once this process ends
+                logger.warning(
+                    "could not drop the hold on region %d: %s", dax.handle.region_id, e
+                )
+
+
+_HOLDS = RegionHolds()
+
+
+class CxlRegionMapping:
+    """A CXL region mapped while this process holds it in the RM (NODE_HOLD,
+    which also checks the handle's token). Page-locked like a DRAM pool."""
+
+    def __init__(
+        self,
+        info: PoolInfo,
+        dax: DaxMapping,
+        who: RegionHolder | None,
+        holds: RegionHolds = _HOLDS,
+    ):
         handle = dax.handle
+        if who is None:
+            raise LocationError(f"pool {info.pool_id}: no holder to hold it in the RM")
         if handle.length < info.capacity:
             raise LocationError(
                 f"pool {info.pool_id}: the region has {handle.length} bytes, "
                 f"the pool {info.capacity}"
             )
-        access = _rm_client(dax.rm_address).get_access(handle)
-        fd = os.open(access.dax_path, os.O_RDWR)
+        self._dax, self._who, self._holds = dax, who, holds
+        access = holds.acquire(dax, who)
         try:
-            mapping = mmap.mmap(
-                fd,
-                handle.length,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                offset=handle.offset,
-            )
-        finally:
-            os.close(fd)
-        try:
-            self._pool = CpuPool(
-                info.pool_id,
-                info.capacity,
-                info.page_size,
-                medium="cxl",
-                mapping=mapping,
-                shared=True,
-            )
+            fd = os.open(access.dax_path, os.O_RDWR)
+            try:
+                mapping = mmap.mmap(
+                    fd,
+                    handle.length,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    offset=handle.offset,
+                )
+            finally:
+                os.close(fd)
+            try:
+                self._pool = CpuPool(
+                    info.pool_id,
+                    info.capacity,
+                    info.page_size,
+                    medium="cxl",
+                    mapping=mapping,
+                    shared=True,
+                )
+            except BaseException:
+                mapping.close()
+                raise
         except BaseException:
-            mapping.close()
+            holds.release(dax, who)  # nothing maps it
             raise
 
     @property
@@ -136,7 +230,15 @@ class CxlRegionMapping:
         self._pool.page_lock()
 
     def close(self) -> None:
-        self._pool.close()
+        self._pool.close()  # raises while views are held: the hold stays
+        if self._pool.unlock_failed:
+            logger.error(
+                "pool %s: CUDA may still reach it; its RM hold stays until the "
+                "process ends",
+                self._pool.pool_id,
+            )
+            return
+        self._holds.release(self._dax, self._who)
 
 
 @dataclass(eq=False)
@@ -183,11 +285,15 @@ class PoolMaps:
         self,
         pin_pools: bool = True,
         map_memfd: Callable[[PoolInfo, int], PoolMapping] = map_dram_memfd,
-        map_dax: Callable[[PoolInfo, DaxMapping], PoolMapping] = CxlRegionMapping,
+        map_dax: Callable[[PoolInfo, DaxMapping], PoolMapping] | None = None,
+        holder: RegionHolder | None = None,
     ):
+        """``holder``: who holds the CXL regions this process maps."""
         self.pin_pools = pin_pools
         self._map_memfd = map_memfd
-        self._map_dax = map_dax
+        self._map_dax = map_dax or (
+            lambda info, dax: CxlRegionMapping(info, dax, holder)
+        )
         self._lock = threading.Lock()
         self._pools: dict[str, MappedPool] = {}
 

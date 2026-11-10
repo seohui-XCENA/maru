@@ -152,6 +152,7 @@ class WorkerRegistry:
         watcher: ProcessWatcher,
         on_exit: Callable[[WorkerRef], None],
         gpu_drain_grace_s: float,
+        on_settled: Callable[[str], None] = lambda incarnation: None,
     ):
         self.node_epoch = node_epoch
         self.previous_node_epoch: str | None = None
@@ -160,6 +161,12 @@ class WorkerRegistry:
         self._ledger = ledger
         self._watcher = watcher
         self._on_exit = on_exit
+        # A worker (of this run or the one before) whose exit is confirmed and
+        # whose GPU drain grace is over: nothing of it touches the pools any
+        # more, so its region holds can go
+        self._on_settled = on_settled
+        # incarnation -> when its exit's GPU drain grace ends
+        self._settles_at: dict[str, float] = {}
         self._lock = threading.RLock()
         self._workers: dict[str, WorkerRecord] = {}
         self._probes: dict[str, WorkerRecord] = {}
@@ -167,7 +174,10 @@ class WorkerRegistry:
         self._adopted: list[str] = []
         self._adopted_released = False
         self._credit_after: set[str] = set()
-        self._release_not_before = 0.0
+        # Old workers this node cannot watch (their pid is another
+        # namespace's): known by incarnation alone
+        self._unwatchable: frozenset[str] = frozenset()
+
         self._stopping = False
         self._timers: set[threading.Timer] = set()
         self._drains: list[ServerDrain] = []  # open, oldest first
@@ -198,9 +208,10 @@ class WorkerRegistry:
             if rec is not None:
                 return self._rebind(rec, conn, ident)
             old = self._old.get(ident.incarnation)
-            if old is not None and (old.ref.pid, old.ref.pid_start) != (
-                ident.pid,
-                ident.pid_start,
+            if (
+                old is not None
+                and ident.incarnation not in self._unwatchable
+                and (old.ref.pid, old.ref.pid_start) != (ident.pid, ident.pid_start)
             ):
                 return None, (
                     "MaruServer lists this incarnation for another process "
@@ -337,6 +348,7 @@ class WorkerRegistry:
             ):
                 return
             del self._workers[incarnation]
+            self._settles_at[incarnation] = 0.0  # it maps nothing any more
             # Under the lock, so a re-attach of the incarnation (which takes
             # it) never loses its new watch or op records; neither the
             # watcher nor the ledger calls back while holding its own lock
@@ -386,6 +398,7 @@ class WorkerRegistry:
             if rec is None or rec.exited:
                 return
             rec.exited = True
+            self._settles_at[incarnation] = time.monotonic() + self.gpu_drain_grace_s
             conn, rec.conn = rec.conn, None
             # Under the lock a server drain starts with: its credit is never
             # tagged as a live worker's
@@ -416,6 +429,17 @@ class WorkerRegistry:
         freed += self._release(tags)
         if freed:
             logger.info("freed %d pages of ended worker %s", freed, incarnation)
+        self._on_settled(incarnation)
+
+    def settled(self, incarnation: str) -> bool:
+        """Detached, or ended with its GPU drain grace over: it maps and
+        copies nothing of this run any more."""
+        with self._lock:
+            rec = self._workers.get(incarnation)
+            if rec is not None and not rec.exited:
+                return rec.detached
+            ends = self._settles_at.get(incarnation)
+        return ends is not None and time.monotonic() >= ends
 
     def _after(self, delay: float, fn: Callable, *args) -> None:
         def run() -> None:
@@ -441,22 +465,33 @@ class WorkerRegistry:
         adopted: list[str],
         previous_node_epoch: str | None = None,
         credit_after: frozenset[str] = frozenset(),
+        unwatchable: frozenset[str] = frozenset(),
+        gone: frozenset[str] = frozenset(),
     ) -> None:
-        """Start confirming the old workers; before workers attach. The
-        adopted pools in ``credit_after`` give credit once released."""
+        """Start confirming the old workers; before workers attach. They are
+        the workers MaruServer names and the holders of the regions this run
+        claimed (the RM keeps those across restarts). One whose process this
+        node cannot watch (``unwatchable``: another host, pid namespace or
+        boot) is confirmed only by its DRAIN_ACK. The adopted pools in
+        ``credit_after`` give credit once released. Old workers in ``gone``
+        ran before this host's last boot: nothing of theirs survives."""
         with self._lock:
             self.previous_node_epoch = previous_node_epoch
             self._adopted = list(adopted)
             self._credit_after = set(credit_after)
-            if not old_workers:
-                # MaruServer names no worker of the run before (it may have
-                # lost them). Such a worker dropped its credit and stores when
-                # its StorageService went; its copies under way get the GPU
-                # drain grace, as an ended worker's do
-                self._release_not_before = time.monotonic() + self.gpu_drain_grace_s
+            self._unwatchable = frozenset(unwatchable)
             for ref in old_workers:
                 self._old.setdefault(ref.incarnation, OldWorker(ref))
-            pending = [o for o in self._old.values() if o.state == OldState.WAITING]
+            for incarnation in gone:
+                old = self._old.get(incarnation)
+                if old is not None:
+                    old.state = OldState.CONFIRMED
+                    old.how = "ran before this host's last boot"
+            pending = [
+                o
+                for o in self._old.values()
+                if o.state == OldState.WAITING and o.ref.incarnation not in unwatchable
+            ]
         for old in pending:
             if not self._watcher.watch(
                 _old_key(old.ref.incarnation), old.ref.pid, old.ref.pid_start
@@ -680,6 +715,7 @@ class WorkerRegistry:
                 return
         self._on_exit(old.ref)
         self._confirm_old(old, "exited")
+        self._after(self.gpu_drain_grace_s, self._on_settled, incarnation)
         with self._lock:
             tags = self._confirm_server_drain(incarnation, None)
         self._release(tags)
@@ -705,9 +741,7 @@ class WorkerRegistry:
                 return
             if any(o.state != OldState.CONFIRMED for o in self._old.values()):
                 return
-            settle = max(
-                [self._release_not_before, *(o.settled_at for o in self._old.values())]
-            )
+            settle = max([0.0, *(o.settled_at for o in self._old.values())])
             wait = settle - time.monotonic()
             if wait > 0:
                 self._after(wait, self._maybe_release_adopted)

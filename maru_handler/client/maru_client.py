@@ -64,7 +64,7 @@ from maru_common.storage_types import (
 from ..storage.cpu import CpuReadLease
 from .credit_cache import CreditCache
 from .pin_table import PinTable
-from .pool_maps import LocationError, PoolMaps
+from .pool_maps import LocationError, PoolMaps, RegionHolder
 from .server_conn import ServerConn, WorkerIdentity
 from .storage_conn import (
     AttachRefusedError,
@@ -183,7 +183,10 @@ class MaruClient:
             rpc_timeout_s if rpc_timeout_s is not None else config.timeout_ms / 1000
         )
         self.reconnect_s = reconnect_s
-        self.pools = PoolMaps(pin_pools=config.pin_pools)
+        self.pools = PoolMaps(
+            pin_pools=config.pin_pools,
+            holder=RegionHolder.this_process(self.identity.incarnation),
+        )
         self.credits = CreditCache()
         self.pins = PinTable()
 

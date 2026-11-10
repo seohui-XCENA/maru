@@ -22,13 +22,14 @@ from maru_common.storage_types import (
     PoolKind,
     Visibility,
 )
-from maru_shm.client import (
+from maru_shm.types import (
+    MaruHandle,
     NodeClaim,
     NodeRegion,
+    RegionHolder,
     RetryableNodeError,
     StaleNodeEpochError,
 )
-from maru_shm.types import MaruHandle
 
 from ..config import TierConfig
 from . import PoolAccess
@@ -57,6 +58,8 @@ class RegionSource(Protocol):
 
     def node_release(self, node_id: str, node_epoch: str) -> int: ...
 
+    def unhold(self, handle: MaruHandle, holder: str, instance: str) -> None: ...
+
 
 def cxl_pool_id(rm_domain: str, region_id: int) -> str:
     return f"cxl:{rm_domain}:{region_id}"
@@ -72,6 +75,8 @@ class CxlRegionPool:
     page_size: int
     visibility: Visibility
     rm_address: str = ""
+    # This run: a worker's hold names it, so the RM refuses an older run's
+    node_epoch: str = ""
     # Claimed from the run before (it may hold its pages); else allocated now
     claimed: bool = False
     pool_generation: int = 1
@@ -106,7 +111,13 @@ class CxlRegionPool:
     def descriptor(self, memfd: int | None = None) -> PoolDescriptor:
         return PoolDescriptor(
             pool=self.info(),
-            dax=DaxMapping(self.rm_domain, self.region.handle, self.rm_address),
+            dax=DaxMapping(
+                self.rm_domain,
+                self.region.handle,
+                self.rm_address,
+                node_id=self.node_id,
+                node_epoch=self.node_epoch,
+            ),
         )
 
     def worker_fd(self) -> int | None:
@@ -227,6 +238,7 @@ class CxlTier:
             page_size=self.page_size,
             visibility=self.tier.visibility,
             rm_address=self.tier.rm or "",
+            node_epoch=self.node_epoch,
             claimed=claimed,
         )
 
@@ -278,26 +290,40 @@ class CxlTier:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
 
-    def release(self, unmapped: set[str]) -> None:
-        """Give back the regions no worker maps any more (leave). The rest,
-        and any the RM does not take, stay until the lease ends."""
-        kept = [p.pool_id for p in self.pools if p.pool_id not in unmapped]
+    def old_holders(self) -> list[RegionHolder]:
+        """Workers that held a claimed region when this run claimed it: the
+        RM keeps holds across restarts, so these are the run before's workers
+        that may still map it (one entry per worker)."""
+        seen: dict[str, RegionHolder] = {}
+        for pool in self.pools:
+            if pool.claimed:
+                for holder in pool.region.holders:
+                    if holder.node_epoch:  # a worker's, not a remote agent's
+                        seen.setdefault(holder.holder, holder)
+        return list(seen.values())
+
+    def drop_holds(self, holder: str) -> None:
+        """A worker settled (ended, its GPU drain grace over): drop its hold
+        on every region. Dropping one that is gone does nothing."""
+        for pool in self.pools:
+            try:
+                self.source.unhold(pool.region.handle, holder, holder)
+            except Exception as e:  # the RM reaps it once it sees the exit
+                logger.warning(
+                    "cxl tier: could not drop %s's hold on %s: %s",
+                    holder,
+                    pool.pool_id,
+                    e,
+                )
+
+    def release(self) -> None:
+        """Give every region back (leave). One still mapped stays out of reuse
+        in the RM until its last hold goes; one the RM does not take back now
+        is freed when the lease ends."""
         try:
-            if not kept:
-                freed = self.source.node_release(self.node_id, self.node_epoch)
-                logger.info("cxl tier: %d regions given back to the RM", freed)
-                return
-            for pool in self.pools:
-                if pool.pool_id in unmapped:
-                    self.source.node_free(
-                        self.node_id, self.node_epoch, pool.region.handle
-                    )
-            logger.error(
-                "cxl tier: regions %s may still be mapped by a worker; left to "
-                "the RM, which frees them when the lease ends",
-                kept,
-            )
-        except Exception as e:  # the RM frees them when the lease ends
+            freed = self.source.node_release(self.node_id, self.node_epoch)
+            logger.info("cxl tier: %d regions given back to the RM", freed)
+        except Exception as e:
             logger.error(
                 "cxl tier: could not give the regions back (%s); the RM frees "
                 "them when the lease ends",

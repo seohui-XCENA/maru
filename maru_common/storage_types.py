@@ -241,11 +241,14 @@ class PoolInfo:
 @dataclass(frozen=True)
 class DaxMapping:
     """A CXL region a worker maps: its RM domain, the RM handle, and the RM
-    address the worker asks for access (rm_domain is an id, not an address)."""
+    address the worker holds it at (rm_domain is an id, not an address)."""
 
     rm_domain: str
     handle: MaruHandle
     rm_address: str = ""
+    # The owner node's current run: a worker's hold must name it (RM fencing)
+    node_id: str = ""
+    node_epoch: str = ""
 
 
 @dataclass(frozen=True)

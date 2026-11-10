@@ -52,6 +52,7 @@ class TierDriver(Protocol):
         ...
 
     def open(self, info: PoolInfo) -> DriverPool:
-        """A pool this run did not create: adopted from the run before, or
-        granted by MaruServer (a CXL region)."""
+        """A pool this run did not create, adopted from the run before. CXL
+        regions come from the RM through CxlTier (claim, renew, release), which
+        does not fit this interface yet."""
         ...

@@ -110,6 +110,7 @@ class StorageManager:
         evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
         op_window: int = OP_WINDOW,
         traits: dict[PoolKind, TierTraits] | None = None,
+        on_worker_settled: Callable[[str], None] = lambda incarnation: None,
     ):
         self.node_epoch = node_epoch
         self.traits = traits or {
@@ -129,6 +130,7 @@ class StorageManager:
             ledger=self.ledger,
             watcher=self.watcher,
             on_exit=self._queue_exit,
+            on_settled=on_worker_settled,
             gpu_drain_grace_s=gpu_drain_grace_s,
         )
 
@@ -749,17 +751,21 @@ class StorageManager:
         old_may_map: AbstractSet[str] = frozenset(),
     ) -> set[str]:
         """Ask every worker that may map ``pools`` (pool_id, generation) to
-        unmap them; the pool_ids each one unmapped (UNMAP_ACK), detached or
-        was seen ending within ``timeout_s``. A worker that reconnects is asked
-        again; one whose connection dropped counts only once it ends. Pools in
+        unmap them; the pool_ids each one unmapped (UNMAP_ACK) or settled
+        (detached, or ended with its GPU drain grace over) within
+        ``timeout_s``. A worker that reconnects is asked again; one whose
+        connection dropped counts only once it settles. Pools in
         ``old_may_map`` also wait for every worker of the run before. A
         timeout is no confirmation. The caller stops new ATTACHes from mapping
-        them first."""
-        asked: dict[str, WorkerEndpoint] = {}
+        them first. Whatever this answers, the RM keeps a region out of reuse
+        while any worker holds it."""
+        asked: dict[str, WorkerEndpoint | None] = {}
         deadline = time.monotonic() + timeout_s
         with self._cv:
             while True:
                 workers = self.workers.mapping()
+                for inc in workers:
+                    asked.setdefault(inc, None)
                 for inc, conn in workers.items():
                     if conn is not None and asked.get(inc) is not conn:
                         asked[inc] = conn
@@ -777,7 +783,9 @@ class StorageManager:
                     for pool_id, generation in pools
                     if not (old and pool_id in old_may_map)
                     and all(
-                        (inc, pool_id, generation) in self._unmapped for inc in workers
+                        (inc, pool_id, generation) in self._unmapped
+                        or self.workers.settled(inc)
+                        for inc in asked
                     )
                 }
                 left = deadline - time.monotonic()

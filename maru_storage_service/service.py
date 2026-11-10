@@ -9,10 +9,13 @@ are refused. The top tier gives credit; demotion to CXL is not there yet.
 """
 
 import logging
+import os
+import socket
 import threading
 import uuid
+from dataclasses import dataclass
 
-from maru_common.storage_types import CloseMode, PoolKind, RmDomain
+from maru_common.storage_types import CloseMode, PoolKind, RmDomain, WorkerRef
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError
@@ -33,6 +36,30 @@ from .storage_manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _OldWorkers:
+    refs: list[WorkerRef]
+    unwatchable: frozenset[str]
+    gone: frozenset[str]
+    previous: str | None
+
+
+def _local_identity() -> tuple[str, str, int]:
+    """(hostname, boot id, pid namespace) of this process, as the RM records
+    a worker's."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = ""
+    try:
+        pid_ns = os.stat("/proc/self/ns/pid").st_ino
+    except OSError:
+        pid_ns = 0
+    return socket.gethostname(), boot, pid_ns
+
 
 # How long a leave waits for the workers to unmap the CXL regions
 DEFAULT_UNMAP_TIMEOUT_S = 30.0
@@ -190,6 +217,7 @@ class StorageService:
             evict_interval_s=self.evict_interval_s,
             op_window=self.op_window,
             traits=traits,
+            on_worker_settled=self._worker_settled,
         )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
         rm_domains = []
@@ -235,10 +263,16 @@ class StorageService:
                 self.pools.add_pool(pool.info(), creditable=traits[PoolKind.CXL].credit)
         self.manager.start()
         credit_kinds = {kind for kind, t in traits.items() if t.credit}
+        old = self._old_workers(opened)
+        for holder in old.gone:  # dead since the reboot: nothing to wait for
+            assert self.cxl is not None
+            self.cxl.drop_holds(holder)
         self.manager.workers.start_restart_drain(
-            opened.old_workers,
+            old.refs,
             self.adopted,
-            opened.previous_node_epoch,
+            old.previous,
+            unwatchable=old.unwatchable,
+            gone=old.gone,
             credit_after=frozenset(
                 pool_id
                 for pool_id in self.adopted
@@ -276,6 +310,51 @@ class StorageService:
                 len(adopted_ids & {p.pool_id for p in cxl_pools}),
             )
 
+    def _old_workers(self, opened) -> _OldWorkers:
+        """The workers of the run before: those MaruServer names (with pids
+        this node sees), and the holders of the regions this run claimed
+        (MaruServer may have lost them; the RM keeps holds). A holder MaruServer
+        does not name is watched only if it ran on this host, boot and pid
+        namespace; another namespace's is confirmed by its DRAIN_ACK alone; one
+        from before this host's last boot is gone, and so are its holds."""
+        refs = list(opened.old_workers)
+        named = {r.incarnation for r in refs}
+        known = set(named)
+        host, boot, pid_ns = _local_identity()
+        unwatchable, gone = set(), set()
+        for h in self.cxl.old_holders() if self.cxl is not None else []:
+            if h.holder in named:
+                continue
+            if h.holder not in known:
+                refs.append(
+                    WorkerRef(
+                        engine_id="",
+                        dp_index=0,
+                        tp_rank=0,
+                        pid=h.pid,
+                        pid_start=h.pid_start,
+                        incarnation=h.holder,
+                    )
+                )
+                known.add(h.holder)
+            if h.host == host and h.boot_id and boot and h.boot_id != boot:
+                gone.add(h.holder)
+            elif (h.host, h.boot_id, h.pid_ns) != (host, boot, pid_ns):
+                unwatchable.add(h.holder)
+        previous = opened.previous_node_epoch
+        if previous is None:
+            previous = (
+                next((h.node_epoch for h in self.cxl.old_holders()), None)
+                if self.cxl is not None
+                else None
+            )
+        return _OldWorkers(refs, frozenset(unwatchable), frozenset(gone), previous)
+
+    def _worker_settled(self, incarnation: str) -> None:
+        """Its GPU drain grace is over: its region holds can go."""
+        if self.cxl is not None:
+            self.cxl.drop_holds(incarnation)
+
     def interrupt(self) -> None:
         """Stop a start still waiting for the RM or MaruServer."""
         self._interrupted.set()
@@ -305,9 +384,13 @@ class StorageService:
     def _teardown(self, mode: CloseMode) -> None:
         if self.cxl is not None:
             self.cxl.stop_renewing(timeout=1.0)
-        unmapped: set[str] = set()
         if self.cxl is not None and mode == CloseMode.LEAVE:
-            unmapped = self._unmap_cxl()
+            still = {p.pool_id for p in self.cxl.pools} - self._unmap_cxl()
+            if still:
+                # Their holds keep them out of reuse in the RM until unmapped
+                logger.warning(
+                    "cxl regions still mapped by a worker: %s", sorted(still)
+                )
         if self.local is not None:
             self.local.stop()
         if self.server is not None:
@@ -319,7 +402,7 @@ class StorageService:
                 logger.info("node session closed (%s)", mode.value)
             self.server.close()
         if self.cxl is not None and mode == CloseMode.LEAVE:
-            self.cxl.release(unmapped)
+            self.cxl.release()
         if self._rm_client is not None:
             self._rm_client.close()
         if self.dram is not None:
