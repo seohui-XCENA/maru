@@ -42,6 +42,8 @@ from maru_common.protocol import (
     NodeReregisterResponse,
     ProbeRequest,
     ProbeResponse,
+    ReleaseFinalizerRequest,
+    ReleaseFinalizerResponse,
     RetireRequest,
     RetireResponse,
     SourcePinRequest,
@@ -60,7 +62,6 @@ from maru_common.protocol import (
 from maru_common.serializer import op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
-    CommitPin,
     ItemOutcome,
     ItemResult,
     Key,
@@ -142,7 +143,7 @@ def result_bytes(result: Any) -> int:
     """Rough size of a stored op result, for op_bytes_max."""
     size = 64
     for item in getattr(result, "items", ()):
-        size += 48 + len(item.pin_id or "")
+        size += 48 + len(item.pin_id or "") + len(item.finalizer_id or "")
         for loc in (item.location, item.plan.source if item.plan else None):
             if loc is not None:
                 size += 64 + len(loc.pool_id) + len(loc.allocation_id)
@@ -417,7 +418,7 @@ class MsService:
         self, req: NodeReregisterRequest, payload: dict
     ) -> NodeReregisterResponse:
         """Locations a node held before this MaruServer started, applied as a
-        COMMIT without pins; accepted after the recovery window too."""
+        COMMIT without finalizers; accepted after the recovery window too."""
         digest = op_digest(payload)
         with self.lock:
             session = self._node_session(req, NodeReregisterResponse)
@@ -449,9 +450,7 @@ class MsService:
                         logger.debug("NODE_REREGISTER %s rejected: %s", item.key, error)
                         batch.outcomes.append(ItemOutcome(ItemResult.REJECTED))
                         continue
-                    commit = CommitItem(
-                        item.key, item.location, item.logical_bytes, CommitPin.NONE
-                    )
+                    commit = CommitItem(item.key, item.location, item.logical_bytes)
                     batch.outcomes.append(self.catalog.commit(commit, session.token))
                 self.registry.reregistered(
                     session, batch.outcomes, req.last, self._clock()
@@ -803,6 +802,38 @@ class MsService:
                 session.node_id,
                 digest,
                 FinalizeMoveResponse,
+                len(req.items),
+                run,
+            )
+
+    def release_finalizer(
+        self, req: ReleaseFinalizerRequest, payload: dict
+    ) -> ReleaseFinalizerResponse:
+        digest = op_digest(payload)
+        with self.lock:
+            session = self._node_session(req, ReleaseFinalizerResponse)
+            if not isinstance(session, NodeSession):
+                return session
+            rejected = self._too_many(req.items, ReleaseFinalizerResponse, "items")
+            if rejected:
+                return rejected
+
+            def run(batch: _Batch) -> ReleaseFinalizerResponse:
+                batch.applying = True
+                for item in req.items:
+                    batch.outcomes.append(
+                        self.catalog.release_finalizer(
+                            session.token, item.key, item.location
+                        )
+                    )
+                return ReleaseFinalizerResponse(status=Status.OK, items=batch.outcomes)
+
+            return self._run_op(
+                req.op,
+                node_origin(session.node_epoch),
+                session.node_id,
+                digest,
+                ReleaseFinalizerResponse,
                 len(req.items),
                 run,
             )

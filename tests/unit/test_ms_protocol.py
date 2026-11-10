@@ -39,7 +39,7 @@ MS_CODES = sorted(MS_MESSAGE_CLASSES)
 
 
 def test_codes_are_in_the_multi_storage_range_and_unique():
-    assert len(set(MS_CODES)) == len(MS_CODES) == 18
+    assert len(set(MS_CODES)) == len(MS_CODES) == 19
     assert all(0x40 <= code <= 0x5F for code in MS_CODES)
     # retired (REGION_REQUEST, REGION_RETURN): never reused
     assert not {0x5E, 0x5F} & {int(code) for code in MessageType}
@@ -81,9 +81,8 @@ def test_enums_travel_as_plain_strings():
     ser = Serializer()
     request = sample(CommitRequest)
     _, payload = ser.decode(ser.encode(MessageType.COMMIT, request))
-    item = payload["items"][0]
-    assert type(item["pin"]) is str and item["pin"] == request.items[0].pin.value
-    assert type(item["location"]["kind"]) is str
+    kind = payload["items"][0]["location"]["kind"]
+    assert type(kind) is str and kind == request.items[0].location.kind.value
 
 
 def test_unknown_fields_are_ignored():
@@ -235,7 +234,7 @@ def _corrupt(path, value):
         _corrupt(["op"], "x"),
         _corrupt(["items", 0, "logical_bytes"], "x"),
         _corrupt(["items", 0, "logical_bytes"], True),
-        _corrupt(["items", 0, "pin"], "sometimes"),
+        _corrupt(["items", 0, "finalizer"], "sometimes"),
         _corrupt(["items", 0, "location", "kind"], "tape"),
         _corrupt(["op", "digest"], "not-bytes"),
         {
@@ -251,7 +250,7 @@ def _corrupt(path, value):
         "op-str",
         "int-as-str",
         "int-as-bool",
-        "bad-enum",
+        "str-as-bool",
         "bad-kind",
         "digest-str",
         "missing-op",
@@ -297,7 +296,7 @@ class TestDigestAcrossVersions:
         ser = Serializer()
         sent = dataclasses.asdict(_commit())
         sent["added_later"] = [1, 2]  # a field this receiver does not know
-        del sent["items"][0]["pin"]  # an older sender leaves a default out
+        del sent["items"][0]["finalizer"]  # an older sender leaves a default out
         decoded = ser.decode_request_payload(ser.encode(MessageType.COMMIT, sent))
         assert op_digest(decoded.payload) == op_digest(sent)
         # the dataclass lost the unknown field and gained the default
@@ -322,3 +321,66 @@ def test_epoch_seq_fits_64_bit_generations():
     assert make_generation(EPOCH_SEQ_MAX, GENERATION_COUNTER_MAX) == (1 << 64) - 1
     with pytest.raises(ValueError):
         make_generation(EPOCH_SEQ_MAX + 1, 0)
+
+
+def test_release_finalizer_round_trip():
+    from maru_common.protocol import (
+        ReleaseFinalizerRequest,
+        ReleaseFinalizerResponse,
+    )
+    from maru_common.storage_types import (
+        ItemOutcome,
+        ItemResult,
+        KeyLocation,
+        Status,
+    )
+
+    assert MessageType.RELEASE_FINALIZER == 0x5C
+    location = Location("cxl:d:1", "a1", make_generation(3, 7), 0, 8, PoolKind.CXL)
+    request = ReleaseFinalizerRequest(
+        session="s",
+        server_epoch="e",
+        op=OpRef("o", 2, b"d" * 16, 1),
+        items=[KeyLocation(Key("ns", "k"), location)],
+    )
+    ser = Serializer()
+    frame = ser.encode(MessageType.RELEASE_FINALIZER, request)
+    header, decoded = ser.decode_request(frame)
+    assert header.msg_type == MessageType.RELEASE_FINALIZER and decoded == request
+    response = ReleaseFinalizerResponse(
+        status=Status.OK,
+        items=[ItemOutcome(ItemResult.RELEASED), ItemOutcome(ItemResult.ABSENT)],
+    )
+    request_header, _ = ser.decode(frame)
+    _, back = ser.decode_response(ser.encode_response(request_header, response))
+    assert back == response
+
+
+def test_finalizer_fields_round_trip():
+    from maru_common.protocol import CommitResponse, FinalizeMoveRequest, MoveItem
+    from maru_common.storage_types import ItemOutcome, ItemResult, Status
+
+    location = Location("cxl:d:1", "a1", make_generation(3, 7), 0, 8, PoolKind.CXL)
+    ser = Serializer()
+    commit = CommitRequest(
+        session="s",
+        server_epoch="e",
+        op=OpRef("o", 1, b"d" * 16, 0),
+        items=[CommitItem(Key("ns", "k"), location, 8, finalizer=True)],
+    )
+    frame = ser.encode(MessageType.COMMIT, commit)
+    assert ser.decode_request(frame)[1] == commit
+    added = CommitResponse(
+        status=Status.OK,
+        items=[ItemOutcome(ItemResult.ADDED, finalizer_id="f-1")],
+    )
+    request_header, _ = ser.decode(frame)
+    _, back = ser.decode_response(ser.encode_response(request_header, added))
+    assert back == added and back.items[0].pin_id is None
+    move = FinalizeMoveRequest(
+        session="s",
+        server_epoch="e",
+        op=OpRef("o", 2, b"d" * 16, 1),
+        items=[MoveItem(Key("ns", "k"), location, location, finalizer_id="f-1")],
+    )
+    assert ser.decode_request(ser.encode(MessageType.FINALIZE_MOVE, move))[1] == move

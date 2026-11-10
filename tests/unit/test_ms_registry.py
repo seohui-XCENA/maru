@@ -12,7 +12,6 @@ from maru_common.protocol import MessageType
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     CloseMode,
-    CommitPin,
     KeptCause,
     MissReason,
     OpRef,
@@ -104,7 +103,7 @@ class TestNodeOpen:
         node.open(pools=[node.dram(), node.ssd()])
         k = key("k")
         loc = node.loc(node.ssd(), 1)
-        node.commit((k, loc), pin=CommitPin.NODE)
+        node.commit((k, loc), finalizer=True)
         old_token = node.token
         clock.advance(31)  # the session expired; the process is still there
         assert node.heartbeat().status == Status.EPOCH
@@ -558,30 +557,79 @@ class TestNodeClose:
         assert not service.catalog.locations(key("c"))
         assert service.catalog.pool(node.cxl().pool_id) is None
 
-    def test_give_up_keeps_cxl_pins_past_expiry_until_worker_exit(self, env):
+    def test_give_up_releases_every_pin_on_the_nodes_locations(self, env, caplog):
+        import logging
+
+        from maru_server.pin_manager import HolderKind
+
+        log = logging.getLogger("maru_server.node_registry")  # does not propagate
+        log.addHandler(caplog.handler)
+        caplog.set_level(logging.INFO, logger=log.name)
         clock, service, wire = env
-        node = FakeNode(wire, "n1")
+        node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
+        other_pool = other.cxl(region_id=8)
         node.open(pools=[node.dram(), node.cxl()])
-        node.commit((key("c"), node.loc(node.cxl(), 1)))
+        other.open(pools=[other.dram(), other_pool])
+        c, d, f = key("c"), key("d"), key("f")
+        cxl = node.loc(node.cxl(), 1)
+        node.commit((c, cxl), (d, node.loc(node.dram(), 1)))
+        node_cxl = node.loc(node.cxl(), 2)
+        finalizer = node.commit((f, node_cxl), finalizer=True).items[0].finalizer_id
+        o = key("o")
+        other_cxl = other.loc(other_pool, 1)
+        other.commit((o, other_cxl))
         worker = FakeWorker(wire, node)
         worker.open()
-        worker.lookup(key("c"))
-        for _ in range(32):  # the node stays away; the worker stays alive
-            clock.advance(20)
-            worker.heartbeat()
-            drain(service)
+        cxl_pin, dram_pin = (i.pin_id for i in worker.lookup(c, d).items)
+        reader = FakeWorker(wire, other)
+        reader.open()
+        other_pin = reader.lookup(o).items[0].pin_id
+        with service.lock:  # n1's worker also reads n2's CXL: not n1's location
+            foreign = service.pins.pin(o, other_cxl, worker.token, HolderKind.WORKER)
+        try:
+            for _ in range(32):  # n1 stays away; n2 and both workers stay alive
+                clock.advance(20)
+                for alive in (worker, reader, other):
+                    alive.heartbeat()
+                drain(service)
+        finally:
+            log.removeHandler(caplog.handler)
         assert service.registry.nodes["n1"].gone
-        assert service.stats()["orphan_sessions"] == 1
-        clock.advance(600)  # the worker expires: pins never go by time
+        assert all(service.pins.get(p) is None for p in (cxl_pin, dram_pin, finalizer))
+        assert not service.catalog.locations(c) and not service.catalog.locations(f)
+        assert service.catalog.pool(node.cxl().pool_id) is None
+        assert "n1 given up: 3 pins on its locations released" in caplog.text
+        # n2's location and every pin on it stay
+        assert service.pins.get(other_pin) and service.pins.get(foreign)
+        assert [e.location for e in service.catalog.locations(o)] == [other_cxl]
+        # kept for its pin on n2's CXL only; UNPIN of a released pin is OK
+        assert service.registry.known_worker(worker.token).orphan
+        assert results(worker.unpin(cxl_pin)) == ["OK"]
+        clock.advance(600)  # pins never go by time
         drain(service)
-        assert service.pins.held_by(worker.token)
-        assert service.catalog.pool(node.cxl().pool_id) is not None
-        # the node's next run lists it in old_workers and confirms its end
+        assert service.pins.get(foreign) is not None
+        # the node's next run lists the worker and confirms its end
         node.restart()
         response = node.open()
         assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
         assert results(node.worker_exit(response.old_workers[0])) == ["OK"]
         assert service.stats()["orphan_sessions"] == 0
+        assert service.pins.get(foreign) is None
+
+    def test_leave_still_keeps_cxl_pins_until_unpinned(self, env):
+        clock, service, wire = env
+        node = FakeNode(wire, "n1")
+        node.open(pools=[node.dram(), node.cxl()])
+        c, cxl = key("c"), node.loc(node.cxl(), 1)
+        node.commit((c, cxl))
+        worker = FakeWorker(wire, node)
+        worker.open()
+        pin = worker.lookup(c).items[0].pin_id
+        node.close(CloseMode.LEAVE)
+        drain(service)
+        assert service.pins.get(pin) is not None
+        assert service.catalog.pool(node.cxl().pool_id) is not None
+        assert results(worker.unpin(pin)) == ["OK"]
         assert service.catalog.pool(node.cxl().pool_id) is None
 
     def test_an_orphan_keeps_pins_it_took_after_its_node_left(self, env):
@@ -1235,14 +1283,17 @@ class TestMaintenanceThread:
             + units(blocks, nr.BLOCK_FREES_PER_UNIT)
             + blocks * units(BLOCK_ITEMS, nr.BLOCK_ITEM_FREES_PER_UNIT)
         )
-        assert sum(works) == 1 + 4 * n + frees
+        # and the CXL pin: every pin on a given-up node's locations goes
+        assert sum(works) == 1 + 4 * n + 1 + frees
         assert registry.nodes["big"].gone and "big" not in registry._access
         assert not registry._freeing and not big.blocks and not big.blocked
         assert not big.listings
-        # the orphan keeps its CXL pin and only that
-        assert registry.worker_sessions() == [registry.known_worker(orphan)]
-        assert [p.location for p in service.pins.held_by(orphan)] == [cxl]
-        assert len(service.pins) == 1 and ("worker", "w0") not in service.ledger
+        # the CXL reader's pin went with the node: no orphan is left
+        assert registry.known_worker(orphan) is None and not service.pins.held_by(
+            orphan
+        )
+        assert registry.worker_sessions() == [] and cxl.pool_id == node.cxl().pool_id
+        assert len(service.pins) == 0 and ("worker", "w0") not in service.ledger
         # no step holds the lock much longer than a typical one
         assert len(works) > 400
         assert max(times) < 10 * statistics.median(times), (

@@ -26,6 +26,7 @@ from maru_common.protocol import (
     NodeRecoverListRequest,
     NodeReregisterRequest,
     ProbeRequest,
+    ReleaseFinalizerRequest,
     ReregisterItem,
     RetireRequest,
     SourcePinRequest,
@@ -39,7 +40,6 @@ from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import (
     MS_PROTOCOL,
     CloseMode,
-    CommitPin,
     ExitCause,
     Key,
     KeyLocation,
@@ -311,14 +311,14 @@ class FakeNode(_OpSender):
             NodeRecoverListRequest(**self.envelope(), pool_id=pool_id, cursor=cursor),
         )
 
-    def commit(self, *items, pin: CommitPin = CommitPin.NONE):
+    def commit(self, *items, finalizer: bool = False):
         """commit((key, location[, logical_bytes]), ...)"""
         commit_items = [
             CommitItem(
                 key=it[0],
                 location=it[1],
                 logical_bytes=it[2] if len(it) > 2 else it[1].length,
-                pin=pin,
+                finalizer=finalizer,
             )
             for it in items
         ]
@@ -353,13 +353,23 @@ class FakeNode(_OpSender):
         )
 
     def finalize_move(self, *items):
-        """finalize_move((key, source, dest, dest_pin_id), ...)"""
+        """finalize_move((key, source, dest, finalizer_id), ...)"""
         return self.send(
             MessageType.FINALIZE_MOVE,
             self.build(
                 FinalizeMoveRequest,
                 **self.envelope(),
                 items=[MoveItem(k, s, d, p) for k, s, d, p in items],
+            ),
+        )
+
+    def release_finalizer(self, *items):
+        return self.send(
+            MessageType.RELEASE_FINALIZER,
+            self.build(
+                ReleaseFinalizerRequest,
+                **self.envelope(),
+                items=[KeyLocation(k, loc) for k, loc in items],
             ),
         )
 

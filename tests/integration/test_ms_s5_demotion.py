@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """Write-back demotion of a [dram, cxl] node against the real MaruServer:
-COMMIT pin=node and FINALIZE_MOVE end to end, with workers (separate
+COMMIT with a finalizer and FINALIZE_MOVE end to end, with workers (separate
 processes) reading while pages move. memfds stand in for the CXL regions; a
 FakeRm gives them, so no RM is needed."""
 
@@ -133,7 +133,7 @@ def test_pages_move_to_cxl_and_stay_readable_while_read(node, agents):
         assert store(w, f"k{i}")
         i += 1
         assert i < 100, node.manager.move_results
-    # COMMIT pin=node then FINALIZE_MOVE: the others moved, k0 has two places
+    # COMMIT with a finalizer, then FINALIZE_MOVE: the others moved, k0 has two places
     moves = node.manager.move_results
     assert moves["RETIRED"] > 0 and moves["COMMIT:ADDED"] >= moves["RETIRED"]
     assert kinds_of(node, "k0") == {PoolKind.DRAM, PoolKind.CXL}
@@ -143,7 +143,8 @@ def test_pages_move_to_cxl_and_stay_readable_while_read(node, agents):
     for key in moved:  # read from CXL by a worker of another process
         assert read(r, key) == value(key)
     r.call("release", key="k0")
-    # pressure again: its copy is pinned again (COMMIT of the same location)
+    # pressure again: its copy gets a finalizer again (COMMIT of the same
+    # location)
     # and FINALIZE_MOVE removes the source
     added = node.manager.move_results["COMMIT:ADDED"]
     while kinds_of(node, "k0") != {PoolKind.CXL}:

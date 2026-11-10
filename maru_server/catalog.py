@@ -12,7 +12,6 @@ from enum import StrEnum, unique
 
 from maru_common.protocol import CommitItem, FetchCompleteItem, MoveItem
 from maru_common.storage_types import (
-    CommitPin,
     FetchPlan,
     ItemOutcome,
     ItemResult,
@@ -166,10 +165,13 @@ class Catalog:
         if pool.state == PoolState.ACTIVE:
             pool.state = PoolState.HIDDEN
 
-    def remove_pool(self, pool: PoolRecord, force: bool = False) -> None:
-        """Hide now; ``sweep`` removes the locations. CXL is never forced: a
+    def remove_pool(
+        self, pool: PoolRecord, force: bool = False, force_cxl: bool = False
+    ) -> None:
+        """Hide now; ``sweep`` removes the locations. CXL is forced only with
+        ``force_cxl`` (its node given up, its pins released): otherwise a
         region goes back only once nothing pins it."""
-        pool.force = pool.force or (force and pool.kind != PoolKind.CXL)
+        pool.force = pool.force or (force and (pool.kind != PoolKind.CXL or force_cxl))
         pool.state = PoolState.REMOVING
         self._removing.add(pool)
         self._sweeps[pool] = None
@@ -392,11 +394,14 @@ class Catalog:
         existing = self._current(item.key, loc.pool_id)
 
         def added() -> ItemOutcome:
-            # every request gets its own pin; true resends replay the ledger
-            pin_id = None
-            if item.pin == CommitPin.NODE:
-                pin_id = self.pins.pin(item.key, loc, holder, HolderKind.NODE)
-            return ItemOutcome(ItemResult.ADDED, pin_id=pin_id)
+            # every request gets its own finalizer; true resends replay the
+            # ledger
+            finalizer_id = None
+            if item.finalizer:
+                finalizer_id = self.pins.pin(
+                    item.key, loc, holder, HolderKind.FINALIZER
+                )
+            return ItemOutcome(ItemResult.ADDED, finalizer_id=finalizer_id)
 
         if existing is not None:
             if existing.location != loc:
@@ -439,16 +444,21 @@ class Catalog:
     # ------------------------------------------------------- finalize_move
 
     def finalize_move(self, node_id: str, holder: str, item: MoveItem) -> ItemOutcome:
-        """Check the target and remove the source at once; ``dest_pin_id`` is
-        released whatever the result when it is this session's pin."""
-        dest_pin = self.pins.get(item.dest_pin_id)
+        """Check the target and remove the source at once; the finalizer
+        ``finalizer_id`` is released whatever the result when it is this
+        session's."""
+        finalizer = self.pins.get(item.finalizer_id)
+        if finalizer is not None and (
+            finalizer.holder != holder or finalizer.holder_kind != HolderKind.FINALIZER
+        ):
+            finalizer = None  # not this session's finalizer: left alone
         try:
-            return self._finalize_move(node_id, holder, item, dest_pin)
+            return self._finalize_move(node_id, holder, item, finalizer)
         finally:
-            if dest_pin is not None and dest_pin.holder == holder:
-                self.pins.unpin(item.dest_pin_id)
+            if finalizer is not None:
+                self.pins.unpin(item.finalizer_id)
 
-    def _finalize_move(self, node_id, holder, item: MoveItem, dest_pin) -> ItemOutcome:
+    def _finalize_move(self, node_id, holder, item: MoveItem, finalizer) -> ItemOutcome:
         src, dest = item.source, item.dest
         if src.pool_id == dest.pool_id:
             return ItemOutcome(ItemResult.REJECTED)  # one location per pool
@@ -457,10 +467,9 @@ class Catalog:
         if dest_pool is None or dest_pool.state != PoolState.ACTIVE:
             return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=dest)
         if (
-            dest_pin is None
-            or dest_pin.holder != holder
-            or dest_pin.key != item.key
-            or dest_pin.location != dest
+            finalizer is None
+            or finalizer.key != item.key
+            or finalizer.location != dest
             or self.entry_exact(item.key, dest) is None
         ):
             # the target is not the location this session protected: the
@@ -476,6 +485,14 @@ class Catalog:
             return ItemOutcome(ItemResult.KEPT, cause=KeptCause.PINNED)
         self.remove_location(source)
         return ItemOutcome(ItemResult.RETIRED)
+
+    def release_finalizer(
+        self, holder: str, key: Key, location: Location
+    ) -> ItemOutcome:
+        """Drop ``holder``'s finalizers on exactly this location of ``key``."""
+        if self.pins.unpin_at(holder, HolderKind.FINALIZER, key, location):
+            return ItemOutcome(ItemResult.RELEASED)
+        return ItemOutcome(ItemResult.ABSENT)
 
     # ------------------------------------------------------ fetch_complete
 
@@ -502,7 +519,11 @@ class Catalog:
         With no worker the copy stays as cache. Every outcome releases this
         node's source pin."""
         source_pin = self.pins.get(item.source_pin_id)
-        own_source = source_pin is not None and source_pin.holder == node_holder
+        own_source = (
+            source_pin is not None
+            and source_pin.holder == node_holder
+            and source_pin.holder_kind == HolderKind.NODE
+        )
         try:
             return self._fetch_complete(
                 node_id,

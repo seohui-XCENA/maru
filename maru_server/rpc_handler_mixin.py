@@ -97,6 +97,7 @@ class RpcHandlerMixin:
                 MessageType.RETIRE.value: ms.retire,
                 MessageType.FINALIZE_MOVE.value: ms.finalize_move,
                 MessageType.FETCH_COMPLETE.value: ms.fetch_complete,
+                MessageType.RELEASE_FINALIZER.value: ms.release_finalizer,
             }
         return self._ms_handlers
 

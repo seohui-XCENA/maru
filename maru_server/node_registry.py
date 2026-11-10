@@ -216,6 +216,8 @@ class NodeRegistry:
         self._access: dict[str, OrderedDict[tuple[str, str, int], list]] = {}
         # holders whose pins are still to release (keeping CXL ones if True)
         self._pin_releases: deque[tuple[str, bool]] = deque()
+        # ids of pins on a given-up node's locations, still to release
+        self._pin_drops: deque[set[str]] = deque()
         # nodes with worker sessions still to drop
         self._dropping: deque[NodeRecord] = deque()
         # maps, sets and listings of ended runs, emptied in maintain() steps
@@ -681,7 +683,9 @@ class NodeRegistry:
             return
         self._drop_node(self.nodes[session.node_id], "left", inline=PINS_INLINE)
 
-    def _drop_node(self, node: NodeRecord, why: str, inline: int) -> None:
+    def _drop_node(
+        self, node: NodeRecord, why: str, inline: int, force_cxl: bool = False
+    ) -> None:
         """Left or given up: the run ends and its locations go. Its worker
         sessions (with their pins and op records) go in maintain() steps, or
         when a request names one."""
@@ -691,7 +695,7 @@ class NodeRegistry:
             node.retired_epochs.append(node.node_epoch)
         node.session = None
         for pool in self.catalog.pools_of(node.node_id):
-            self.catalog.remove_pool(pool, force=True)
+            self.catalog.remove_pool(pool, force=True, force_cxl=force_cxl)
         tokens = self._workers_by_node.pop(node.node_id, set())
         if len(tokens) < len(node.dropping):
             node.dropping.update(tokens)
@@ -1033,10 +1037,25 @@ class NodeRegistry:
         return due
 
     def give_up(self, now: float, limit: int) -> int:
-        """Drop at most ``limit`` nodes due; returns how many."""
+        """Drop at most ``limit`` nodes due; returns how many. Every pin on
+        a given-up node's locations goes too (in maintain() steps), also on
+        CXL: nothing hands out its pages any more, and a reader's RM hold
+        keeps a region's bytes until it unmaps."""
         due = self.give_up_due(now)[:limit]
         for node in due:
-            self._drop_node(node, f"stayed away over {self.node_give_up_s}s", 0)
+            pins = [
+                self.pins.take_pool(p.pool_id)
+                for p in self.catalog.pools_of(node.node_id)
+            ]
+            self._pin_drops.extend(s for s in pins if s)
+            self._drop_node(
+                node, f"stayed away over {self.node_give_up_s}s", 0, force_cxl=True
+            )
+            logger.info(
+                "node %s given up: %d pins on its locations released",
+                node.node_id,
+                sum(len(s) for s in pins),
+            )
         return len(due)
 
     def maintain(self, now: float, budget: int) -> int:
@@ -1069,6 +1088,15 @@ class NodeRegistry:
             else:
                 # WORKER_EXIT, WORKER_CLOSE, UNPIN or a reopen frees them
                 heapq.heappush(self._expiry, (now + self.session_ttl_s, token))
+        # Before the worker sessions: those of a given-up node keep no pin on
+        # its locations (they are not kept as orphans for them)
+        while self._pin_drops and work < budget:
+            pin_ids = self._pin_drops[0]
+            while pin_ids and work < budget:
+                self.pins.unpin(pin_ids.pop())
+                work += 1
+            if not pin_ids:
+                self._pin_drops.popleft()
         while self._dropping and work < budget:
             node = self._dropping[0]
             while node.dropping and work < budget:

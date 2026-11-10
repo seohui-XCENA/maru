@@ -17,7 +17,10 @@ from maru_common.storage_types import Key, Location, PoolKind
 @unique
 class HolderKind(StrEnum):
     WORKER = "worker"  # LOOKUP_AND_PIN, FETCH_COMPLETE copies
-    NODE = "node"  # SOURCE_PIN, COMMIT pin=node
+    NODE = "node"  # SOURCE_PIN
+    # COMMIT with a finalizer: keeps a demotion destination until
+    # FINALIZE_MOVE or RELEASE_FINALIZER
+    FINALIZER = "finalizer"
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class PinManager:
         # pin ids per holder: CXL apart, as those may outlive their node
         self._by_holder: dict[str, set[str]] = {}
         self._cxl_by_holder: dict[str, set[str]] = {}
+        # pin ids by the pool of their location: a node given up drops them
+        self._by_pool: dict[str, set[str]] = {}
         self._counts: dict[tuple[Key, Location], int] = {}
         # called with (key, location) when its last pin goes
         self.on_last_unpin: Callable[[Key, Location], None] | None = None
@@ -59,6 +64,7 @@ class PinManager:
         pin = Pin(pin_id, key, location, holder, holder_kind, creator)
         self._pins[pin_id] = pin
         self._index(pin).setdefault(holder, set()).add(pin_id)
+        self._by_pool.setdefault(location.pool_id, set()).add(pin_id)
         target = (key, location)
         self._counts[target] = self._counts.get(target, 0) + 1
         return pin_id
@@ -95,6 +101,30 @@ class PinManager:
                 del index[pin.holder]
         self._drop_count(pin)
         return pin
+
+    def take_pool(self, pool_id: str) -> set[str]:
+        """The ids of every pin on ``pool_id``'s locations, which the caller
+        unpins; no new pin may come on them (its pool is being removed)."""
+        return self._by_pool.pop(pool_id, set())
+
+    def unpin_at(
+        self, holder: str, kind: HolderKind, key: Key, location: Location
+    ) -> int:
+        """Release ``holder``'s pins of ``kind`` on exactly this location of
+        ``key``; returns how many."""
+        index = (
+            self._cxl_by_holder if location.kind == PoolKind.CXL else self._by_holder
+        )
+        found = [
+            pin_id
+            for pin_id in index.get(holder, ())
+            if (pin := self._pins[pin_id]).holder_kind == kind
+            and pin.key == key
+            and pin.location == location
+        ]
+        for pin_id in found:
+            self.unpin(pin_id)
+        return len(found)
 
     def release_holder(
         self, holder: str, limit: int | None = None, keep_cxl: bool = False
@@ -136,6 +166,11 @@ class PinManager:
         return self._by_holder
 
     def _drop_count(self, pin: Pin) -> None:
+        on_pool = self._by_pool.get(pin.location.pool_id)
+        if on_pool is not None:
+            on_pool.discard(pin.pin_id)
+            if not on_pool:
+                del self._by_pool[pin.location.pool_id]
         target = (pin.key, pin.location)
         left = self._counts[target] - 1
         if left:

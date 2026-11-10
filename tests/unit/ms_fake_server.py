@@ -34,6 +34,7 @@ from maru_common.protocol import (
     NodeReregisterResponse,
     ProbeResponse,
     RecoverItem,
+    ReleaseFinalizerResponse,
     RetireResponse,
     UnpinResponse,
     WorkerCloseResponse,
@@ -48,7 +49,6 @@ from maru_common.storage_types import (
     AccessInfo,
     BlockRequest,
     CloseMode,
-    CommitPin,
     FetchPlan,
     ItemOutcome,
     ItemResult,
@@ -73,6 +73,7 @@ OP_CODES = {
     MessageType.RETIRE,
     MessageType.FINALIZE_MOVE,
     MessageType.FETCH_COMPLETE,
+    MessageType.RELEASE_FINALIZER,
     MessageType.NODE_REREGISTER,
     MessageType.WORKER_EXIT,
 }
@@ -87,6 +88,7 @@ NODE_CODES = {
     MessageType.RETIRE,
     MessageType.FINALIZE_MOVE,
     MessageType.FETCH_COMPLETE,
+    MessageType.RELEASE_FINALIZER,
 }
 WORKER_CODES = {
     MessageType.WORKER_HEARTBEAT,
@@ -153,7 +155,8 @@ class Entry:
 @dataclass
 class Pin:
     pin_id: str
-    owner: str  # "worker:<incarnation>" or "node:<node_id>"
+    # "worker:<incarnation>", "node:<node_id>" or "finalizer:<node_id>"
+    owner: str
     key: Key
     location: Location
 
@@ -563,9 +566,12 @@ class FakeMaruServer:
             self.ended_epochs.add(old.node_epoch)
             self.node_sessions.pop(old.session, None)
             if old.node_epoch != req.node_epoch:
-                # The old run's node pins go; its DRAM locations are hidden
+                # The old run's node pins and finalizers go; its DRAM
+                # locations are hidden
                 for pin in [
-                    p for p in self.pins.values() if p.owner == f"node:{req.node_id}"
+                    p
+                    for p in self.pins.values()
+                    if p.owner in (f"node:{req.node_id}", f"finalizer:{req.node_id}")
                 ]:
                     self._drop_pin(pin.pin_id)
                 for pool in old.pools.values():
@@ -961,11 +967,10 @@ class FakeMaruServer:
                     ItemOutcome(ItemResult.DUPLICATE, location=same_pool[0].location)
                 )
                 continue
-            pin = getattr(item, "pin", CommitPin.NONE)
-            if same_pool:  # the same location again: pinned as asked
+            if same_pool:  # the same location again: a finalizer if asked
                 items.append(
                     ItemOutcome(
-                        ItemResult.ADDED, pin_id=self._node_pin(node, pin, item)
+                        ItemResult.ADDED, finalizer_id=self._finalizer(node, item)
                     )
                 )
                 continue
@@ -976,17 +981,35 @@ class FakeMaruServer:
             self.catalog.setdefault(item.key, []).append(entry)
             self.by_loc[loc_id(loc)] = entry
             items.append(
-                ItemOutcome(ItemResult.ADDED, pin_id=self._node_pin(node, pin, item))
+                ItemOutcome(ItemResult.ADDED, finalizer_id=self._finalizer(node, item))
             )
         return CommitResponse(status=Status.OK, items=items)
 
-    def _node_pin(self, node: NodeRec, pin: CommitPin, item) -> str | None:
-        if pin != CommitPin.NODE:
+    def _finalizer(self, node: NodeRec, item) -> str | None:
+        """Held like a pin: a RETIRE of the location is KEPT(PINNED)."""
+        if not getattr(item, "finalizer", False):  # a ReregisterItem has none
             return None
         pin_id = uuid.uuid4().hex
-        self.pins[pin_id] = Pin(pin_id, f"node:{node.node_id}", item.key, item.location)
+        self.pins[pin_id] = Pin(
+            pin_id, f"finalizer:{node.node_id}", item.key, item.location
+        )
         self.loc_pins[loc_id(item.location)].add(pin_id)
         return pin_id
+
+    def _release_finalizer(self, node: NodeRec, req):
+        owner = f"finalizer:{node.node_id}"
+        items = []
+        for kl in req.items:
+            found = [
+                p.pin_id
+                for p in self.pins.values()
+                if p.owner == owner and p.key == kl.key and p.location == kl.location
+            ]
+            for pin_id in found:
+                self._drop_pin(pin_id)
+            result = ItemResult.RELEASED if found else ItemResult.ABSENT
+            items.append(ItemOutcome(result))
+        return ReleaseFinalizerResponse(status=Status.OK, items=items)
 
     def _retire(self, node: NodeRec, req):
         items = []
@@ -1019,20 +1042,20 @@ class FakeMaruServer:
         return RetireResponse(status=Status.OK, items=items)
 
     def _finalize_move(self, node: NodeRec, req):
-        """As Catalog.finalize_move: the dest pin goes whatever the result
+        """As Catalog.finalize_move: the finalizer goes whatever the result
         when it is this node's."""
-        owner = f"node:{node.node_id}"
+        owner = f"finalizer:{node.node_id}"
         items = []
         for item in req.items:
-            pin = self.pins.get(item.dest_pin_id)
+            finalizer = self.pins.get(item.finalizer_id)
             try:
-                items.append(self._move_one(node, item, pin, owner))
+                items.append(self._move_one(node, item, finalizer, owner))
             finally:
-                if pin is not None and pin.owner == owner:
-                    self._drop_pin(item.dest_pin_id)
+                if finalizer is not None and finalizer.owner == owner:
+                    self._drop_pin(item.finalizer_id)
         return FinalizeMoveResponse(status=Status.OK, items=items)
 
-    def _move_one(self, node: NodeRec, item, dest_pin, owner: str) -> ItemOutcome:
+    def _move_one(self, node: NodeRec, item, finalizer, owner: str) -> ItemOutcome:
         src, dest = item.source, item.dest
         if src.pool_id == dest.pool_id:
             return ItemOutcome(ItemResult.REJECTED)
@@ -1040,10 +1063,10 @@ class FakeMaruServer:
             return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=dest)
         target = self.by_loc.get(loc_id(dest))
         if (
-            dest_pin is None
-            or dest_pin.owner != owner
-            or dest_pin.key != item.key
-            or dest_pin.location != dest
+            finalizer is None
+            or finalizer.owner != owner
+            or finalizer.key != item.key
+            or finalizer.location != dest
             or target is None
             or target.key != item.key
             or target.location != dest

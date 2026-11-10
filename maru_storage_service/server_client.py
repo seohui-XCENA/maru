@@ -36,6 +36,8 @@ from maru_common.protocol import (
     NodeReregisterRequest,
     NodeReregisterResponse,
     RecoverItem,
+    ReleaseFinalizerRequest,
+    ReleaseFinalizerResponse,
     ReregisterItem,
     RetireRequest,
     RetireResponse,
@@ -419,6 +421,21 @@ class ServerClient:
         response: FinalizeMoveResponse = self._call_op(
             MessageType.FINALIZE_MOVE,
             FinalizeMoveRequest(
+                session=session,
+                server_epoch=epoch,
+                op=PLACEHOLDER_OP,
+                items=items,
+            ),
+            len(items),
+        )
+        return response
+
+    def release_finalizer(self, items: list[KeyLocation]) -> ReleaseFinalizerResponse:
+        """RELEASE_FINALIZER until its result is known."""
+        session, epoch = self._ids()
+        response: ReleaseFinalizerResponse = self._call_op(
+            MessageType.RELEASE_FINALIZER,
+            ReleaseFinalizerRequest(
                 session=session,
                 server_epoch=epoch,
                 op=PLACEHOLDER_OP,

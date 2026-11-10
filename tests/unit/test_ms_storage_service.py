@@ -2102,9 +2102,10 @@ class TestFakeFidelity:
         (item,) = response.items
         assert item.result == ItemResult.MISS and item.reason == MissReason.OFFLINE
 
-    def test_the_same_location_again_is_pinned_as_asked(self, fake, nodes, handlers):
+    def test_the_same_location_again_gets_a_finalizer_as_asked(
+        self, fake, nodes, handlers
+    ):
         from maru_common.protocol import CommitItem
-        from maru_common.storage_types import CommitPin
 
         node = nodes()
         h = handlers(node)
@@ -2116,13 +2117,13 @@ class TestFakeFidelity:
                     key=page.key,
                     location=page.location,
                     logical_bytes=page.location.length,
-                    pin=CommitPin.NODE,
+                    finalizer=True,
                 )
             ]
         )
         (item,) = response.items
-        assert item.result == ItemResult.ADDED and item.pin_id is not None
-        assert fake.pins[item.pin_id].owner == "node:gpu-test"
+        assert item.result == ItemResult.ADDED and item.finalizer_id is not None
+        assert fake.pins[item.finalizer_id].owner == "finalizer:gpu-test"
 
 
 class TestFirstConnect:

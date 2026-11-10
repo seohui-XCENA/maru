@@ -16,6 +16,7 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenResponse,
     NodeReregisterResponse,
+    ReleaseFinalizerResponse,
     ReregisterItem,
     RetireResponse,
     WorkerExitResponse,
@@ -74,6 +75,10 @@ class MetadataPort(Protocol):
     def retire(self, items: list[KeyLocation]) -> RetireResponse: ...
 
     def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse: ...
+
+    def release_finalizer(
+        self, items: list[KeyLocation]
+    ) -> ReleaseFinalizerResponse: ...
 
     def worker_exit(
         self, workers: list[WorkerRef], cause: ExitCause

@@ -9,7 +9,6 @@ from dataclasses import replace
 import pytest
 
 from maru_common.storage_types import (
-    CommitPin,
     KeptCause,
     MissReason,
     SessionRole,
@@ -198,7 +197,7 @@ class TestCommit:
         request = a.build(
             CommitRequest,
             **a.envelope(),
-            items=[CommitItem(key("k"), loc, PAGE, CommitPin.NODE)],
+            items=[CommitItem(key("k"), loc, PAGE, finalizer=True)],
         )
         first = wire.call(MessageType.COMMIT, request)
         assert results(first) == ["ADDED"]
@@ -248,12 +247,12 @@ class TestCommit:
         a = open_node(wire, "a")
         k = key("k")
         loc = a.loc(a.dram(), 1)
-        first = a.commit((k, loc), pin=CommitPin.NODE)
+        first = a.commit((k, loc), finalizer=True)
         # a new op naming the very same location: it is in, not a duplicate,
-        # and the request gets a pin of its own
-        again = a.commit((k, loc), pin=CommitPin.NODE)
+        # and the request gets a finalizer of its own
+        again = a.commit((k, loc), finalizer=True)
         assert results(again) == ["ADDED"]
-        assert again.items[0].pin_id != first.items[0].pin_id
+        assert again.items[0].finalizer_id != first.items[0].finalizer_id
         assert service.pins.count(k, loc) == 2
 
     def test_overlapping_bytes_are_rejected(self, env):
@@ -270,13 +269,13 @@ class TestCommit:
         after = replace(a.loc(a.dram(), 7), offset=first.offset + 2 * PAGE, length=8)
         assert results(a.commit((key("d"), after))) == ["ADDED"]
 
-    def test_pin_node_protects_a_demotion_target(self, env):
+    def test_a_finalizer_protects_a_demotion_target(self, env):
         _, service, wire = env
         a = open_node(wire, "a", ssd=True)
         k = key("k")
         dest = a.loc(a.ssd(), 1)
-        response = a.commit((k, dest), pin=CommitPin.NODE)
-        assert results(response) == ["ADDED"] and response.items[0].pin_id
+        response = a.commit((k, dest), finalizer=True)
+        assert results(response) == ["ADDED"] and response.items[0].finalizer_id
         assert results(a.retire((k, dest))) == ["KEPT"]
 
     def test_batch_over_limit_is_rejected(self, env):
@@ -367,6 +366,55 @@ class TestRetire:
         assert results(a.retire((k, loc))) == ["RETIRED"]
 
 
+class TestReleaseFinalizer:
+    def test_it_drops_this_sessions_finalizers_on_that_location(self, env):
+        _, service, wire = env
+        a = open_node(wire, "a", ssd=True)
+        k = key("k")
+        dest = a.loc(a.ssd(), 1)
+        first = a.commit((k, dest), finalizer=True).items[0].finalizer_id
+        again = a.commit((k, dest), finalizer=True).items[0].finalizer_id
+        source_pin = a.source_pin((k, dest)).items[0].pin_id  # not a finalizer
+        response = a.release_finalizer((k, dest), (k, a.loc(a.ssd(), 2)))
+        assert results(response) == ["RELEASED", "ABSENT"]
+        assert service.pins.get(first) is None and service.pins.get(again) is None
+        assert service.pins.get(source_pin) is not None
+        assert results(a.release_finalizer((key("other"), dest))) == ["ABSENT"]
+        a.unpin(source_pin)
+        assert results(a.retire((k, dest))) == ["RETIRED"]  # nothing holds it
+
+    def test_another_sessions_finalizer_is_not_touched(self, env):
+        _, service, wire = env
+        a = open_node(wire, "a", ssd=True)
+        b = open_node(wire, "b", ssd=True)
+        k = key("k")
+        dest = b.loc(b.ssd(), 1)
+        finalizer = b.commit((k, dest), finalizer=True).items[0].finalizer_id
+        assert results(a.release_finalizer((k, dest))) == ["ABSENT"]
+        assert service.pins.get(finalizer) is not None
+        assert results(b.retire((k, dest))) == ["KEPT"]
+
+    def test_it_is_idempotent(self, env):
+        from maru_common.protocol import MessageType, ReleaseFinalizerRequest
+        from maru_common.storage_types import KeyLocation
+
+        _, service, wire = env
+        a = open_node(wire, "a", ssd=True)
+        k = key("k")
+        dest = a.loc(a.ssd(), 1)
+        a.commit((k, dest), finalizer=True)
+        request = a.build(
+            ReleaseFinalizerRequest,
+            **a.envelope(),
+            items=[KeyLocation(k, dest)],
+        )
+        first = wire.call(MessageType.RELEASE_FINALIZER, request)
+        assert results(first) == ["RELEASED"]
+        assert wire.call(MessageType.RELEASE_FINALIZER, request) == first  # replayed
+        assert results(a.release_finalizer((k, dest))) == ["ABSENT"]  # a new op
+        assert service.pins.count(k, dest) == 0
+
+
 class TestFinalizeMove:
     def _setup(self, wire):
         a = open_node(wire, "a", ssd=True)
@@ -374,9 +422,9 @@ class TestFinalizeMove:
         src1, src2 = a.loc(a.dram(), 1), a.loc(a.dram(), 2)
         a.commit((k1, src1), (k2, src2))
         dst1, dst2 = a.loc(a.ssd(), 1), a.loc(a.ssd(), 2)
-        response = a.commit((k1, dst1), (k2, dst2), pin=CommitPin.NODE)
-        pin1, pin2 = (item.pin_id for item in response.items)
-        return a, (k1, src1, dst1, pin1), (k2, src2, dst2, pin2)
+        response = a.commit((k1, dst1), (k2, dst2), finalizer=True)
+        fin1, fin2 = (item.finalizer_id for item in response.items)
+        return a, (k1, src1, dst1, fin1), (k2, src2, dst2, fin2)
 
     def test_partial_failure_keeps_the_source(self, env):
         _, service, wire = env
@@ -388,7 +436,7 @@ class TestFinalizeMove:
         response = a.finalize_move(one, two)
         assert results(response) == ["RETIRED", "KEPT"]
         assert response.items[1].cause == KeptCause.PINNED
-        # both target pins are released whatever the result
+        # both finalizers are released whatever the result
         assert service.pins.get(one[3]) is None and service.pins.get(two[3]) is None
         locations = {e.location for e in service.catalog.locations(two[0])}
         # the kept source stays and the target is one more location
@@ -397,10 +445,10 @@ class TestFinalizeMove:
         worker.unpin(reader_pin)
         assert worker.lookup(two[0]).items[0].location == two[1]
 
-    def test_dead_target_pin_keeps_the_source(self, env):
+    def test_a_released_finalizer_keeps_the_source(self, env):
         _, service, wire = env
         a, one, two = self._setup(wire)
-        a.unpin(one[3])  # the target guard is gone
+        a.release_finalizer((one[0], one[2]))  # the finalizer is gone
         response = a.finalize_move(one, two)
         assert results(response) == ["REJECTED", "RETIRED"]
         assert {e.location for e in service.catalog.locations(one[0])} == {
@@ -408,63 +456,74 @@ class TestFinalizeMove:
             one[2],
         }
 
-    def test_target_pin_of_another_location_is_rejected(self, env):
+    def test_a_finalizer_of_another_location_is_rejected(self, env):
         _, service, wire = env
         a, one, two = self._setup(wire)
         crossed = (one[0], one[1], one[2], two[3])
         response = a.finalize_move(crossed)
         assert results(response) == ["REJECTED"]
         assert service.catalog.entry_exact(one[0], one[1]) is not None
-        # it was this node's pin: released anyway
+        # it was this node's finalizer: released anyway
         assert service.pins.get(two[3]) is None
 
     def test_source_gone_is_moved_only_when_the_page_is_occupied(self, env):
         _, service, wire = env
         a, one, two = self._setup(wire)
-        k, src, dest, pin = one
+        k, src, dest, finalizer = one
         assert results(a.retire((k, src))) == ["RETIRED"]
         # another key now holds the source page
         occupant = replace(src, generation=src.generation + 1)
         a.commit((key("z"), occupant))
-        item = a.finalize_move((k, src, dest, pin)).items[0]
+        item = a.finalize_move((k, src, dest, finalizer)).items[0]
         assert item.cause == KeptCause.MOVED
         assert (item.key, item.location) == (key("z"), occupant)
         # a free source page is RETIRED (the move is done)
-        k2, src2, dest2, pin2 = two
+        k2, src2, dest2, fin2 = two
         a.retire((k2, src2))
-        assert results(a.finalize_move((k2, src2, dest2, pin2))) == ["RETIRED"]
+        assert results(a.finalize_move((k2, src2, dest2, fin2))) == ["RETIRED"]
 
-    def test_target_pin_of_another_node_is_not_released(self, env):
+    def test_a_finalizer_of_another_node_is_not_released(self, env):
         _, service, wire = env
         a, one, _ = self._setup(wire)
         b = open_node(wire, "b", ssd=True)
         kb = key("kb")
         b_dest = b.loc(b.ssd(), 1)
-        b_pin = b.commit((kb, b_dest), pin=CommitPin.NODE).items[0].pin_id
-        response = a.finalize_move((one[0], one[1], one[2], b_pin))
+        b_finalizer = b.commit((kb, b_dest), finalizer=True).items[0].finalizer_id
+        response = a.finalize_move((one[0], one[1], one[2], b_finalizer))
         assert results(response) == ["REJECTED"]
-        assert service.pins.get(b_pin) is not None
+        assert service.pins.get(b_finalizer) is not None
         assert service.catalog.entry_exact(one[0], one[1]) is not None
 
     def test_target_no_longer_in_the_catalog_is_rejected(self, env):
         _, service, wire = env
         a, one, _ = self._setup(wire)
-        k, src, dest, pin = one
-        a.unpin(pin)
+        k, src, dest, finalizer = one
+        a.release_finalizer((k, dest))
         assert results(a.retire((k, dest))) == ["RETIRED"]
-        # a pin on it again cannot exist; name a fresh target pin of k's source
+        # no finalizer on it can exist; name a fresh source pin of k instead
         fresh = a.source_pin((k, src)).items[0].pin_id
         response = a.finalize_move((k, src, dest, fresh))
         assert results(response) == ["REJECTED"]
         assert service.catalog.entry_exact(k, src) is not None
-        assert service.pins.get(fresh) is None  # this session's: released
+        assert service.pins.get(fresh) is not None  # not a finalizer: kept
+
+    def test_a_source_pin_is_not_a_finalizer(self, env):
+        _, service, wire = env
+        a, one, _ = self._setup(wire)
+        k, src, dest, finalizer = one
+        source_pin = a.source_pin((k, dest)).items[0].pin_id
+        response = a.finalize_move((k, src, dest, source_pin))
+        assert results(response) == ["REJECTED"]
+        assert service.catalog.entry_exact(k, src) is not None
+        assert service.pins.get(source_pin) is not None
+        assert service.pins.get(finalizer) is not None
 
     def test_target_in_an_invalid_pool_is_kept_invalid(self, env):
         _, service, wire = env
         a, one, _ = self._setup(wire)
-        k, src, dest, pin = one
+        k, src, dest, finalizer = one
         service.catalog.pool(dest.pool_id).state = PoolState.HIDDEN
-        item = a.finalize_move((k, src, dest, pin)).items[0]
+        item = a.finalize_move((k, src, dest, finalizer)).items[0]
         assert (item.result, item.cause) == ("KEPT", KeptCause.INVALID)
 
     def test_same_pool_is_rejected(self, env):
@@ -595,6 +654,15 @@ class TestFetch:
         assert done.status == Status.OK and results(done) == ["REJECTED"]
         assert service.pins.get(pin) is None
         assert service.catalog.entry_exact(k, source) is not None
+
+    def test_a_finalizer_is_not_a_source_pin(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        dest = a.loc(a.ssd(), 1)
+        finalizer = a.commit((k, dest), finalizer=True).items[0].finalizer_id
+        done = a.fetch_complete(worker.token, (k, finalizer, a.loc(a.dram(), 1)))
+        assert results(done) == ["REJECTED"]
+        assert service.pins.get(finalizer) is not None
 
     def test_worker_gone_before_the_first_run_keeps_the_copy_as_cache(self, env):
         _, service, wire = env

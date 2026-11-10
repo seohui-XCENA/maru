@@ -22,7 +22,6 @@ from .storage_types import (
     AccessInfo,
     BlockRequest,
     CloseMode,
-    CommitPin,
     ExitCause,
     ItemOutcome,
     Key,
@@ -99,6 +98,7 @@ class MessageType(IntEnum):
     RETIRE = 0x59
     FINALIZE_MOVE = 0x5A
     FETCH_COMPLETE = 0x5B
+    RELEASE_FINALIZER = 0x5C
     # 0x5E, 0x5F: retired (REGION_REQUEST, REGION_RETURN); never reuse them
 
     # Admin (0xF0 - 0xFF)
@@ -643,7 +643,9 @@ class CommitItem:
     key: Key
     location: Location
     logical_bytes: int
-    pin: CommitPin = CommitPin.NONE
+    # Holds the new location against removal until FINALIZE_MOVE (a demotion
+    # destination)
+    finalizer: bool = False
 
 
 @dataclass
@@ -651,7 +653,7 @@ class MoveItem:
     key: Key
     source: Location
     dest: Location
-    dest_pin_id: str
+    finalizer_id: str
 
 
 @dataclass
@@ -975,6 +977,24 @@ class FinalizeMoveResponse:
 
 
 @dataclass
+class ReleaseFinalizerRequest:
+    """RELEASE_FINALIZER (0x5C) - Drops this node session's finalizers on
+    exactly these locations; RELEASED, or ABSENT when there was none."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+
+
+@dataclass
+class ReleaseFinalizerResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
 class FetchCompleteRequest:
     """FETCH_COMPLETE (0x5B) - Commits a fetched copy, pins it for the worker
     and releases the source pin, as one request."""
@@ -1049,6 +1069,10 @@ MS_MESSAGE_CLASSES = {
     MessageType.RETIRE: (RetireRequest, RetireResponse),
     MessageType.FINALIZE_MOVE: (FinalizeMoveRequest, FinalizeMoveResponse),
     MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
+    MessageType.RELEASE_FINALIZER: (
+        ReleaseFinalizerRequest,
+        ReleaseFinalizerResponse,
+    ),
 }
 _overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
 if _overlap:

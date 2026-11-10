@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """Write-back demotion in a [dram, cxl] node: DRAM makes room by moving its
-pages to CXL (COMMIT pin=node, FINALIZE_MOVE), CXL by dropping. memfds stand
+pages to CXL (COMMIT with a finalizer, FINALIZE_MOVE), CXL by dropping. memfds stand
 in for the CXL regions, both in the node and in the workers."""
 
 import dataclasses
@@ -14,8 +14,8 @@ import pytest
 
 from maru_common.config import MaruConfig
 from maru_common.node_protocol import Budgets
-from maru_common.protocol import MessageType
-from maru_common.storage_types import CommitPin, Key, Location, PoolInfo, PoolKind
+from maru_common.protocol import CommitResponse, MessageType
+from maru_common.storage_types import Key, Location, PoolInfo, PoolKind, Status
 from maru_handler import MaruHandler
 from maru_handler.client import pool_maps
 from maru_handler.storage.cpu import CpuPool
@@ -345,7 +345,7 @@ def test_a_full_dram_moves_its_pages_to_cxl_and_reads_follow(fake, nodes, handle
     assert all(kinds(fake, f"k{i}") for i in range(10))
     for item in finalized(fake):
         assert item.dest.kind == PoolKind.CXL and item.source.kind == PoolKind.DRAM
-    wait_until(lambda: fake.pin_count() == 0, what="every guard released")
+    wait_until(lambda: fake.pin_count() == 0, what="every finalizer released")
     node.pools.check()
 
 
@@ -363,11 +363,11 @@ def test_a_pinned_source_is_kept_and_its_copy_moves_it_later(fake, nodes, handle
     )
     assert kinds(fake, "k0") == {PoolKind.DRAM, PoolKind.CXL}
     assert bytes(pinned.view) == value_of("k0")
-    with fake._lock:  # the guard went with FINALIZE_MOVE
+    with fake._lock:  # the finalizer went with FINALIZE_MOVE
         assert not [
             p
             for p in fake.pins.values()
-            if p.owner.startswith("node:") and p.key == Key(NS, "k0")
+            if p.owner.startswith("finalizer:") and p.key == Key(NS, "k0")
         ]
     h.release_retrieved([pinned])
     time.sleep(0.3)  # past the KEPT backoff
@@ -394,21 +394,21 @@ def test_a_pinned_source_is_kept_and_its_copy_moves_it_later(fake, nodes, handle
 def test_a_rejected_move_retires_and_frees_the_copy(fake, nodes, handlers):
     node = nodes(low=0.0625)  # keeps demoting: the sources are tried again
     h = handlers(node)
-    guards: set[str] = set()
+    finalizers: set[str] = set()
 
-    def drop_guards(response):
-        # The guards of one batch vanish before FINALIZE_MOVE: REJECTED
-        if not guards and any(o.pin_id for o in response.items):
+    def drop_finalizers(response):
+        # The finalizers of one batch vanish before FINALIZE_MOVE: REJECTED
+        if not finalizers and any(o.finalizer_id for o in response.items):
             for outcome in response.items:
-                guards.add(outcome.pin_id)
-                fake._drop_pin(outcome.pin_id)
+                finalizers.add(outcome.finalizer_id)
+                fake._drop_pin(outcome.finalizer_id)
         return response
 
-    fake.rewrite_responses(MessageType.COMMIT, drop_guards, count=1000)
+    fake.rewrite_responses(MessageType.COMMIT, drop_finalizers, count=1000)
     for i in range(10):
         assert put(h, f"k{i}")
     wait_until(lambda: node.manager.move_results["REJECTED"] >= 1, what="rejected")
-    rejected = [i for i in finalized(fake) if i.dest_pin_id in guards]
+    rejected = [i for i in finalized(fake) if i.finalizer_id in finalizers]
     assert len(rejected) == node.manager.move_results["REJECTED"]
     for item in rejected:
         # retired, then freed: the page left that generation
@@ -433,7 +433,7 @@ def test_an_invalid_pool_below_keeps_the_source_and_dram_credit(fake, nodes, han
     (cxl,) = cxl_ids(node)
 
     def hide_cxl(response):
-        if any(o.pin_id for o in response.items):
+        if any(o.finalizer_id for o in response.items):
             with fake._lock:
                 fake.hidden_pools.add(cxl)
         return response
@@ -653,7 +653,7 @@ def test_copies_queued_by_a_lost_session_go_out_after_reregistration(
     drain = [False]
 
     def commit(items):
-        if items[0].pin == CommitPin.NODE and not lost:
+        if items[0].finalizer and not lost:
             lost.append(len(items))
             drain[0] = True  # a server drain keeps eviction off from here
             raise EpochChanged("test: the session went")
@@ -686,7 +686,7 @@ def test_a_copy_of_a_page_now_holding_another_key_is_retired(fake, nodes, handle
     def take_page(response):
         # Before FINALIZE_MOVE, another key takes the source page of the
         # first demoted key: KEPT(MOVED) names it
-        if moved or not any(o.pin_id for o in response.items):
+        if moved or not any(o.finalizer_id for o in response.items):
             return response
         item = fake.requests(MessageType.COMMIT)[-1].items[0]
         (source,) = [
@@ -794,4 +794,73 @@ def test_past_high_the_pages_without_room_are_dropped_while_others_move(
     wait_until(
         lambda: any(a and d for a, d in passes), what="a pass that moved and dropped"
     )
+    node.pools.check()
+
+
+# =============================================================================
+# RELEASE_FINALIZER where the finalizer id is unknown or of no use
+# =============================================================================
+
+
+def released(fake) -> list:
+    return [i for r in fake.requests(MessageType.RELEASE_FINALIZER) for i in r.items]
+
+
+def test_an_unusable_commit_reply_releases_the_finalizers_and_frees_the_copies(
+    fake, nodes, handlers
+):
+    node = nodes(low=0.0625)
+    h = handlers(node)
+    lost: list = []
+
+    def unusable(response):
+        # One result short: ReplyError, while the copies were ADDED with
+        # finalizers
+        if not lost and any(o.finalizer_id for o in response.items):
+            lost.extend(fake.requests(MessageType.COMMIT)[-1].items)
+            return CommitResponse(status=Status.OK, items=response.items[:-1])
+        return response
+
+    fake.rewrite_responses(MessageType.COMMIT, unusable, count=1000)
+    for i in range(10):
+        assert put(h, f"k{i}")
+    wait_until(lambda: lost and released(fake), what="RELEASE_FINALIZER sent")
+    assert {(i.key, i.location) for i in released(fake)} >= {
+        (i.key, i.location) for i in lost
+    }
+    for item in lost:  # released, then RETIREd and freed
+        wait_until(
+            lambda item=item: node.pools.find(item.location) is None, what="freed"
+        )
+        assert item.location not in fake.locations(item.key)
+    # the sources stayed, and moved on a later try
+    wait_until(
+        lambda: all(kinds(fake, i.key.key) == {PoolKind.CXL} for i in lost),
+        what="moved later",
+    )
+    wait_until(lambda: fake.pin_count() == 0, what="no finalizer left")
+    node.pools.check()
+
+
+def test_a_finalize_move_refused_as_a_whole_releases_and_moves_later(
+    fake, nodes, handlers
+):
+    node = nodes(low=0.0625)
+    h = handlers(node)
+    fake.fail_requests(MessageType.FINALIZE_MOVE, Status.REJECTED)
+    for i in range(10):
+        assert put(h, f"k{i}")
+    wait_until(lambda: released(fake), what="RELEASE_FINALIZER sent")
+    refused = fake.requests(MessageType.FINALIZE_MOVE)[0].items
+    assert [(i.key, i.location) for i in released(fake)] == [
+        (i.key, i.dest) for i in refused
+    ]
+    assert node.manager.move_results["RELEASE_FINALIZER:RELEASED"] == len(refused)
+    # the copies stay; the next demotion finalizes onto them
+    for item in refused:
+        wait_until(
+            lambda item=item: fake.locations(item.key) == [item.dest],
+            what="moved onto the same copy",
+        )
+    wait_until(lambda: fake.pin_count() == 0, what="no finalizer left")
     node.pools.check()

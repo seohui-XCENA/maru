@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from maru_common.protocol import CommitItem, CommitRequest, MessageType
-from maru_common.storage_types import CommitPin, OpRef, Status
+from maru_common.storage_types import OpRef, Status
 from maru_server.catalog import Catalog
 from maru_server.op_ledger import OpLedger, Verdict
 from tests.unit.ms_fakes import FakeClock, FakeNode, FakeWorker, Wire, key, make_service
@@ -20,8 +20,10 @@ def op(seq, digest=b"d" * 16, ack=0, origin="a"):
     return OpRef(origin=origin, seq=seq, digest=digest, ack=ack)
 
 
-def commit_item(k, loc, pin=CommitPin.NONE):
-    return CommitItem(key=k, location=loc, logical_bytes=loc.length, pin=pin)
+def commit_item(k, loc, finalizer=False):
+    return CommitItem(
+        key=k, location=loc, logical_bytes=loc.length, finalizer=finalizer
+    )
 
 
 class TestLedger:
@@ -141,10 +143,10 @@ class TestServiceOps:
         request = node.build(
             CommitRequest,
             **node.envelope(),
-            items=[commit_item(key("k"), loc, pin=CommitPin.NODE)],
+            items=[commit_item(key("k"), loc, finalizer=True)],
         )
         first = wire.call(MessageType.COMMIT, request)
-        assert first.items[0].result == "ADDED" and first.items[0].pin_id
+        assert first.items[0].result == "ADDED" and first.items[0].finalizer_id
         assert wire.call(MessageType.COMMIT, request) == first
         assert len(service.catalog.locations(key("k"))) == 1
         assert len(service.pins) == 1
@@ -317,7 +319,7 @@ class TestServiceOps:
             CommitRequest,
             **node.envelope(),
             items=[
-                commit_item(key(f"k{i}"), loc, pin=CommitPin.NODE)
+                commit_item(key(f"k{i}"), loc, finalizer=True)
                 for i, loc in enumerate(locs)
             ],
         )

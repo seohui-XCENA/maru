@@ -42,7 +42,6 @@ from maru_common.storage_types import (
     MAX_BATCH,
     AccessInfo,
     BlockRequest,
-    CommitPin,
     ExitCause,
     ItemOutcome,
     ItemResult,
@@ -114,10 +113,10 @@ class _Move:
     source: Location
     dest: PageRef
     dest_location: Location  # what is committed: the logical bytes
-    pin_id: str = ""  # once ADDED: FINALIZE_MOVE releases it
+    finalizer_id: str = ""  # once ADDED: FINALIZE_MOVE releases it
     # The copy is READY below already (left by a KEPT or unknown move): the
-    # COMMIT only pins it again
-    repin: bool = False
+    # COMMIT of the same location only places a finalizer on it again
+    existing: bool = False
 
 
 class StorageManager:
@@ -203,12 +202,12 @@ class StorageManager:
         # the high watermark)
         self.move_results: collections.Counter[str] = collections.Counter()
         # Copied demotions whose COMMIT goes out once MaruServer takes it
-        # (right after a re-registration), and guarded ones whose
+        # (right after a re-registration), and finalized ones whose
         # FINALIZE_MOVE waits for the next eviction pass
         self._moves: list[_Move] = []
         self._finals: list[_Move] = []
         # Source -> its READY copy below, left by a KEPT, DUPLICATE or unknown
-        # result: the next demotion pins that copy again instead of copying
+        # result: the next demotion finalizes onto that copy instead of copying
         self._copies: dict[PageRef, PageRef] = {}
         # Pools MaruServer called INVALID: no demotion goes there
         self._invalid_pools: set[str] = set()
@@ -386,7 +385,7 @@ class StorageManager:
         # retry after a failure part way sends every READY page again
         first = self._sorted_for != epoch
         sent, added = self._reregister(epoch, deleted if first else None)
-        self._guards_lost()
+        self._finalizers_lost()
         self._complete_at = epoch
         seconds = time.monotonic() - started
         self._recovered(
@@ -764,7 +763,6 @@ class StorageManager:
                         key=item.key,
                         location=location,
                         logical_bytes=item.logical_bytes,
-                        pin=CommitPin.NONE,
                     ),
                     write_done=wd,
                     index=i,
@@ -1074,8 +1072,8 @@ class StorageManager:
         items: list[KeyLocation],
     ) -> None:
         """Write-back: copy READY pages to the tier below, COMMIT the copies
-        with a node pin, then FINALIZE_MOVE the sources. A source with a copy
-        below already has that copy pinned again instead. Pages that find no
+        with a finalizer, then FINALIZE_MOVE the sources. A source with a copy
+        below already gets a finalizer on that copy instead. Pages that find no
         room wait for the tier below to evict (it ran first in this pass);
         while this pool is past its high watermark they are dropped instead:
         writes must not stall."""
@@ -1087,7 +1085,7 @@ class StorageManager:
                 todo.append((ref, item))
             else:
                 moves.append(
-                    _Move(ref, item.key, item.location, copy[0], copy[1], repin=True)
+                    _Move(ref, item.key, item.location, copy[0], copy[1], existing=True)
                 )
         dests = self._reserve_below(below, len(todo))
         for (ref, item), dest in zip(todo, dests, strict=False):
@@ -1182,8 +1180,8 @@ class StorageManager:
 
     def _run_moves(self, moves: list[_Move]) -> None:
         assert self.transfers is not None
-        fresh = [m for m in moves if not m.repin]
-        copied = [m for m in moves if m.repin]
+        fresh = [m for m in moves if not m.existing]
+        copied = [m for m in moves if m.existing]
         if self._halted():  # no copy started: all go back
             for move in fresh:
                 self.pools.transfer_failed(move.dest)
@@ -1231,9 +1229,9 @@ class StorageManager:
         with self._lock:
             self._finals.extend(finals)
 
-    def _guards_lost(self) -> None:
-        """A new MaruServer took no node pin over: moves waiting for their
-        FINALIZE_MOVE pin their copies again (both were re-registered)."""
+    def _finalizers_lost(self) -> None:
+        """A new MaruServer took no finalizer over: moves waiting for their
+        FINALIZE_MOVE finalize again later (both pages were re-registered)."""
         with self._lock:
             finals, self._finals = self._finals, []
         for move in finals:
@@ -1241,17 +1239,17 @@ class StorageManager:
         self.placement.release([m.src for m in finals], backoff=False)
 
     def _commit_moves(self, moves: list[_Move]) -> list[_Move]:
-        """COMMIT the copies with a node pin; returns those to FINALIZE_MOVE.
+        """COMMIT the copies with a finalizer; returns those to FINALIZE_MOVE.
         A result lost with the session is sent again as a new op once
         MaruServer takes the session again; one left unknown otherwise is
         settled as the commit path does."""
         live = []
         for move in moves:
-            if move.repin and not self._is_ready(move.dest, move.key):
+            if move.existing and not self._is_ready(move.dest, move.key):
                 self.placement.release([move.src])  # the copy went while queued
             elif self._is_ready(move.src, move.key):
                 live.append(move)
-            elif not move.repin:
+            elif not move.existing:
                 self._settle_copies([move])  # the source went while queued
         if not live:
             return []
@@ -1262,7 +1260,7 @@ class StorageManager:
                         key=m.key,
                         location=m.dest_location,
                         logical_bytes=m.source.length,
-                        pin=CommitPin.NODE,
+                        finalizer=True,
                     )
                     for m in live
                 ]
@@ -1278,14 +1276,12 @@ class StorageManager:
             self._queue_moves(live)
             raise
         except Exception as e:
-            # Sent, maybe applied: not sent again as a new op. A guard it
-            # took stays (its pin_id is unknown)
+            # Sent, maybe applied: not sent again as a new op
             if isinstance(e, ReplyError):
                 logger.error("COMMIT of %d demoted pages: %s", len(live), e)
             else:
                 logger.exception("COMMIT of %d demoted pages failed", len(live))
-            for move in live:
-                self._commit_unknown(move)
+            self._commit_unknown(live)
             return []
         if response.status == Status.OK:
             outcomes = response.items
@@ -1298,49 +1294,87 @@ class StorageManager:
             )
             outcomes = [ItemOutcome(ItemResult.REJECTED)] * len(live)
         finals: list[_Move] = []
+        unknown: list[_Move] = []
         for move, outcome in zip(live, outcomes, strict=True):
             try:
-                if self._apply_move_commit(move, outcome):
-                    finals.append(move)
+                answer = self._apply_move_commit(move, outcome)
             except Exception:
                 logger.exception("applying the COMMIT result of %s failed", move.dest)
                 self.placement.release([move.src])
+                continue
+            if answer is True:
+                finals.append(move)
+            elif answer is None:
+                unknown.append(move)
+        if unknown:
+            self._commit_unknown(unknown)
         return finals
 
-    def _apply_move_commit(self, move: _Move, outcome: ItemOutcome) -> bool:
-        """Whether the copy is guarded for its FINALIZE_MOVE."""
+    def _apply_move_commit(self, move: _Move, outcome: ItemOutcome) -> bool | None:
+        """True if the copy has its finalizer for FINALIZE_MOVE, None if the
+        result is unknown."""
         result = outcome.result
         with self._lock:
             self.move_results[f"COMMIT:{result.value}"] += 1
         if result == ItemResult.ADDED:
-            if not move.repin:
+            if not move.existing:
                 self.pools.commit_added(move.dest)
-            if outcome.pin_id:
-                move.pin_id = outcome.pin_id
+            if outcome.finalizer_id:
+                move.finalizer_id = outcome.finalizer_id
                 return True
-            self._keep_copy(move)  # nothing guards it for a move
+            self._keep_copy(move)  # no finalizer to move under
         elif result in (ItemResult.DUPLICATE, ItemResult.REJECTED):
-            if move.repin:
+            if move.existing:
                 with self._lock:
                     self._copies.pop(move.src, None)
             else:
                 self.pools.commit_freed(move.dest)
             if result == ItemResult.DUPLICATE and outcome.location is not None:
-                # The key is in that pool already: that copy is pinned next
+                # The key is in that pool already: the next demotion
+                # finalizes onto that copy
                 self._note_copy(move.src, move.key, outcome.location)
         else:
             logger.error("COMMIT of demoted page %s answered %s", move.dest, result)
-            self._commit_unknown(move)
-            return False
+            return None
         self.placement.release([move.src])
         return False
 
-    def _commit_unknown(self, move: _Move) -> None:
-        """Maybe in the Catalog: a new copy is settled by a RETIRE (RETIRED
-        frees, PINNED proves it there); a pinned again copy stays a copy."""
-        if not move.repin:
-            self._settle_copies([move])
-        self.placement.release([move.src])
+    def _commit_unknown(self, moves: list[_Move]) -> None:
+        """Maybe in the Catalog with a finalizer whose id is unknown: release
+        it by location, then settle a new copy with a RETIRE (RETIRED frees,
+        PINNED proves it there); an existing copy stays a copy."""
+        try:
+            self._release_finalizers(moves)
+            new = [m for m in moves if not m.existing]
+            if new:
+                self._settle_copies(new)
+        finally:
+            self.placement.release([m.src for m in moves])
+
+    def _release_finalizers(self, moves: list[_Move]) -> None:
+        """RELEASE_FINALIZER on the copies, once. Without a usable answer the
+        finalizers go when the node session ends."""
+        items = [KeyLocation(key=m.key, location=m.dest_location) for m in moves]
+        try:
+            response = self.metadata.release_finalizer(items)
+        except EpochChanged as e:
+            self.server_lost(f"MaruServer answered EPOCH to RELEASE_FINALIZER ({e})")
+            return
+        except ServerStopped:
+            raise
+        except Exception as e:
+            logger.error("RELEASE_FINALIZER of %d copies failed: %s", len(items), e)
+            return
+        if response.status != Status.OK:
+            logger.error(
+                "RELEASE_FINALIZER refused as a whole: %s %s",
+                response.status,
+                response.error,
+            )
+            return
+        with self._lock:
+            for outcome in response.items:
+                self.move_results[f"RELEASE_FINALIZER:{outcome.result.value}"] += 1
 
     def _note_copy(self, src: PageRef, key: Key, location: Location) -> None:
         ref = self.pools.find(location)
@@ -1357,7 +1391,7 @@ class StorageManager:
             self._finalize_moves(moves[start : start + MAX_BATCH])
 
     def _finalize_moves(self, moves: list[_Move]) -> None:
-        """Remove the sources now that the copies are guarded."""
+        """Remove the sources now that the copies have their finalizers."""
         self.local_pins.block([m.src for m in moves])
         try:
             response = self.metadata.finalize_move(
@@ -1366,7 +1400,7 @@ class StorageManager:
                         key=m.key,
                         source=m.source,
                         dest=m.dest_location,
-                        dest_pin_id=m.pin_id,
+                        finalizer_id=m.finalizer_id,
                     )
                     for m in moves
                 ]
@@ -1391,9 +1425,13 @@ class StorageManager:
                 response.status,
                 response.error,
             )
-            # Not run: the guards stay held, as nothing here sends UNPIN
-            self._move_unknown(moves)
-            self.local_pins.unblock([m.src for m in moves])
+            # Not run: the finalizers are released; the next demotion places
+            # them again on the copies and finalizes
+            try:
+                self._release_finalizers(moves)
+            finally:
+                self._move_unknown(moves)
+                self.local_pins.unblock([m.src for m in moves])
             return
         # Copies not kept as locations of their key: retired, freed once RETIRED
         retire: list[_Move] = []
@@ -1418,7 +1456,7 @@ class StorageManager:
         """Act on one FINALIZE_MOVE result; whether to retire the copy."""
         result, cause = outcome.result, outcome.cause
         if result == ItemResult.REJECTED:
-            # The copy was not guarded: the source stays
+            # The copy had no finalizer of this session: the source stays
             with self._lock:
                 self.move_results["REJECTED"] += 1
             if self._is_ready(move.src, move.key):
@@ -1463,7 +1501,7 @@ class StorageManager:
     def _move_unknown(self, moves: list[_Move]) -> None:
         """No usable FINALIZE_MOVE result: both stay READY (re-registered
         after a MaruServer restart), the source's local pins stay blocked,
-        and its next demotion pins the copy again."""
+        and its next demotion finalizes onto the copy again."""
         for move in moves:
             self._keep_copy(move)
         with self._lock:

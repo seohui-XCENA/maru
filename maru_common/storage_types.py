@@ -120,6 +120,8 @@ class ItemResult(StrEnum):
     KEPT = "KEPT"
     STALE = "STALE"
     REJECTED = "REJECTED"
+    RELEASED = "RELEASED"
+    ABSENT = "ABSENT"
 
 
 @unique
@@ -153,12 +155,6 @@ class CloseMode(StrEnum):
 class ExitCause(StrEnum):
     EXIT = "exit"
     LOST = "lost"
-
-
-@unique
-class CommitPin(StrEnum):
-    NONE = "none"
-    NODE = "node"
 
 
 @unique
@@ -284,7 +280,9 @@ class ItemOutcome:
 
     result: ItemResult
     location: Location | None = None
-    pin_id: str | None = None
+    pin_id: str | None = None  # a read pin (HIT)
+    # COMMIT with a finalizer: FINALIZE_MOVE releases it by this id
+    finalizer_id: str | None = None
     plan: FetchPlan | None = None
     reason: MissReason | None = None
     cause: KeptCause | None = None
