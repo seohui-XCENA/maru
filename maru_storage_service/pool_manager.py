@@ -69,7 +69,8 @@ class PoolManager:
         self.page_size = page_size
         self._lock = threading.RLock()
         self._tables: dict[str, PageTable] = {}
-        # Pools that give credit; an adopted or disabled pool does not
+        # Pools that give credit; an adopted pool (until released) or a
+        # disabled one does not
         self._creditable: set[str] = set()
         self._epoch_seq: int | None = None
         self._counter = 0
@@ -130,6 +131,12 @@ class PoolManager:
                 return False
             self._creditable.discard(pool_id)
             return True
+
+    def enable_pool(self, pool_id: str) -> None:
+        """Credit from a pool from now on (an adopted pool once released)."""
+        with self._lock:
+            if pool_id in self._tables:
+                self._creditable.add(pool_id)
 
     def pool_ids(self) -> list[str]:
         with self._lock:
@@ -200,7 +207,13 @@ class PoolManager:
             if self._bytes(PageState.PENDING) >= self.budgets.commit_pending_max_bytes:
                 return []
             ps = table.page_size
+            # The transfer reserve is the tier's, over all its pools
             reserve = self.budgets.transfer_reserve_bytes.get(table.info.kind.value, 0)
+            tier_free = sum(
+                t.bytes[PageState.FREE]
+                for pool_id, t in self._tables.items()
+                if t.info.kind == table.info.kind and pool_id in self._creditable
+            )
             now = time.monotonic()
             self._waiting = {
                 h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
@@ -214,7 +227,8 @@ class PoolManager:
                     - self._held[holder]
                 )
                 // ps,
-                (table.bytes[PageState.FREE] - reserve) // ps,
+                (tier_free - reserve) // ps,
+                table.free_count(),
             )
             count = min(
                 uncapped,
@@ -290,14 +304,16 @@ class PoolManager:
             return asks
 
     def _credit_pool(self, kind: PoolKind | None) -> PageTable | None:
-        """The pool credit comes from: the first creditable one of ``kind``.
-        Choosing among several pools of a tier belongs here."""
+        """The pool credit comes from: the creditable one of ``kind`` with
+        the most FREE pages (the first of them on a tie)."""
+        best = None
         for pool_id, table in self._tables.items():
             if pool_id in self._creditable and (
                 kind is None or table.info.kind == kind
             ):
-                return table
-        return None
+                if best is None or table.free_count() > best.free_count():
+                    best = table
+        return best
 
     def set_credit_max(self, holder: str, nbytes: int) -> None:
         """``holder``'s own credit cap (the default otherwise)."""
@@ -321,10 +337,14 @@ class PoolManager:
 
     # ------------------------------------------------- worker-named transitions
 
-    def check_credit(self, holder: str, credit: Location) -> tuple[Page | None, str]:
-        """The page ``credit`` names if ``holder`` holds it, else the reason."""
+    def check_credit(
+        self, holder: str, credit: Location, *, returning: bool = False
+    ) -> tuple[Page | None, str]:
+        """The page ``credit`` names if ``holder`` holds it, else the reason.
+        Credit of a disabled pool can still come back (``returning``), not be
+        written."""
         table = self._tables.get(credit.pool_id)
-        if table is None or credit.pool_id not in self._creditable:
+        if table is None or (credit.pool_id not in self._creditable and not returning):
             return None, f"pool {credit.pool_id!r} is not a pool of this node"
         if generation_epoch_seq(credit.generation) != self._epoch_seq:
             return None, "the credit comes from another StorageService run"
@@ -370,7 +390,7 @@ class PoolManager:
     def abort(self, holder: str, credit: Location) -> tuple[bool, str]:
         """CREDITED -> FREE: the worker drained its GPU work on the page."""
         with self._lock:
-            page, reason = self.check_credit(holder, credit)
+            page, reason = self.check_credit(holder, credit, returning=True)
             if page is None:
                 return False, reason
             self._free_credited(page, credit.pool_id, holder)
@@ -380,14 +400,13 @@ class PoolManager:
         """CREDITED -> FREE. CREDIT_RETURN has no op, so a credit already back is
         OK again (no change)."""
         with self._lock:
-            page, reason = self.check_credit(holder, credit)
+            page, reason = self.check_credit(holder, credit, returning=True)
             if page is not None:
                 self._free_credited(page, credit.pool_id, holder)
                 return True, ""
             table = self._tables.get(credit.pool_id)
             if (
                 table is not None
-                and credit.pool_id in self._creditable
                 and generation_epoch_seq(credit.generation) == self._epoch_seq
             ):
                 current = table.at(credit.offset)

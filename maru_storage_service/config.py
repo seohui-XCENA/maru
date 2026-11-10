@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from maru_common.node_protocol import DEFAULT_NODE_SOCKET, Budgets, TransferDefaults
-from maru_common.storage_types import Visibility
+from maru_common.storage_types import PoolKind, Visibility
 
 
 class NodeConfigError(ValueError):
@@ -139,6 +139,16 @@ class TierConfig:
 
 
 @dataclass(frozen=True)
+class TierTraits:
+    """What the StorageService does with a tier's pools, instead of asking
+    which medium they are."""
+
+    kind: PoolKind
+    credit: bool  # workers get credit from it (the top tier)
+    evicts: bool  # pressure makes room by retiring its READY pages
+
+
+@dataclass(frozen=True)
 class RemoteServerConfig:
     listen: str
     key_file: str
@@ -167,6 +177,18 @@ class NodeConfig:
 
     def tier(self, store: str) -> TierConfig | None:
         return next((t for t in self.tiers if t.store == store), None)
+
+    def traits(self) -> dict[PoolKind, TierTraits]:
+        """Traits of each memory tier, by the kind of its pools. Until
+        write-back demotion only the tier that gets new pages (credit) evicts,
+        by dropping."""
+        memory = [t for t in self.tiers if t.is_memory]
+        return {
+            PoolKind(t.store): TierTraits(
+                kind=PoolKind(t.store), credit=i == 0, evicts=i == 0
+            )
+            for i, t in enumerate(memory)
+        }
 
     def transfer_defaults(self) -> TransferDefaults:
         """Workers park loads when a tier can only be fetched from; a store

@@ -4,15 +4,15 @@
 
 Start order: claim the socket, DRAM pool, the node's CXL regions from the RM,
 NODE_OPEN, adopted ledgers, old worker drain, heartbeat, then accept on the
-UDS. A GPU node with [dram] or [dram, cxl] is served; other configs are
-refused. CXL pools are registered and kept, but not used yet.
+UDS. A GPU node with [dram], [cxl] or [dram, cxl] is served; other configs
+are refused. The top tier gives credit; demotion to CXL is not there yet.
 """
 
 import logging
 import threading
 import uuid
 
-from maru_common.storage_types import CloseMode, RmDomain
+from maru_common.storage_types import CloseMode, PoolKind, RmDomain
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError
@@ -47,10 +47,10 @@ def check_servable(config: NodeConfig) -> None:
     if config.role != "gpu":
         raise NotServableError("serving a memory node is not implemented yet")
     stores = [t.store for t in config.tiers]
-    if stores not in (["dram"], ["dram", "cxl"]):
+    if stores not in (["dram"], ["cxl"], ["dram", "cxl"]):
         raise NotServableError(
-            f"serving the tiers {stores} is not implemented yet: only [dram] "
-            "and [dram, cxl] are served"
+            f"serving the tiers {stores} is not implemented yet: only [dram], "
+            "[cxl] and [dram, cxl] are served"
         )
     cxl = config.tier("cxl")
     if cxl is not None and cxl.size is None:
@@ -137,12 +137,14 @@ class StorageService:
             socket_group=config.socket_group,
         )
         self.local.claim()
-        self.dram = DramDriver().create(
-            top,
-            node_id=config.node_id,
-            node_epoch=self.node_epoch,
-            page_size=config.page_size,
-        )
+        dram_tier = config.tier("dram")
+        if dram_tier is not None:
+            self.dram = DramDriver().create(
+                dram_tier,
+                node_id=config.node_id,
+                node_epoch=self.node_epoch,
+                page_size=config.page_size,
+            )
         cxl_tier = config.tier("cxl")
         if cxl_tier is not None:
             # Before NODE_OPEN: only regions this run owns are announced
@@ -163,8 +165,12 @@ class StorageService:
                 raise ServerStopped()
             self.cxl.start_renewing()
             self._check_stopped()
+        traits = config.traits()
         self.pools = PoolManager(config.budgets, config.page_size)
-        self.pools.add_pool(self.dram.info())
+        if self.dram is not None:
+            self.pools.add_pool(
+                self.dram.info(), creditable=traits[PoolKind.DRAM].credit
+            )
         self.server = ServerClient(
             config.server,
             config.node_id,
@@ -183,6 +189,7 @@ class StorageService:
             gpu_drain_grace_s=self.gpu_drain_grace_s,
             evict_interval_s=self.evict_interval_s,
             op_window=self.op_window,
+            traits=traits,
         )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
         rm_domains = []
@@ -190,13 +197,16 @@ class StorageService:
             devices = sorted({p.region.device_uuid for p in cxl_pools} - {""})
             rm_domains = [RmDomain(self.cxl.rm_domain, tuple(devices))]
         opened = self.server.open(
-            [self.dram.info()] + [p.info() for p in cxl_pools], rm_domains=rm_domains
+            ([self.dram.info()] if self.dram is not None else [])
+            + [p.info() for p in cxl_pools],
+            rm_domains=rm_domains,
         )
         self._check_stopped()
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
             # Its committed pages come back READY; no credit from it yet
+            # No credit until its old workers are confirmed (then released)
             self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
             items = self.server.recover_list(info.pool_id)
             refs = self.pools.recovered(
@@ -222,25 +232,41 @@ class StorageService:
                 )
                 self.adopted.append(pool.pool_id)
             else:
-                self.pools.add_pool(pool.info(), creditable=False)
+                self.pools.add_pool(pool.info(), creditable=traits[PoolKind.CXL].credit)
         self.manager.start()
+        credit_kinds = {kind for kind, t in traits.items() if t.credit}
         self.manager.workers.start_restart_drain(
-            opened.old_workers, self.adopted, opened.previous_node_epoch
+            opened.old_workers,
+            self.adopted,
+            opened.previous_node_epoch,
+            credit_after=frozenset(
+                pool_id
+                for pool_id in self.adopted
+                if (adopted := self.pools.pool_info(pool_id)) is not None
+                and adopted.kind in credit_kinds
+            ),
         )
         self.manager.start_heartbeat()
         self.local.manager = self.manager
-        self.local.pools = [(self.dram.descriptor(memfd=0), self.dram.fd)] + [
+        dram_pools = (
+            [] if self.dram is None else [(self.dram.descriptor(memfd=0), self.dram.fd)]
+        )
+        self.local.pools = dram_pools + [
             (pool.descriptor(), None) for pool in cxl_pools
         ]
         self.local.start()
         logger.info(
-            "StorageService %s serving node %s: dram pool %s (%d MiB, pages of %d KiB)",
+            "StorageService %s serving node %s, pages of %d KiB",
             self.node_epoch,
             config.node_id,
-            self.dram.pool_id,
-            self.dram.capacity >> 20,
             config.page_size >> 10,
         )
+        if self.dram is not None:
+            logger.info(
+                "dram tier: pool %s (%d MiB)",
+                self.dram.pool_id,
+                self.dram.capacity >> 20,
+            )
         if cxl_pools:
             logger.info(
                 "cxl tier: %d regions (%d MiB) from RM %s, %d adopted",

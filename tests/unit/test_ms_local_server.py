@@ -187,7 +187,7 @@ class TestCredit:
                 )
             ),
         )
-        assert r.status == Status.REJECTED and "no cxl tier" in r.error
+        assert r.status == Status.REJECTED and "not cxl" in r.error
         assert worker.credit(0).status == Status.REJECTED
         assert len(worker.credit(PAGE).credits) == 1
 

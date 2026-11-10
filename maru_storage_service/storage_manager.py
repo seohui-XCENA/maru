@@ -50,6 +50,7 @@ from maru_common.storage_types import (
     WorkerRef,
 )
 
+from .config import TierTraits
 from .local_pin import LocalPins
 from .op_ledger import OP_WINDOW, LedgerEntry, OpLedger, Verdict
 from .placement import PlacementPolicy
@@ -108,8 +109,13 @@ class StorageManager:
         gpu_drain_grace_s: float = DEFAULT_GPU_DRAIN_GRACE_S,
         evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
         op_window: int = OP_WINDOW,
+        traits: dict[PoolKind, TierTraits] | None = None,
     ):
         self.node_epoch = node_epoch
+        self.traits = traits or {
+            PoolKind.DRAM: TierTraits(PoolKind.DRAM, credit=True, evicts=True)
+        }
+        self.credit_kind = next(k for k, t in self.traits.items() if t.credit)
         self.pools = pool_manager
         self.placement = placement
         self.local_pins = local_pins
@@ -524,9 +530,10 @@ class StorageManager:
                 status=Status.REJECTED,
                 error="credit needs the worker_session of MaruServer",
             )
-        if req.kind not in (None, PoolKind.DRAM):
+        if req.kind not in (None, self.credit_kind):
             return CreditResponse(
-                status=Status.REJECTED, error=f"this node has no {req.kind} tier"
+                status=Status.REJECTED,
+                error=f"credit comes from the {self.credit_kind} tier, not {req.kind}",
             )
         if req.want_bytes <= 0:
             return CreditResponse(
@@ -546,7 +553,9 @@ class StorageManager:
 
         def grant() -> tuple[list[Location], list[tuple[WorkerEndpoint, int]]]:
             rec.worker_session = req.worker_session
-            credits = self.pools.credit(rec.incarnation, req.want_bytes, req.kind)
+            credits = self.pools.credit(
+                rec.incarnation, req.want_bytes, self.credit_kind
+            )
             asks = [
                 (conn, nbytes)
                 for incarnation, nbytes in self.pools.credit_asks(rec.incarnation)
@@ -916,6 +925,7 @@ class StorageManager:
                     self._evict_once()
                 elif draining:
                     self.workers.log_server_drain()
+                self.workers.log_old_workers()
             except ServerStopped:
                 return
             except Exception:
@@ -928,11 +938,13 @@ class StorageManager:
     def _evict_once(self) -> None:
         for pool_id in self.pools.pool_ids():
             info = self.pools.pool_info(pool_id)
+            traits = self.traits.get(info.kind) if info is not None else None
             if (
                 info is None
-                or info.kind != PoolKind.DRAM
+                or traits is None
+                or not traits.evicts
                 or self.workers.is_adopted(pool_id)
-                or not self.pools.creditable(pool_id)
+                or (traits.credit and not self.pools.creditable(pool_id))
             ):
                 continue
             candidates = self.placement.candidates(

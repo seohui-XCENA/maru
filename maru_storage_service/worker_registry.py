@@ -95,6 +95,8 @@ class OldWorker:
     ref: WorkerRef
     state: OldState = OldState.WAITING
     how: str = ""
+    # When its pages are safe to reuse (an exit waits the GPU drain grace)
+    settled_at: float = 0.0
 
 
 # How often the workers an open server drain waits for are logged
@@ -164,11 +166,14 @@ class WorkerRegistry:
         self._old: dict[str, OldWorker] = {}
         self._adopted: list[str] = []
         self._adopted_released = False
+        self._credit_after: set[str] = set()
+        self._release_not_before = 0.0
         self._stopping = False
         self._timers: set[threading.Timer] = set()
         self._drains: list[ServerDrain] = []  # open, oldest first
         self._drain_ids = itertools.count(1)
         self._drain_logged = 0.0
+        self._old_logged = 0.0
         self.server_drains_done = 0
 
     def stop(self) -> None:
@@ -435,11 +440,20 @@ class WorkerRegistry:
         old_workers: list[WorkerRef],
         adopted: list[str],
         previous_node_epoch: str | None = None,
+        credit_after: frozenset[str] = frozenset(),
     ) -> None:
-        """Start confirming the old workers; before workers attach."""
+        """Start confirming the old workers; before workers attach. The
+        adopted pools in ``credit_after`` give credit once released."""
         with self._lock:
             self.previous_node_epoch = previous_node_epoch
             self._adopted = list(adopted)
+            self._credit_after = set(credit_after)
+            if not old_workers:
+                # MaruServer names no worker of the run before (it may have
+                # lost them). Such a worker dropped its credit and stores when
+                # its StorageService went; its copies under way get the GPU
+                # drain grace, as an ended worker's do
+                self._release_not_before = time.monotonic() + self.gpu_drain_grace_s
             for ref in old_workers:
                 self._old.setdefault(ref.incarnation, OldWorker(ref))
             pending = [o for o in self._old.values() if o.state == OldState.WAITING]
@@ -558,6 +572,27 @@ class WorkerRegistry:
                     out.setdefault(incarnation, []).append(drain.old_epoch)
             return out
 
+    def log_old_workers(self) -> None:
+        """Name the old workers the adopted pools wait for, every DRAIN_LOG_S."""
+        now = time.monotonic()
+        with self._lock:
+            if self._adopted_released or now - self._old_logged < DRAIN_LOG_S:
+                return
+            waiting = sorted(
+                o.ref.incarnation
+                for o in self._old.values()
+                if o.state == OldState.WAITING
+            )
+            if not waiting:
+                return
+            self._old_logged = now
+        logger.warning(
+            "pools %s of the run before stay quarantined: waiting for DRAIN_ACK "
+            "or the exit of old workers %s",
+            sorted(self._adopted),
+            waiting,
+        )
+
     def log_server_drain(self) -> None:
         """Name the workers an open drain waits for, every DRAIN_LOG_S."""
         now = time.monotonic()
@@ -634,9 +669,9 @@ class WorkerRegistry:
             return {k: dataclasses.replace(v) for k, v in self._old.items()}
 
     def is_adopted(self, pool_id: str) -> bool:
-        """A pool of the run before, kept until its old workers are confirmed."""
+        """A pool of the run before whose old workers are not all confirmed."""
         with self._lock:
-            return pool_id in self._adopted
+            return pool_id in self._adopted and not self._adopted_released
 
     def _old_worker_exited(self, incarnation: str) -> None:
         with self._lock:
@@ -651,11 +686,16 @@ class WorkerRegistry:
         self._finish_server_drains()
 
     def _confirm_old(self, old: OldWorker, how: str) -> None:
+        """Confirmed by DRAIN_ACK (its copies ended) or by its exit (its GPU
+        copies still get the drain grace)."""
         with self._lock:
             if old.state == OldState.CONFIRMED:
                 return
             old.state = OldState.CONFIRMED
             old.how = how
+            old.settled_at = time.monotonic() + (
+                self.gpu_drain_grace_s if how == "exited" else 0.0
+            )
         logger.info("old worker %s confirmed (%s)", old.ref.incarnation, how)
         self._maybe_release_adopted()
 
@@ -665,10 +705,20 @@ class WorkerRegistry:
                 return
             if any(o.state != OldState.CONFIRMED for o in self._old.values()):
                 return
+            settle = max(
+                [self._release_not_before, *(o.settled_at for o in self._old.values())]
+            )
+            wait = settle - time.monotonic()
+            if wait > 0:
+                self._after(wait, self._maybe_release_adopted)
+                return
             self._adopted_released = True
             adopted = list(self._adopted)
+            credit_after = set(self._credit_after)
         for pool_id in adopted:
             freed = self._pools.release_quarantine(RECOVERY_TAG, pool_id)
+            if pool_id in credit_after:
+                self._pools.enable_pool(pool_id)
             logger.info(
                 "every old worker is confirmed: %d quarantined pages of adopted "
                 "pool %s are free",

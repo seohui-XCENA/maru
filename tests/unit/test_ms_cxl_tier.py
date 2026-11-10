@@ -456,3 +456,230 @@ def _start_quietly(service, stopped_error) -> None:
         service.start()
     except stopped_error:
         pass
+
+
+# =============================================================================
+# Credit from the cxl tier
+# =============================================================================
+
+
+def _two_pool_manager(free_a: int, free_b: int, reserve: int = 0):
+    from maru_common.node_protocol import Budgets
+    from maru_common.storage_types import PoolInfo
+    from maru_storage_service.pool_manager import PoolManager
+
+    pm = PoolManager(
+        Budgets(
+            credit_max_bytes=64 * PAGE,
+            credit_total_max_bytes=64 * PAGE,
+            credit_refill_low=PAGE,
+            credit_refill_high=4 * PAGE,
+            commit_pending_max_bytes=64 * PAGE,
+            transfer_reserve_bytes={"cxl": reserve},
+        ),
+        PAGE,
+    )
+    for name, pages in (("a", free_a), ("b", free_b)):
+        pm.add_pool(
+            PoolInfo(
+                pool_id=cxl_pool_id(DOMAIN, ord(name)),
+                kind=PoolKind.CXL,
+                node_id="n",
+                pool_generation=1,
+                capacity=pages * PAGE,
+                page_size=PAGE,
+            )
+        )
+    pm.set_epoch_seq(1)
+    return pm
+
+
+def test_credit_comes_from_the_pool_with_the_most_room():
+    pm = _two_pool_manager(2, 6)
+    got = pm.credit("w", 3 * PAGE, PoolKind.CXL)
+    assert {c.pool_id for c in got} == {cxl_pool_id(DOMAIN, ord("b"))}
+    got = pm.credit("w", 2 * PAGE, PoolKind.CXL)  # b has 3 left, a 2
+    assert {c.pool_id for c in got} == {cxl_pool_id(DOMAIN, ord("b"))}
+    pm.check()
+
+
+def test_the_transfer_reserve_is_the_tiers_over_all_its_pools():
+    pm = _two_pool_manager(4, 4, reserve=6 * PAGE)
+    got = pm.credit("w", 8 * PAGE, PoolKind.CXL)
+    assert len(got) == 2  # 8 free in the tier, 6 kept for transfers
+
+
+def cxl_only_config(fake, sockdir, pages: int = 16, region_pages: int = 8):
+    from maru_storage_service.config import parse_node_config
+
+    return parse_node_config(
+        {
+            "node_id": "gpu-test",
+            "socket": f"{sockdir}/node.sock",
+            "server": fake.url,
+            "page_size": PAGE,
+            "tiers": [
+                {
+                    "store": "cxl",
+                    "size": pages * PAGE,
+                    "region_size": region_pages * PAGE,
+                }
+            ],
+            "budgets": {
+                "credit_max_bytes": 4 * PAGE,
+                "credit_total_max_bytes": 8 * PAGE,
+                "credit_refill_low": PAGE,
+                "credit_refill_high": 4 * PAGE,
+                "commit_pending_max_bytes": 4 * PAGE,
+                "transfer_reserve_bytes": PAGE,
+            },
+        }
+    )
+
+
+def test_a_cxl_only_node_gives_credit_from_its_regions(fake, sockdir):
+    from tests.unit.ms_node_helpers import RawWorker
+
+    rm = FakeRm()
+    node = start_node(
+        cxl_only_config(fake, sockdir), region_source=rm, cxl_renew_s=0.02
+    )
+    try:
+        assert node.dram is None
+        worker = RawWorker(f"{sockdir}/node.sock")
+        response = worker.attach()
+        assert {d.pool.pool_id for d in response.pools} == {
+            p.pool_id for p in node.cxl.pools
+        }
+        credits = worker.credit(2 * PAGE).credits
+        assert credits and all(c.kind == PoolKind.CXL for c in credits)
+        assert worker.write_done(credits[:1], ["k1"]).status.value == "OK"
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_claimed_regions_wait_the_gpu_grace_when_no_old_worker_is_known(fake, sockdir):
+    rm = FakeRm()
+    rm.regions["gpu-test"] = [rm.region(2 * PAGE)]
+    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=3.0)
+    try:
+        claimed = node.cxl.pools[0].pool_id
+        assert node.pools.bytes_in(PageState.QUARANTINED, claimed) == 2 * PAGE
+        assert node.manager.workers.is_adopted(claimed)
+        wait_until(
+            lambda: node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE,
+            timeout=5.0,
+            what="released after the grace",
+        )
+        assert not node.manager.workers.is_adopted(claimed)
+    finally:
+        node.stop()
+
+
+def test_pressure_on_a_cxl_only_node_retires_its_pages(fake, sockdir):
+    from tests.unit.ms_node_helpers import RawWorker
+
+    rm = FakeRm()
+    node = start_node(
+        cxl_only_config(fake, sockdir), region_source=rm, cxl_renew_s=0.02
+    )
+    try:
+        worker = RawWorker(f"{sockdir}/node.sock")
+        worker.attach()
+        written = 0
+        for _ in range(20):
+            credits = worker.credit(4 * PAGE).credits
+            if not credits:
+                continue
+            keys = [f"k{written + i}" for i in range(len(credits))]
+            assert worker.write_done(credits, keys).status.value == "OK"
+            written += len(credits)
+            if node.manager.retire_results:
+                break
+        wait_until(lambda: node.manager.retire_results, what="a retire")
+        assert written >= 8
+        worker.close()
+    finally:
+        node.stop()
+
+
+class GoneWatcher:
+    """Every watched process has already ended."""
+
+    def watch(self, key, pid, pid_start) -> bool:
+        return False
+
+    def start(self, callback) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+def test_an_old_worker_seen_ending_releases_after_the_gpu_grace():
+    """Its GPU copies may still land: the adopted pool is freed, and gives
+    credit, only after the drain grace."""
+    import time
+
+    from maru_common.storage_types import PoolInfo, WorkerRef
+    from maru_storage_service.op_ledger import OpLedger
+    from maru_storage_service.worker_registry import WorkerRegistry
+
+    pm = _two_pool_manager(2, 2)
+    adopted = cxl_pool_id(DOMAIN, ord("a"))
+    other = PoolInfo(
+        pool_id=adopted + "-q",
+        kind=PoolKind.CXL,
+        node_id="n",
+        pool_generation=1,
+        capacity=2 * PAGE,
+        page_size=PAGE,
+    )
+    pm.add_pool(other, creditable=False, state=PageState.QUARANTINED)
+    registry = WorkerRegistry(
+        node_epoch="e2",
+        pools=pm,
+        ledger=OpLedger(16),
+        watcher=GoneWatcher(),
+        on_exit=lambda ref: None,
+        gpu_drain_grace_s=0.5,
+    )
+    ref = WorkerRef("eng", 0, 0, pid=1 << 22, pid_start=1, incarnation="old")
+    started = time.monotonic()
+    registry.start_restart_drain(
+        [ref], [other.pool_id], "e1", credit_after=frozenset({other.pool_id})
+    )
+    assert pm.bytes_in(PageState.QUARANTINED, other.pool_id) == 2 * PAGE
+    assert not pm.creditable(other.pool_id)
+    wait_until(
+        lambda: pm.bytes_in(PageState.FREE, other.pool_id) == 2 * PAGE,
+        what="released",
+    )
+    assert time.monotonic() - started >= 0.5
+    assert pm.creditable(other.pool_id)
+    registry.stop()
+
+
+def test_a_cxl_only_restart_gives_credit_from_claimed_regions_once_released(
+    fake, sockdir
+):
+    from tests.unit.ms_node_helpers import RawWorker
+
+    rm = FakeRm()
+    rm.regions["gpu-test"] = [rm.region(8 * PAGE), rm.region(8 * PAGE)]
+    node = start_node(
+        cxl_only_config(fake, sockdir),
+        region_source=rm,
+        cxl_renew_s=0.02,
+        gpu_drain_grace_s=1.0,
+    )
+    try:
+        assert all(p.claimed for p in node.cxl.pools)  # nothing new to allocate
+        worker = RawWorker(f"{sockdir}/node.sock")
+        worker.attach()
+        assert worker.credit(PAGE).credits == []  # all quarantined still
+        wait_until(lambda: worker.credit(PAGE).credits, what="credit after release")
+        worker.close()
+    finally:
+        node.stop()
