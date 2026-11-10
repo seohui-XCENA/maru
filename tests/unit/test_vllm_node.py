@@ -683,14 +683,88 @@ class FailedWait(Done):
         raise RuntimeError("copy completion unknown")
 
 
-def test_a_failed_write_wait_keeps_its_pages():
-    """The copy may still be writing: the page is not handed out again."""
+def page() -> SimpleNamespace:
+    return SimpleNamespace(buf=memoryview(bytearray(4)))
+
+
+def write_behind_worker():
     worker = pinning_worker()
-    handle = SimpleNamespace(buf=memoryview(bytearray(4)))
-    worker._pending_store_keys.add("k")
-    worker._finish_write_behind_store(FailedWait(), ["k"], [handle], [])
+    worker._write_behind = True
+    return worker
+
+
+def wait_on(worker, req_id: str, *keys: str) -> None:
+    """``req_id`` waits for the write-behind stores of ``keys``."""
+    with worker._store_lock:
+        for key in keys:
+            worker._pending_store_keys.add(key)
+            worker._store_key_waiters.setdefault(key, set()).add(req_id)
+            worker._request_pending_store_keys.setdefault(req_id, set()).add(key)
+
+
+def test_a_failed_write_wait_keeps_its_pages_and_blocks():
+    """The copy may still write the page and read the request's GPU blocks:
+    neither is handed out again."""
+    worker = write_behind_worker()
+    wait_on(worker, "r", "k")
+    worker._finish_write_behind_store(FailedWait(), ["k"], [page()], [])
     worker._handler.free.assert_not_called()
     assert "k" not in worker._pending_store_keys
+    assert worker.get_finished_saving({"r"}) is None
+
+
+def test_a_later_store_of_the_key_finishes_only_its_own_requests():
+    worker = write_behind_worker()
+    wait_on(worker, "r", "k")
+    worker._finish_write_behind_store(FailedWait(), ["k"], [page()], [])
+    assert worker.get_finished_saving({"r"}) is None
+    wait_on(worker, "r2", "k")
+    worker._complete_write_behind_keys(["k"], [False])
+    assert worker.get_finished_saving({"r2"}) == {"r2"}
+    assert worker.get_finished_saving(set()) is None
+
+
+def test_chunks_waiting_for_credit_stay_with_an_unconfirmed_batch():
+    """Their slabs were gathered by the same copies: the slabs, their room and
+    their requests' blocks are kept too."""
+    worker = write_behind_worker()
+    worker._release_deferred = MagicMock()
+    wait_on(worker, "r", "k")
+    wait_on(worker, "r2", "d")
+    slab = torch.zeros(4)
+    worker._finish_write_behind_store(
+        FailedWait(), ["k"], [page()], [], None, [("d", slab, {})]
+    )
+    assert worker.get_finished_saving({"r", "r2"}) is None
+    worker._release_deferred.assert_not_called()
+    assert any(s is slab for held in worker._unconfirmed for _, s, _ in held[2])
+
+
+@pytest.mark.parametrize("ended", [True, False])
+def test_an_abandoned_batch_waits_for_its_copies(ended):
+    """A lost event, a failed submit or a gone handler: pages go back and
+    requests finish only once the copies are known to have ended."""
+    worker = write_behind_worker()
+    handle = page()
+    wait_on(worker, "r", "k")
+    worker._abandon_write_behind(
+        Done() if ended else FailedWait(), ["k"], [handle], [], []
+    )
+    assert "k" not in worker._pending_store_keys
+    if ended:
+        worker._handler.free.assert_called_once_with(handle)
+        assert worker.get_finished_saving({"r"}) == {"r"}
+    else:
+        worker._handler.free.assert_not_called()
+        assert worker.get_finished_saving({"r"}) is None
+
+
+def test_a_batch_without_a_handler_still_waits_for_its_copies():
+    worker = write_behind_worker()
+    wait_on(worker, "r", "k")
+    worker._handler = None
+    worker._finish_write_behind_store(FailedWait(), ["k"], [page()], [])
+    assert worker.get_finished_saving({"r"}) is None
 
 
 def test_a_failed_shutdown_wait_keeps_reads_and_mappings():

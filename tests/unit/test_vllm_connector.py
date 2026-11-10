@@ -4131,6 +4131,23 @@ class TestWriteBehindStoreLifecycle:
         assert worker._stored_keys == set()
         assert worker._pending_store_keys == set()
 
+    def test_unconfirmed_copy_keeps_handle_and_request_blocks(self):
+        """The D2H may still read the request's GPU blocks and write the page:
+        the request never finishes and the handle is not freed."""
+        worker = self._make_worker()
+        self._reserve(worker)
+        assert worker.get_finished_saving({"r1"}) is None
+        event = MagicMock()
+        event.synchronize.side_effect = RuntimeError("copy completion unknown")
+        handle = object()
+
+        worker._finish_write_behind_store(event, ["k1"], [handle], [])
+
+        worker._handler.free.assert_not_called()
+        worker._handler.batch_store.assert_not_called()
+        assert worker._pending_store_keys == set()
+        assert worker.get_finished_saving(set()) is None
+
     def test_preemption_drains_store_stream_before_block_reuse(self):
         from maru_vllm.connector import MaruConnectorMetadata
 

@@ -634,7 +634,8 @@ class _FakeCudaEvent:
 
 def _cpu_cuda(monkeypatch):
     """Let the write-behind path run its CUDA stream calls on the CPU."""
-    stream = SimpleNamespace(wait_stream=lambda other: None)
+    # CPU copies end before the call returns: waiting is a no-op
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None, **kw: stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())

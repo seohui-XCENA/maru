@@ -434,6 +434,11 @@ class _QueuedCopyError(RuntimeError):
     """A chunk of a pipelined load batch failed after its copies were queued."""
 
 
+class _UnconfirmedCopyError(RuntimeError):
+    """A store's GPU copies could not be waited for. What they use is kept,
+    and the step must not go on: vLLM would reuse blocks they may still read."""
+
+
 class _CopyAhead:
     """Copy chunk slabs to the device ahead of the injects that read them.
 
@@ -6334,7 +6339,8 @@ class MaruWorkerConnector:
         vLLM, so remember it until every key associated with that request has
         finished its D2H and ``batch_store`` registration. Store failures also
         release the request: they make that cache entry unavailable, but must
-        never leak GPU blocks.
+        never leak GPU blocks. The exception is a copy that could not be waited
+        for: it may still read the blocks, so its requests never finish.
         """
         recv_only = self._recv_only_finished_req_ids & finished_req_ids
         self._recv_only_finished_req_ids.difference_update(recv_only)
@@ -7612,9 +7618,11 @@ class MaruWorkerConnector:
         blocks stay until the request finishes. Everything stored now is
         registered with one ``batch_store``, including what a group gathered
         before it failed, unless its copies could not be confirmed
-        (``_gather_packed_slabs``). On remote_cxl with ``maru_async_store``
-        that ``batch_store``, which writes the staged objects by RDMA, runs
-        on the write-behind thread (``_register_objects_behind``).
+        (``_gather_packed_slabs``). Such a group raises once the rest is
+        registered: vLLM would reuse blocks its copies may still read. On
+        remote_cxl with ``maru_async_store`` that ``batch_store``, which
+        writes the staged objects by RDMA, runs on the write-behind thread
+        (``_register_objects_behind``).
         """
         if not self._multi_group or not self._group_caches:
             return
@@ -7625,6 +7633,7 @@ class MaruWorkerConnector:
             return
         keys: list[str] = []
         handles: list = []
+        unconfirmed: _UnconfirmedCopyError | None = None
         for cache in self._group_caches:
             group = cache.group
             if not self._stores(group):
@@ -7647,10 +7656,14 @@ class MaruWorkerConnector:
                 logger.error(
                     "Maru store of KV cache group %d failed: %s", group.group_id, e
                 )
+                if isinstance(e, _UnconfirmedCopyError):
+                    unconfirmed = e
         if self._remote_cxl_mode and self._write_behind:
             self._register_objects_behind(keys, handles)
         else:
             self._register_objects(keys, handles, "group")
+        if unconfirmed is not None:
+            raise unconfirmed
 
     def _register_objects_behind(
         self,
@@ -8136,11 +8149,11 @@ class MaruWorkerConnector:
             if stream is not None:
                 try:
                     stream.synchronize()
-                except Exception:
+                except Exception as e:
                     # The copies may still be writing these pages
                     self._keep_unconfirmed(handles[first_key:])
                     del keys[first_key:], handles[first_key:]
-                    raise
+                    raise _UnconfirmedCopyError(f"store copies unconfirmed: {e}") from e
         if self._timing and len(keys) > first_key:
             mode = "kernel"
             if staged_chunks:
@@ -8365,13 +8378,9 @@ class MaruWorkerConnector:
                 event.record(store_stream)
             except Exception as e:
                 logger.error("Maru write-behind cannot track its copies: %s", e)
-                keys = ready_keys + self._drop_deferred(deferred)
-                try:
-                    store_stream.synchronize()  # before the pages go back
-                    self._free_handles_best_effort(ready_handles)
-                except Exception:
-                    pass  # pages a copy may still write are kept
-                self._complete_write_behind_keys(keys, [False] * len(keys))
+                self._abandon_write_behind(
+                    store_stream, ready_keys, ready_handles, slot_refs, deferred
+                )
                 return
 
         if self._store_executor is None:
@@ -8389,13 +8398,54 @@ class MaruWorkerConnector:
                 deferred,
             )
         except Exception as e:
-            # Executor creation/submission failures are exceptional. Drain the
-            # queued copies before freeing their destination handles.
+            # Executor creation/submission failures are exceptional
             logger.error("Maru write-behind submit failed: %s", e)
-            event.synchronize()
-            self._free_handles_best_effort(ready_handles)
-            keys = ready_keys + self._drop_deferred(deferred)
-            self._complete_write_behind_keys(keys, [False] * len(keys))
+            self._abandon_write_behind(
+                event, ready_keys, ready_handles, slot_refs, deferred
+            )
+
+    def _abandon_write_behind(
+        self,
+        copies: Any,
+        keys: list[str],
+        handles: list[Any],
+        refs: list[Any],
+        deferred: list[tuple[str, torch.Tensor, dict[str, str]]],
+    ) -> None:
+        """Fail a write-behind batch: wait for its copies (``copies``: an event
+        or a stream, None if there are none), then give its pages back and let
+        its requests finish."""
+        try:
+            if copies is not None:
+                copies.synchronize()
+        except Exception as e:
+            self._keep_write_behind(e, keys, handles, refs, deferred)
+            return
+        self._free_handles_best_effort(handles)
+        keys = keys + self._drop_deferred(deferred)
+        self._complete_write_behind_keys(keys, [False] * len(keys))
+
+    def _keep_write_behind(
+        self,
+        exc: Exception,
+        keys: list[str],
+        handles: list[Any],
+        refs: list[Any],
+        deferred: list[tuple[str, torch.Tensor, dict[str, str]]],
+    ) -> None:
+        """Fail a write-behind batch whose copies could not be waited for. They
+        may still read the requests' GPU blocks and write the pages and device
+        slabs: all of them are kept, and the requests never finish."""
+        logger.error(
+            "Maru write-behind copies unconfirmed; their pages and GPU blocks "
+            "are kept: %s",
+            exc,
+        )
+        self._keep_unconfirmed(handles, list(refs), list(deferred))
+        keys = keys + [key for key, *_ in deferred]
+        self._complete_write_behind_keys(
+            keys, [False] * len(keys), copy_confirmed=False
+        )
 
     def _finish_write_behind_store(
         self,
@@ -8416,18 +8466,13 @@ class MaruWorkerConnector:
         later = [key for key, *_ in deferred]
         if handler is None:
             logger.error("Maru write-behind completion: handler unavailable")
-            keys = keys + self._drop_deferred(deferred)
-            self._complete_write_behind_keys(keys, [False] * len(keys))
+            self._abandon_write_behind(event, keys, handles, refs, deferred)
             return
         try:
             if event is not None:
                 event.synchronize()
         except Exception as e:
-            # The copy may still be writing: its pages are not reused
-            logger.error("Maru write-behind D2H failed; its pages are kept: %s", e)
-            self._keep_unconfirmed(handles, list(refs))
-            keys = keys + self._drop_deferred(deferred)
-            self._complete_write_behind_keys(keys, [False] * len(keys))
+            self._keep_write_behind(e, keys, handles, refs, deferred)
             return
         refs.clear()  # safe to release stream inputs after the event
         if self._node_mode:
@@ -8556,11 +8601,18 @@ class MaruWorkerConnector:
         )
 
     def _complete_write_behind_keys(
-        self, keys: list[str], results: list[bool], *, reported: bool = False
+        self,
+        keys: list[str],
+        results: list[bool],
+        *,
+        reported: bool = False,
+        copy_confirmed: bool = True,
     ) -> None:
         """Publish key outcomes and release all request waiters atomically.
 
         ``reported``: the caller already logged why the keys failed.
+        ``copy_confirmed``: False if the copies may still read the requests'
+        GPU blocks; those requests then never finish.
         """
         with self._store_lock:
             for base_key, ok in zip(keys, results, strict=True):
@@ -8569,7 +8621,23 @@ class MaruWorkerConnector:
                 elif not reported:
                     logger.warning("Maru write-behind store failed: %s", base_key)
                 self._pending_store_keys.discard(base_key)
-            self._release_store_waiters(keys)
+            if copy_confirmed:
+                self._release_store_waiters(keys)
+            else:
+                self._hold_store_waiters(keys)
+
+    def _hold_store_waiters(self, keys: list[str]) -> None:
+        """Keep the requests waiting for ``keys`` from finishing, so vLLM does
+        not reuse their GPU blocks. A later store of a key releases only its
+        own waiters. Caller holds ``_store_lock``."""
+        held: set[str] = set()
+        for base_key in keys:
+            held |= self._store_key_waiters.pop(base_key, set())
+        if held:
+            logger.error(
+                "Maru: %d requests keep their GPU blocks until the process exits",
+                len(held),
+            )
 
     def _release_store_waiters(self, keys: list[str]) -> None:
         """Let the requests waiting for ``keys`` finish; caller holds

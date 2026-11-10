@@ -1662,12 +1662,14 @@ def test_kernel_store_uses_the_group_pointer_table(version):
 def test_kernel_store_registers_no_group_object_whose_copy_failed(version):
     """The attention group's slabs, whose copies could not be confirmed, are
     neither registered nor freed (a copy may still write them); the Mamba
-    states, copied synchronously, still are registered."""
+    states, copied synchronously, still are registered. The step then fails:
+    vLLM would reuse blocks the copies may still read."""
     worker, store, shared = _kernel_worker(version=version)
     worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(shared.device))
     worker._sync_store_stream_device = shared.device
     tokens = list(range(40))
-    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    with pytest.raises(RuntimeError, match="store copies unconfirmed"):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
     assert set(store) == {group_object_key(k1, g, TINY_BLOCK) for g in range(3)}
     worker._handler.free.assert_not_called()
