@@ -223,11 +223,17 @@ class Agent:
         log_dir: str | None = None,
         read_only: bool = False,
         store_timeout_s: float | None = None,
+        cxl_paths: dict[int, str] | None = None,
     ):
+        """``cxl_paths``: files standing in for CXL regions, by region id."""
         env = dict(os.environ)
         env["PYTHONPATH"] = WORKTREE + os.pathsep + env.get("PYTHONPATH", "")
         if read_only:
             env["AGENT_READ_ONLY"] = "1"
+        if cxl_paths:
+            env["AGENT_CXL_PATHS"] = json.dumps(
+                {str(k): v for k, v in cxl_paths.items()}
+            )
         if store_timeout_s is not None:
             env["AGENT_STORE_TIMEOUT_S"] = str(store_timeout_s)
         self.log_path = os.path.join(

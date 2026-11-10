@@ -23,6 +23,7 @@ from maru_common.protocol import (
     MS_MESSAGE_CLASSES,
     AdminDeleteResponse,
     CommitResponse,
+    FinalizeMoveResponse,
     HandshakeResponse,
     LookupAndPinResponse,
     MessageType,
@@ -1016,6 +1017,56 @@ class FakeMaruServer:
             self._remove(entry)
             items.append(ItemOutcome(ItemResult.RETIRED))
         return RetireResponse(status=Status.OK, items=items)
+
+    def _finalize_move(self, node: NodeRec, req):
+        """As Catalog.finalize_move: the dest pin goes whatever the result
+        when it is this node's."""
+        owner = f"node:{node.node_id}"
+        items = []
+        for item in req.items:
+            pin = self.pins.get(item.dest_pin_id)
+            try:
+                items.append(self._move_one(node, item, pin, owner))
+            finally:
+                if pin is not None and pin.owner == owner:
+                    self._drop_pin(item.dest_pin_id)
+        return FinalizeMoveResponse(status=Status.OK, items=items)
+
+    def _move_one(self, node: NodeRec, item, dest_pin, owner: str) -> ItemOutcome:
+        src, dest = item.source, item.dest
+        if src.pool_id == dest.pool_id:
+            return ItemOutcome(ItemResult.REJECTED)
+        if dest.pool_id not in node.pools or dest.pool_id in self.hidden_pools:
+            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=dest)
+        target = self.by_loc.get(loc_id(dest))
+        if (
+            dest_pin is None
+            or dest_pin.owner != owner
+            or dest_pin.key != item.key
+            or dest_pin.location != dest
+            or target is None
+            or target.key != item.key
+            or target.location != dest
+        ):
+            return ItemOutcome(ItemResult.REJECTED)
+        if src.pool_id not in node.pools or src.pool_id in self.hidden_pools:
+            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=src)
+        entry = self.by_loc.get(loc_id(src))
+        if entry is None or entry.key != item.key or entry.location != src:
+            occupant = self._page_holder(src)
+            if occupant is None:
+                return ItemOutcome(ItemResult.RETIRED)
+            return ItemOutcome(
+                ItemResult.KEPT,
+                cause=KeptCause.MOVED,
+                location=occupant.location,
+                key=occupant.key,
+            )
+        # A demotion is not an eviction: preservation does not hold the source
+        if self.loc_pins.get(loc_id(src)):
+            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.PINNED)
+        self._remove(entry)
+        return ItemOutcome(ItemResult.RETIRED)
 
     def _page_holder(self, loc: Location) -> Entry | None:
         """A live location with this allocation_id, else one overlapping these

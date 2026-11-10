@@ -9,6 +9,8 @@ go before the RM may give the regions to another node.
 """
 
 import logging
+import mmap
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -22,6 +24,7 @@ from maru_common.storage_types import (
     PoolKind,
     Visibility,
 )
+from maru_shm.ipc import GetAccessResp
 from maru_shm.types import (
     MaruHandle,
     NodeClaim,
@@ -59,6 +62,8 @@ class RegionSource(Protocol):
     def node_release(self, node_id: str, node_epoch: str) -> int: ...
 
     def unhold(self, handle: MaruHandle, holder: str, instance: str) -> None: ...
+
+    def get_access(self, handle: MaruHandle) -> GetAccessResp: ...
 
 
 def cxl_pool_id(rm_domain: str, region_id: int) -> str:
@@ -125,6 +130,25 @@ class CxlRegionPool:
 
     def close(self) -> None:
         """Nothing to undo: the region stays the node's in the RM."""
+
+
+def map_region(source: RegionSource, pool: CxlRegionPool) -> mmap.mmap:
+    """The region's bytes for the node's own copies. GET_ACCESS checks the
+    handle's token; no hold, as the node owns the region and unmaps it before
+    giving it back."""
+    handle = pool.region.handle
+    access = source.get_access(handle)
+    fd = os.open(access.dax_path, os.O_RDWR)
+    try:
+        return mmap.mmap(
+            fd,
+            handle.length,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=handle.offset,
+        )
+    finally:
+        os.close(fd)
 
 
 class CxlTier:

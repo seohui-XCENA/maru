@@ -195,7 +195,8 @@ class PoolManager:
         self, holder: str, want_bytes: int, kind: PoolKind | None = None
     ) -> list[Location]:
         """FREE pages for ``holder`` within every budget; empty when
-        credit is stopped or the commit-pending bytes reached their cap."""
+        credit is stopped or the credit tier's commit-pending bytes reached
+        their cap."""
         if want_bytes <= 0:
             return []
         with self._lock:
@@ -204,7 +205,13 @@ class PoolManager:
             table = self._credit_pool(kind)
             if table is None:
                 return []
-            if self._bytes(PageState.PENDING) >= self.budgets.commit_pending_max_bytes:
+            # The credit tier's writes only: demotion copies wait elsewhere
+            pending = sum(
+                t.bytes[PageState.PENDING]
+                for t in self._tables.values()
+                if t.info.kind == table.info.kind
+            )
+            if pending >= self.budgets.commit_pending_max_bytes:
                 return []
             ps = table.page_size
             # The transfer reserve is the tier's, over all its pools

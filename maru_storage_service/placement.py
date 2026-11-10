@@ -2,8 +2,8 @@
 # Copyright 2026 XCENA Inc.
 """PlacementPolicy: LRU removal candidates per pool.
 
-A candidate is not an approval: the policy sends no RPC. Demotion to a lower
-tier is not supported yet.
+A candidate is not an approval: the policy sends no RPC. A tier that demotes
+moves its candidates to the tier below; one that does not drops them.
 """
 
 import collections
@@ -43,6 +43,21 @@ class PlacementPolicy:
         # Never offered again (KEPT MOVED/INVALID, unknown outcome)
         self._held: set[PageRef] = set()
         self._evicting: dict[str, bool] = {}
+        # (high, low) of pools whose tier is not the top one
+        self._marks: dict[str, tuple[float, float]] = {}
+
+    def set_watermarks(self, pool_id: str, high: float, low: float) -> None:
+        """The watermarks of ``pool_id`` (its tier's) instead of the top tier's."""
+        if not 0 < low < high <= 1:
+            raise ValueError("need 0 < low_watermark < high_watermark <= 1")
+        with self._lock:
+            self._marks[pool_id] = (high, low)
+
+    def above_high(self, pool_id: str, *, capacity: int, free_bytes: int) -> bool:
+        """The pool uses more than its high watermark."""
+        with self._lock:
+            high, _ = self._marks.get(pool_id, (self.high, self.low))
+        return capacity - free_bytes > high * capacity
 
     def on_ready(self, ref: PageRef) -> None:
         """A page became READY: most recently used."""
@@ -87,17 +102,18 @@ class PlacementPolicy:
         """READY pages to retire, LRU first: from above ``high`` down to ``low``.
         In-flight and RETIRING pages count as leaving."""
         with self._lock:
+            high, low = self._marks.get(pool_id, (self.high, self.low))
             used = capacity - free_bytes
             evicting = self._evicting.get(pool_id, False)
-            if not evicting and used > self.high * capacity:
+            if not evicting and used > high * capacity:
                 evicting = True
-            if used <= self.low * capacity:
+            if used <= low * capacity:
                 evicting = False
             self._evicting[pool_id] = evicting
             if not evicting:
                 return []
             inflight = sum(1 for r in self._inflight if r.pool_id == pool_id)
-            need = used - retiring_bytes - inflight * page_size - self.low * capacity
+            need = used - retiring_bytes - inflight * page_size - low * capacity
             now = self._clock()
             out: list[PageRef] = []
             for ref in self._lru.get(pool_id, ()):
@@ -134,13 +150,15 @@ class PlacementPolicy:
             self._inflight.discard(ref)
             self._held.add(ref)
 
-    def release(self, refs: Iterable[PageRef]) -> None:
-        """Not retired; offered again after a backoff."""
+    def release(self, refs: Iterable[PageRef], backoff: bool = True) -> None:
+        """Not retired; offered again, after a backoff unless ``backoff`` is
+        False."""
         with self._lock:
             until = self._clock() + self.kept_backoff_s
             for ref in refs:
                 self._inflight.discard(ref)
-                self._backoff[ref] = until
+                if backoff:
+                    self._backoff[ref] = until
 
     def is_held(self, ref: PageRef) -> bool:
         with self._lock:

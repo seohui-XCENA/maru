@@ -21,6 +21,9 @@ def main() -> int:
     from maru_common.config import MaruConfig
     from maru_handler import MaruHandler
 
+    if os.environ.get("AGENT_CXL_PATHS"):
+        _map_cxl_from(json.loads(os.environ["AGENT_CXL_PATHS"]))
+
     handler = MaruHandler(
         MaruConfig(
             maru_node=socket_path,
@@ -134,6 +137,40 @@ def main() -> int:
             answer = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         print(json.dumps(answer), flush=True)
     return 0
+
+
+def _map_cxl_from(paths: dict[str, str]) -> None:
+    """Map each CXL region from the file standing in for its device, by
+    region id, instead of holding it in an RM."""
+    import mmap
+
+    from maru_handler.client import pool_maps
+    from maru_handler.storage.cpu import CpuPool
+
+    def stand_in(info, dax, who):
+        path = paths.get(str(dax.handle.region_id))
+        if path is None:
+            raise OSError(f"no stand-in for region {dax.handle.region_id}")
+        fd = os.open(path, os.O_RDWR)
+        try:
+            mapping = mmap.mmap(
+                fd,
+                info.capacity,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        finally:
+            os.close(fd)
+        return CpuPool(
+            info.pool_id,
+            info.capacity,
+            info.page_size,
+            medium="cxl",
+            mapping=mapping,
+            shared=True,
+        )
+
+    pool_maps.CxlRegionMapping = stand_in
 
 
 if __name__ == "__main__":

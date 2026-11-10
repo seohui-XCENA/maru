@@ -5,21 +5,30 @@
 Start order: claim the socket, DRAM pool, the node's CXL regions from the RM,
 NODE_OPEN, adopted ledgers, old worker drain, heartbeat, then accept on the
 UDS. A GPU node with [dram], [cxl] or [dram, cxl] is served; other configs
-are refused. The top tier gives credit; demotion to CXL is not there yet.
+are refused. The top tier gives credit; in [dram, cxl] DRAM makes room by
+demoting its pages to CXL (write-back), and CXL by dropping its own.
 """
 
 import logging
+import mmap
 import os
 import socket
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from maru_common.storage_types import CloseMode, PoolKind, RmDomain, WorkerRef
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError
-from .drivers.cxl import DEFAULT_RENEW_S, CxlTier, RegionSource
+from .drivers.cxl import (
+    DEFAULT_RENEW_S,
+    CxlRegionPool,
+    CxlTier,
+    RegionSource,
+    map_region,
+)
 from .drivers.dram import DramDriver, DramPool
 from .local_pin import LocalPins
 from .local_server import LocalServer
@@ -34,6 +43,7 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
+from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +92,10 @@ def check_servable(config: NodeConfig) -> None:
     cxl = config.tier("cxl")
     if cxl is not None and cxl.size is None:
         raise NotServableError("the cxl tier needs a size")
+    if any(t.demotion == "through" for t in config.tiers):
+        raise NotServableError(
+            "write-through demotion is not implemented yet: use demotion back"
+        )
 
 
 class StorageService:
@@ -99,7 +113,12 @@ class StorageService:
         region_source: RegionSource | None = None,
         cxl_renew_s: float = DEFAULT_RENEW_S,
         unmap_timeout_s: float = DEFAULT_UNMAP_TIMEOUT_S,
+        transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
+        map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
     ):
+        """``transfer_bytes_per_s``: the demotion copy budget.
+        ``map_region``: maps a CXL region for those copies (GET_ACCESS and the
+        device by default)."""
         check_servable(config)
         self.config = config
         self.node_epoch = node_epoch or uuid.uuid4().hex
@@ -112,6 +131,9 @@ class StorageService:
         self.region_source = region_source
         self.cxl_renew_s = cxl_renew_s
         self.unmap_timeout_s = unmap_timeout_s
+        self.transfer_bytes_per_s = transfer_bytes_per_s
+        self.map_region = map_region
+        self.transfers: TransferEngine | None = None
         self.dram: DramPool | None = None
         self.cxl: CxlTier | None = None
         # Why the run let go of its CXL regions and stopped, if it did
@@ -193,6 +215,9 @@ class StorageService:
             self.cxl.start_renewing()
             self._check_stopped()
         traits = config.traits()
+        if any(t.demotes_to is not None for t in traits.values()):
+            self.transfers = TransferEngine(self.transfer_bytes_per_s)
+            self._map_for_transfers(self.transfers)
         self.pools = PoolManager(config.budgets, config.page_size)
         if self.dram is not None:
             self.pools.add_pool(
@@ -206,6 +231,17 @@ class StorageService:
             host_boot_id=self.host_boot_id,
         )
         placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
+        if (
+            cxl_tier is not None
+            and cxl_tier is not top
+            and cxl_tier.high_watermark is not None
+            and cxl_tier.low_watermark is not None
+        ):
+            assert self.cxl is not None
+            for pool in self.cxl.pools:
+                placement.set_watermarks(
+                    pool.pool_id, cxl_tier.high_watermark, cxl_tier.low_watermark
+                )
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,
@@ -218,6 +254,7 @@ class StorageService:
             op_window=self.op_window,
             traits=traits,
             on_worker_settled=self._worker_settled,
+            transfers=self.transfers,
         )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
         rm_domains = []
@@ -310,6 +347,33 @@ class StorageService:
                 len(adopted_ids & {p.pool_id for p in cxl_pools}),
             )
 
+    def _map_for_transfers(self, engine: TransferEngine) -> None:
+        """The node's own mappings of its pools, for demotion copies. A
+        region it cannot map takes no demotions."""
+        if self.dram is not None:
+            engine.add_pool(
+                self.dram.pool_id,
+                mmap.mmap(
+                    self.dram.fd,
+                    self.dram.capacity,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                ),
+            )
+        if self.cxl is not None:
+            cxl = self.cxl
+            mapper = self.map_region or (lambda pool: map_region(cxl.source, pool))
+            for pool in cxl.pools:
+                try:
+                    engine.add_pool(pool.pool_id, mapper(pool))
+                except (OSError, RuntimeError, ValueError) as e:
+                    logger.error(
+                        "cxl tier: cannot map %s for demotion, so it takes none: %s",
+                        pool.pool_id,
+                        e,
+                    )
+        engine.start()
+
     def _old_workers(self, opened) -> _OldWorkers:
         """The workers of the run before: those MaruServer names (with pids
         this node sees), and the holders of the regions this run claimed
@@ -382,6 +446,8 @@ class StorageService:
         self._finished.set()
 
     def _teardown(self, mode: CloseMode) -> None:
+        if self.transfers is not None:
+            self.transfers.stop()  # the copy under way ends; no new one starts
         if self.cxl is not None:
             self.cxl.stop_renewing(timeout=1.0)
         if self.cxl is not None and mode == CloseMode.LEAVE:
@@ -397,6 +463,8 @@ class StorageService:
             self.server.stop()
         if self.manager is not None:
             self.manager.stop()
+        if self.transfers is not None:
+            self.transfers.close()  # unmapped before the regions may go back
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)

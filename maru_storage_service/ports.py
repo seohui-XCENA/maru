@@ -11,6 +11,8 @@ from maru_common.node_protocol import Notify
 from maru_common.protocol import (
     CommitItem,
     CommitResponse,
+    FinalizeMoveResponse,
+    MoveItem,
     NodeHeartbeatResponse,
     NodeOpenResponse,
     NodeReregisterResponse,
@@ -70,6 +72,8 @@ class MetadataPort(Protocol):
     def commit(self, items: list[CommitItem]) -> CommitResponse: ...
 
     def retire(self, items: list[KeyLocation]) -> RetireResponse: ...
+
+    def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse: ...
 
     def worker_exit(
         self, workers: list[WorkerRef], cause: ExitCause

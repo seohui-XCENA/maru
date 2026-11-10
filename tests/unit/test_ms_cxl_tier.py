@@ -312,8 +312,16 @@ def sockdir():
     remove_tree(path)
 
 
+def anon_region(pool):
+    """Stands in for the region's device in the node's own mapping."""
+    import mmap
+
+    return mmap.mmap(-1, pool.region.handle.length)
+
+
 def cxl_node(fake, sockdir, rm, **kwargs):
     config = node_config(fake.url, f"{sockdir}/node.sock", cxl_pages=4, region_pages=2)
+    kwargs.setdefault("map_region", anon_region)
     return start_node(config, region_source=rm, cxl_renew_s=0.02, **kwargs)
 
 
@@ -426,7 +434,11 @@ def test_a_lease_lost_during_the_start_stops_it(fake, sockdir):
     from maru_storage_service.service import StorageService
 
     service = StorageService(
-        config, rpc_timeout_s=0.3, region_source=rm, cxl_renew_s=0.02
+        config,
+        rpc_timeout_s=0.3,
+        region_source=rm,
+        cxl_renew_s=0.02,
+        map_region=anon_region,
     )
     starter = threading.Thread(target=lambda: _start_quietly(service, ServerStopped))
     starter.start()

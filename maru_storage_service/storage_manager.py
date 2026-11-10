@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageManager: credit, WRITE_DONE -> COMMIT, removal (eviction, RETIRE and
-central deletes), WORKER_EXIT reports and the recovery after a MaruServer
-restart, each in the order it needs.
+"""StorageManager: credit, WRITE_DONE -> COMMIT, removal (eviction, write-back
+demotion, RETIRE and central deletes), WORKER_EXIT reports and the recovery
+after a MaruServer restart, each in the order it needs.
 
 Worker records live in a WorkerRegistry, op results in an OpLedger; MaruServer
 is reached through a MetadataPort.
 """
 
 import collections
+import dataclasses
 import logging
 import threading
 import time
@@ -30,7 +31,12 @@ from maru_common.node_protocol import (
     WriteDoneRequest,
     WriteDoneResponse,
 )
-from maru_common.protocol import CommitItem, NodeHeartbeatResponse, ReregisterItem
+from maru_common.protocol import (
+    CommitItem,
+    MoveItem,
+    NodeHeartbeatResponse,
+    ReregisterItem,
+)
 from maru_common.serializer import DecodedRequest, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
@@ -41,10 +47,12 @@ from maru_common.storage_types import (
     ItemOutcome,
     ItemResult,
     KeptCause,
+    Key,
     KeyLocation,
     Location,
     NotifyKind,
     OpRef,
+    PoolInfo,
     PoolKind,
     Status,
     WorkerRef,
@@ -65,6 +73,7 @@ from .ports import (
     StaleOp,
     WorkerEndpoint,
 )
+from .transfer_engine import Copy, TransferEngine
 from .worker_registry import WorkerRecord, WorkerRegistry
 
 logger = logging.getLogger(__name__)
@@ -96,6 +105,21 @@ class _Ticket:
     index: int
 
 
+@dataclass(eq=False)
+class _Move:
+    """A READY page moving to the tier below (write-back demotion)."""
+
+    src: PageRef
+    key: Key
+    source: Location
+    dest: PageRef
+    dest_location: Location  # what is committed: the logical bytes
+    pin_id: str = ""  # once ADDED: FINALIZE_MOVE releases it
+    # The copy is READY below already (left by a KEPT or unknown move): the
+    # COMMIT only pins it again
+    repin: bool = False
+
+
 class StorageManager:
     def __init__(
         self,
@@ -111,6 +135,7 @@ class StorageManager:
         op_window: int = OP_WINDOW,
         traits: dict[PoolKind, TierTraits] | None = None,
         on_worker_settled: Callable[[str], None] = lambda incarnation: None,
+        transfers: TransferEngine | None = None,
     ):
         self.node_epoch = node_epoch
         self.traits = traits or {
@@ -119,6 +144,8 @@ class StorageManager:
         self.credit_kind = next(k for k, t in self.traits.items() if t.credit)
         self.pools = pool_manager
         self.placement = placement
+        # Copies for demotion; without it a tier that demotes drops instead
+        self.transfers = transfers
         self.local_pins = local_pins
         self.metadata = metadata
         self.evict_interval_s = evict_interval_s
@@ -171,6 +198,20 @@ class StorageManager:
         self._unmapped: set[tuple[str, str, int]] = set()
         # RETIRE results by outcome ("RETIRED", "KEPT:PINNED", ...)
         self.retire_results: collections.Counter[str] = collections.Counter()
+        # Demotions: FINALIZE_MOVE results as above (and "UNKNOWN"), plus
+        # "COMMIT:<result>", "COPY_FAILED" and "DROPPED" (no room below past
+        # the high watermark)
+        self.move_results: collections.Counter[str] = collections.Counter()
+        # Copied demotions whose COMMIT goes out once MaruServer takes it
+        # (right after a re-registration), and guarded ones whose
+        # FINALIZE_MOVE waits for the next eviction pass
+        self._moves: list[_Move] = []
+        self._finals: list[_Move] = []
+        # Source -> its READY copy below, left by a KEPT, DUPLICATE or unknown
+        # result: the next demotion pins that copy again instead of copying
+        self._copies: dict[PageRef, PageRef] = {}
+        # Pools MaruServer called INVALID: no demotion goes there
+        self._invalid_pools: set[str] = set()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -258,6 +299,8 @@ class StorageManager:
         with self._lock:
             pending = len(self._tickets)
             retire = dict(self.retire_results)
+            demotions = dict(self.move_results)
+            pending_moves = len(self._moves) + len(self._finals)
         return {
             "safe_state": self._safe,
             "recovering": self._recovering,
@@ -267,6 +310,8 @@ class StorageManager:
             "server_drain_waiting": self.workers.server_drain_pending(),
             "pending_commits": pending,
             "retire_results": retire,
+            "demotions": demotions,
+            "pending_moves": pending_moves,
         }
 
     # -------------------------------------------------------------- recovery
@@ -341,6 +386,7 @@ class StorageManager:
         # retry after a failure part way sends every READY page again
         first = self._sorted_for != epoch
         sent, added = self._reregister(epoch, deleted if first else None)
+        self._guards_lost()
         self._complete_at = epoch
         seconds = time.monotonic() - started
         self._recovered(
@@ -387,6 +433,9 @@ class StorageManager:
     def _recovered(self, server_epoch: str, reregistration: dict | None) -> None:
         """Requests go to MaruServer again, unless the session was lost
         again meanwhile (then the recovery runs again)."""
+        # Demotion copies left PENDING go out after the last batch, not
+        # behind the server drain: they would hold back credit
+        self._commit_queued_moves()
         with self._cv:
             self.recoveries += 1
             if reregistration is not None:
@@ -944,13 +993,24 @@ class StorageManager:
                     self._cv.notify_all()
 
     def _evict_once(self) -> None:
-        for pool_id in self.pools.pool_ids():
+        with self._lock:
+            queued, self._moves = self._moves, []
+            finals, self._finals = self._finals, []
+        finals += self._commit_queued(queued, recovering=False)
+        self._finalize_queued(finals)
+        # Lower tiers first: the room they make takes the pages from above
+        for pool_id in self._eviction_order():
+            if self._halted():  # the session went during this pass
+                return
             info = self.pools.pool_info(pool_id)
             traits = self.traits.get(info.kind) if info is not None else None
+            with self._lock:
+                invalid = pool_id in self._invalid_pools
             if (
                 info is None
                 or traits is None
                 or not traits.evicts
+                or invalid
                 or self.workers.is_adopted(pool_id)
                 or (traits.credit and not self.pools.creditable(pool_id))
             ):
@@ -964,8 +1024,28 @@ class StorageManager:
                 limit=MAX_BATCH,
             )
             refs, items = self._ready_items(candidates)
-            if refs:
+            if not refs:
+                continue
+            if traits.demotes_to is not None and self.transfers is not None:
+                assert info is not None
+                self._demote(info, traits.demotes_to, refs, items)
+            else:
                 self.retire(refs, items)
+
+    def _halted(self) -> bool:
+        """Nothing may go to MaruServer now."""
+        with self._lock:
+            paused = self._paused() or self._stopping
+        return paused or self.metadata.epoch_lost
+
+    def _eviction_order(self) -> list[str]:
+        depth = {kind: i for i, kind in enumerate(self.traits)}
+
+        def key(pool_id: str) -> int:
+            info = self.pools.pool_info(pool_id)
+            return -depth.get(info.kind, 0) if info is not None else 0
+
+        return sorted(self.pools.pool_ids(), key=key)
 
     def _ready_items(self, candidates) -> tuple[list[PageRef], list[KeyLocation]]:
         refs, items = [], []
@@ -983,6 +1063,431 @@ class StorageManager:
             refs.append(ref)
             items.append(KeyLocation(key=page.key, location=page.location))
         return refs, items
+
+    # ------------------------------------------------------------- demotion
+
+    def _demote(
+        self,
+        info: PoolInfo,
+        below: PoolKind,
+        refs: list[PageRef],
+        items: list[KeyLocation],
+    ) -> None:
+        """Write-back: copy READY pages to the tier below, COMMIT the copies
+        with a node pin, then FINALIZE_MOVE the sources. A source with a copy
+        below already has that copy pinned again instead. Pages that find no
+        room wait for the tier below to evict (it ran first in this pass);
+        while this pool is past its high watermark they are dropped instead:
+        writes must not stall."""
+        moves: list[_Move] = []
+        todo = []
+        for ref, item in zip(refs, items, strict=True):
+            copy = self._copy_of(ref, item.key)
+            if copy is None:
+                todo.append((ref, item))
+            else:
+                moves.append(
+                    _Move(ref, item.key, item.location, copy[0], copy[1], repin=True)
+                )
+        dests = self._reserve_below(below, len(todo))
+        for (ref, item), dest in zip(todo, dests, strict=False):
+            location = self.pools.transfer_location(dest)
+            moves.append(
+                _Move(
+                    ref,
+                    item.key,
+                    item.location,
+                    dest,
+                    dataclasses.replace(location, length=item.location.length),
+                )
+            )
+        rest = todo[len(dests) :]
+        drop = []
+        if rest:
+            if self.placement.above_high(
+                info.pool_id,
+                capacity=info.capacity,
+                free_bytes=self.pools.bytes_in(PageState.FREE, info.pool_id),
+            ):
+                logger.debug(
+                    "no room below %s: dropping %d pages", info.pool_id, len(rest)
+                )
+                with self._lock:
+                    self.move_results["DROPPED"] += len(rest)
+                drop = rest
+            else:
+                self.placement.release([ref for ref, _ in rest], backoff=False)
+        # Every reserved page and every candidate is settled, also on an error
+        try:
+            if moves:
+                self._run_moves(moves)
+        finally:
+            if drop:
+                self.retire([r for r, _ in drop], [i for _, i in drop])
+
+    def _copy_of(self, ref: PageRef, key: Key) -> tuple[PageRef, Location] | None:
+        """The source's READY copy below and its location, if it has one."""
+        with self._lock:
+            dest = self._copies.get(ref)
+            invalid = dest is not None and dest.pool_id in self._invalid_pools
+        if dest is None:
+            return None
+        page = self.pools.page(dest)
+        if (
+            not invalid
+            and page is not None
+            and page.state == PageState.READY
+            and page.key == key
+            and page.location is not None
+        ):
+            return dest, page.location
+        with self._lock:
+            self._copies.pop(ref, None)
+        return None
+
+    def _is_ready(self, ref: PageRef, key: Key) -> bool:
+        page = self.pools.page(ref)
+        return page is not None and page.state == PageState.READY and page.key == key
+
+    def _reserve_below(self, kind: PoolKind, count: int) -> list[PageRef]:
+        """Destination pages, each from the pool of ``kind`` with the most
+        room: one region filled past its high watermark would drop pages
+        while the others have room."""
+        assert self.transfers is not None
+        with self._lock:
+            invalid = set(self._invalid_pools)
+        room: dict[str, int] = {}
+        for pool_id in self.pools.pool_ids():
+            info = self.pools.pool_info(pool_id)
+            if (
+                info is not None
+                and info.kind == kind
+                and pool_id not in invalid
+                and self.transfers.has_pool(pool_id)
+                and not self.workers.is_adopted(pool_id)
+            ):
+                free = self.pools.bytes_in(PageState.FREE, pool_id)
+                room[pool_id] = free // info.page_size
+        take = dict.fromkeys(room, 0)
+        for _ in range(count):
+            best = max(room, key=lambda p: room[p] - take[p], default=None)
+            if best is None or room[best] - take[best] <= 0:
+                break
+            take[best] += 1
+        out: list[PageRef] = []
+        for pool_id, n in take.items():
+            if n:
+                out += self.pools.reserve_transfer(pool_id, n)
+        return out
+
+    def _run_moves(self, moves: list[_Move]) -> None:
+        assert self.transfers is not None
+        fresh = [m for m in moves if not m.repin]
+        copied = [m for m in moves if m.repin]
+        if self._halted():  # no copy started: all go back
+            for move in fresh:
+                self.pools.transfer_failed(move.dest)
+            self.placement.release([m.src for m in moves], backoff=False)
+            return
+        copies = [Copy(m.source, m.dest_location, m.source.length) for m in fresh]
+        results = self.transfers.run(copies) if copies else []
+        for move, ok in zip(fresh, results, strict=True):
+            try:
+                if ok:
+                    self.pools.transfer_done(move.dest, move.key, move.source.length)
+                    copied.append(move)
+                    continue
+                # run() answers once the copy has ended
+                self.pools.transfer_failed(move.dest)
+                with self._lock:
+                    self.move_results["COPY_FAILED"] += 1
+            except Exception:
+                logger.exception("ending the copy to %s failed", move.dest)
+            self.placement.release([move.src])
+        if self._halted():
+            # Sent once MaruServer takes the session again
+            self._queue_moves(copied)
+        elif copied:
+            finals = self._commit_moves(copied)
+            if finals:
+                self._finalize_moves(finals)
+        self._reclaim_retiring()
+
+    def _commit_queued(self, moves: list[_Move], recovering: bool) -> list[_Move]:
+        """COMMIT queued moves in batches until the session goes again."""
+        finals = []
+        for start in range(0, len(moves), MAX_BATCH):
+            if self.metadata.epoch_lost if recovering else self._halted():
+                self._queue_moves(moves[start:])
+                break
+            finals += self._commit_moves(moves[start : start + MAX_BATCH])
+        return finals
+
+    def _commit_queued_moves(self) -> None:
+        """After a re-registration; FINALIZE_MOVE waits for eviction."""
+        with self._lock:
+            queued, self._moves = self._moves, []
+        finals = self._commit_queued(queued, recovering=True)
+        with self._lock:
+            self._finals.extend(finals)
+
+    def _guards_lost(self) -> None:
+        """A new MaruServer took no node pin over: moves waiting for their
+        FINALIZE_MOVE pin their copies again (both were re-registered)."""
+        with self._lock:
+            finals, self._finals = self._finals, []
+        for move in finals:
+            self._keep_copy(move)
+        self.placement.release([m.src for m in finals], backoff=False)
+
+    def _commit_moves(self, moves: list[_Move]) -> list[_Move]:
+        """COMMIT the copies with a node pin; returns those to FINALIZE_MOVE.
+        A result lost with the session is sent again as a new op once
+        MaruServer takes the session again; one left unknown otherwise is
+        settled as the commit path does."""
+        live = []
+        for move in moves:
+            if move.repin and not self._is_ready(move.dest, move.key):
+                self.placement.release([move.src])  # the copy went while queued
+            elif self._is_ready(move.src, move.key):
+                live.append(move)
+            elif not move.repin:
+                self._settle_copies([move])  # the source went while queued
+        if not live:
+            return []
+        try:
+            response = self.metadata.commit(
+                [
+                    CommitItem(
+                        key=m.key,
+                        location=m.dest_location,
+                        logical_bytes=m.source.length,
+                        pin=CommitPin.NODE,
+                    )
+                    for m in live
+                ]
+            )
+        except EpochChanged as e:
+            self._queue_moves(live)
+            self.server_lost(f"MaruServer answered EPOCH to COMMIT ({e})")
+            return []
+        except StaleOp:
+            self._queue_moves(live)
+            return []
+        except ServerStopped:
+            self._queue_moves(live)
+            raise
+        except Exception as e:
+            # Sent, maybe applied: not sent again as a new op. A guard it
+            # took stays (its pin_id is unknown)
+            if isinstance(e, ReplyError):
+                logger.error("COMMIT of %d demoted pages: %s", len(live), e)
+            else:
+                logger.exception("COMMIT of %d demoted pages failed", len(live))
+            for move in live:
+                self._commit_unknown(move)
+            return []
+        if response.status == Status.OK:
+            outcomes = response.items
+        else:
+            logger.error(
+                "COMMIT of %d demoted pages refused as a whole: %s %s",
+                len(live),
+                response.status,
+                response.error,
+            )
+            outcomes = [ItemOutcome(ItemResult.REJECTED)] * len(live)
+        finals: list[_Move] = []
+        for move, outcome in zip(live, outcomes, strict=True):
+            try:
+                if self._apply_move_commit(move, outcome):
+                    finals.append(move)
+            except Exception:
+                logger.exception("applying the COMMIT result of %s failed", move.dest)
+                self.placement.release([move.src])
+        return finals
+
+    def _apply_move_commit(self, move: _Move, outcome: ItemOutcome) -> bool:
+        """Whether the copy is guarded for its FINALIZE_MOVE."""
+        result = outcome.result
+        with self._lock:
+            self.move_results[f"COMMIT:{result.value}"] += 1
+        if result == ItemResult.ADDED:
+            if not move.repin:
+                self.pools.commit_added(move.dest)
+            if outcome.pin_id:
+                move.pin_id = outcome.pin_id
+                return True
+            self._keep_copy(move)  # nothing guards it for a move
+        elif result in (ItemResult.DUPLICATE, ItemResult.REJECTED):
+            if move.repin:
+                with self._lock:
+                    self._copies.pop(move.src, None)
+            else:
+                self.pools.commit_freed(move.dest)
+            if result == ItemResult.DUPLICATE and outcome.location is not None:
+                # The key is in that pool already: that copy is pinned next
+                self._note_copy(move.src, move.key, outcome.location)
+        else:
+            logger.error("COMMIT of demoted page %s answered %s", move.dest, result)
+            self._commit_unknown(move)
+            return False
+        self.placement.release([move.src])
+        return False
+
+    def _commit_unknown(self, move: _Move) -> None:
+        """Maybe in the Catalog: a new copy is settled by a RETIRE (RETIRED
+        frees, PINNED proves it there); a pinned again copy stays a copy."""
+        if not move.repin:
+            self._settle_copies([move])
+        self.placement.release([move.src])
+
+    def _note_copy(self, src: PageRef, key: Key, location: Location) -> None:
+        ref = self.pools.find(location)
+        if ref is not None and self._is_ready(ref, key):
+            with self._lock:
+                self._copies[src] = ref
+
+    def _finalize_queued(self, moves: list[_Move]) -> None:
+        for start in range(0, len(moves), MAX_BATCH):
+            if self._halted():
+                with self._lock:
+                    self._finals.extend(moves[start:])
+                return
+            self._finalize_moves(moves[start : start + MAX_BATCH])
+
+    def _finalize_moves(self, moves: list[_Move]) -> None:
+        """Remove the sources now that the copies are guarded."""
+        self.local_pins.block([m.src for m in moves])
+        try:
+            response = self.metadata.finalize_move(
+                [
+                    MoveItem(
+                        key=m.key,
+                        source=m.source,
+                        dest=m.dest_location,
+                        dest_pin_id=m.pin_id,
+                    )
+                    for m in moves
+                ]
+            )
+        except EpochChanged as e:
+            self._move_unknown(moves)
+            self.server_lost(f"MaruServer answered EPOCH to FINALIZE_MOVE ({e})")
+            return
+        except ServerStopped:
+            self._move_unknown(moves)
+            raise
+        except (StaleOp, ReplyError):
+            self._move_unknown(moves)
+            return
+        except Exception:
+            logger.exception("FINALIZE_MOVE failed")
+            self._move_unknown(moves)
+            return
+        if response.status != Status.OK:
+            logger.error(
+                "FINALIZE_MOVE refused as a whole: %s %s",
+                response.status,
+                response.error,
+            )
+            # Not run: the guards stay held, as nothing here sends UNPIN
+            self._move_unknown(moves)
+            self.local_pins.unblock([m.src for m in moves])
+            return
+        # Copies not kept as locations of their key: retired, freed once RETIRED
+        retire: list[_Move] = []
+        for move, outcome in zip(moves, response.items, strict=True):
+            try:
+                if self._apply_move(move, outcome):
+                    retire.append(move)
+            except Exception:
+                logger.exception(
+                    "applying the FINALIZE_MOVE result of %s failed", move.src
+                )
+                self._hold([move.src])
+        if retire:
+            for move in retire:
+                self.placement.on_ready(move.dest)
+            self.retire(
+                [m.dest for m in retire],
+                [KeyLocation(key=m.key, location=m.dest_location) for m in retire],
+            )
+
+    def _apply_move(self, move: _Move, outcome: ItemOutcome) -> bool:
+        """Act on one FINALIZE_MOVE result; whether to retire the copy."""
+        result, cause = outcome.result, outcome.cause
+        if result == ItemResult.REJECTED:
+            # The copy was not guarded: the source stays
+            with self._lock:
+                self.move_results["REJECTED"] += 1
+            if self._is_ready(move.src, move.key):
+                self._retire_failed([move.src])
+            return True
+        if result not in (ItemResult.RETIRED, ItemResult.KEPT):
+            logger.error("FINALIZE_MOVE item answered %s for %s", result, move.src)
+            self._move_unknown([move])
+            return False
+        if (
+            result == ItemResult.KEPT
+            and cause == KeptCause.INVALID
+            and outcome.location is not None
+            and outcome.location.pool_id == move.dest_location.pool_id
+        ):
+            # The pool below is the invalid one: the source stays, the copy
+            # is not used
+            with self._lock:
+                self.move_results["KEPT:INVALID"] += 1
+            self._retire_failed([move.src])
+            self._pool_invalid(move.dest)
+            return False
+        if not self._is_ready(move.src, move.key):
+            self.placement.on_ready(move.dest)  # the source went meanwhile
+            return False
+        # The page holds another key per the Catalog: its bytes were not
+        # this key's
+        foreign = (
+            result == ItemResult.KEPT
+            and cause == KeptCause.MOVED
+            and outcome.key != move.key
+        )
+        if not foreign:
+            self.placement.on_ready(move.dest)  # a location of the key either way
+            if result == ItemResult.KEPT:
+                with self._lock:
+                    self._copies[move.src] = move.dest
+        # The source as after a RETIRE with this result
+        self._apply_retire(move.src, outcome, self.move_results)
+        return foreign
+
+    def _move_unknown(self, moves: list[_Move]) -> None:
+        """No usable FINALIZE_MOVE result: both stay READY (re-registered
+        after a MaruServer restart), the source's local pins stay blocked,
+        and its next demotion pins the copy again."""
+        for move in moves:
+            self._keep_copy(move)
+        with self._lock:
+            self.move_results["UNKNOWN"] += len(moves)
+        self.placement.release([m.src for m in moves])
+
+    def _keep_copy(self, move: _Move) -> None:
+        self.placement.on_ready(move.dest)
+        with self._lock:
+            self._copies[move.src] = move.dest
+
+    def _settle_copies(self, moves: list[_Move]) -> None:
+        """Copies whose COMMIT result is unknown, as the commit path settles
+        them: a RETIRE tells (RETIRED frees, PINNED proves them there)."""
+        for move in moves:
+            self.pools.commit_added(move.dest)
+            self._settle_page(move.dest)
+        self._evict_wake.set()
+
+    def _queue_moves(self, moves: list[_Move]) -> None:
+        with self._lock:
+            self._moves.extend(moves)
+
+    # --------------------------------------------------------------- removal
 
     def _retire_queued(self) -> None:
         """RETIRE pages of block requests and pages being settled."""
@@ -1043,12 +1548,18 @@ class StorageManager:
                 self._hold([ref])
         self._reclaim_retiring()
 
-    def _apply_retire(self, ref: PageRef, outcome: ItemOutcome) -> None:
+    def _apply_retire(
+        self,
+        ref: PageRef,
+        outcome: ItemOutcome,
+        results: collections.Counter[str] | None = None,
+    ) -> None:
         with self._lock:
             central = ref in self._central
             settling = ref in self._settle
             cause = f":{outcome.cause.value}" if outcome.cause else ""
-            self.retire_results[f"{outcome.result.value}{cause}"] += 1
+            counts = self.retire_results if results is None else results
+            counts[f"{outcome.result.value}{cause}"] += 1
         if outcome.result == ItemResult.RETIRED:
             self._retired(ref)
         elif outcome.result == ItemResult.KEPT and outcome.cause == KeptCause.PINNED:
@@ -1102,6 +1613,8 @@ class StorageManager:
         self.placement.on_ready(new)
 
     def _pool_invalid(self, ref: PageRef) -> None:
+        with self._lock:
+            self._invalid_pools.add(ref.pool_id)
         if self.pools.disable_pool(ref.pool_id):
             logger.error(
                 "MaruServer says pool %s is no longer valid for this node; it is "
@@ -1141,6 +1654,7 @@ class StorageManager:
             self._retire_queue.pop(ref, None)
             self._central.discard(ref)
             self._settle.discard(ref)
+            self._copies.pop(ref, None)
 
     def _reclaim_retiring(self) -> None:
         with self._lock:

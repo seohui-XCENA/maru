@@ -21,8 +21,11 @@ from maru_common.protocol import (
     CommitItem,
     CommitRequest,
     CommitResponse,
+    FinalizeMoveRequest,
+    FinalizeMoveResponse,
     HandshakeRequest,
     MessageType,
+    MoveItem,
     NodeCloseRequest,
     NodeCloseResponse,
     NodeHeartbeatRequest,
@@ -401,6 +404,21 @@ class ServerClient:
         response: RetireResponse = self._call_op(
             MessageType.RETIRE,
             RetireRequest(
+                session=session,
+                server_epoch=epoch,
+                op=PLACEHOLDER_OP,
+                items=items,
+            ),
+            len(items),
+        )
+        return response
+
+    def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse:
+        """FINALIZE_MOVE until its result is known."""
+        session, epoch = self._ids()
+        response: FinalizeMoveResponse = self._call_op(
+            MessageType.FINALIZE_MOVE,
+            FinalizeMoveRequest(
                 session=session,
                 server_epoch=epoch,
                 op=PLACEHOLDER_OP,

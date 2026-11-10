@@ -453,8 +453,9 @@ class Catalog:
         if src.pool_id == dest.pool_id:
             return ItemOutcome(ItemResult.REJECTED)  # one location per pool
         dest_pool = self._pools.get(dest.pool_id)
+        # KEPT(INVALID) names the invalid pool by its location
         if dest_pool is None or dest_pool.state != PoolState.ACTIVE:
-            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID)
+            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=dest)
         if (
             dest_pin is None
             or dest_pin.holder != holder
@@ -466,7 +467,7 @@ class Catalog:
             # item fails, the source stays published
             return ItemOutcome(ItemResult.REJECTED)
         if self.own_pool(node_id, src.pool_id) is None:
-            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID)
+            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=src)
         source = self.entry_exact(item.key, src)
         if source is None:
             return self._moved(src) or ItemOutcome(ItemResult.RETIRED)

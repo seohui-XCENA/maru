@@ -145,7 +145,8 @@ class TierTraits:
 
     kind: PoolKind
     credit: bool  # workers get credit from it (the top tier)
-    evicts: bool  # pressure makes room by retiring its READY pages
+    evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
+    demotes_to: PoolKind | None = None  # write-back target (demotion "back")
 
 
 @dataclass(frozen=True)
@@ -179,16 +180,26 @@ class NodeConfig:
         return next((t for t in self.tiers if t.store == store), None)
 
     def traits(self) -> dict[PoolKind, TierTraits]:
-        """Traits of each memory tier, by the kind of its pools. Until
-        write-back demotion only the tier that gets new pages (credit) evicts,
-        by dropping."""
-        memory = [t for t in self.tiers if t.is_memory]
-        return {
-            PoolKind(t.store): TierTraits(
-                kind=PoolKind(t.store), credit=i == 0, evicts=i == 0
+        """Traits of each memory tier, by the kind of its pools. The top tier
+        gives credit. A tier with demotion "back" over a memory tier evicts by
+        moving its pages there; a tier that gets new pages (credit or
+        demotion) and demotes nowhere evicts by dropping."""
+        out: dict[PoolKind, TierTraits] = {}
+        receives = True  # the top tier gets the writes
+        for i, t in enumerate(self.tiers):
+            if not t.is_memory:
+                receives = False
+                continue
+            below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
+            demotes = t.demotion == "back" and below is not None and below.is_memory
+            out[PoolKind(t.store)] = TierTraits(
+                kind=PoolKind(t.store),
+                credit=i == 0,
+                evicts=receives,
+                demotes_to=PoolKind(below.store) if demotes and below else None,
             )
-            for i, t in enumerate(memory)
-        }
+            receives = demotes
+        return out
 
     def transfer_defaults(self) -> TransferDefaults:
         """Workers park loads when a tier can only be fetched from; a store
