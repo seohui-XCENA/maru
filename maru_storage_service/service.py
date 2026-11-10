@@ -461,6 +461,12 @@ class StorageService:
             self.server.stop()
         if self.manager is not None:
             self.manager.stop()
+            stats = self.manager.stats()
+            logger.info(
+                "this run removed pages: retire %s, demotion %s",
+                stats["retire_results"] or "none",
+                stats["demotions"] or "none",
+            )
         if self.transfers is not None:
             self.transfers.close()  # unmapped before the regions may go back
         if self.server is not None:
