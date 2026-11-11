@@ -617,7 +617,9 @@ class TestPoolMaps:
             closer = maps._closer
             assert maps.wait_closed(info.pool_id, 5)
             wait_until(lambda: maps._closer is None, what="the closer to end")
-            assert closer is None or not closer.is_alive()
+            if closer is not None:
+                closer.join(5)
+                assert not closer.is_alive()
             # a later close starts a new thread
             maps.add(descriptor, os.dup(info.fd), "e")
             assert maps.remove(info.pool_id) and maps.wait_closed(info.pool_id, 5)

@@ -90,11 +90,19 @@ def test_a_reopen_waiting_for_another_open_does_not_open_again():
     conn = make_conn(call)
     first = threading.Thread(target=conn.open)
     second = threading.Thread(target=lambda: conn._reopen_after_epoch("old", "s1"))
+    waiting = threading.Event()
+    real_open = conn.open
+
+    def open_marked(**kwargs):
+        waiting.set()  # right before the open lock is asked for
+        real_open(**kwargs)
+
+    conn.open = open_marked
     try:
         first.start()
         assert entered.wait(5)
         second.start()
-        time.sleep(0.1)  # it waits for the open lock
+        assert waiting.wait(5)
         gate.set()
         first.join(5)
         second.join(5)

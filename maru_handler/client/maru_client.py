@@ -1681,6 +1681,12 @@ class MaruClient:
         if pool_id is None or generation is None:
             logger.warning("NOTIFY pool_remove without pool_id or generation; ignored")
             return
+        with self._lock:
+            # What the notice is about: this run, this connection, this mapping
+            epoch, storage = self.node_epoch, self._storage
+            mapped = self.pools.get(pool_id)
+            if mapped is not None and mapped.node_epoch != epoch:
+                mapped = None  # an old run's: left to the old-pool cleanup
         # Its credit at hand goes back first: no new write starts in it
         credits = self.credits.remove_pool(pool_id)
         if credits:
@@ -1693,20 +1699,25 @@ class MaruClient:
                     and not any(r.location.pool_id == pool_id for r in self._reads)
                 )
             )
-        if self._closing.is_set():
-            return
-        credits = self.credits.remove_pool(pool_id)
+        with self._lock:
+            # A new run or connection owns the pool_id now: not this notice's
+            if (
+                self._closing.is_set()
+                or self.node_epoch != epoch
+                or self._storage is not storage
+            ):
+                return
+            credits = self.credits.remove_pool(pool_id)
         if credits:
             self._return_credits(credits)
-        if not self.pools.remove(pool_id) or not self.pools.wait_closed(
-            pool_id, CLOSE_TIMEOUT_S
+        if mapped is not None and (
+            not self.pools.remove(pool_id, expected=mapped)
+            or not self.pools.wait_closed(pool_id, CLOSE_TIMEOUT_S)
         ):
             logger.warning(
                 "pool %s is still in use by the caller; not unmapped", pool_id
             )
             return
-        with self._lock:
-            storage = self._storage
         if storage is not None and not storage.closed:
             storage.submit(
                 NodeMessageType.UNMAP_ACK,

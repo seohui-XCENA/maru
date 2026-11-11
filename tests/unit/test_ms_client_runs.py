@@ -3,6 +3,9 @@
 """MaruClient across node runs: a credit of an ended run, and pools being
 installed by an attach."""
 
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 from maru_common.config import MaruConfig
@@ -99,3 +102,43 @@ def test_removing_leaves_a_mapping_installed_since(client, pool):
     assert maps.get(info.pool_id) is second
     assert maps.remove(info.pool_id, expected=second)
     assert maps.get(info.pool_id) is None
+
+
+class Busy(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
+def test_a_pool_remove_of_an_ended_run_leaves_the_new_runs_mapping(client, pool):
+    class Conn:
+        closed = False
+
+        def __init__(self):
+            self.sent = []
+
+        def submit(self, code, request):
+            self.sent.append(code)
+
+    old_conn, new_conn = Conn(), Conn()
+    info = pool.info()
+    client.pools._install(info, FakeMapping(), "e1")
+    client.node_epoch, client._storage = "e1", old_conn
+    busy = Busy(location=Location(info.pool_id, "a", 1, 0, M, PoolKind.DRAM))
+    client._handles.add(busy)
+    started = threading.Event()
+    real = client.credits.remove_pool
+    client.credits.remove_pool = lambda pool_id: (started.set(), real(pool_id))[1]
+    notify = SimpleNamespace(pool_id=info.pool_id, pool_generation=1)
+    thread = threading.Thread(target=client._pool_remove, args=(notify,))
+    thread.start()
+    assert started.wait(5)
+    # a new run maps the same pool_id while the notice waits on the handle
+    new = FakeMapping()
+    client.pools._install(info, new, "e2")
+    with client._lock:
+        client.node_epoch, client._storage = "e2", new_conn
+        client._handles.discard(busy)
+        client._cv.notify_all()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert client.pools.get(info.pool_id) is not None and not new.closed
+    assert not new_conn.sent and not old_conn.sent
