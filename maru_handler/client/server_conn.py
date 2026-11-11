@@ -47,6 +47,8 @@ MAX_UNRESOLVED_LOOKUPS = 32
 NODE_RUN_WARN_S = 30.0
 # Heartbeat interval while MaruServer does not answer
 DOWN_POLL_S = 0.5
+# The heartbeat logs an unexpected error of one type this often at most
+LOOP_ERROR_LOG_S = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -270,6 +272,7 @@ class ServerConn:
         failing = False
         unknown_since: float | None = None  # MaruServer has not known the run since
         warned = False
+        last_logged: dict[type, float] = {}
         while True:
             self._beat.wait(
                 DOWN_POLL_S if self._down or self._reopen else self.heartbeat_s or 1.0
@@ -296,8 +299,11 @@ class ServerConn:
                 self._set_down(False)
                 if response.status == Status.EPOCH:
                     with self._lock:
-                        self._reopen = True
-                    self.open()  # expired, or MaruServer restarted
+                        moved = self.session != session
+                        if not moved:
+                            self._reopen = True
+                    if not moved:
+                        self.open()  # expired, or MaruServer restarted
             except (RpcUnknownError, StorageUnavailableError) as e:
                 if isinstance(e, NodeRunUnknownError):
                     now = time.monotonic()
@@ -316,6 +322,14 @@ class ServerConn:
                 elif not self._down and not failing:
                     logger.warning("worker heartbeat: %s", e)
                 failing = True
+            except Exception as e:
+                # A callback failed: the thread goes on, or lookups would miss
+                # for good while the session is to reopen
+                now = time.monotonic()
+                kind = type(e)
+                if now - last_logged.get(kind, -LOOP_ERROR_LOG_S) >= LOOP_ERROR_LOG_S:
+                    last_logged[kind] = now
+                    logger.exception("worker heartbeat failed")
 
     def heartbeat_once(self) -> bool:
         """One WORKER_HEARTBEAT; whether it was answered OK."""
@@ -378,11 +392,14 @@ class ServerConn:
             except Exception:
                 logger.exception("resolving lookups failed")
 
-    def _reopen_after_epoch(self, epoch: str) -> bool:
-        """Reopen after EPOCH to a background request of ``epoch``; whether
-        the session is at that server epoch still (it may have moved
-        meanwhile)."""
-        self.open()
+    def _reopen_after_epoch(self, epoch: str, session: str) -> bool:
+        """Reopen after EPOCH to a background request of ``epoch`` on
+        ``session``, unless the session moved on already; whether the session
+        is at that server epoch still."""
+        with self._lock:
+            moved = self.session != session
+        if not moved:
+            self.open()
         with self._lock:
             return self.server_epoch == epoch
 
@@ -452,7 +469,7 @@ class ServerConn:
                 return None
             if response.status == Status.EPOCH:
                 try:
-                    self._reopen_after_epoch(request.server_epoch)
+                    self._reopen_after_epoch(request.server_epoch, request.session)
                 except StorageUnavailableError as e:
                     if isinstance(e, NodeRunUnknownError):
                         logger.debug("reopening the worker session: %s", e)
@@ -597,7 +614,7 @@ class ServerConn:
                 return False
             if response.status == Status.EPOCH:
                 try:
-                    same = self._reopen_after_epoch(epoch)
+                    same = self._reopen_after_epoch(epoch, session)
                 except StorageUnavailableError:
                     return False
                 if not same:

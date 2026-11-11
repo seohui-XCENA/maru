@@ -609,6 +609,8 @@ class Node:
             except Exception as e:
                 if self._claimed_elsewhere(service, str(e)):
                     return False
+                if service.teardown_failed is not None:
+                    self.failed = service.teardown_failed
                 raise
             while not self._stop.wait(0.1) and not service.wait(0):
                 pass

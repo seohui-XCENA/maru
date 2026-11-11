@@ -6,14 +6,18 @@ workers of an earlier run, and a lease no renewal reaches."""
 
 import logging
 import mmap
+import os
+import signal
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from maru_shm.types import StaleNodeEpochError
 from maru_storage_service import service as service_module
-from maru_storage_service.cli import EXIT_FAILED, serve
+from maru_storage_service.cli import EXIT_FAILED, _signal_handler, serve
+from maru_storage_service.drivers import dram
 from maru_storage_service.drivers.dram import DramDriver, DramPoolError
 from maru_storage_service.ports import NodeOpenError, ServerStopped
 from maru_storage_service.service import Node, StorageService
@@ -27,6 +31,7 @@ from tests.unit.ms_node_helpers import (
 from tests.unit.test_ms_cxl_tier import FakeRm, anon_region
 from tests.unit.test_ms_new_run import new_run
 
+M = 1 << 20
 OPTIONS = {"rpc_timeout_s": 0.3, "evict_interval_s": 0.02, "kept_backoff_s": 0.2}
 
 
@@ -197,6 +202,87 @@ def test_a_failed_teardown_exits_nonzero(monkeypatch):
     assert serve(config()) == EXIT_FAILED
 
 
+def test_a_failed_start_with_a_failed_teardown_is_recorded():
+    class Run(FakeRun):
+        def start(self):
+            self.teardown_failed = "RuntimeError: boom"
+            raise NodeOpenError("refused")
+
+    node = fake_node([Run()])
+    with pytest.raises(NodeOpenError):
+        node.run()
+    assert node.failed == "RuntimeError: boom"
+
+
+def test_a_claim_lost_in_a_failed_start_stays_lost_not_failed():
+    class Run(FakeRun):
+        def start(self):
+            self.teardown_failed = "RuntimeError: boom"
+            raise RuntimeError("stale")
+
+    node = fake_node([Run(claimed=True)])
+    assert node.run() is False and node.failed is None
+
+
+def test_a_start_failure_with_a_failed_teardown_exits_failed(monkeypatch):
+    class Failed:
+        def __init__(self, config):
+            self.failed, self.ended = "RuntimeError: boom", None
+
+        def run(self):
+            raise NodeOpenError("refused")
+
+    monkeypatch.setattr(service_module, "Node", Failed)
+    assert serve(config()) == EXIT_FAILED
+
+
+def test_the_signal_handler_only_writes_to_the_pipe():
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
+    try:
+        handler = _signal_handler(wfd)
+        handler(signal.SIGTERM, None)
+        handler(signal.SIGTERM, None)
+        assert os.read(rfd, 1) == b"x"
+    finally:
+        os.close(rfd)
+        os.close(wfd)
+
+
+def test_a_signal_stops_the_node_from_another_thread(monkeypatch):
+    handlers, stopped = {}, []
+    in_handler = threading.Event()
+    done = threading.Event()
+
+    class Waiting:
+        def __init__(self, config):
+            self.failed, self.ended = None, None
+
+        def stop(self):
+            stopped.append((threading.current_thread(), in_handler.is_set()))
+            done.set()
+
+        def run(self):
+            assert done.wait(5)
+            return True
+
+    monkeypatch.setattr(service_module, "Node", Waiting)
+    monkeypatch.setattr(
+        signal, "signal", lambda sig, h: handlers.setdefault(sig, h) or signal.SIG_DFL
+    )
+    result = []
+    thread = threading.Thread(target=lambda: result.append(serve(config())))
+    thread.start()
+    wait_until(lambda: signal.SIGTERM in handlers, what="the handler")
+    in_handler.set()
+    handlers[signal.SIGTERM](signal.SIGTERM, None)
+    in_handler.clear()
+    thread.join(5)
+    assert result == [0] and len(stopped) == 1
+    stop_thread, from_handler = stopped[0]
+    assert stop_thread.name == "maru-signal" and not from_handler
+
+
 # =============================================================================
 # Node with StorageService runs
 # =============================================================================
@@ -275,6 +361,79 @@ def test_a_later_run_waits_while_workers_map_the_old_pool(
     assert short_dram == [0] and second.later_run and not node.kept
     hints = {id(r) for r in caplog.records if "may still map" in r.getMessage()}
     assert len(hints) == 1  # once per DRAM_LOG_S
+
+
+class OldMapping:
+    """An earlier run's pool, mapped by a worker until ``release``."""
+
+    def __init__(self):
+        self.pool = dram.create_dram_pool("n", "old", 2 * M, M, hugepage=False)
+        self.mapping = mmap.mmap(self.pool.fd, self.pool.capacity)
+
+    def release(self):
+        self.mapping.close()
+
+    def close(self):
+        if not self.mapping.closed:
+            self.mapping.close()
+        self.pool.close()
+
+
+@pytest.fixture
+def dram_service(monkeypatch):
+    """A later run's service whose DRAM allocation fails while the old
+    mapping is held; (service, old mapping, creates made)."""
+    monkeypatch.setattr(service_module, "DRAM_RETRY_S", 0.1)
+    monkeypatch.setattr(service_module, "DRAM_RETRY_MAX_S", 0.5)
+    old, creates = OldMapping(), []
+
+    def create(self, tier, **kwargs):
+        creates.append(1)
+        if not old.mapping.closed:
+            raise DramPoolError("cannot allocate: ENOMEM", short=True)
+        return "pool"
+
+    monkeypatch.setattr(DramDriver, "create", create)
+    service = StorageService(node_config("tcp://127.0.0.1:1", "/tmp/x.sock"))
+    service.later_run = True
+    yield service, old, creates
+    old.close()
+
+
+def test_a_later_run_waits_with_a_growing_backoff_until_the_old_mapping_goes(
+    dram_service,
+):
+    service, old, creates = dram_service
+    pauses = []
+
+    def wait(pause):
+        pauses.append(pause)
+        if len(pauses) == 5:
+            old.release()  # the worker unmaps the old pool
+        return False
+
+    service._interrupted.wait = wait
+    assert service._create_dram(service.config.top) == "pool"
+    assert pauses == [0.1, 0.2, 0.4, 0.5, 0.5]  # doubled up to the cap
+    assert len(creates) == 6
+
+
+def test_a_stop_ends_the_wait_in_the_middle_of_it(dram_service):
+    service, old, creates = dram_service
+    service._interrupted.wait = lambda pause: len(creates) >= 2
+    with pytest.raises(ServerStopped):
+        service._create_dram(service.config.top)
+    assert len(creates) == 2 and not old.mapping.closed
+
+
+def test_a_stop_during_a_long_wait_returns_at_once(dram_service, monkeypatch):
+    service, old, creates = dram_service
+    monkeypatch.setattr(service_module, "DRAM_RETRY_S", 30.0)
+    threading.Timer(0.1, service.interrupt).start()
+    start = time.monotonic()
+    with pytest.raises(ServerStopped):
+        service._create_dram(service.config.top)
+    assert time.monotonic() - start < 5
 
 
 def test_a_stop_ends_the_wait_for_the_dram_pool(fake, runs, short_dram):

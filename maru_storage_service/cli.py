@@ -8,8 +8,10 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import signal
 import sys
+import threading
 from enum import Enum
 from typing import Any
 
@@ -69,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
     return serve(config, args.log_level)
 
 
+def _signal_handler(wfd: int):
+    """A handler that only wakes the thread that stops the node."""
+
+    def on_signal(_signum, _frame) -> None:
+        try:
+            os.write(wfd, b"x")
+        except OSError:  # a full pipe: a stop is pending already
+            pass
+
+    return on_signal
+
+
 def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     """Run the node until SIGTERM or SIGINT."""
     from .drivers.cxl import CxlTierError
@@ -87,11 +101,22 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
         print(f"maru-storage: {e}", file=sys.stderr)
         return EXIT_NOT_SERVING
 
-    def on_signal(signum, _frame) -> None:
-        logger.info("signal %d: stopping", signum)
-        # Also stops a start still waiting for the RM or MaruServer
-        node.stop()
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
+    # Only a write in the handler: stop() sets Events the main thread may be
+    # waiting in, and that would deadlock if the signal landed in set()
+    on_signal = _signal_handler(wfd)
 
+    def stop_on_signal() -> None:
+        try:
+            woken = os.read(rfd, 1)
+        finally:
+            os.close(rfd)
+        if woken:  # empty: serve() ended
+            # Also stops a start still waiting for the RM or MaruServer
+            node.stop()
+
+    threading.Thread(target=stop_on_signal, name="maru-signal", daemon=True).start()
     previous = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
     }
@@ -107,6 +132,8 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
             OSError,
         ) as e:
             print(f"maru-storage: cannot start: {e}", file=sys.stderr)
+            if node.failed is not None:
+                return EXIT_FAILED
             return EXIT_START
         if node.failed is not None:
             print(
@@ -118,3 +145,4 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        os.close(wfd)  # the signal thread's read ends

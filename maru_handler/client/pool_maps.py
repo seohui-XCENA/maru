@@ -318,6 +318,8 @@ class PoolMaps:
         self._detached: set[MappedPool] = set()
         self._closes: collections.deque[MappedPool] = collections.deque()
         self._closing: MappedPool | None = None
+        # Closes that raised: the mapping and its RM hold stay
+        self._failed: set[MappedPool] = set()
         self._closer: threading.Thread | None = None
 
     def add(self, descriptor: PoolDescriptor, fd: int, node_epoch: str) -> MappedPool:
@@ -445,12 +447,17 @@ class PoolMaps:
 
     def wait_closed(self, pool_id: str, timeout: float) -> bool:
         """Whether every mapping of ``pool_id`` taken out of use is closed
-        within ``timeout``."""
+        within ``timeout``; False at once if a close failed."""
+
+        def open_ones() -> list[MappedPool]:
+            return [m for m in self._detached if m.info.pool_id == pool_id]
+
         with self._cv:
-            return self._cv.wait_for(
-                lambda: all(m.info.pool_id != pool_id for m in self._detached),
+            self._cv.wait_for(
+                lambda: not open_ones() or any(m in self._failed for m in open_ones()),
                 timeout,
             )
+            return not open_ones()
 
     def close(
         self, keep: set[str] | frozenset[str] = frozenset(), timeout: float = 10.0
@@ -465,6 +472,22 @@ class PoolMaps:
                     _KEPT_UNTIL_EXIT.append(self._pools.pop(pool_id))
             elif not self.remove(pool_id):
                 errors.append(pool_id)
+        with self._lock:
+            # Detached by a lost connection while a view is held, or queued
+            # and not started: kept too, and no later view release closes it
+            for mapped in list(self._detached):
+                if (
+                    mapped.info.pool_id in keep
+                    and mapped is not self._closing
+                    and mapped not in self._failed
+                ):
+                    self._detached.discard(mapped)
+                    if mapped in self._closes:
+                        self._closes.remove(mapped)
+                    with mapped.lock:
+                        mapped.retired = False
+                    _KEPT_UNTIL_EXIT.append(mapped)
+            self._cv.notify_all()
         self.flush(timeout)
         if errors:
             raise RuntimeError(
@@ -491,7 +514,8 @@ class PoolMaps:
 
     def _close_later(self, mapped: MappedPool) -> None:
         with self._lock:
-            self._queue_close(mapped)
+            if mapped in self._detached:  # not kept meanwhile
+                self._queue_close(mapped)
 
     def _queue_close(self, mapped: MappedPool) -> None:
         """Caller holds the lock."""
@@ -506,18 +530,25 @@ class PoolMaps:
     def _close_loop(self) -> None:
         while True:
             with self._cv:
-                self._cv.wait_for(lambda: self._closes)
+                if not self._closes:
+                    self._closer = None  # a later close starts a new thread
+                    return
                 mapped = self._closing = self._closes.popleft()
+            closed = True
             try:
                 # No view is left, so the unmap after the CUDA unregister works
                 mapped.mapping.close()
             except Exception:
+                closed = False
                 logger.exception(
                     "closing the mapping of %s failed", mapped.info.pool_id
                 )
             with self._cv:
                 self._closing = None
-                self._detached.discard(mapped)
+                if closed:
+                    self._detached.discard(mapped)
+                else:
+                    self._failed.add(mapped)  # not retried; wait_closed is False
                 self._cv.notify_all()
 
     def views(self, pool_id: str) -> int:

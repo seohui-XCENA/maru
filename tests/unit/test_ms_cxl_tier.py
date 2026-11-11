@@ -1549,10 +1549,14 @@ class TestUnholds:
 
         from maru_shm.unholds import Unholds
 
-        unholds = Unholds(retry_s=0.01, max_retry_s=0.01)
+        # No retry on its own within the test: each send is stepped by hand
+        unholds = Unholds(retry_s=60, max_retry_s=60)
+        entered, gate = threading.Semaphore(0), threading.Semaphore(0)
         fails = [2]
 
         def flaky():
+            entered.release()
+            assert gate.acquire(timeout=5)
             if fails[0]:
                 fails[0] -= 1
                 raise ConnectionRefusedError("RM down")
@@ -1561,10 +1565,17 @@ class TestUnholds:
         log.addHandler(caplog.handler)
         try:
             unholds.put("k", flaky, "the drop")
-            wait_until(lambda: fails[0] == 1, what="one failure")
-            unholds.take_back("k")
-            fails[0] = 1
+            assert entered.acquire(timeout=5)
+            gate.release()  # the first send fails and is queued again
+            assert unholds.take_back("k") is not None  # after the send ended
             unholds.put("k", flaky, "the drop")
+            assert entered.acquire(timeout=5)
+            gate.release()  # the second send fails: warned about afresh
+            wait_until(
+                lambda: fails[0] == 0 and unholds._sending is None,
+                what="the second send to end",
+            )
+            gate.release()  # the one flush sends again succeeds
             assert unholds.flush(5)
         finally:
             log.removeHandler(caplog.handler)
