@@ -17,7 +17,6 @@ from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
     DetachRequest,
-    DrainAckRequest,
     FetchCancelRequest,
     FetchRequest,
     GroupLayout,
@@ -33,7 +32,6 @@ from maru_common.protocol import MessageType
 from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
-    DrainKind,
     ItemResult,
     Key,
     NotifyKind,
@@ -454,16 +452,13 @@ class TestOtherRequests:
 
     def test_notify_is_not_a_request(self, worker):
         worker.attach()
-        r = worker.request(NodeMessageType.NOTIFY, Notify(kind=NotifyKind.EPOCH))
+        r = worker.request(
+            NodeMessageType.NOTIFY, Notify(kind=NotifyKind.CREDIT_RETURN)
+        )
         assert r.status == Status.REJECTED
 
-    def test_drain_unmap_and_detach(self, worker):
+    def test_unmap_and_detach(self, worker):
         worker.attach()
-        r = worker.request(
-            NodeMessageType.DRAIN_ACK,
-            DrainAckRequest(kind=DrainKind.SERVER, epoch="old"),
-        )
-        assert r.status == Status.OK  # no open drain: nothing to confirm
         r = worker.request(
             NodeMessageType.UNMAP_ACK, UnmapAckRequest(pool_id="p", pool_generation=1)
         )

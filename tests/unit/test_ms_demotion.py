@@ -22,7 +22,12 @@ from maru_handler.storage.cpu import CpuPool
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.pool_manager import PageState, PoolManager
 from maru_storage_service.ports import EpochChanged
-from maru_storage_service.service import NotServableError, check_servable
+from maru_storage_service.service import (
+    Node,
+    NotServableError,
+    StorageService,
+    check_servable,
+)
 from maru_storage_service.transfer_engine import Copy, TransferEngine
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
@@ -188,6 +193,20 @@ def put(handler, key: str) -> bool:
     handle = handler.alloc(len(value))
     handle.buf[:] = value
     return handler.store(key, handle)
+
+
+def put_until_the_run_ends(node, handler, count: int = 10) -> None:
+    for i in range(count):
+        wait_until(
+            lambda: node.wait(0) or handler._cpu.credits.unused_bytes >= PAGE,
+            what="credit or the end of the run",
+        )
+        if node.wait(0):
+            return
+        try:
+            put(handler, f"k{i}")
+        except Exception:
+            return  # the run ended meanwhile
 
 
 def kinds(fake, key: str) -> set[PoolKind]:
@@ -471,26 +490,18 @@ def test_a_failed_copy_frees_its_destination(fake, nodes, handlers, regions):
     node.pools.check()
 
 
-@pytest.mark.parametrize("pause", ["recovering", "safe state"])
-def test_no_demotion_while_paused(fake, nodes, handlers, pause):
+def test_no_demotion_once_the_run_ended(fake, nodes, handlers):
     node = nodes(high=0.9, low=0.8)
     h = handlers(node)
     for i in range(8):
         assert put(h, f"k{i}")
     assert not node.manager.move_results
-    if pause == "recovering":
-        fake.pause(hold=False)
-        node.manager.server_lost("test")
-        wait_until(lambda: node.manager.recovering, what="recovering")
-    else:
-        node.manager.enter_safe_state("test")
+    node.manager._on_end = lambda reason: None  # the run is not stopped here
+    node.manager.end_run("test")
     node.manager.placement.high, node.manager.placement.low = 0.3, 0.1  # pressure
     time.sleep(0.5)
     assert not node.manager.move_results
     assert cxl_bytes(node, PageState.FREE) == 16 * PAGE
-    if pause == "recovering":
-        fake.resume()
-        wait_until(lambda: node.manager.move_results["RETIRED"], what="demoted")
 
 
 def test_a_full_cxl_drops_its_own_pages(fake, nodes, handlers):
@@ -579,29 +590,69 @@ def test_a_lost_finalize_move_reply_is_sent_again_as_the_same_op(fake, nodes, ha
     node.pools.check()
 
 
-def test_demotion_goes_on_after_a_maruserver_restart(fake, nodes, handlers):
-    node = nodes(low=0.0625)
-    h = handlers(node)
-    for i in range(10):
-        assert put(h, f"k{i}")
-    wait_until(lambda: node.manager.move_results["RETIRED"] >= 3, what="demoted")
-    fake.restart()
-    wait_until(lambda: node.manager.recoveries >= 1, what="re-registered")
-    before = node.manager.move_results["RETIRED"]
-    for i in range(10, 20):
-        assert put(h, f"k{i}")
-    wait_until(
-        lambda: node.manager.move_results["RETIRED"] > before, what="demoting again"
+def test_a_new_run_demotes_again(fake, sockdir, regions, handlers):
+    """After a MaruServer restart the next run in the process maps the
+    regions for its copies again and demotes."""
+    config = node_config(
+        fake.url,
+        f"{sockdir}/node.sock",
+        pages=16,
+        high=0.5,
+        low=0.0625,
+        cxl_pages=16,
+        region_pages=8,
+        budgets=SMALL_CREDIT,
     )
-    # once quiet, every READY page of either tier is in the new Catalog
-    wait_until(
-        lambda: all(
-            fake.locations(key).count(location) == 1
-            for _, key, location in node.pools.ready_pages()
+    cxl = dataclasses.replace(config.tiers[1], rm="127.0.0.1:1")
+    config = dataclasses.replace(config, tiers=(config.tiers[0], cxl))
+    rm = FakeRm()
+    node = Node(
+        config,
+        lambda c: StorageService(
+            c,
+            rpc_timeout_s=0.3,
+            evict_interval_s=0.02,
+            kept_backoff_s=0.2,
+            region_source=rm,
+            cxl_renew_s=0.05,
+            map_region=regions.node_map,
         ),
-        what="ledger and Catalog agree",
+        pause_s=0.05,
     )
-    node.pools.check()
+    thread = threading.Thread(target=node.run, daemon=True)
+    thread.start()
+    try:
+        first = wait_until(lambda: serving(node, None), what="the first run")
+        h = handlers(first)
+        for i in range(10):
+            assert put(h, f"k{i}")
+        wait_until(lambda: first.manager.move_results["RETIRED"] >= 3, what="demoted")
+        fake.restart()
+        second = wait_until(lambda: serving(node, first), what="the next run")
+        wait_until(lambda: h._cpu.node_epoch == second.node_epoch, what="re-attached")
+        assert all(second.transfers.has_pool(p.pool_id) for p in second.cxl.pools)
+        for i in range(10, 20):
+            assert put(h, f"k{i}")
+        wait_until(
+            lambda: second.manager.move_results["RETIRED"] >= 3, what="demoting again"
+        )
+        second.pools.check()
+    finally:
+        node.stop()
+        thread.join(15)
+
+
+def serving(node, old):
+    service = node.service
+    if (
+        service is None
+        or service is old
+        or service.local is None
+        or not service.local.started
+        or service.wait(0)
+    ):
+        return None
+    return service
 
 
 # =============================================================================
@@ -641,40 +692,24 @@ def test_copies_pending_below_do_not_hold_back_credit():
     pm.check()
 
 
-def test_copies_queued_by_a_lost_session_go_out_after_reregistration(
+def test_a_session_lost_on_a_demotion_commit_ends_the_run(
     fake, nodes, handlers, monkeypatch
 ):
-    """Not behind the server drain: PENDING copies would hold back credit."""
     node = nodes(high=0.5, low=0.25)
     m = node.manager
     real_commit = m.metadata.commit
-    lost: list[int] = []
-    drain = [False]
 
     def commit(items):
-        if items[0].finalizer and not lost:
-            lost.append(len(items))
-            drain[0] = True  # a server drain keeps eviction off from here
+        if items[0].finalizer:
             raise EpochChanged("test: the session went")
         return real_commit(items)
 
     monkeypatch.setattr(m.metadata, "commit", commit)
-    monkeypatch.setattr(m.workers, "server_drain_open", lambda: drain[0])
     h = handlers(node)
-    for i in range(10):
-        assert put(h, f"k{i}")
-    wait_until(lambda: lost and m.recoveries >= 1, what="recovered")
-    wait_until(
-        lambda: cxl_bytes(node, PageState.READY) == lost[0] * PAGE,
-        what="copies committed during the drain",
-    )
-    assert cxl_bytes(node, PageState.PENDING) == 0
-    assert not finalized(fake)  # FINALIZE_MOVE waits for eviction
-    for i in range(10, 13):
-        assert put(h, f"k{i}")  # credit goes on
-    drain[0] = False
-    wait_until(lambda: m.move_results["RETIRED"] >= lost[0], what="moved")
-    node.pools.check()
+    put_until_the_run_ends(node, h)
+    assert node.wait_finished(10)
+    assert "no longer knows the session" in node.ended and node.new_run
+    assert not finalized(fake)
 
 
 def test_a_copy_of_a_page_now_holding_another_key_is_retired(fake, nodes, handlers):
@@ -758,7 +793,8 @@ def test_an_invalid_pool_is_not_evicted(fake, nodes, handlers):
     with m._lock:
         m._invalid_pools.add(cxl)
     # A pass that began before the mark may still retire: let it end first
-    wait_until(lambda: not m._evict_busy and not m._retire_queue, what="pass ended")
+    wait_until(lambda: not m._retire_queue, what="nothing queued")
+    time.sleep(0.2)  # several passes at evict_interval_s
     m.placement.set_watermarks("cxl", 0.2, 0.1)  # it would evict now
     before = cxl_retires()
     time.sleep(0.5)
@@ -797,72 +833,43 @@ def test_past_high_the_pages_without_room_are_dropped_while_others_move(
 
 
 # =============================================================================
-# RELEASE_FINALIZER where the finalizer id is unknown or of no use
+# A demotion whose result stays unknown ends the run
 # =============================================================================
 
 
-def released(fake) -> list:
-    return [i for r in fake.requests(MessageType.RELEASE_FINALIZER) for i in r.items]
-
-
-def test_an_unusable_commit_reply_releases_the_finalizers_and_frees_the_copies(
-    fake, nodes, handlers
-):
+def test_an_unusable_commit_reply_ends_the_run(fake, nodes, handlers):
     node = nodes(low=0.0625)
     h = handlers(node)
     lost: list = []
 
     def unusable(response):
         # One result short: ReplyError, while the copies were ADDED with
-        # finalizers
+        # finalizers whose ids are unknown
         if not lost and any(o.finalizer_id for o in response.items):
             lost.extend(fake.requests(MessageType.COMMIT)[-1].items)
             return CommitResponse(status=Status.OK, items=response.items[:-1])
         return response
 
     fake.rewrite_responses(MessageType.COMMIT, unusable, count=1000)
-    for i in range(10):
-        assert put(h, f"k{i}")
-    wait_until(lambda: lost and released(fake), what="RELEASE_FINALIZER sent")
-    assert {(i.key, i.location) for i in released(fake)} >= {
-        (i.key, i.location) for i in lost
-    }
-    for item in lost:  # released, then RETIREd and freed
-        wait_until(
-            lambda item=item: node.pools.find(item.location) is None, what="freed"
-        )
-        assert item.location not in fake.locations(item.key)
-    # the sources stayed, and moved on a later try
-    wait_until(
-        lambda: all(kinds(fake, i.key.key) == {PoolKind.CXL} for i in lost),
-        what="moved later",
-    )
-    wait_until(lambda: fake.pin_count() == 0, what="no finalizer left")
-    node.pools.check()
+    put_until_the_run_ends(node, h)
+    assert node.wait_finished(10)
+    assert "result unknown" in node.ended and node.new_run
+    assert not finalized(fake)
+    assert [c.mode.value for c in fake.requests(MessageType.NODE_CLOSE)] == ["restart"]
 
 
-def test_a_finalize_move_refused_as_a_whole_releases_and_moves_later(
-    fake, nodes, handlers
-):
+def test_a_finalize_move_refused_as_a_whole_ends_the_run(fake, nodes, handlers):
+    """Not run, but the copies' finalizers stay until the session ends."""
     node = nodes(low=0.0625)
     h = handlers(node)
     fake.fail_requests(MessageType.FINALIZE_MOVE, Status.REJECTED)
-    for i in range(10):
-        assert put(h, f"k{i}")
-    wait_until(lambda: released(fake), what="RELEASE_FINALIZER sent")
+    put_until_the_run_ends(node, h)
+    assert node.wait_finished(10)
+    assert "refused as a whole" in node.ended
     refused = fake.requests(MessageType.FINALIZE_MOVE)[0].items
-    assert [(i.key, i.location) for i in released(fake)] == [
-        (i.key, i.dest) for i in refused
-    ]
-    assert node.manager.move_results["RELEASE_FINALIZER:RELEASED"] == len(refused)
-    # the copies stay; the next demotion finalizes onto them
-    for item in refused:
-        wait_until(
-            lambda item=item: fake.locations(item.key) == [item.dest],
-            what="moved onto the same copy",
-        )
-    wait_until(lambda: fake.pin_count() == 0, what="no finalizer left")
-    node.pools.check()
+    assert node.manager.move_results["UNKNOWN"] == len(refused)
+    for item in refused:  # both stay published
+        assert item.source in fake.locations(item.key)
 
 
 # =============================================================================

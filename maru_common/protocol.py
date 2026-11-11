@@ -83,7 +83,6 @@ class MessageType(IntEnum):
     NODE_OPEN = 0x40
     NODE_HEARTBEAT = 0x41
     NODE_CLOSE = 0x42
-    NODE_REREGISTER = 0x43
     NODE_RECOVER_LIST = 0x44
     WORKER_EXIT = 0x45
     ADMIN_DELETE = 0x46
@@ -98,8 +97,8 @@ class MessageType(IntEnum):
     RETIRE = 0x59
     FINALIZE_MOVE = 0x5A
     FETCH_COMPLETE = 0x5B
-    RELEASE_FINALIZER = 0x5C
-    # 0x5E, 0x5F: retired (REGION_REQUEST, REGION_RETURN); never reuse them
+    # 0x43, 0x5C, 0x5E, 0x5F: retired (NODE_REREGISTER, RELEASE_FINALIZER,
+    # REGION_REQUEST, REGION_RETURN); never reuse them
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -624,13 +623,6 @@ class ShutdownResponse:
 
 
 @dataclass
-class ReregisterItem:
-    key: Key
-    location: Location
-    logical_bytes: int
-
-
-@dataclass
 class RecoverItem:
     key: Key
     location: Location
@@ -675,9 +667,6 @@ class NodeOpenRequest:
     capabilities: list[str] = field(default_factory=list)
     pools: list[PoolInfo] = field(default_factory=list)
     rm_domains: list[RmDomain] = field(default_factory=list)
-    # epoch_seq of this same process, when it opens again after a MaruServer
-    # restart; None for a new process
-    resume: int | None = None
 
 
 @dataclass
@@ -689,7 +678,6 @@ class NodeOpenResponse:
     epoch_seq: int = 0
     heartbeat_s: float = 0.0
     session_ttl_s: float = 0.0
-    recovering: bool = False
     adopted: list[PoolInfo] = field(default_factory=list)
 
 
@@ -724,24 +712,6 @@ class NodeCloseRequest:
 class NodeCloseResponse:
     status: Status
     error: str | None = None
-
-
-@dataclass
-class NodeReregisterRequest:
-    """NODE_REREGISTER (0x43) - Locations sent again after a MaruServer restart."""
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    items: list[ReregisterItem]
-    last: bool
-
-
-@dataclass
-class NodeReregisterResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
 
 
 @dataclass
@@ -824,7 +794,6 @@ class WorkerOpenResponse:
     worker_session: str = ""
     heartbeat_s: float = 0.0
     session_ttl_s: float = 0.0
-    recovering: bool = False
 
 
 @dataclass
@@ -973,24 +942,6 @@ class FinalizeMoveResponse:
 
 
 @dataclass
-class ReleaseFinalizerRequest:
-    """RELEASE_FINALIZER (0x5C) - Drops this node session's finalizers on
-    exactly these locations; RELEASED, or ABSENT when there was none."""
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    items: list[KeyLocation]
-
-
-@dataclass
-class ReleaseFinalizerResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-
-
-@dataclass
 class FetchCompleteRequest:
     """FETCH_COMPLETE (0x5B) - Commits a fetched copy, pins it for the worker
     and releases the source pin, as one request."""
@@ -1050,7 +1001,6 @@ MS_MESSAGE_CLASSES = {
     MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),
     MessageType.NODE_HEARTBEAT: (NodeHeartbeatRequest, NodeHeartbeatResponse),
     MessageType.NODE_CLOSE: (NodeCloseRequest, NodeCloseResponse),
-    MessageType.NODE_REREGISTER: (NodeReregisterRequest, NodeReregisterResponse),
     MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),
     MessageType.WORKER_EXIT: (WorkerExitRequest, WorkerExitResponse),
     MessageType.ADMIN_DELETE: (AdminDeleteRequest, AdminDeleteResponse),
@@ -1065,10 +1015,6 @@ MS_MESSAGE_CLASSES = {
     MessageType.RETIRE: (RetireRequest, RetireResponse),
     MessageType.FINALIZE_MOVE: (FinalizeMoveRequest, FinalizeMoveResponse),
     MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
-    MessageType.RELEASE_FINALIZER: (
-        ReleaseFinalizerRequest,
-        ReleaseFinalizerResponse,
-    ),
 }
 _overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
 if _overlap:

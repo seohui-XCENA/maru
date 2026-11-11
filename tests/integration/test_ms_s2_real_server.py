@@ -68,7 +68,6 @@ class RealMaruServer:
         policy=None,
         *,
         port: int | None = None,
-        recovery_window_s: float = 0.0,
     ):
         for _ in range(5):
             chosen = port or free_port()
@@ -80,7 +79,6 @@ class RealMaruServer:
             args = [sys.executable, "-m", "maru_server", "--cpu-only"]
             args += ["--host", "127.0.0.1", "--port", str(chosen), "--workers", "2"]
             args += ["--session-ttl-s", str(ttl_s), "--heartbeat-s", str(heartbeat_s)]
-            args += ["--recovery-window-s", str(recovery_window_s)]
             if policy is not None:
                 args += ["--policy-file", policy]
             self.proc = subprocess.Popen(
@@ -360,7 +358,7 @@ def test_maruserver_stopped_then_back(servers, nodes, agents):
     for key in stored:
         assert readable(w, key)
     assert store(w, "after")
-    assert node.server.renewals == 0 and node.manager.safe_state is None
+    assert node.server.renewals == 0 and node.manager.ended is None
     node.pools.check()
 
 
@@ -381,7 +379,7 @@ def test_node_session_expiry_is_renewed(servers, nodes, agents):
     server.resume()
     wait_until(lambda: node.server.renewals >= 1, timeout=15, what="renewal")
     assert node.server.epoch_seq == epoch_seq  # the same run
-    assert node.manager.safe_state is None
+    assert node.manager.ended is None
     assert readable(w, "before")  # the worker reopens its expired session
     assert store(w, "after")
     assert readable(w, "after")

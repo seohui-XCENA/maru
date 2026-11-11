@@ -89,6 +89,8 @@ class ServerConn:
         self._open_lock = threading.RLock()
         self.session: str | None = None
         self.server_epoch: str | None = None
+        # The node run the open session is attached to
+        self.session_node_epoch: str | None = None
         self.heartbeat_s = 0.0
         self.session_ttl_s = 0.0
         self._origin: OpOrigin | None = None
@@ -174,14 +176,13 @@ class ServerConn:
             self._poll_soon()
             error = NodeResumingError if resuming else StorageUnavailableError
             raise error(f"WORKER_OPEN refused: {response.status} {response.error}")
-        if response.recovering:
-            logger.info("MaruServer is recovering: keys not re-registered yet miss")
         with self._lock:
             self._reopen = self._refused = False
             self._opens += 1
             old_epoch = self.server_epoch
             self.session = response.worker_session
             self.server_epoch = response.server_epoch
+            self.session_node_epoch = request.node_epoch
             self.heartbeat_s = response.heartbeat_s
             self.session_ttl_s = response.session_ttl_s
             if old_epoch != response.server_epoch:
@@ -220,13 +221,6 @@ class ServerConn:
         )
         self._thread.start()
         self._resolver.start()
-
-    def poke(self, server_epoch: str | None = None) -> None:
-        """Heartbeat now; a node saw MaruServer at ``server_epoch``."""
-        if server_epoch is not None and server_epoch != self.server_epoch:
-            with self._lock:
-                self._reopen = True
-        self._beat.set()
 
     def stop_reopening(self) -> None:
         """Never open the session again (Maru is off on this worker);
@@ -391,9 +385,12 @@ class ServerConn:
 
     # ----------------------------------------------------------------- lookup
 
-    def lookup_and_pin(self, keys: list[Key]) -> tuple[list[ItemOutcome], str] | None:
-        """One LOOKUP_AND_PIN: the outcomes and the server epoch whose pins
-        they hold; None when unknown or unavailable."""
+    def lookup_and_pin(
+        self, keys: list[Key]
+    ) -> tuple[list[ItemOutcome], str, str | None] | None:
+        """One LOOKUP_AND_PIN: the outcomes, the server epoch whose pins they
+        hold and the node run they were answered under; None when unknown or
+        unavailable."""
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a lookup carries 1..{MAX_BATCH}")
         with self._lock:
@@ -405,6 +402,7 @@ class ServerConn:
             origin = self._origin
             if origin is None or self.session is None or self.server_epoch is None:
                 return None  # not open
+            node_epoch = self.session_node_epoch
             request = origin.stamp(
                 LookupAndPinRequest(
                     session=self.session,
@@ -413,11 +411,11 @@ class ServerConn:
                     items=list(keys),
                 )
             )
-        return self._send_lookup(origin, request)
+        return self._send_lookup(origin, request, node_epoch)
 
     def _send_lookup(
-        self, origin: OpOrigin, request: LookupAndPinRequest
-    ) -> tuple[list[ItemOutcome], str] | None:
+        self, origin: OpOrigin, request: LookupAndPinRequest, node_epoch: str | None
+    ) -> tuple[list[ItemOutcome], str, str | None] | None:
         seq = request.op.seq
         for _ in range(2):
             try:
@@ -449,7 +447,7 @@ class ServerConn:
                         origin is self._origin
                         and self.server_epoch == request.server_epoch
                     )
-                    session = self.session
+                    session, node_epoch = self.session, self.session_node_epoch
                 if not same or session is None:
                     return None  # the op and its pins are gone with the server
                 # The digest leaves out the session
@@ -480,7 +478,7 @@ class ServerConn:
                         [o.pin_id for o in response.items if o.pin_id is not None]
                     )
                 return None
-            return response.items, request.server_epoch
+            return response.items, request.server_epoch, node_epoch
         # EPOCH again after reopening: not run; resent in the background
         with self._lock:
             if origin is self._origin:
@@ -497,6 +495,7 @@ class ServerConn:
                 if not self._unresolved or origin is None:
                     return
                 session, epoch = self._ids()
+                node_epoch = self.session_node_epoch
                 request = origin.refresh(
                     dataclasses.replace(
                         next(iter(self._unresolved.values())),
@@ -504,7 +503,7 @@ class ServerConn:
                         server_epoch=epoch,
                     )
                 )
-            answered = self._send_lookup(origin, request)
+            answered = self._send_lookup(origin, request, node_epoch)
             if answered is None:
                 return  # still no answer; try again next beat
             pins = [

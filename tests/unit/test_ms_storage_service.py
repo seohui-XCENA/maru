@@ -458,35 +458,20 @@ class TestSessions:
             == usage.capacity
         )
 
-    def test_maruserver_restart_recovers_the_session(self, fake, nodes, handlers):
+    def test_a_maruserver_restart_ends_the_run(self, fake, nodes, handlers):
+        """The run closes with restart (MaruServer knows no session of it)
+        and asks for a new one; nothing is sent to the new MaruServer."""
         node = nodes()
         h = handlers(node, store_timeout_s=0.3)
         assert put(h, "before")
-        wait_credit(h)
-        fake.fail_requests(MessageType.NODE_OPEN, Status.BUSY, count=1000)
+        old = node.server.server_epoch
         fake.restart()
-        wait_until(lambda: node.manager.recovering, what="recovering")
+        assert node.wait_finished(15)
+        assert "restarted" in node.ended and node.new_run
         assert node.server.renewals == 0  # a new server epoch: no renewal
-        assert node.manager.safe_state is None
-        assert not node.pools.credit_stopped
-        # the old credit is dropped, new credit comes from free pages; writes
-        # go on but stay PENDING until re-registered
-        wait_until(lambda: h._cpu.credits.era == 1, what="the old credit dropped")
-        wait_credit(h)
-        handle = h.alloc(4)
-        handle.buf[:] = b"late"
-        assert h.store("late", handle) is False  # bounded wait
-        assert node.pools.bytes_in(PageState.PENDING) == PAGE
-        assert node.pools.bytes_in(PageState.RETIRING) == 0
-        # no node session at the new MaruServer yet: the worker cannot reopen
-        # its session, so reads are unavailable
-        assert h.retrieve("before") is None
-        assert h._cpu.stats["retrieve_unavailable"] >= 1
-        with fake._lock:
-            fake._fail[int(MessageType.NODE_OPEN)].clear()
-        wait_until(lambda: node.manager.recoveries == 1, timeout=15, what="resumed")
-        wait_until(lambda: h.retrieve("late") is not None, what="the late write")
-        wait_until(lambda: h.retrieve("before") is not None, what="the old one")
+        sent = [r for _, r in fake.log if getattr(r, "server_epoch", None)]
+        assert all(r.server_epoch == old for r in sent)
+        assert not fake.requests(MessageType.NODE_CLOSE)  # its session is gone
 
     def test_expired_node_session_is_renewed(self, fake, nodes, handlers):
         node = nodes()
@@ -498,7 +483,7 @@ class TestSessions:
         wait_until(lambda: node.server.renewals == 1, what="renewed")
         assert node.server.session != token
         assert node.server.epoch_seq == fake.node("gpu-test").epoch_seq
-        assert node.manager.safe_state is None
+        assert node.manager.ended is None
         wait_credit(h)
         assert put(h, "b")
         assert len(fake.requests(MessageType.HANDSHAKE)) >= 1
@@ -1347,7 +1332,7 @@ class TestNodeStart:
         # nothing reached MaruServer, and the first node still serves
         assert len(fake.requests(MessageType.NODE_OPEN)) == 1
         assert os.path.exists(node.config.socket)
-        assert node.manager.safe_state is None
+        assert node.manager.ended is None
         h = handlers(node)
         assert put(h, "still-serving")
 
@@ -1451,25 +1436,19 @@ class TestRepliesAndResults:
         ],
         ids=["unexpected-result", "wrong-count"],
     )
-    def test_unknown_commit_results_are_settled(self, fake, nodes, handlers, rewrite):
+    def test_unknown_commit_results_end_the_run(self, fake, nodes, handlers, rewrite):
+        """Whether the location is in the Catalog is unknown: the page is
+        never reused, and the run ends for a new one."""
         node = nodes()
         h = handlers(node)
         wait_credit(h)
         fake.rewrite_responses(MessageType.COMMIT, rewrite)
         assert put(h, "u") is False
-        # treated as in the Catalog, then a RETIRE settles it: freed, not stuck
-        wait_until(
-            lambda: (
-                node.pools.bytes_in(PageState.PENDING) == 0
-                and node.pools.bytes_in(PageState.READY) == 0
-                and not node.manager._settle
-            ),
-            what="settled",
-        )
-        assert Key(NS, "u") not in fake.keys()
-        node.pools.check()
+        assert node.wait_finished(10)
+        assert "COMMIT" in node.ended and node.new_run
+        assert node.pools.bytes_in(PageState.PENDING) == PAGE  # never reused
 
-    def test_bad_retire_and_exit_replies_are_retried(self, fake, nodes, handlers):
+    def test_a_bad_retire_reply_ends_the_run(self, fake, nodes, handlers):
         node = nodes()
         h = handlers(node)
         assert put(h, "k")
@@ -1478,10 +1457,13 @@ class TestRepliesAndResults:
             MessageType.RETIRE, lambda r: dataclasses.replace(r, items=[])
         )
         node.manager.retire([ref], [KeyLocation(page.key, page.location)])
-        assert node.pools.page(ref).state == PageState.READY  # no usable result
-        assert not node.manager.local_pins.is_blocked(ref)
-        node.manager.retire([ref], [KeyLocation(page.key, page.location)])
-        assert node.pools.page(ref).state == PageState.FREE
+        assert node.wait_finished(10)
+        assert "RETIRE" in node.ended and node.new_run
+        assert node.pools.page(ref).state == PageState.READY  # never reused
+        assert node.manager.placement.is_held(ref)
+
+    def test_a_refused_worker_exit_is_sent_again(self, fake, nodes):
+        node = nodes()
         fake.fail_requests(MessageType.WORKER_EXIT, Status.REJECTED)
         node.manager._queue_exit(
             WorkerRef("e", 0, 0, 1, 1, "gone-worker", worker_session=None)
@@ -1829,33 +1811,6 @@ class TestClientLifecycle:
 
 
 class TestStaleRuns:
-    def test_maruserver_restart_does_not_flap_the_uds(self, fake, nodes, handlers):
-        node = nodes()
-        h = handlers(node, store_timeout_s=0.2)
-        client = h._cpu
-        assert put(h, "k")
-        wait_credit(h)
-        attaches = client.stats["attach"]
-        opens = len(fake.requests(MessageType.WORKER_OPEN))
-        fake.fail_requests(MessageType.NODE_OPEN, Status.BUSY, count=1000)
-        fake.restart()
-        wait_until(lambda: node.manager.recovering, what="recovering")
-        wait_until(lambda: client.credits.era == 1, what="the old credit dropped")
-        wait_credit(h)
-        handle = h.alloc(4)
-        handle.buf[:] = b"late"
-        assert h.store("late", handle) is False  # stuck PENDING (not resumed)
-        rpcs = len(fake.log)
-        for _ in range(20):
-            assert h.retrieve("k") is None  # WORKER_OPEN keeps getting EPOCH
-        time.sleep(0.3)
-        assert len(fake.requests(MessageType.WORKER_OPEN)) > opens  # all EPOCH
-        # lookups answer at once: no RPC each while the session cannot reopen
-        assert len(fake.log) - rpcs < 20
-        assert client.stats["attach"] == attaches  # the live UDS stays
-        assert client.storage_connected
-        assert node.manager.ledger.waiters(client.identity.incarnation) <= 1
-
     def test_waiters_stay_bounded_across_reattaches(
         self, fake, nodes, handlers, monkeypatch
     ):

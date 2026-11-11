@@ -10,7 +10,6 @@ run on a maintenance thread in bounded steps.
 
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -21,7 +20,6 @@ from typing import Any, TypeVar
 from maru_common.protocol import (
     AdminDeleteRequest,
     AdminDeleteResponse,
-    CommitItem,
     CommitRequest,
     CommitResponse,
     FetchCompleteRequest,
@@ -38,12 +36,8 @@ from maru_common.protocol import (
     NodeOpenResponse,
     NodeRecoverListRequest,
     NodeRecoverListResponse,
-    NodeReregisterRequest,
-    NodeReregisterResponse,
     ProbeRequest,
     ProbeResponse,
-    ReleaseFinalizerRequest,
-    ReleaseFinalizerResponse,
     RetireRequest,
     RetireResponse,
     SourcePinRequest,
@@ -65,7 +59,6 @@ from maru_common.storage_types import (
     ItemOutcome,
     ItemResult,
     Key,
-    MissReason,
     OpRef,
     SessionRole,
     Status,
@@ -93,9 +86,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_TTL_S = 30.0
 DEFAULT_NODE_GIVE_UP_S = 600.0
-# After a start, keys not in the Catalog answer RECOVERING this long: a start
-# may be a restart whose nodes are re-registering
-DEFAULT_RECOVERY_WINDOW_S = 30.0
 # maintenance steps per hold of the lock (about 1 ms), and the pause between
 DEFAULT_MAINTENANCE_BUDGET = 512
 DEFAULT_MAINTENANCE_INTERVAL_S = 1.0
@@ -172,7 +162,6 @@ class MsService:
         wall_clock: Callable[[], float] = time.time,
         maintenance_interval_s: float = DEFAULT_MAINTENANCE_INTERVAL_S,
         maintenance_budget: int = DEFAULT_MAINTENANCE_BUDGET,
-        recovery_window_s: float = DEFAULT_RECOVERY_WINDOW_S,
     ):
         if heartbeat_s is None:
             heartbeat_s = session_ttl_s / 3
@@ -184,8 +173,6 @@ class MsService:
             raise ValueError("node_give_up_s must be positive")
         if not maintenance_interval_s > 0 or maintenance_budget < 1:
             raise ValueError("maintenance interval and budget must be positive")
-        if not (math.isfinite(recovery_window_s) and recovery_window_s >= 0):
-            raise ValueError("recovery_window_s must be finite and not negative")
         self.server_epoch = server_epoch
         self.session_ttl_s = session_ttl_s
         self.heartbeat_s = heartbeat_s
@@ -193,9 +180,6 @@ class MsService:
         self._clock = clock
         self.maintenance_interval_s = maintenance_interval_s
         self.maintenance_budget = maintenance_budget
-        self.recovery_window_s = recovery_window_s
-        self.recovery_ends = clock() + recovery_window_s
-        self._recovery_over_logged = recovery_window_s == 0
         self.lock = threading.Lock()
         self.pins = PinManager()
         self.catalog = Catalog(self.pins)
@@ -219,13 +203,6 @@ class MsService:
         self._thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
         self._stop = threading.Event()
-        if recovery_window_s > 0:
-            logger.info(
-                "server epoch %s: keys no node has re-registered answer "
-                "RECOVERING for %g s",
-                server_epoch,
-                recovery_window_s,
-            )
 
     # ============================================================ helpers
 
@@ -282,22 +259,6 @@ class MsService:
         if req.server_epoch != self.server_epoch:
             return "server_epoch is not this MaruServer run's; open the session again"
         return None
-
-    def recovering(self, now: float | None = None) -> bool:
-        """Within the recovery window that follows the start."""
-        return (self._clock() if now is None else now) < self.recovery_ends
-
-    @staticmethod
-    def _absent(outcome: ItemOutcome, recovering: bool) -> ItemOutcome:
-        """A key not in the Catalog is RECOVERING while nodes may still
-        re-register it."""
-        if (
-            recovering
-            and outcome.result == ItemResult.MISS
-            and outcome.reason == MissReason.ABSENT
-        ):
-            return ItemOutcome(ItemResult.RECOVERING)
-        return outcome
 
     @staticmethod
     def _too_many(items: list, response_cls: Callable[..., R], what: str) -> R | None:
@@ -386,13 +347,11 @@ class MsService:
         with self.lock:
             now = self._clock()
             try:
-                response = self.registry.node_open(req, now)
+                return self.registry.node_open(req, now)
             except OpenError as e:
                 return NodeOpenResponse(
                     status=e.status, error=str(e), server_epoch=self.server_epoch
                 )
-            response.recovering = self.recovering(now)
-            return response
 
     def node_heartbeat(
         self, req: NodeHeartbeatRequest, payload: dict
@@ -413,59 +372,6 @@ class MsService:
                 return session
             self.registry.node_close(session, req.mode, self._clock())
             return NodeCloseResponse(status=Status.OK)
-
-    def node_reregister(
-        self, req: NodeReregisterRequest, payload: dict
-    ) -> NodeReregisterResponse:
-        """Locations a node held before this MaruServer started, applied as a
-        COMMIT without finalizers; accepted after the recovery window too."""
-        digest = op_digest(payload)
-        with self.lock:
-            session = self._node_session(req, NodeReregisterResponse)
-            if not isinstance(session, NodeSession):
-                return session
-            rejected = self._too_many(req.items, NodeReregisterResponse, "items")
-            if rejected:
-                return rejected
-            if not self.registry.resumed(session):
-                return NodeReregisterResponse(
-                    status=Status.REJECTED,
-                    error="only a run resumed after a MaruServer restart re-registers",
-                )
-
-            def run(batch: _Batch) -> NodeReregisterResponse:
-                errors = [
-                    self.catalog.check_new_location(
-                        session.node_id,
-                        session.epoch_seq,
-                        item.location,
-                        item.logical_bytes,
-                        earlier_runs=True,
-                    )
-                    for item in req.items
-                ]
-                batch.applying = True
-                for item, error in zip(req.items, errors, strict=True):
-                    if error is not None:
-                        logger.debug("NODE_REREGISTER %s rejected: %s", item.key, error)
-                        batch.outcomes.append(ItemOutcome(ItemResult.REJECTED))
-                        continue
-                    commit = CommitItem(item.key, item.location, item.logical_bytes)
-                    batch.outcomes.append(self.catalog.commit(commit, session.token))
-                self.registry.reregistered(
-                    session, batch.outcomes, req.last, self._clock()
-                )
-                return NodeReregisterResponse(status=Status.OK, items=batch.outcomes)
-
-            return self._run_op(
-                req.op,
-                node_origin(session.node_epoch),
-                session.node_id,
-                digest,
-                NodeReregisterResponse,
-                len(req.items),
-                run,
-            )
 
     def node_recover_list(
         self, req: NodeRecoverListRequest, payload: dict
@@ -510,21 +416,12 @@ class MsService:
     def admin_delete(
         self, req: AdminDeleteRequest, payload: dict
     ) -> AdminDeleteResponse:
-        """Block requests to the owning nodes, which retire. While nodes may
-        still re-register, a key not in the Catalog is MISS(offline): its
-        absence is not known yet."""
+        """Block requests to the owning nodes, which retire."""
         with self.lock:
             rejected = self._too_many(req.items, AdminDeleteResponse, "items")
             if rejected:
                 return rejected
             items = self.registry.delete(req.items)
-            if self.recovering():
-                items = [
-                    ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
-                    if o.result == ItemResult.MISS and o.reason == MissReason.ABSENT
-                    else o
-                    for o in items
-                ]
             return AdminDeleteResponse(status=Status.OK, items=items)
 
     # ====================================================== worker session
@@ -533,14 +430,12 @@ class MsService:
         with self.lock:
             now = self._clock()
             try:
-                response = self.registry.worker_open(req, now)
+                return self.registry.worker_open(req, now)
             except OpenError as e:
                 # with the epoch: a worker tells a restarted MaruServer
                 return WorkerOpenResponse(
                     status=e.status, error=str(e), server_epoch=self.server_epoch
                 )
-            response.recovering = self.recovering(now)
-            return response
 
     def worker_heartbeat(
         self, req: WorkerHeartbeatRequest, payload: dict
@@ -572,14 +467,11 @@ class MsService:
             rejected = self._too_many(req.items, ProbeResponse, "items")
             if rejected:
                 return rejected
-            now = self._clock()
-            requester = self.registry.requester(session, now)
-            recovering = self.recovering(now)
+            requester = self.registry.requester(session, self._clock())
             items = []
             for key in req.items:
                 selection = self.catalog.select(key, requester)
-                outcome = ItemOutcome(selection.result, reason=selection.reason)
-                items.append(self._absent(outcome, recovering))
+                items.append(ItemOutcome(selection.result, reason=selection.reason))
             return ProbeResponse(status=Status.OK, items=items)
 
     def lookup_and_pin(
@@ -595,13 +487,10 @@ class MsService:
                 return rejected
 
             def run(batch: _Batch) -> LookupAndPinResponse:
-                now = self._clock()
-                requester = self.registry.requester(session, now)
-                recovering = self.recovering(now)
+                requester = self.registry.requester(session, self._clock())
                 batch.applying = True
                 for key in req.items:
-                    outcome = self._lookup_one(key, requester, session)
-                    batch.outcomes.append(self._absent(outcome, recovering))
+                    batch.outcomes.append(self._lookup_one(key, requester, session))
                 return LookupAndPinResponse(status=Status.OK, items=batch.outcomes)
 
             return self._run_op(
@@ -806,38 +695,6 @@ class MsService:
                 run,
             )
 
-    def release_finalizer(
-        self, req: ReleaseFinalizerRequest, payload: dict
-    ) -> ReleaseFinalizerResponse:
-        digest = op_digest(payload)
-        with self.lock:
-            session = self._node_session(req, ReleaseFinalizerResponse)
-            if not isinstance(session, NodeSession):
-                return session
-            rejected = self._too_many(req.items, ReleaseFinalizerResponse, "items")
-            if rejected:
-                return rejected
-
-            def run(batch: _Batch) -> ReleaseFinalizerResponse:
-                batch.applying = True
-                for item in req.items:
-                    batch.outcomes.append(
-                        self.catalog.release_finalizer(
-                            session.token, item.key, item.location
-                        )
-                    )
-                return ReleaseFinalizerResponse(status=Status.OK, items=batch.outcomes)
-
-            return self._run_op(
-                req.op,
-                node_origin(session.node_epoch),
-                session.node_id,
-                digest,
-                ReleaseFinalizerResponse,
-                len(req.items),
-                run,
-            )
-
     def fetch_complete(
         self, req: FetchCompleteRequest, payload: dict
     ) -> FetchCompleteResponse:
@@ -952,8 +809,6 @@ class MsService:
                 "worker_sessions": len(self.registry.worker_sessions()),
                 "orphan_sessions": self.registry.orphan_sessions(),
                 "blocks_waiting": self.registry.blocks_waiting(),
-                "recovering": self.recovering(),
-                "reregistering_nodes": self.registry.reregistering(),
             }
 
     # ========================================================= maintenance
@@ -964,13 +819,6 @@ class MsService:
         work done, the budget when more may be left."""
         with self.lock:
             now = self._clock()
-            if not self._recovery_over_logged and not self.recovering(now):
-                self._recovery_over_logged = True
-                logger.info(
-                    "recovery window over: keys not re-registered answer MISS; "
-                    "%d nodes still re-registering",
-                    self.registry.reregistering(),
-                )
             budget = self.maintenance_budget
             work = self.registry.give_up(now, budget) if give_up else 0
             work += self.registry.maintain(now, budget - work)

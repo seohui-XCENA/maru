@@ -366,53 +366,19 @@ class TestRetire:
         assert results(a.retire((k, loc))) == ["RETIRED"]
 
 
-class TestReleaseFinalizer:
-    def test_it_drops_this_sessions_finalizers_on_that_location(self, env):
-        _, service, wire = env
-        a = open_node(wire, "a", ssd=True)
-        k = key("k")
-        dest = a.loc(a.ssd(), 1)
-        first = a.commit((k, dest), finalizer=True).items[0].finalizer_id
-        again = a.commit((k, dest), finalizer=True).items[0].finalizer_id
-        source_pin = a.source_pin((k, dest)).items[0].pin_id  # not a finalizer
-        response = a.release_finalizer((k, dest), (k, a.loc(a.ssd(), 2)))
-        assert results(response) == ["RELEASED", "ABSENT"]
-        assert service.pins.get(first) is None and service.pins.get(again) is None
-        assert service.pins.get(source_pin) is not None
-        assert results(a.release_finalizer((key("other"), dest))) == ["ABSENT"]
-        a.unpin(source_pin)
-        assert results(a.retire((k, dest))) == ["RETIRED"]  # nothing holds it
-
-    def test_another_sessions_finalizer_is_not_touched(self, env):
-        _, service, wire = env
-        a = open_node(wire, "a", ssd=True)
-        b = open_node(wire, "b", ssd=True)
-        k = key("k")
-        dest = b.loc(b.ssd(), 1)
-        finalizer = b.commit((k, dest), finalizer=True).items[0].finalizer_id
-        assert results(a.release_finalizer((k, dest))) == ["ABSENT"]
-        assert service.pins.get(finalizer) is not None
-        assert results(b.retire((k, dest))) == ["KEPT"]
-
-    def test_it_is_idempotent(self, env):
-        from maru_common.protocol import MessageType, ReleaseFinalizerRequest
-        from maru_common.storage_types import KeyLocation
-
-        _, service, wire = env
-        a = open_node(wire, "a", ssd=True)
-        k = key("k")
-        dest = a.loc(a.ssd(), 1)
-        a.commit((k, dest), finalizer=True)
-        request = a.build(
-            ReleaseFinalizerRequest,
-            **a.envelope(),
-            items=[KeyLocation(k, dest)],
-        )
-        first = wire.call(MessageType.RELEASE_FINALIZER, request)
-        assert results(first) == ["RELEASED"]
-        assert wire.call(MessageType.RELEASE_FINALIZER, request) == first  # replayed
-        assert results(a.release_finalizer((k, dest))) == ["ABSENT"]  # a new op
-        assert service.pins.count(k, dest) == 0
+def test_a_runs_finalizers_go_with_it(env):
+    """No message releases a finalizer by itself: one that FINALIZE_MOVE did
+    not release goes when the next run of the node opens."""
+    _, service, wire = env
+    a = open_node(wire, "a", ssd=True)
+    k = key("k")
+    dest = a.loc(a.ssd(), 1)
+    finalizer = a.commit((k, dest), finalizer=True).items[0].finalizer_id
+    assert results(a.retire((k, dest))) == ["KEPT"]
+    a.restart()
+    assert a.open(pools=[a.dram(), a.ssd()]).status == Status.OK
+    assert service.pins.get(finalizer) is None
+    assert results(a.retire((k, dest))) == ["RETIRED"]
 
 
 class TestFinalizeMove:
@@ -448,7 +414,8 @@ class TestFinalizeMove:
     def test_a_released_finalizer_keeps_the_source(self, env):
         _, service, wire = env
         a, one, two = self._setup(wire)
-        a.release_finalizer((one[0], one[2]))  # the finalizer is gone
+        with service.lock:
+            service.pins.unpin(one[3])  # the finalizer is gone
         response = a.finalize_move(one, two)
         assert results(response) == ["REJECTED", "RETIRED"]
         assert {e.location for e in service.catalog.locations(one[0])} == {
@@ -498,7 +465,8 @@ class TestFinalizeMove:
         _, service, wire = env
         a, one, _ = self._setup(wire)
         k, src, dest, finalizer = one
-        a.release_finalizer((k, dest))
+        with service.lock:
+            service.pins.unpin(finalizer)
         assert results(a.retire((k, dest))) == ["RETIRED"]
         # no finalizer on it can exist; name a fresh source pin of k instead
         fresh = a.source_pin((k, src)).items[0].pin_id

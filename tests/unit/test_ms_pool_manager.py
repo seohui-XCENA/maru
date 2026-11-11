@@ -453,8 +453,8 @@ class TestServiceTransitions:
         pm.check()
 
     def test_a_quarantined_pool_frees_nothing_until_its_quarantine_ends(self):
-        """An earlier run may still write it: retired or dropped pages stay
-        QUARANTINED, and no credit comes from it, until it ends."""
+        """An earlier run may still write it: retired pages stay QUARANTINED,
+        and no credit comes from it, until it ends."""
         pm = PoolManager(budgets(), PS)
         info = dataclasses.replace(
             dram(), pool_id="cxl:rm:5", kind=PoolKind.CXL, capacity=4 * PS
@@ -471,9 +471,9 @@ class TestServiceTransitions:
         )
         assert pm.pool_quarantined(info.pool_id)
         assert pm.credit("w", PS, PoolKind.CXL) == []
-        pm.retired(first)
-        pm.reclaim(first)
-        pm.drop_ready(second)
+        for ref in (first, second):
+            pm.retired(ref)
+            pm.reclaim(ref)
         assert pm.bytes_in(PageState.QUARANTINED, info.pool_id) == 4 * PS
         assert pm.bytes_in(PageState.FREE, info.pool_id) == 0
         assert pm.end_pool_quarantine(info.pool_id, creditable=True) == 4

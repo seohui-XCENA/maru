@@ -19,7 +19,6 @@ from enum import IntEnum, unique
 
 from .protocol import HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION, MessageHeader
 from .storage_types import (
-    DrainKind,
     FetchPlan,
     ItemOutcome,
     Key,
@@ -54,7 +53,7 @@ class NodeMessageType(IntEnum):
     FETCH_CANCEL = 0x19
     LOCAL_PIN = 0x20
     LOCAL_UNPIN = 0x21
-    DRAIN_ACK = 0x28
+    # 0x28: retired (DRAIN_ACK); never reuse it
     UNMAP_ACK = 0x29
     NOTIFY = 0x30
 
@@ -293,20 +292,6 @@ class LocalUnpinResponse:
 
 
 @dataclass
-class DrainAckRequest:
-    """DRAIN_ACK (0x28) - Every access of the ended epoch has finished."""
-
-    kind: DrainKind
-    epoch: str
-
-
-@dataclass
-class DrainAckResponse:
-    status: Status
-    error: str | None = None
-
-
-@dataclass
 class UnmapAckRequest:
     """UNMAP_ACK (0x29) - The pool's mapping and CUDA registration are gone."""
 
@@ -324,19 +309,15 @@ class UnmapAckResponse:
 class Notify:
     """NOTIFY (0x30), StorageService to worker, no response.
 
-    Fields by kind: drain (drain_kind, epoch), credit_return (bytes),
-    pool_add (pool), pool_remove (pool_id, pool_generation), epoch.
+    Fields by kind: credit_return (bytes), pool_add (pool), pool_remove
+    (pool_id, pool_generation).
     """
 
     kind: NotifyKind
-    drain_kind: DrainKind | None = None
-    epoch: str | None = None
     bytes: int | None = None
     pool: PoolDescriptor | None = None
     pool_id: str | None = None
     pool_generation: int | None = None
-    node_epoch: str | None = None
-    server_epoch: str | None = None
 
 
 @dataclass
@@ -357,7 +338,6 @@ NODE_MESSAGE_CLASSES = {
     NodeMessageType.FETCH_CANCEL: (FetchCancelRequest, FetchCancelResponse),
     NodeMessageType.LOCAL_PIN: (LocalPinRequest, LocalPinResponse),
     NodeMessageType.LOCAL_UNPIN: (LocalUnpinRequest, LocalUnpinResponse),
-    NodeMessageType.DRAIN_ACK: (DrainAckRequest, DrainAckResponse),
     NodeMessageType.UNMAP_ACK: (UnmapAckRequest, UnmapAckResponse),
     NodeMessageType.NOTIFY: (Notify, NotifyAck),
 }

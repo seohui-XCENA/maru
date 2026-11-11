@@ -60,7 +60,6 @@ class TestNodeOpen:
         assert response.server_epoch == service.server_epoch
         assert response.epoch_seq == 1
         assert response.session_ttl_s == 30.0 and response.heartbeat_s == 10.0
-        assert not response.recovering
         assert response.adopted == []
 
     @pytest.mark.parametrize(
@@ -89,13 +88,6 @@ class TestNodeOpen:
             [node.dram(), node.dram()],
         ):
             assert node.open(pools=pools).status == Status.REJECTED
-
-    @pytest.mark.parametrize("resume", [0, -1, EPOCH_SEQ_MAX + 1])
-    def test_resume_out_of_range_is_rejected(self, env, resume):
-        _, _, wire = env
-        node = FakeNode(wire, "n1")
-        response = node.open(resume=resume)
-        assert response.status == Status.REJECTED and "resume" in response.error
 
     def test_same_epoch_reopen_keeps_the_run(self, env):
         clock, service, wire = env
@@ -1000,16 +992,6 @@ class TestEpochChecks:
         assert node.heartbeat(usage=usage).status == Status.REJECTED
         assert admin_delete(wire, *keys).status == Status.REJECTED
         assert worker.lookup(*keys[:1024]).status == Status.OK
-
-
-class TestRecoveryWindow:
-    def test_no_recovery_window_never_recovers(self, env):
-        _, _, wire = env
-        node = FakeNode(wire, "n1")
-        assert node.open().recovering is False
-        worker = FakeWorker(wire, node)
-        assert worker.open().recovering is False
-        assert "RECOVERING" not in results(worker.lookup(key("x")))
 
 
 class TestHeartbeatQueues:

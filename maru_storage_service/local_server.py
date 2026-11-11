@@ -402,8 +402,6 @@ class LocalServer:
             )
         elif code == NodeMessageType.ABORT:
             conn.respond(header, manager.abort(rec, decoded))
-        elif code == NodeMessageType.DRAIN_ACK:
-            conn.respond(header, manager.workers.drain_ack(rec, request))
         elif code == NodeMessageType.UNMAP_ACK:
             conn.respond(header, manager.unmap_ack(rec, request))
         elif code == NodeMessageType.DETACH:
@@ -498,5 +496,3 @@ class LocalServer:
             else f"; credit {budgets.credit_refill_high // self.page_size} pages "
             f"at hand, up to {budgets.credit_max_bytes // self.page_size} pages",
         )
-        if not probe:
-            manager.workers.after_attach_reply(rec)

@@ -19,7 +19,7 @@ class HolderKind(StrEnum):
     WORKER = "worker"  # LOOKUP_AND_PIN, FETCH_COMPLETE copies
     NODE = "node"  # SOURCE_PIN
     # COMMIT with a finalizer: keeps a demotion destination until
-    # FINALIZE_MOVE or RELEASE_FINALIZER
+    # FINALIZE_MOVE or the end of the node session
     FINALIZER = "finalizer"
 
 
@@ -106,25 +106,6 @@ class PinManager:
         """The ids of every pin on ``pool_id``'s locations, which the caller
         unpins; no new pin may come on them (its pool is being removed)."""
         return self._by_pool.pop(pool_id, set())
-
-    def unpin_at(
-        self, holder: str, kind: HolderKind, key: Key, location: Location
-    ) -> int:
-        """Release ``holder``'s pins of ``kind`` on exactly this location of
-        ``key``; returns how many."""
-        index = (
-            self._cxl_by_holder if location.kind == PoolKind.CXL else self._by_holder
-        )
-        found = [
-            pin_id
-            for pin_id in index.get(holder, ())
-            if (pin := self._pins[pin_id]).holder_kind == kind
-            and pin.key == key
-            and pin.location == location
-        ]
-        for pin_id in found:
-            self.unpin(pin_id)
-        return len(found)
 
     def release_holder(
         self, holder: str, limit: int | None = None, keep_cxl: bool = False

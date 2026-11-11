@@ -14,10 +14,6 @@ from maru_common.protocol import (
     FinalizeMoveResponse,
     MoveItem,
     NodeHeartbeatResponse,
-    NodeOpenResponse,
-    NodeReregisterResponse,
-    ReleaseFinalizerResponse,
-    ReregisterItem,
     RetireResponse,
     WorkerExitResponse,
 )
@@ -29,12 +25,7 @@ class ServerStopped(Exception):  # noqa: N818 - a state, not a failure
 
 
 class EpochChanged(Exception):  # noqa: N818 - a state, not a failure
-    """MaruServer answered EPOCH: the node session is gone."""
-
-
-class StaleOp(Exception):  # noqa: N818 - a state, not a failure
-    """The op was for a MaruServer run that ended; the session went on at a
-    newer one, which never gets it. Send it again as a new op."""
+    """MaruServer no longer knows the node session: this run is over."""
 
 
 class NodeOpenError(RuntimeError):
@@ -46,15 +37,14 @@ class ReplyError(RuntimeError):
 
 
 class MetadataPort(Protocol):
-    """The node session with MaruServer. Each op is resent until its result is
-    known (OK, REJECTED or DISABLED); EpochChanged, ServerStopped and
-    ReplyError end it otherwise. After EpochChanged no op is sent until
-    resume() succeeds."""
+    """The node session with MaruServer. Each op is resent with the same op
+    until its result is known (OK, REJECTED or DISABLED); EpochChanged,
+    ServerStopped and ReplyError end it otherwise. After EpochChanged no op
+    is sent."""
 
-    # server_epoch of the session, and the one found after losing it; when
-    # the session was last confirmed (monotonic)
+    # server_epoch of the session; when the session was last confirmed
+    # (monotonic)
     server_epoch: str | None
-    new_server_epoch: str | None
     session_ttl_s: float
     last_heartbeat_ok: float
 
@@ -76,21 +66,9 @@ class MetadataPort(Protocol):
 
     def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse: ...
 
-    def release_finalizer(
-        self, items: list[KeyLocation]
-    ) -> ReleaseFinalizerResponse: ...
-
     def worker_exit(
         self, workers: list[WorkerRef], cause: ExitCause
     ) -> WorkerExitResponse: ...
-
-    def resume(self) -> NodeOpenResponse:
-        """Reopen the session of this run at a restarted MaruServer."""
-        ...
-
-    def reregister(
-        self, items: list[ReregisterItem], last: bool
-    ) -> NodeReregisterResponse: ...
 
     def stop(self) -> None:
         """Give up unresolved ops and stop the heartbeat."""

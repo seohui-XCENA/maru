@@ -4,22 +4,24 @@
 
 The node, not a process, owns its regions (spec 4.4). A new run claims them
 back with its node_epoch before NODE_OPEN, renews the lease while it runs and
-gives them back on leave. A run that cannot renew for half the lease must let
-go before the RM may give the regions to another node. A claimed region that
-an earlier run still holds in the RM (a worker's or the node's own mapping)
+gives them back on leave. A run that cannot renew for half the lease, or whose
+lease the RM says ended, must let go before the RM may give the regions to
+another node, and so must one whose node another run claimed. A claimed region
+that an earlier run still holds in the RM (a worker's or the node's own mapping)
 is watched with NODE_HOLDS until those holds are gone.
 """
 
 import logging
 import mmap
 import os
+import platform
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from maru_common.node_protocol import process_identity
+from maru_common.node_protocol import process_identity, process_start_time
 from maru_common.storage_types import (
     DaxMapping,
     PoolDescriptor,
@@ -33,10 +35,12 @@ from maru_shm.types import (
     MaruHandle,
     NodeClaim,
     NodeLeaseExpiredError,
+    NodeOwnershipUnsupportedError,
     NodeRegion,
     RetryableNodeError,
     StaleNodeEpochError,
 )
+from maru_shm.unholds import Unholds
 
 from ..config import TierConfig
 from . import PoolAccess
@@ -44,8 +48,16 @@ from . import PoolAccess
 logger = logging.getLogger(__name__)
 
 DEFAULT_RENEW_S = 10.0
-# How often NODE_HOLDS is asked while a region waits for an earlier run
+# How often NODE_HOLDS is asked while a region waits for an earlier run, and
+# how often the holds it waits for are logged
 HOLDS_POLL_S = 1.0
+HOLDS_LOG_S = 30.0
+# Holder name of the StorageService's own holds (run_holder)
+OWN_HOLDER = "ss"
+
+# Holds the node failed to drop, sent again until the RM confirms them; for
+# the process, so they outlive the run that queued them
+UNHOLDS = Unholds()
 
 
 class CxlTierError(RuntimeError):
@@ -83,6 +95,14 @@ class RegionSource(Protocol):
     def node_holds(self, node_id: str, node_epoch: str) -> list[NodeRegion]: ...
 
     def unhold(self, handle: MaruHandle, holder: str, instance: str) -> None: ...
+
+
+def _alive(pid: int, pid_start: int) -> bool:
+    """Whether the process (pid, start time) still runs here."""
+    try:
+        return process_start_time(pid) == pid_start
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def cxl_pool_id(rm_domain: str, region_id: int) -> str:
@@ -219,6 +239,9 @@ class CxlTier:
         self._thread: threading.Thread | None = None
         self._watcher: threading.Thread | None = None
         self.lost: str | None = None
+        # The RM says another run of the node claimed it: this process must
+        # not claim it back
+        self.claimed_elsewhere = False
         # Claimed pool -> names of the earlier runs' holds on it, as last
         # listed (by NODE_CLAIM, then NODE_HOLDS); a pool without any is gone
         self._lock = threading.Lock()
@@ -263,9 +286,11 @@ class CxlTier:
         ]
         with self._lock:
             for pool in self.pools:
-                held = self._earlier_holds(pool.region)
+                held = self._earlier_holds(pool.region) - self._drop_ended_own(pool)
                 if held:
                     self._earlier[pool.pool_id] = held
+        if self._earlier:
+            self._check_node_holds()
         total = sum(p.capacity for p in self.pools)
         size = self.tier.size
         assert size is not None and self.tier.region_size is not None
@@ -344,6 +369,7 @@ class CxlTier:
         except NodeLeaseExpiredError:
             return "the RM no longer counts this run as the owner (its lease ended)"
         except StaleNodeEpochError:
+            self.claimed_elsewhere = True
             return (
                 "the RM no longer counts this run as the owner (another run "
                 "claimed the node)"
@@ -373,6 +399,46 @@ class CxlTier:
             if h.node_epoch and h.node_epoch != self.node_epoch
         }
 
+    def _drop_ended_own(self, pool: CxlRegionPool) -> set[str]:
+        """Drop the holds of earlier StorageService runs whose process is
+        this one (that run's teardown unmapped) or is gone, judged as the RM
+        judges a holder, from this host, boot and pid namespace: the RM cannot
+        judge one in another pid namespace. Returns their names."""
+        boot, pid, start, pid_ns = process_identity()
+        dropped = set()
+        for h in pool.region.holders:
+            if (
+                h.holder.partition("@")[0] != OWN_HOLDER
+                or not h.node_epoch
+                or h.node_epoch == self.node_epoch
+                or not (boot and pid_ns and h.pid and h.pid_start)
+                or (h.host, h.boot_id, h.pid_ns) != (platform.node(), boot, pid_ns)
+            ):
+                continue
+            if (h.pid, h.pid_start) != (pid, start) and _alive(h.pid, h.pid_start):
+                continue
+            logger.info(
+                "cxl tier: dropping %s's hold on %s: its run is over",
+                h.holder,
+                pool.pool_id,
+            )
+            self._drop(pool, h.holder)
+            dropped.add(h.holder)
+        return dropped
+
+    def _check_node_holds(self) -> None:
+        """An RM without NODE_HOLDS would keep the held regions quarantined
+        for good: refuse to start."""
+        try:
+            self.source.node_holds(self.node_id, self.node_epoch)
+        except NodeOwnershipUnsupportedError as e:
+            raise CxlTierError(
+                f"RM {self.tier.rm} does not answer NODE_HOLDS, needed while an "
+                f"earlier run holds a region; upgrade the RM ({e})"
+            ) from e
+        except Exception as e:  # the watch asks again
+            logger.warning("cxl tier: NODE_HOLDS failed (%s)", e)
+
     def earlier_holds(self) -> dict[str, set[str]]:
         """Claimed pools an earlier run still holds, with those holders."""
         with self._lock:
@@ -396,7 +462,11 @@ class CxlTier:
 
     def _watch_loop(self, on_clear: Callable[[str], None], interval_s: float) -> None:
         failing = False
+        logged = self._clock()
         while not self._stop.wait(interval_s):
+            if self._clock() - logged >= HOLDS_LOG_S:
+                logged = self._clock()
+                self._log_waiting()
             try:
                 regions = self.source.node_holds(self.node_id, self.node_epoch)
             except StaleNodeEpochError:
@@ -411,12 +481,15 @@ class CxlTier:
             listed = {
                 cxl_pool_id(self.rm_domain, r.handle.region_id): r for r in regions
             }
-            cleared = []
+            cleared, gone = [], []
             with self._lock:
                 for pool_id in list(self._earlier):
                     region = listed.get(pool_id)
                     if region is None:
-                        continue  # not listed as the node's: never reused
+                        # Not the node's any more: never reused, not watched
+                        del self._earlier[pool_id]
+                        gone.append(pool_id)
+                        continue
                     held = self._earlier_holds(region)
                     if held:
                         self._earlier[pool_id] = held
@@ -424,6 +497,12 @@ class CxlTier:
                         del self._earlier[pool_id]
                         cleared.append(pool_id)
                 done = not self._earlier
+            for pool_id in gone:
+                logger.warning(
+                    "cxl tier: %s is no longer the node's in the RM; it stays "
+                    "quarantined",
+                    pool_id,
+                )
             for pool_id in cleared:
                 if self._stop.is_set():
                     return
@@ -431,19 +510,35 @@ class CxlTier:
             if done:
                 return
 
+    def _log_waiting(self) -> None:
+        held = self.earlier_holds()
+        if not held:
+            return
+        logger.warning(
+            "cxl tier: still quarantined while earlier runs hold them: %s. The "
+            "RM drops a hold once it sees its process gone, but not one of "
+            "another host or pid namespace (a worker or StorageService in a "
+            "container): once that process is surely gone, run "
+            "'maru-rm-ctl drop-holds <holder> --confirm'",
+            {pool_id: sorted(names) for pool_id, names in sorted(held.items())},
+        )
+
     def unhold(self, holder: str) -> None:
-        """Drop ``holder``'s hold on every region. Dropping one that is gone
-        does nothing."""
+        """Drop ``holder``'s hold on every region; one that fails is sent
+        again in the background. Dropping one that is gone does nothing."""
         for pool in self.pools:
-            try:
-                self.source.unhold(pool.region.handle, holder, holder)
-            except Exception as e:  # the RM reaps it once it sees the exit
-                logger.warning(
-                    "cxl tier: could not drop %s's hold on %s: %s",
-                    holder,
-                    pool.pool_id,
-                    e,
-                )
+            self._drop(pool, holder)
+
+    def _drop(self, pool: CxlRegionPool, holder: str) -> None:
+        source, handle = self.source, pool.region.handle
+        try:
+            source.unhold(handle, holder, holder)
+        except Exception:
+            UNHOLDS.put(
+                (self.rm_domain, handle.region_id, holder),
+                lambda: source.unhold(handle, holder, holder),
+                f"the hold {holder} on {pool.pool_id}",
+            )
 
     def drop_holds(self, incarnation: str) -> None:
         """A worker settled (ended, its GPU drain grace over): drop its holds

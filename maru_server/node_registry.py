@@ -145,11 +145,6 @@ class NodeRecord:
     blocked: set[tuple[Key, Location]] = field(default_factory=set)
     # worker sessions of a left or given up run, still to drop (maintain)
     dropping: set[str] = field(default_factory=set)
-    # a run that came back after a MaruServer restart (NODE_OPEN resume):
-    # when, locations re-registered, and whether its last batch came
-    resumed_at: float | None = None
-    reregistered: int = 0
-    reregister_done: bool = False
 
 
 @dataclass(eq=False)
@@ -305,22 +300,12 @@ class NodeRegistry:
             and node.node_epoch == req.node_epoch
             and node.session is not None
         ):
-            if req.resume is not None and req.resume != node.epoch_seq:
-                raise OpenError(
-                    Status.REJECTED,
-                    f"resume {req.resume} is not epoch_seq {node.epoch_seq} of "
-                    f"this run of {req.node_id}",
-                )
             return self._reopen_same_epoch(node, req, now)
-        if req.resume is not None:
-            return self._resume_run(node, req, now)
         return self._open_new_epoch(node, req, now)
 
     def _check_node_open(self, req: NodeOpenRequest) -> None:
         if req.protocol != MS_PROTOCOL:
             raise OpenError(Status.REJECTED, f"unknown protocol {req.protocol!r}")
-        if req.resume is not None and not 1 <= req.resume <= EPOCH_SEQ_MAX:
-            raise OpenError(Status.REJECTED, f"resume {req.resume} is out of range")
         if not NODE_ID_RE.match(req.node_id):
             raise OpenError(Status.REJECTED, f"bad node_id {req.node_id!r}")
         if not req.node_epoch or not req.host_boot_id:
@@ -422,48 +407,6 @@ class NodeRegistry:
         )
         return self._open_reply(node, session)
 
-    def _resume_run(
-        self, node: NodeRecord | None, req: NodeOpenRequest, now: float
-    ) -> NodeOpenResponse:
-        """A run this MaruServer has not seen, back after a restart with its
-        epoch_seq (its pages carry it); it re-registers its locations."""
-        if node is not None:
-            # The first run to resume wins: the node's socket lock allows one
-            # live run, so a second one is a stale process
-            logger.warning(
-                "node %s: run %s may not resume, run %s is here already",
-                req.node_id,
-                req.node_epoch,
-                node.node_epoch,
-            )
-            raise OpenError(
-                Status.REJECTED,
-                f"node {req.node_id} has another run here ({node.node_epoch}); "
-                "resume is only for a run this MaruServer has not seen",
-            )
-        assert req.resume is not None
-        node = NodeRecord(
-            node_id=req.node_id,
-            epoch_seq=req.resume,
-            node_epoch=req.node_epoch,
-            resumed_at=now,
-        )
-        self.nodes[node.node_id] = node
-        for info in req.pools:
-            # DRAM is this run's own; a kept pool may hold pages of any
-            # earlier run of the node
-            since = node.epoch_seq if info.kind == PoolKind.DRAM else 1
-            self.catalog.register_pool(info, since)
-        session = self._new_session(node, req, now)
-        logger.info(
-            "node %s resumed node_epoch %s (epoch_seq %d) after a MaruServer "
-            "restart; re-registering",
-            node.node_id,
-            req.node_epoch,
-            node.epoch_seq,
-        )
-        return self._open_reply(node, session)
-
     def _open_new_epoch(
         self, node: NodeRecord | None, req: NodeOpenRequest, now: float
     ) -> NodeOpenResponse:
@@ -492,7 +435,6 @@ class NodeRegistry:
         node.epoch_seq += 1
         node.node_epoch = req.node_epoch
         node.gone = False
-        node.resumed_at, node.reregistered, node.reregister_done = None, 0, False
         node.adopted = sorted(pool.pool_id for pool in adopt)
         adopted_ids = set(node.adopted)
         self._keep_blocks(node, adopted_ids)
@@ -581,7 +523,6 @@ class NodeRegistry:
             epoch_seq=session.epoch_seq,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=False,
             adopted=adopted,
         )
 
@@ -644,38 +585,6 @@ class NodeRegistry:
             access=self._take_access(node.node_id),
             blocks=self._pending_blocks(node),
             policy_version=self.policy_version,
-        )
-
-    def reregistered(
-        self,
-        session: NodeSession,
-        outcomes: list[ItemOutcome],
-        last: bool,
-        now: float,
-    ) -> None:
-        node = self.nodes[session.node_id]
-        node.reregistered += sum(1 for o in outcomes if o.result == ItemResult.ADDED)
-        if last and not node.reregister_done:
-            node.reregister_done = True
-            since = node.resumed_at
-            logger.info(
-                "node %s re-registered %d locations%s",
-                node.node_id,
-                node.reregistered,
-                "" if since is None else f" in {now - since:.3f} s",
-            )
-
-    def resumed(self, session: NodeSession) -> bool:
-        """The session's run came back after a MaruServer restart."""
-        node = self.nodes.get(session.node_id)
-        return node is not None and node.resumed_at is not None
-
-    def reregistering(self) -> int:
-        """Resumed runs whose last re-registration batch has not come."""
-        return sum(
-            1
-            for n in self.nodes.values()
-            if n.resumed_at is not None and not n.reregister_done and not n.gone
         )
 
     def node_close(self, session: NodeSession, mode: CloseMode, now: float) -> None:
@@ -805,8 +714,7 @@ class NodeRegistry:
             if node is None:
                 raise OpenError(
                     Status.EPOCH,
-                    f"node {req.node_id} has not opened its session here yet; "
-                    "it may still be resuming",
+                    f"node {req.node_id} has not opened its session here yet",
                 )
             if node.gone or node.node_epoch != req.node_epoch:
                 raise OpenError(
@@ -871,7 +779,6 @@ class NodeRegistry:
             worker_session=session.token,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=False,
         )
 
     def worker_heartbeat(self, session: WorkerSession, now: float) -> None:

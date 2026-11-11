@@ -116,21 +116,17 @@ def test_malformed_request_is_rejected_with_its_header(served, code, payload):
     assert FakeNode(wire, "n1").open().status == Status.OK
 
 
-def test_resume_and_reregister_round_trip(served):
-    server, wire = served
-    server.ms_service.recovery_ends = time.monotonic() + 30  # in the window
+def test_a_started_server_answers_miss_at_once(served):
+    _, wire = served
     node = FakeNode(wire, "n1")
-    opened = node.open(resume=5)
-    assert opened.status == Status.OK and opened.epoch_seq == 5
-    assert opened.recovering  # the default window follows the start
+    assert node.open().status == Status.OK
     k = key("k")
-    response = node.reregister((k, node.loc(node.dram(), 0)), last=True)
-    assert response.status == Status.OK
+    response = node.commit((k, node.loc(node.dram(), 0)))
     assert [i.result.value for i in response.items] == ["ADDED"]
     worker = FakeWorker(wire, node)
-    assert worker.open().recovering
+    assert worker.open().status == Status.OK
     lookup = worker.lookup(k, key("absent"))
-    assert [i.result.value for i in lookup.items] == ["HIT", "RECOVERING"]
+    assert [i.result.value for i in lookup.items] == ["HIT", "MISS"]
 
 
 def test_legacy_requests_keep_their_path(served):
@@ -176,7 +172,6 @@ def test_admin_delete_and_its_cli_over_zmq(served, capsys):
     from maru_server import ms_admin
 
     server, wire = served
-    server.ms_service.recovery_ends = 0.0  # past the window: absent is known
     node = FakeNode(wire, "n1")
     node.open()
     loc = node.loc(node.dram(), 1)

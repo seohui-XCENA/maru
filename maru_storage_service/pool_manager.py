@@ -13,7 +13,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 
 from maru_common.node_protocol import Budgets
@@ -84,9 +84,6 @@ class PoolManager:
         self._waiting: dict[str, tuple[int, float]] = {}
         # When each holder was last asked to return credit
         self._asked: dict[str, float] = {}
-        # (tag, generation): a page given before that generation is
-        # quarantined under tag instead of freed (see hold_frees)
-        self._hold: tuple[str, int] | None = None
         # How many times each transition ran, for tests and metrics
         self.transitions: Transitions = collections.Counter()
         # CREDITs answered short, and the bytes they lacked, by the limit
@@ -185,18 +182,6 @@ class PoolManager:
     @property
     def epoch_seq(self) -> int | None:
         return self._epoch_seq
-
-    def hold_frees(self, tag: str | None) -> None:
-        """From now on, a page given before this call that would become FREE
-        is QUARANTINED under ``tag`` instead: who still reads it is not known.
-        Releasing a quarantine is not held. None ends the hold."""
-        with self._lock:
-            if tag is None:
-                self._hold = None
-                return
-            if self._epoch_seq is None:
-                raise InvalidTransitionError("no hold before the epoch_seq")
-            self._hold = (tag, make_generation(self._epoch_seq, self._counter))
 
     def stop_credit(self, reason: str) -> None:
         """No new credit from now on (safe state, exhausted counter)."""
@@ -488,7 +473,6 @@ class PoolManager:
             return False, reason
 
     def _free_credited(self, page: Page, pool_id: str, holder: str) -> None:
-        """Not held by hold_frees: no reader can have a credited page."""
         table = self._tables[pool_id]
         table.free(page, PageState.CREDITED)
         self._held[holder] -= table.page_size
@@ -560,30 +544,6 @@ class PoolManager:
             self._asked.pop(holder, None)
             return out
 
-    def quarantine_credited(
-        self, tag_of: Callable[[str], str], holders: set[str]
-    ) -> dict[str, int]:
-        """CREDITED -> QUARANTINED for each of ``holders``, under
-        ``tag_of(holder)``; returns the page count by holder."""
-        with self._lock:
-            out: dict[str, int] = {}
-            for table in self._tables.values():
-                for page in table.pages:
-                    holder = page.holder
-                    if (
-                        page.state != PageState.CREDITED
-                        or holder is None
-                        or holder not in holders
-                    ):
-                        continue
-                    table.quarantine(page, PageState.CREDITED, tag_of(holder))
-                    self._held[holder] -= table.page_size
-                    out[holder] = out.get(holder, 0) + 1
-            for holder in out:
-                if self._held[holder] == 0:
-                    del self._held[holder]
-            return out
-
     def release_quarantine(self, tag: str, pool_id: str | None = None) -> int:
         """QUARANTINED -> FREE for pages waiting on ``tag``; returns the count."""
         with self._lock:
@@ -621,12 +581,6 @@ class PoolManager:
                 table.bind(page, location.allocation_id, location.generation)
                 out.append(table.ref(page))
             return out
-
-    def drop_ready(self, ref: PageRef) -> None:
-        """READY -> FREE for a page not in the Catalog (held: QUARANTINED)."""
-        with self._lock:
-            table, page = self._page(ref, PageState.READY)
-            self._to_free(table, page, PageState.READY)
 
     def ready_pages(self) -> list[tuple[PageRef, Key, Location]]:
         """Every READY page with its key and location."""
@@ -756,19 +710,11 @@ class PoolManager:
         return table, table.get(ref, state)
 
     def _to_free(self, table: PageTable, page: Page, src: PageState) -> None:
-        """``src`` -> FREE, or QUARANTINED while its pool is quarantined or
-        hold_frees holds a page this old."""
+        """``src`` -> FREE, or QUARANTINED while its pool is quarantined."""
         if table.pool_id in self._quarantined:
             if src == PageState.QUARANTINED:
                 page.tag = RECOVERY_TAG
             else:
                 table.quarantine(page, src, RECOVERY_TAG)
-            return
-        if (
-            self._hold is not None
-            and src != PageState.QUARANTINED
-            and page.generation < self._hold[1]
-        ):
-            table.quarantine(page, src, self._hold[0])
             return
         table.free(page, src)

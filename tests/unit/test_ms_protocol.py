@@ -39,10 +39,11 @@ MS_CODES = sorted(MS_MESSAGE_CLASSES)
 
 
 def test_codes_are_in_the_multi_storage_range_and_unique():
-    assert len(set(MS_CODES)) == len(MS_CODES) == 19
+    assert len(set(MS_CODES)) == len(MS_CODES) == 17
     assert all(0x40 <= code <= 0x5F for code in MS_CODES)
-    # retired (REGION_REQUEST, REGION_RETURN): never reused
-    assert not {0x5E, 0x5F} & {int(code) for code in MessageType}
+    # retired (NODE_REREGISTER, RELEASE_FINALIZER, REGION_REQUEST,
+    # REGION_RETURN): never reused
+    assert not {0x43, 0x5C, 0x5E, 0x5F} & {int(code) for code in MessageType}
     # the response code keeps the request code below the response bit
     assert all(code & RESPONSE_BIT == 0 for code in MS_CODES)
 
@@ -321,39 +322,6 @@ def test_epoch_seq_fits_64_bit_generations():
     assert make_generation(EPOCH_SEQ_MAX, GENERATION_COUNTER_MAX) == (1 << 64) - 1
     with pytest.raises(ValueError):
         make_generation(EPOCH_SEQ_MAX + 1, 0)
-
-
-def test_release_finalizer_round_trip():
-    from maru_common.protocol import (
-        ReleaseFinalizerRequest,
-        ReleaseFinalizerResponse,
-    )
-    from maru_common.storage_types import (
-        ItemOutcome,
-        ItemResult,
-        KeyLocation,
-        Status,
-    )
-
-    assert MessageType.RELEASE_FINALIZER == 0x5C
-    location = Location("cxl:d:1", "a1", make_generation(3, 7), 0, 8, PoolKind.CXL)
-    request = ReleaseFinalizerRequest(
-        session="s",
-        server_epoch="e",
-        op=OpRef("o", 2, b"d" * 16, 1),
-        items=[KeyLocation(Key("ns", "k"), location)],
-    )
-    ser = Serializer()
-    frame = ser.encode(MessageType.RELEASE_FINALIZER, request)
-    header, decoded = ser.decode_request(frame)
-    assert header.msg_type == MessageType.RELEASE_FINALIZER and decoded == request
-    response = ReleaseFinalizerResponse(
-        status=Status.OK,
-        items=[ItemOutcome(ItemResult.RELEASED), ItemOutcome(ItemResult.ABSENT)],
-    )
-    request_header, _ = ser.decode(frame)
-    _, back = ser.decode_response(ser.encode_response(request_header, response))
-    assert back == response
 
 
 def test_finalizer_fields_round_trip():

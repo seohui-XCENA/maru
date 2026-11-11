@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""StorageService: builds and runs the parts of one node.
+"""StorageService: builds and runs the parts of one node for one run.
 
 Start order: claim the socket, DRAM pool, the node's CXL regions from the RM,
 NODE_OPEN, adopted ledgers, quarantine of the regions an earlier run still
@@ -8,6 +8,11 @@ holds, heartbeat, then accept on the UDS. A GPU node with [dram], [cxl] or
 [dram, cxl] is served; other configs are refused. The top tier gives credit;
 in [dram, cxl] DRAM makes room by demoting its pages to CXL (write-back), and
 CXL by dropping its own.
+
+A run ends on its own when MaruServer restarted or ended it, when a result
+stays unknown (both close with restart), or when the RM lease is lost (leave);
+Node then starts a new run in the same process. When the RM says another run
+claimed the node, the run leaves and no new run starts.
 """
 
 import logging
@@ -22,6 +27,7 @@ from maru_shm.client import MaruShmClient
 from .config import NodeConfig, NodeConfigError
 from .drivers.cxl import (
     DEFAULT_RENEW_S,
+    OWN_HOLDER,
     CxlRegionPool,
     CxlTier,
     RegionSource,
@@ -34,7 +40,7 @@ from .op_ledger import OP_WINDOW
 from .peer_watcher import PeerWatcher
 from .placement import DEFAULT_KEPT_BACKOFF_S, PlacementPolicy
 from .pool_manager import PageState, PoolManager
-from .ports import ServerStopped
+from .ports import EpochChanged, ServerStopped
 from .server_client import ServerClient
 from .storage_manager import (
     DEFAULT_EVICT_INTERVAL_S,
@@ -48,6 +54,8 @@ logger = logging.getLogger(__name__)
 
 # How long a leave waits for the workers to unmap the CXL regions
 DEFAULT_UNMAP_TIMEOUT_S = 30.0
+# Pause between a run that ended and the next one
+NEW_RUN_PAUSE_S = 1.0
 
 
 class NotServableError(RuntimeError):
@@ -98,7 +106,7 @@ class StorageService:
         self.config = config
         self.node_epoch = node_epoch or uuid.uuid4().hex
         # This process's RM hold on the regions it maps for those copies
-        self.own_holder = run_holder("ss", self.node_epoch)
+        self.own_holder = run_holder(OWN_HOLDER, self.node_epoch)
         self.rpc_timeout_s = rpc_timeout_s
         self.gpu_drain_grace_s = gpu_drain_grace_s
         self.evict_interval_s = evict_interval_s
@@ -113,8 +121,9 @@ class StorageService:
         self.transfers: TransferEngine | None = None
         self.dram: DramPool | None = None
         self.cxl: CxlTier | None = None
-        # Why the run let go of its CXL regions and stopped, if it did
-        self.lost: str | None = None
+        # Why the run ended on its own, and whether a new run follows
+        self.ended: str | None = None
+        self.new_run = False
         self._interrupted = threading.Event()
         self._finished = threading.Event()
         # One stop at a time, and never while a start is half done
@@ -131,10 +140,19 @@ class StorageService:
         self._stopped = threading.Event()
 
     def start(self) -> None:
-        """Bring the node up; on failure everything started is undone."""
+        """Bring the node up; on failure everything started is undone.
+        ServerStopped if stopped meanwhile, or if the run ended during the
+        start (``ended``)."""
         try:
             with self._lifecycle:
                 self._start()
+        except EpochChanged as e:
+            self._end_run(
+                f"MaruServer no longer knows the session ({e})",
+                CloseMode.RESTART,
+                new_run=True,
+            )
+            raise ServerStopped(str(e)) from e
         except BaseException:
             self.stop(CloseMode.RESTART)
             raise
@@ -208,6 +226,8 @@ class StorageService:
             rpc_timeout_s=self.rpc_timeout_s,
             host_boot_id=self.host_boot_id,
         )
+        if self._interrupted.is_set():  # before interrupt() could stop it
+            raise ServerStopped()
         placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
         if (
             cxl_tier is not None
@@ -231,6 +251,9 @@ class StorageService:
             traits=traits,
             on_worker_settled=self._worker_settled,
             transfers=self.transfers,
+            on_end=lambda reason: self._end_run(
+                reason, CloseMode.RESTART, new_run=True
+            ),
         )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
         self._credit_kinds = {
@@ -350,13 +373,18 @@ class StorageService:
 
     def _end_quarantine(self, pool_id: str) -> None:
         """No earlier run holds the pool: its quarantined pages are free, and
-        it gives credit if its tier does. Never after a stop began."""
-        assert self.pools is not None
+        it gives credit if its tier does and MaruServer did not call it
+        invalid. Never after a stop began."""
+        assert self.pools is not None and self.manager is not None
         with self._stop_lock:
             if self._stopped.is_set():
                 return
             info = self.pools.pool_info(pool_id)
-            creditable = info is not None and info.kind in self._credit_kinds
+            creditable = (
+                info is not None
+                and info.kind in self._credit_kinds
+                and not self.manager.is_invalid(pool_id)
+            )
             freed = self.pools.end_pool_quarantine(pool_id, creditable)
         logger.info(
             "pool %s: no earlier run holds it; %d quarantined pages are free",
@@ -377,12 +405,21 @@ class StorageService:
 
     def _lose_regions(self, reason: str) -> None:
         """The lease may end: stop with leave so no location keeps pointing at
-        the regions and no worker copies into them (spec 4.4). Runs on the
-        lease thread, so the stop runs on its own."""
-        self.lost = reason
-        threading.Thread(
-            target=self.stop, args=(CloseMode.LEAVE,), name="maru-cxl-lost"
-        ).start()
+        the regions and no worker copies into them. A new run follows unless
+        another run claimed the node."""
+        assert self.cxl is not None
+        self._end_run(reason, CloseMode.LEAVE, new_run=not self.cxl.claimed_elsewhere)
+
+    def _end_run(self, reason: str, mode: CloseMode, new_run: bool) -> None:
+        """The run ends on its own: stop with ``mode`` on a thread of its own
+        (the caller may be a thread the stop joins). The first reason wins;
+        none after a stop began."""
+        with self._stop_lock:
+            if self.ended is not None or self._stopped.is_set():
+                return
+            self.ended, self.new_run = reason, new_run
+        logger.warning("run %s ends (%s): %s", self.node_epoch, mode.value, reason)
+        threading.Thread(target=self.stop, args=(mode,), name="maru-run-end").start()
 
     def stop(self, mode: CloseMode = CloseMode.RESTART) -> None:
         """Stop serving, then NODE_CLOSE (restart: back soon; leave: gone)."""
@@ -451,7 +488,7 @@ class StorageService:
         for pool in cxl.pools:
             self.pools.disable_pool(pool.pool_id)
         timeout = self.unmap_timeout_s
-        if self.lost is not None:  # the RM may free them once the lease ends
+        if self.ended is not None:  # the RM may free them once the lease ends
             timeout = min(timeout, cxl.time_left() / 2)
         done = self.manager.unmap_pools(
             [(p.pool_id, p.pool_generation) for p in cxl.pools], max(0.0, timeout)
@@ -465,3 +502,61 @@ class StorageService:
     def wait_finished(self, timeout: float | None = None) -> bool:
         """Whether a stop has run to its end."""
         return self._finished.wait(timeout)
+
+
+class Node:
+    """Runs of the node's StorageService, one after another in this process:
+    a run that ends on its own and asks for a new one is followed by a new
+    run with a new node_epoch. Workers re-attach to it as after a process
+    restart."""
+
+    def __init__(
+        self,
+        config: NodeConfig,
+        make_service: Callable[[NodeConfig], StorageService] = StorageService,
+        pause_s: float = NEW_RUN_PAUSE_S,
+    ):
+        check_servable(config)
+        self.config = config
+        self._make_service = make_service
+        self.pause_s = pause_s
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self.service: StorageService | None = None
+        self.runs = 0
+        # Why the last run ended on its own
+        self.ended: str | None = None
+
+    def stop(self) -> None:
+        """End the current run with restart and start no other; any thread."""
+        self._stop.set()
+        with self._lock:
+            service = self.service
+        if service is not None:
+            service.interrupt()
+
+    def run(self) -> bool:
+        """Serve until stop() (True) or until another run claimed the node
+        (False). A start that fails raises."""
+        while True:
+            with self._lock:
+                if self._stop.is_set():
+                    return True
+                service = self.service = self._make_service(self.config)
+                self.runs += 1
+            try:
+                service.start()
+            except ServerStopped:
+                pass  # stopped, or the run ended during its start
+            while not self._stop.wait(0.1) and not service.wait(0):
+                pass
+            if service.ended is None:
+                service.stop(CloseMode.RESTART)
+                return True
+            service.wait_finished()
+            self.ended = service.ended
+            if not service.new_run:
+                return False
+            logger.warning("starting a new run after: %s", service.ended)
+            if self._stop.wait(self.pause_s):
+                return True

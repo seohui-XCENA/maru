@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """Restarts with real processes: MaruServer killed (SIGKILL) and started again
-on the same port, and a StorageService killed and started again. Workers are
-separate processes (MaruHandler on maru_node); no RM needed."""
+on the same port, after which the node serves a new run in the same process,
+and a StorageService killed and started again. Workers are separate processes
+(MaruHandler on maru_node); no RM needed."""
 
 import hashlib
 import json
@@ -10,11 +11,13 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
 from maru_storage_service.pool_manager import PageState
+from maru_storage_service.service import Node, StorageService
 from tests.integration.test_ms_s2_real_server import (
     RealMaruServer,
     _raw_config,
@@ -29,13 +32,12 @@ from tests.unit.ms_node_helpers import (
     node_config,
     remove_tree,
     short_tmpdir,
-    start_node,
     wait_until,
 )
+from tests.unit.test_ms_new_run import new_run
 
 pytestmark = pytest.mark.integration
 
-WINDOW_S = 10.0
 SMALL_CREDIT = {
     "credit_max_bytes": 2 * PAGE,
     "credit_total_max_bytes": 4 * PAGE,
@@ -57,9 +59,7 @@ def servers(workdir):
     made = []
 
     def make(port=None):
-        server = RealMaruServer(
-            workdir, 6.0, 0.3, port=port, recovery_window_s=WINDOW_S
-        )
+        server = RealMaruServer(workdir, 6.0, 0.3, port=port)
         made.append(server)
         return server
 
@@ -70,19 +70,25 @@ def servers(workdir):
 
 @pytest.fixture
 def nodes(workdir):
+    """A Node serving its runs on a thread of its own."""
     made = []
 
     def make(server, **kwargs):
-        node = start_node(
+        node = Node(
             node_config(server.url, f"{workdir}/node.sock", **kwargs),
-            rpc_timeout_s=0.5,
+            lambda c: StorageService(c, rpc_timeout_s=0.5),
+            pause_s=0.2,
         )
-        made.append(node)
+        thread = threading.Thread(target=node.run, daemon=True)
+        thread.start()
+        made.append((node, thread))
+        new_run(node, None)
         return node
 
     yield make
-    for node in made:
+    for node, thread in made:
         node.stop()
+        thread.join(30)
 
 
 @pytest.fixture
@@ -132,11 +138,11 @@ def readable(agent, key: str) -> bool:
     return got is not None
 
 
-def used_share(node) -> float:
+def used_share(service) -> float:
     """Share of the DRAM pool not free: above high, eviction would run."""
-    (pool_id,) = node.pools.pool_ids()
-    capacity = node.pools.pool_info(pool_id).capacity
-    return 1 - node.pools.bytes_in(PageState.FREE, pool_id) / capacity
+    (pool_id,) = service.pools.pool_ids()
+    capacity = service.pools.pool_info(pool_id).capacity
+    return 1 - service.pools.bytes_in(PageState.FREE, pool_id) / capacity
 
 
 def restart_server(server, servers):
@@ -146,9 +152,21 @@ def restart_server(server, servers):
     return servers(port=port)
 
 
-def test_maruserver_killed_during_reads_comes_back(servers, nodes, agents):
+def on_run(agent, service) -> None:
+    """The worker re-attached to ``service``."""
+    wait_until(
+        lambda: agent.call("state")["node_epoch"] == service.node_epoch,
+        timeout=30,
+        what="attached to the new run",
+    )
+
+
+def test_maruserver_killed_during_reads_brings_a_new_run(servers, nodes, agents):
+    """The new MaruServer knows no KV: the node serves a new run, the workers
+    re-attach without a restart, the old keys miss and new ones are served."""
     server = servers()
     node = nodes(server)
+    first = node.service
     writer = agents(node.config.socket, "writer")
     reader = agents(node.config.socket, "reader", read_only=True)
     keys = [f"k{i}" for i in range(10)]
@@ -158,26 +176,26 @@ def test_maruserver_killed_during_reads_comes_back(servers, nodes, agents):
     for i in range(40):
         if i == 10:
             server = restart_server(server, servers)
-        key = keys[i % len(keys)]
-        if not readable(reader, key):
-            misses += 1  # down, recovering or not re-registered yet
-    wait_until(lambda: node.manager.recoveries == 1, timeout=30, what="recovery")
-    for key in keys:
-        wait_until(lambda key=key: readable(reader, key), timeout=30, what=key)
-    stats = node.manager.stats()
-    assert stats["last_reregistration"]["added"] == len(keys)
-    assert stats["safe_state"] is None
-    assert reader.call("state")["server_epoch"] == server.server_epoch
-    counters = reader.call("state")["stats"]
-    assert counters.get("retrieve_unavailable", 0) >= misses > 0
+        if not readable(reader, keys[i % len(keys)]):
+            misses += 1
+    second = new_run(node, first)
+    assert "restarted" in first.ended
+    on_run(writer, second)
+    on_run(reader, second)
+    assert misses > 0
+    assert not any(readable(reader, key) for key in keys)
     assert store(writer, "after")
-    assert readable(reader, "after")
-    node.pools.check()
+    wait_until(lambda: readable(reader, "after"), timeout=30, what="after")
+    assert reader.call("state")["server_epoch"] == server.server_epoch
+    second.pools.check()
 
 
 def test_a_pinned_page_never_changes_until_released(servers, nodes, agents):
+    """A read of the old run goes on through the old memfd while the new run
+    fills its own pool past the high watermark."""
     server = servers()
     node = nodes(server, high=0.5, low=0.25, budgets=SMALL_CREDIT)
+    first = node.service
     writer = agents(node.config.socket, "writer")
     reader = agents(node.config.socket, "reader", read_only=True)
     assert store(writer, "pinned")
@@ -186,68 +204,48 @@ def test_a_pinned_page_never_changes_until_released(servers, nodes, agents):
     for i in range(4):
         assert store(writer, f"a{i}")
     server = restart_server(server, servers)
-    wait_until(lambda: node.manager.recoveries == 1, timeout=30, what="recovery")
-    # Writes go on past the high watermark; nothing old may be reused while
-    # the reader may still read a page pinned at the ended MaruServer
+    second = new_run(node, first)
+    on_run(writer, second)
     stored = 0
     for i in range(30):
-        stored += try_store(writer, f"b{i}")  # skipped once the pool is full
+        stored += try_store(writer, f"b{i}")
         assert reader.call("held", key="pinned") == expected
     assert stored > 0
-    assert used_share(node) > 0.5  # above the high watermark
-    assert node.manager.workers.server_drain_open()
-    waiting = node.manager.stats()["server_drain_waiting"]
-    assert set(waiting) == {reader.incarnation}
-    assert node.pools.bytes_in(PageState.RETIRING) == 0
-    assert sum(node.manager.retire_results.values()) == 0
-    reader.call("release", key="pinned")
     wait_until(
-        lambda: not node.manager.workers.server_drain_open(), timeout=30, what="drain"
-    )
-    wait_until(
-        lambda: sum(node.manager.retire_results.values()) > 0,
+        lambda: sum(second.manager.retire_results.values()) > 0,
         timeout=30,
-        what="eviction again",
+        what="the new run evicts",
     )
+    assert reader.call("held", key="pinned") == expected
+    reader.call("release", key="pinned")
     assert store(writer, "later")
-    assert readable(reader, "later")
-    node.pools.check()
+    on_run(reader, second)
+    wait_until(lambda: readable(reader, "later"), timeout=30, what="later")
+    second.pools.check()
 
 
-def test_an_unresponsive_worker_pauses_eviction_until_it_exits(servers, nodes, agents):
+def test_a_silent_worker_does_not_hold_up_the_new_run(servers, nodes, agents):
     server = servers()
     node = nodes(server, high=0.5, low=0.25, budgets=SMALL_CREDIT)
+    first = node.service
     writer = agents(node.config.socket, "writer")
     silent = agents(node.config.socket, "silent", read_only=True)
     for i in range(6):
         assert store(writer, f"a{i}")
     silent.proc.send_signal(signal.SIGSTOP)  # alive, never answers
     server = restart_server(server, servers)
-    wait_until(lambda: node.manager.recoveries == 1, timeout=30, what="recovery")
-    wait_until(
-        lambda: (
-            set(node.manager.stats()["server_drain_waiting"]) == {silent.incarnation}
-        ),
-        timeout=30,
-        what="only the silent worker left",
-    )
+    second = new_run(node, first)
+    on_run(writer, second)
     for i in range(10):
-        try_store(writer, f"b{i}")  # skipped once no page is free
-    time.sleep(1.0)
-    assert used_share(node) > 0.5  # above the high watermark
-    assert sum(node.manager.retire_results.values()) == 0  # eviction paused
-    assert node.manager.workers.server_drain_open()
-    silent.kill()  # its exit is confirmed by the process watcher
+        try_store(writer, f"b{i}")
     wait_until(
-        lambda: not node.manager.workers.server_drain_open(), timeout=30, what="drain"
-    )
-    wait_until(
-        lambda: sum(node.manager.retire_results.values()) > 0,
+        lambda: sum(second.manager.retire_results.values()) > 0,
         timeout=30,
-        what="eviction again",
+        what="eviction",
     )
-    assert node.pools.bytes_in(PageState.QUARANTINED) == 0
+    assert used_share(second) <= 0.75
     assert store(writer, "later")
+    silent.kill()
 
 
 def _storage_cli(config_path: str, log_path: str) -> subprocess.Popen:

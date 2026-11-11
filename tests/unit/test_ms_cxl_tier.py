@@ -3,6 +3,7 @@
 """The cxl tier: claiming the node's regions from the RM, the lease, letting
 go, and the StorageService registering them."""
 
+import dataclasses
 import threading
 import time
 
@@ -59,6 +60,8 @@ class FakeRm:
         # region_id -> holder -> its record; the RM keeps them across runs
         self.holds: dict[int, dict[str, RegionHolder]] = {}
         self.unholds: list[tuple[int, str]] = []
+        self.unhold_errors = 0  # unholds that fail before one gets through
+        self.holds_error: Exception | None = None  # what NODE_HOLDS raises
         self.dax_path = "/dev/dax9.0"  # what NODE_HOLD answers
 
     def _check(self, node_id: str, node_epoch: str) -> None:
@@ -123,6 +126,8 @@ class FakeRm:
 
     def node_holds(self, node_id, node_epoch):
         self.calls.append("holds")
+        if self.holds_error is not None:
+            raise self.holds_error
         self._check(node_id, node_epoch)
         return [
             NodeRegion(
@@ -136,6 +141,9 @@ class FakeRm:
         ]
 
     def unhold(self, handle, holder, instance):
+        if self.unhold_errors:
+            self.unhold_errors -= 1
+            raise ConnectionRefusedError("RM down")
         self.unholds.append((handle.region_id, holder))
         self.holds.get(handle.region_id, {}).pop(holder, None)
 
@@ -432,7 +440,8 @@ def test_a_lost_lease_stops_the_run_with_leave(fake, sockdir):
     node = cxl_node(fake, sockdir, rm)
     rm.epochs["gpu-test"] = "someone-else"
     assert node.wait_finished(5.0)
-    assert node.lost and "no longer counts this run" in node.lost
+    assert node.ended and "no longer counts this run" in node.ended
+    assert not node.new_run  # another run claimed the node
     assert not fake.nodes["gpu-test"].online  # closed with leave
 
 
@@ -511,7 +520,7 @@ def test_a_lease_lost_during_the_start_stops_it(fake, sockdir):
     starter.join(10)
     fake.resume()
     assert not starter.is_alive()
-    assert service.wait_finished(5.0) and service.lost
+    assert service.wait_finished(5.0) and service.ended
     assert service.manager is None or service.local is None or not service.local.started
 
 
@@ -988,6 +997,7 @@ class HoldingRm:
         self.path = path
         self.calls: list[tuple] = []
         self.refuse: Exception | None = None
+        self.unhold_error: Exception | None = None  # the next unhold raises it
 
     def node_hold(self, node_id, node_epoch, handle, holder, **who):
         self.calls.append(("hold", handle.region_id, holder, node_epoch))
@@ -1005,6 +1015,9 @@ class HoldingRm:
 
     def unhold(self, handle, holder, instance):
         self.calls.append(("unhold", handle.region_id, holder))
+        if self.unhold_error is not None:
+            error, self.unhold_error = self.unhold_error, None
+            raise error
 
 
 @pytest.fixture
@@ -1020,6 +1033,14 @@ def holding_rm(monkeypatch):
     monkeypatch.setattr(pool_maps, "_HOLDS", pool_maps.RegionHolds())
     yield rm
     os.close(fd)
+
+
+def unheld(rm):
+    """The last RM call once every queued unhold went out."""
+    from maru_handler.client import pool_maps
+
+    assert pool_maps._HOLDS.unholds.flush(5)
+    return rm.calls[-1]
 
 
 def _cxl_descriptor(region_pages: int = 2, epoch: str = "e1"):
@@ -1049,7 +1070,7 @@ def test_a_worker_holds_a_region_before_mapping_and_unholds_after(holding_rm):
     maps.add_dax(descriptor, "e1")  # the same run maps it again: no new hold
     assert holding_rm.calls[-1] == ("access", 5)
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
 
 
 def test_each_run_holds_apart_and_the_old_runs_hold_goes_with_its_mapping(
@@ -1067,9 +1088,9 @@ def test_each_run_holds_apart_and_the_old_runs_hold_goes_with_its_mapping(
     maps.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # retires the old mapping
     assert holding_rm.calls == [("hold", 5, "w1@e1", "e1"), ("hold", 5, "w1@e2", "e2")]
     view.release()  # the old mapping closes
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
     assert maps.remove(old.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e2")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e2")
 
 
 def test_a_hold_name_fits_the_rm():
@@ -1106,7 +1127,7 @@ def test_a_mapping_still_in_use_keeps_its_hold(holding_rm):
     assert holding_rm.calls == [("hold", 5, "w1@e1", "e1")]
     view.release()
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
 
 
 def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
@@ -1125,7 +1146,7 @@ def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
     maps.add_dax(second, "e1")  # retires the first mapping
     assert [c[0] for c in holding_rm.calls] == ["hold", "access"]
     assert maps.remove(first.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
 
 
 def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
@@ -1138,7 +1159,7 @@ def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
     with pytest.raises(OSError):
         maps.add_dax(descriptor, "e1")
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
 
 
 def test_a_forgotten_detached_worker_counts_as_settled():
@@ -1157,3 +1178,278 @@ def test_a_forgotten_detached_worker_counts_as_settled():
         registry._settles_at["w"] = 0.0  # what forgetting a detached one records
     assert registry.settled("w")
     registry.stop()
+
+
+# =============================================================================
+# Unholds that fail are sent again; the node drops its own ended runs' holds
+# =============================================================================
+
+
+def test_a_worker_drops_a_hold_off_the_releasing_thread_and_again_on_failure(
+    holding_rm,
+):
+    from maru_handler.client.pool_maps import PoolMaps, RegionHolder
+
+    maps = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
+    descriptor = _cxl_descriptor()
+    maps.add_dax(descriptor, "e1")
+    gate = threading.Event()
+    unhold = holding_rm.unhold
+
+    def slow_unhold(handle, holder, instance):
+        assert gate.wait(5)
+        unhold(handle, holder, instance)
+
+    holding_rm.unhold = slow_unhold
+    holding_rm.unhold_error = ConnectionRefusedError("RM down")
+    started = time.monotonic()
+    assert maps.remove(descriptor.pool.pool_id)
+    assert time.monotonic() - started < 1.0  # the RM is not waited on
+    gate.set()
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert [c for c in holding_rm.calls if c[0] == "unhold"] == [
+        ("unhold", 5, "w1@e1")
+    ] * 2  # failed once, then confirmed
+
+
+def test_a_hold_wanted_again_is_not_dropped(holding_rm):
+    """A drop still queued when the run maps the region again is taken back."""
+    from maru_handler.client import pool_maps
+    from maru_handler.client.pool_maps import PoolMaps, RegionHolder
+
+    gate = threading.Event()
+    unhold = holding_rm.unhold
+
+    def slow_unhold(handle, holder, instance):
+        assert gate.wait(5)
+        unhold(handle, holder, instance)
+
+    holding_rm.unhold = slow_unhold
+    maps = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
+    descriptor = _cxl_descriptor()
+    other = dataclasses.replace(
+        descriptor,
+        dax=dataclasses.replace(
+            descriptor.dax,
+            handle=dataclasses.replace(descriptor.dax.handle, region_id=6),
+        ),
+        pool=dataclasses.replace(descriptor.pool, pool_id=cxl_pool_id(DOMAIN, 6)),
+    )
+    maps.add_dax(other, "e1")
+    assert maps.remove(other.pool.pool_id)  # its drop holds up the queue
+    maps.add_dax(descriptor, "e1")
+    assert maps.remove(descriptor.pool.pool_id)  # queued behind it
+    maps.add_dax(descriptor, "e1")  # mapped again before it went out
+    gate.set()
+    assert pool_maps._HOLDS.unholds.flush(5)
+    dropped = [c for c in holding_rm.calls if c[0] == "unhold"]
+    assert dropped == [("unhold", 6, "w1@e1")]
+    assert holding_rm.calls.count(("hold", 5, "w1@e1", "e1")) == 2
+
+
+def test_the_node_sends_a_failed_unhold_again():
+    from maru_storage_service.drivers.cxl import UNHOLDS
+
+    rm = FakeRm()
+    t = tier(rm)
+    t.claim(threading.Event())
+    region = t.pools[0].region
+    rm.hold(region, "ss@e1", "e1")
+    rm.unhold_errors = 2
+    t.unhold("ss@e1")
+    assert UNHOLDS.flush(10)
+    assert "ss@e1" not in rm.holds[region.handle.region_id]
+    assert rm.unhold_errors == 0
+
+
+def _dead_pid() -> int:
+    import os
+
+    pid = 4_000_000
+    while os.path.exists(f"/proc/{pid}"):
+        pid -= 1
+    return pid
+
+
+def test_an_ended_runs_own_hold_is_dropped_at_the_start():
+    """This process's earlier run (its teardown unmapped) and one of a process
+    that is gone, judged from this host, boot and pid namespace; not another
+    namespace's, nor a worker's (the RM's own reaper judges those)."""
+    import platform
+
+    from maru_common.node_protocol import process_identity
+
+    rm = FakeRm()
+    region = rm.region(2 * PAGE)
+    rm.regions["n"] = [region]
+    boot, pid, start, ns = process_identity()
+    host, rid = platform.node(), region.handle.region_id
+    dead = _dead_pid()
+    rm.holds[rid] = {
+        "ss@e0": RegionHolder("ss@e0", "e0", host, boot, pid, start, ns),
+        "ss@e8": RegionHolder("ss@e8", "e8", host, boot, dead, 7, ns),
+        "ss@e9": RegionHolder("ss@e9", "e9", host, boot, dead, 7, ns + 1),
+        "w@e0": RegionHolder("w@e0", "e0", host, boot, dead, 7, ns),
+    }
+    t = tier(rm, epoch="e1")
+    t.claim(threading.Event())
+    assert t.earlier_holds() == {t.pools[0].pool_id: {"ss@e9", "w@e0"}}
+    assert sorted(h for _, h in rm.unholds) == ["ss@e0", "ss@e8"]
+
+
+def test_an_rm_without_node_holds_refuses_the_start_while_regions_are_held():
+    from maru_shm.types import NodeOwnershipUnsupportedError
+
+    rm = FakeRm()
+    rm.holds_error = NodeOwnershipUnsupportedError("old RM")
+    plain = tier(rm, epoch="e1")
+    plain.claim(threading.Event())  # nothing held: NODE_HOLDS is not needed
+    region = rm.region(2 * PAGE)
+    rm.regions["n"].append(region)
+    rm.hold(region, "w@e1", "e1")
+    with pytest.raises(CxlTierError, match="upgrade the RM"):
+        tier(rm, epoch="e2").claim(threading.Event())
+
+
+def test_a_region_no_longer_the_nodes_is_watched_no_more(caplog):
+    import logging
+
+    rm = FakeRm()
+    gone, kept = rm.region(2 * PAGE), rm.region(2 * PAGE)
+    rm.regions["n"] = [gone, kept]
+    rm.hold(gone, "w@e0", "e0")
+    rm.hold(kept, "w@e0", "e0")
+    t = tier(rm, epoch="e1")
+    t.claim(threading.Event())
+    log = logging.getLogger("maru_storage_service.drivers.cxl")
+    log.addHandler(caplog.handler)
+    cleared = []
+    try:
+        caplog.set_level(logging.INFO, logger=log.name)
+        rm.regions["n"] = [kept]  # an operator freed it
+        t.watch_holds(cleared.append, interval_s=0.01)
+        wait_until(
+            lambda: set(t.earlier_holds()) == {t.pools[1].pool_id}, what="dropped"
+        )
+        time.sleep(0.1)
+    finally:
+        log.removeHandler(caplog.handler)
+        t.stop()
+    assert cleared == []
+    notes = {id(r) for r in caplog.records if "no longer the node's" in r.getMessage()}
+    assert len(notes) == 1
+
+
+def test_regions_still_held_are_logged_with_a_hint(caplog, monkeypatch):
+    import logging
+
+    from maru_storage_service.drivers import cxl
+
+    monkeypatch.setattr(cxl, "HOLDS_LOG_S", 0.0)
+    rm = FakeRm()
+    region = rm.region(2 * PAGE)
+    rm.regions["n"] = [region]
+    rm.hold(region, "w@e0", "e0")
+    t = tier(rm, epoch="e1")
+    t.claim(threading.Event())
+    log = logging.getLogger("maru_storage_service.drivers.cxl")
+    log.addHandler(caplog.handler)
+    try:
+        caplog.set_level(logging.INFO, logger=log.name)
+        t.watch_holds(lambda pool_id: None, interval_s=0.01)
+        wait_until(
+            lambda: any("drop-holds" in r.getMessage() for r in caplog.records),
+            what="the hint",
+        )
+    finally:
+        log.removeHandler(caplog.handler)
+        t.stop()
+    (hint, *_) = [
+        r.getMessage() for r in caplog.records if "drop-holds" in r.getMessage()
+    ]
+    assert "w@e0" in hint and "maru-rm-ctl drop-holds <holder> --confirm" in hint
+
+
+def test_an_invalid_pool_gives_no_credit_when_its_quarantine_ends(fake, sockdir):
+    from maru_storage_service.pool_manager import PageRef
+
+    rm = FakeRm()
+    region = rm.region(2 * PAGE)
+    rm.regions["gpu-test"] = [region]
+    rm.hold(region, "w@e0", "e0")
+    node = cxl_node(fake, sockdir, rm, node_epoch="e1")
+    try:
+        pool_id = node.cxl.pools[0].pool_id
+        node.manager._pool_invalid(PageRef(pool_id, 0, 0))
+        rm.unhold(region.handle, "w@e0", "w@e0")
+        wait_until(lambda: not node.pools.pool_quarantined(pool_id), what="ended")
+        assert not node.pools.creditable(pool_id)
+    finally:
+        node.stop()
+
+
+# =============================================================================
+# A read goes through the mapping of the run its lookup was answered under
+# =============================================================================
+
+
+class _Unpins:
+    def __init__(self):
+        self.pins: list[str] = []
+
+    def unpin(self, pin_ids):
+        self.pins.extend(pin_ids)
+
+
+def _lookup_client():
+    from maru_common.config import MaruConfig
+    from maru_handler.client.maru_client import MaruClient
+    from maru_handler.client.pool_maps import PoolMaps, RegionHolder
+
+    client = MaruClient(
+        MaruConfig(
+            maru_node="/nonexistent/node.sock",
+            engine_id="e",
+            cache_namespace="ns",
+            auto_connect=False,
+            pin_pools=False,
+        )
+    )
+    client.pools = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
+    return client
+
+
+def _hit(pin_id: str):
+    from maru_common.storage_types import ItemOutcome, ItemResult, Location
+
+    location = Location(cxl_pool_id(DOMAIN, 5), "a", 1, 0, PAGE, PoolKind.CXL)
+    return ItemOutcome(ItemResult.HIT, location=location, pin_id=pin_id)
+
+
+def test_a_lookup_of_an_earlier_run_is_not_read_through_the_new_mapping(holding_rm):
+    """The new run released that run's pins: the page may be reused under a
+    read through the new run's mapping of the same region."""
+    client = _lookup_client()
+    client.pools.add_dax(_cxl_descriptor(epoch="e1"), "e1")
+    client.pools.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # re-attached
+    client.node_epoch = "e2"
+    server = _Unpins()
+    assert client._take_outcome(server, "k", _hit("p1"), "srv", "e1") is None
+    assert server.pins == ["p1"] and not client._reads
+    assert client.stats["retrieve_unavailable"] == 1
+    read = client._take_outcome(server, "k", _hit("p2"), "srv", "e2")
+    assert read is not None
+    client.release_retrieved([read])
+
+
+def test_an_earlier_runs_mapping_keeps_its_hold_while_it_serves_a_read(holding_rm):
+    client = _lookup_client()
+    client.pools.add_dax(_cxl_descriptor(epoch="e1"), "e1")
+    client.node_epoch = "e1"
+    read = client._take_outcome(_Unpins(), "k", _hit("p1"), "srv", "e1")
+    assert read is not None
+    client.pools.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # re-attached
+    client.node_epoch = "e2"
+    assert unheld(holding_rm) == ("hold", 5, "w1@e2", "e2")  # e1's stays
+    client.release_retrieved([read])  # the old mapping closes
+    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")

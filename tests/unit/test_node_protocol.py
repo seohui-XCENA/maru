@@ -50,8 +50,9 @@ def pair():
 
 
 def test_codes_are_unique_and_below_the_response_bit():
-    assert len(set(CODES)) == len(CODES) == 13
+    assert len(set(CODES)) == len(CODES) == 12
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
+    assert 0x28 not in CODES  # DRAIN_ACK, retired: never reused
 
 
 @pytest.mark.parametrize("code", CODES, ids=lambda c: NodeMessageType(c).name)
@@ -178,7 +179,7 @@ class TestDescriptors:
             NodeMessageType.ATTACH | RESPONSE_BIT, sample(AttachResponse)
         )
         second = ser.encode(
-            NodeMessageType.NOTIFY, Notify(kind=NotifyKind.EPOCH, node_epoch="n2")
+            NodeMessageType.NOTIFY, Notify(kind=NotifyKind.CREDIT_RETURN, bytes=4096)
         )
         try:
             send_frame(a, first, [fd])
@@ -207,10 +208,12 @@ def test_peer_credentials(pair):
 def test_notify_uses_sequence_zero():
     ser = Serializer(NODE_MESSAGE_CLASSES)
     frame = ser.encode(
-        NodeMessageType.NOTIFY, Notify(kind=NotifyKind.DRAIN), seq=NOTIFY_SEQUENCE
+        NodeMessageType.NOTIFY,
+        Notify(kind=NotifyKind.POOL_REMOVE),
+        seq=NOTIFY_SEQUENCE,
     )
     header, decoded = ser.decode_request(frame)
-    assert header.sequence == 0 and decoded.kind is NotifyKind.DRAIN
+    assert header.sequence == 0 and decoded.kind is NotifyKind.POOL_REMOVE
 
 
 # ---------------------------------------------------------------------------

@@ -363,11 +363,11 @@ class TestOutcomeCounters:
             fake.catalog[entry.key] = [entry]
             fake.by_loc[("dram:other:o", "x", 1)] = entry
 
-        def recovering(response):
-            response.items[-1] = ItemOutcome(ItemResult.RECOVERING)
+        def offline(response):
+            response.items[-1] = ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
             return response
 
-        fake.rewrite_responses(MessageType.LOOKUP_AND_PIN, recovering)
+        fake.rewrite_responses(MessageType.LOOKUP_AND_PIN, offline)
         reads = handler.batch_retrieve(["here", "gone", "remote", "late"])
         assert reads[0] is not None and reads[1:] == [None, None, None]
         handler.release_retrieved(reads)
@@ -376,7 +376,7 @@ class TestOutcomeCounters:
         assert stats["retrieve_not_found"] == 1
         assert stats["retrieve_fetch"] == 1
         assert stats["retrieve_unavailable"] == 1
-        assert stats["retrieve_unavailable_recovering"] == 1
+        assert stats["retrieve_unavailable_offline"] == 1
 
         fake.pause(hold=False)
         assert handler.batch_retrieve(["here"]) == [None]

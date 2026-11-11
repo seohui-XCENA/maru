@@ -4,8 +4,7 @@
 
 Keeps a Catalog, pins, sessions and op ledgers by MsService's rules.
 Failure injection: pause/resume, drop_responses, drop_requests, delay, restart
-(a new server epoch with no state, as after a crash; nodes resume and
-re-register).
+(a new server epoch with no state, as after a crash; nodes start new runs).
 """
 
 import collections
@@ -31,10 +30,8 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenResponse,
     NodeRecoverListResponse,
-    NodeReregisterResponse,
     ProbeResponse,
     RecoverItem,
-    ReleaseFinalizerResponse,
     RetireResponse,
     UnpinResponse,
     WorkerCloseResponse,
@@ -73,14 +70,11 @@ OP_CODES = {
     MessageType.RETIRE,
     MessageType.FINALIZE_MOVE,
     MessageType.FETCH_COMPLETE,
-    MessageType.RELEASE_FINALIZER,
-    MessageType.NODE_REREGISTER,
     MessageType.WORKER_EXIT,
 }
 NODE_CODES = {
     MessageType.NODE_HEARTBEAT,
     MessageType.NODE_CLOSE,
-    MessageType.NODE_REREGISTER,
     MessageType.NODE_RECOVER_LIST,
     MessageType.WORKER_EXIT,
     MessageType.SOURCE_PIN,
@@ -88,7 +82,6 @@ NODE_CODES = {
     MessageType.RETIRE,
     MessageType.FINALIZE_MOVE,
     MessageType.FETCH_COMPLETE,
-    MessageType.RELEASE_FINALIZER,
 }
 WORKER_CODES = {
     MessageType.WORKER_HEARTBEAT,
@@ -177,9 +170,7 @@ class FakeMaruServer:
         op_window: int = 65536,
         op_bytes_max: int = 64 << 20,
         recover_page: int = 2,
-        recovery_window_s: float = 0.0,
     ):
-        self.recovery_window_s = recovery_window_s
         self.heartbeat_s = heartbeat_s
         self.session_ttl_s = session_ttl_s
         self.op_window = op_window
@@ -215,9 +206,6 @@ class FakeMaruServer:
 
     def _reset_state(self) -> None:
         self.server_epoch = uuid.uuid4().hex
-        self.recovering_until = time.monotonic() + self.recovery_window_s
-        # node_id -> [locations ADDED by NODE_REREGISTER, last seen]
-        self.reregistered: dict[str, list] = {}
         self.nodes: dict[str, NodeRec] = {}
         self.node_sessions: dict[str, str] = {}  # token -> node_id
         self.epoch_seqs: dict[str, int] = {}
@@ -277,11 +265,9 @@ class FakeMaruServer:
         with self._lock:
             self._delays[int(code)] = seconds
 
-    def restart(self, recovery_window_s: float | None = None) -> None:
+    def restart(self) -> None:
         """New server_epoch, no state."""
         with self._lock:
-            if recovery_window_s is not None:
-                self.recovery_window_s = recovery_window_s
             self._reset_state()
 
     def close(self) -> None:
@@ -520,12 +506,6 @@ class FakeMaruServer:
             return NodeOpenResponse(status=Status.REJECTED, error="protocol")
         if req.node_epoch in self.ended_epochs:
             return NodeOpenResponse(status=Status.REJECTED, error="node epoch ended")
-        known = self.nodes.get(req.node_id)
-        if req.resume is not None and (
-            (known is not None and known.node_epoch != req.node_epoch)
-            or (known is not None and known.epoch_seq != req.resume)
-        ):
-            return NodeOpenResponse(status=Status.REJECTED, error="resume")
         domains = {d.rm_domain for d in req.rm_domains}
         for pool in req.pools:
             ok_id = (
@@ -575,9 +555,6 @@ class FakeMaruServer:
                         self.hidden_pools.add(pool.pool_id)
                 self._drop_hidden_unpinned()
         seq = self.epoch_seqs.get(req.node_id, 0) + 1
-        if req.resume is not None:  # a run this server has not seen
-            seq = req.resume
-            self.reregistered[req.node_id] = [0, False]
         self.epoch_seqs[req.node_id] = seq
         token = uuid.uuid4().hex
         adopted = self.adopt.pop(req.node_id, [])
@@ -602,9 +579,6 @@ class FakeMaruServer:
     def _adopted_of(self, node: NodeRec):
         return self.adopted_by.get(node.node_id, [])
 
-    def recovering(self) -> bool:
-        return time.monotonic() < self.recovering_until
-
     def _open_response(self, node: NodeRec, adopted) -> NodeOpenResponse:
         return NodeOpenResponse(
             status=Status.OK,
@@ -613,7 +587,6 @@ class FakeMaruServer:
             epoch_seq=node.epoch_seq,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=self.recovering(),
             adopted=adopted,
         )
 
@@ -782,7 +755,6 @@ class FakeMaruServer:
             worker_session=token,
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
-            recovering=self.recovering(),
         )
 
     def _worker_heartbeat(self, worker: WorkerRec, req):
@@ -830,8 +802,6 @@ class FakeMaruServer:
             return ItemResult.FETCH, best
         if offline:
             return ItemResult.MISS, MissReason.OFFLINE
-        if self.recovering():
-            return ItemResult.RECOVERING, None
         return ItemResult.MISS, MissReason.ABSENT
 
     def _probe(self, worker: WorkerRec, req):
@@ -873,8 +843,6 @@ class FakeMaruServer:
                         ),
                     )
                 )
-            elif result == ItemResult.RECOVERING:
-                items.append(ItemOutcome(ItemResult.RECOVERING))
             else:
                 items.append(ItemOutcome(ItemResult.MISS, reason=found))
         return LookupAndPinResponse(status=Status.OK, items=items)
@@ -911,16 +879,7 @@ class FakeMaruServer:
 
     # ---------------------------------------------------- publish, remove
 
-    def _node_reregister(self, node: NodeRec, req):
-        done = self.reregistered.get(node.node_id)
-        if done is None:  # only a resumed run
-            return NodeReregisterResponse(status=Status.REJECTED, error="not resumed")
-        response = self._commit(node, req, earlier_runs=True)
-        done[0] += sum(1 for o in response.items if o.result == ItemResult.ADDED)
-        done[1] = done[1] or req.last
-        return NodeReregisterResponse(status=Status.OK, items=response.items)
-
-    def _commit(self, node: NodeRec, req, earlier_runs: bool = False):
+    def _commit(self, node: NodeRec, req):
         items = []
         for item in req.items:
             loc = item.location
@@ -934,8 +893,7 @@ class FakeMaruServer:
                 or not 0 < item.logical_bytes <= loc.length
                 or loc.offset < 0
                 or loc.offset + loc.length > pool.capacity
-                or given_by > node.epoch_seq
-                or (given_by != node.epoch_seq and not earlier_runs)
+                or given_by != node.epoch_seq
             ):
                 items.append(ItemOutcome(ItemResult.REJECTED))
                 continue
@@ -971,7 +929,7 @@ class FakeMaruServer:
 
     def _finalizer(self, node: NodeRec, item) -> str | None:
         """Held like a pin: a RETIRE of the location is KEPT(PINNED)."""
-        if not getattr(item, "finalizer", False):  # a ReregisterItem has none
+        if not item.finalizer:
             return None
         pin_id = uuid.uuid4().hex
         self.pins[pin_id] = Pin(
@@ -979,21 +937,6 @@ class FakeMaruServer:
         )
         self.loc_pins[loc_id(item.location)].add(pin_id)
         return pin_id
-
-    def _release_finalizer(self, node: NodeRec, req):
-        owner = f"finalizer:{node.node_id}"
-        items = []
-        for kl in req.items:
-            found = [
-                p.pin_id
-                for p in self.pins.values()
-                if p.owner == owner and p.key == kl.key and p.location == kl.location
-            ]
-            for pin_id in found:
-                self._drop_pin(pin_id)
-            result = ItemResult.RELEASED if found else ItemResult.ABSENT
-            items.append(ItemOutcome(result))
-        return ReleaseFinalizerResponse(status=Status.OK, items=items)
 
     def _retire(self, node: NodeRec, req):
         items = []

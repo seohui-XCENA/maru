@@ -24,10 +24,7 @@ from maru_common.protocol import (
     NodeHeartbeatRequest,
     NodeOpenRequest,
     NodeRecoverListRequest,
-    NodeReregisterRequest,
     ProbeRequest,
-    ReleaseFinalizerRequest,
-    ReregisterItem,
     RetireRequest,
     SourcePinRequest,
     UnpinRequest,
@@ -73,7 +70,6 @@ class FakeClock:
 def make_service(clock: FakeClock | None = None, **kwargs) -> MsService:
     kwargs.setdefault("session_ttl_s", 30.0)
     kwargs.setdefault("node_give_up_s", 600.0)
-    kwargs.setdefault("recovery_window_s", 0.0)  # recovery tests set their own
     return MsService(
         server_epoch=uuid.uuid4().hex, clock=clock or FakeClock(), **kwargs
     )
@@ -327,21 +323,6 @@ class FakeNode(_OpSender):
             self.build(CommitRequest, **self.envelope(), items=commit_items),
         )
 
-    def reregister(self, *items, last: bool = False):
-        """reregister((key, location[, logical_bytes]), ..., last=...)"""
-        return self.send(
-            MessageType.NODE_REREGISTER,
-            self.build(
-                NodeReregisterRequest,
-                **self.envelope(),
-                items=[
-                    ReregisterItem(it[0], it[1], it[2] if len(it) > 2 else it[1].length)
-                    for it in items
-                ],
-                last=last,
-            ),
-        )
-
     def retire(self, *items):
         return self.send(
             MessageType.RETIRE,
@@ -360,16 +341,6 @@ class FakeNode(_OpSender):
                 FinalizeMoveRequest,
                 **self.envelope(),
                 items=[MoveItem(k, s, d, p) for k, s, d, p in items],
-            ),
-        )
-
-    def release_finalizer(self, *items):
-        return self.send(
-            MessageType.RELEASE_FINALIZER,
-            self.build(
-                ReleaseFinalizerRequest,
-                **self.envelope(),
-                items=[KeyLocation(k, loc) for k, loc in items],
             ),
         )
 

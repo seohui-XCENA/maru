@@ -25,6 +25,7 @@ from maru_common.storage_types import (
 )
 from maru_handler.storage.cpu import CpuPool
 from maru_shm.client import MaruShmClient
+from maru_shm.unholds import Unholds
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ _KEPT_UNTIL_EXIT: list["MappedPool"] = []
 
 class LocationError(ValueError):
     """A location that does not fall inside a mapped pool (#59)."""
+
+
+class StaleRunError(LocationError):
+    """The pool is mapped for another node run than the one asked for."""
 
 
 class PoolMapping(Protocol):
@@ -112,14 +117,17 @@ class RegionHolds:
     of it lives: a region is mapped only after its hold is durable, and the
     hold is dropped only once every mapping of it in that run is unregistered
     and unmapped. The holder name carries the run, so an old run's mapping
-    and a new run's are separate holds."""
+    and a new run's are separate holds. Drops go out on a thread of their
+    own (never on the thread that released the last view), each sent again
+    until the RM confirms it."""
 
-    def __init__(self) -> None:
+    def __init__(self, unholds: Unholds | None = None) -> None:
         self._lock = threading.Lock()
         # (RM id, region, holder name) as the RM keys holds: an RM written as
         # another address is the same RM, and two clients of one process hold
         # apart
         self._count: dict[tuple[str, int, str], int] = {}
+        self.unholds = unholds or Unholds()
 
     def acquire(self, dax: DaxMapping, who: RegionHolder):
         """The region's device access, holding it; RuntimeError (stale run,
@@ -132,6 +140,9 @@ class RegionHolds:
                 access = client.get_access(dax.handle)
                 self._count[key] += 1
                 return access
+            # A drop still queued is not needed any more (NODE_HOLD of the
+            # same holder again is harmless)
+            self.unholds.take_back(key)
             access = client.node_hold(
                 dax.node_id,
                 dax.node_epoch,
@@ -146,6 +157,7 @@ class RegionHolds:
             return access
 
     def release(self, dax: DaxMapping, who: RegionHolder) -> None:
+        """Queue the drop once no mapping of the hold is left."""
         name = run_holder(who.holder, dax.node_epoch)
         key = (dax.rm_domain, dax.handle.region_id, name)
         with self._lock:
@@ -154,12 +166,12 @@ class RegionHolds:
                 self._count[key] = count
                 return
             self._count.pop(key, None)
-            try:
-                _rm_client(dax.rm_address).unhold(dax.handle, name, name)
-            except Exception as e:  # the RM reaps it once this process ends
-                logger.warning(
-                    "could not drop the hold on region %d: %s", dax.handle.region_id, e
-                )
+            handle, address = dax.handle, dax.rm_address
+            self.unholds.put(
+                key,
+                lambda: _rm_client(address).unhold(handle, name, name),
+                f"the hold {name} on region {handle.region_id}",
+            )
 
 
 _HOLDS = RegionHolds()
@@ -174,7 +186,7 @@ class CxlRegionMapping:
         info: PoolInfo,
         dax: DaxMapping,
         who: RegionHolder | None,
-        holds: RegionHolds = _HOLDS,
+        holds: RegionHolds | None = None,
     ):
         handle = dax.handle
         if who is None:
@@ -184,6 +196,7 @@ class CxlRegionMapping:
                 f"pool {info.pool_id}: the region has {handle.length} bytes, "
                 f"the pool {info.capacity}"
             )
+        holds = holds or _HOLDS
         self._dax, self._who, self._holds = dax, who, holds
         access = holds.acquire(dax, who)
         try:
@@ -353,8 +366,14 @@ class PoolMaps:
             )
         return mapped
 
-    def view(self, location: Location, length: int | None = None) -> memoryview:
-        """Checked bytes of ``location`` (the first ``length``)."""
+    def view(
+        self,
+        location: Location,
+        length: int | None = None,
+        node_epoch: str | None = None,
+    ) -> memoryview:
+        """Checked bytes of ``location`` (the first ``length``); with
+        ``node_epoch``, only through that run's mapping of the pool."""
         n = location.length if length is None else length
         if not 0 < n <= location.length:
             raise LocationError(f"length {n} is not within the location")
@@ -362,6 +381,11 @@ class PoolMaps:
             mapped = self.check(location)
             if mapped.removing:
                 raise LocationError(f"pool {location.pool_id!r} is being unmapped")
+            if node_epoch is not None and mapped.node_epoch != node_epoch:
+                raise StaleRunError(
+                    f"pool {location.pool_id!r} is mapped for node run "
+                    f"{mapped.node_epoch}, not {node_epoch}"
+                )
             # Counted before the caller sees it
             return memoryview(_PoolSlice(mapped, location.offset, n))
 

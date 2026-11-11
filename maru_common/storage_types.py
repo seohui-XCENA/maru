@@ -113,15 +113,12 @@ class ItemResult(StrEnum):
     HIT = "HIT"
     FETCH = "FETCH"
     MISS = "MISS"
-    RECOVERING = "RECOVERING"
     ADDED = "ADDED"
     DUPLICATE = "DUPLICATE"
     RETIRED = "RETIRED"
     KEPT = "KEPT"
     STALE = "STALE"
     REJECTED = "REJECTED"
-    RELEASED = "RELEASED"
-    ABSENT = "ABSENT"
 
 
 @unique
@@ -164,17 +161,10 @@ class WaitLevel(StrEnum):
 
 
 @unique
-class DrainKind(StrEnum):
-    SERVER = "server"
-
-
-@unique
 class NotifyKind(StrEnum):
-    DRAIN = "drain"
     CREDIT_RETURN = "credit_return"
     POOL_ADD = "pool_add"
     POOL_REMOVE = "pool_remove"
-    EPOCH = "epoch"
 
 
 @dataclass(frozen=True)

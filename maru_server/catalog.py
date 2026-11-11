@@ -355,11 +355,8 @@ class Catalog:
         epoch_seq: int,
         location: Location,
         logical_bytes: int,
-        earlier_runs: bool = False,
     ) -> str | None:
-        """Why the node may not commit this location, or None.
-        ``earlier_runs``: a page given by an earlier run of the node since the
-        pool was registered is allowed too (re-registration)."""
+        """Why the node may not commit this location, or None."""
         pool = self.own_pool(node_id, location.pool_id)
         if pool is None:
             return f"pool {location.pool_id} is not an active pool of {node_id}"
@@ -377,13 +374,7 @@ class Catalog:
             return "generation out of range"
         # The high bits name the run that gave the page
         given_by = generation_epoch_seq(location.generation)
-        if earlier_runs:
-            if not pool.since_epoch_seq <= given_by <= epoch_seq:
-                return (
-                    f"generation {location.generation} is not of epoch_seq "
-                    f"{pool.since_epoch_seq}..{epoch_seq}"
-                )
-        elif given_by != epoch_seq:
+        if given_by != epoch_seq:
             return f"generation {location.generation} is not of epoch_seq {epoch_seq}"
         return None
 
@@ -485,14 +476,6 @@ class Catalog:
             return ItemOutcome(ItemResult.KEPT, cause=KeptCause.PINNED)
         self.remove_location(source)
         return ItemOutcome(ItemResult.RETIRED)
-
-    def release_finalizer(
-        self, holder: str, key: Key, location: Location
-    ) -> ItemOutcome:
-        """Drop ``holder``'s finalizers on exactly this location of ``key``."""
-        if self.pins.unpin_at(holder, HolderKind.FINALIZER, key, location):
-            return ItemOutcome(ItemResult.RELEASED)
-        return ItemOutcome(ItemResult.ABSENT)
 
     # ------------------------------------------------------ fetch_complete
 

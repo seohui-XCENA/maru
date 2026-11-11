@@ -82,7 +82,6 @@ class RpcHandlerMixin:
                 MessageType.NODE_OPEN.value: ms.node_open,
                 MessageType.NODE_HEARTBEAT.value: ms.node_heartbeat,
                 MessageType.NODE_CLOSE.value: ms.node_close,
-                MessageType.NODE_REREGISTER.value: ms.node_reregister,
                 MessageType.NODE_RECOVER_LIST.value: ms.node_recover_list,
                 MessageType.WORKER_EXIT.value: ms.worker_exit,
                 MessageType.ADMIN_DELETE.value: ms.admin_delete,
@@ -97,7 +96,6 @@ class RpcHandlerMixin:
                 MessageType.RETIRE.value: ms.retire,
                 MessageType.FINALIZE_MOVE.value: ms.finalize_move,
                 MessageType.FETCH_COMPLETE.value: ms.fetch_complete,
-                MessageType.RELEASE_FINALIZER.value: ms.release_finalizer,
             }
         return self._ms_handlers
 
