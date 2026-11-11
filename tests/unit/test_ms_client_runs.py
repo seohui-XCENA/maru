@@ -4,15 +4,26 @@
 installed by an attach."""
 
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 
 from maru_common.config import MaruConfig
-from maru_common.storage_types import Location, PoolKind
-from maru_handler.client import CreditUnavailableError
+from maru_common.node_protocol import AttachResponse, Budgets, NodeMessageType, Notify
+from maru_common.storage_types import (
+    DaxMapping,
+    Location,
+    NotifyKind,
+    PoolDescriptor,
+    PoolInfo,
+    PoolKind,
+    Status,
+)
+from maru_handler.client import CreditUnavailableError, maru_client
 from maru_handler.client.maru_client import MaruClient
 from maru_handler.client.pool_maps import PoolMaps
+from maru_shm.types import MaruHandle
 from maru_storage_service.drivers import dram
 
 M = 1 << 20
@@ -128,7 +139,10 @@ def test_a_pool_remove_of_an_ended_run_leaves_the_new_runs_mapping(client, pool)
     real = client.credits.remove_pool
     client.credits.remove_pool = lambda pool_id: (started.set(), real(pool_id))[1]
     notify = SimpleNamespace(pool_id=info.pool_id, pool_generation=1)
-    thread = threading.Thread(target=client._pool_remove, args=(notify,))
+    thread = threading.Thread(
+        target=client._pool_remove,
+        args=(notify, "e1", old_conn, client.pools.get(info.pool_id)),
+    )
     thread.start()
     assert started.wait(5)
     # a new run maps the same pool_id while the notice waits on the handle
@@ -142,3 +156,108 @@ def test_a_pool_remove_of_an_ended_run_leaves_the_new_runs_mapping(client, pool)
     assert not thread.is_alive()
     assert client.pools.get(info.pool_id) is not None and not new.closed
     assert not new_conn.sent and not old_conn.sent
+
+
+CXL = PoolInfo("cxl-domain-1", PoolKind.CXL, "node", 1, 2 * M, M)
+
+
+class AttachConn:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+
+    def start_notifications(self):
+        pass
+
+    def submit(self, code, request):
+        self.sent.append(code)
+        future = Future()
+        future.set_result(None)
+        return future
+
+
+def attach_response(epoch, *, pools=True):
+    dax = DaxMapping(
+        "domain", MaruHandle(1, 0, 2 * M, 42), node_id="node", node_epoch=epoch
+    )
+    return AttachResponse(
+        status=Status.OK,
+        node_id="node",
+        node_epoch=epoch,
+        page_size=M,
+        budgets=Budgets(4 * M, 8 * M, M, 4 * M, 4 * M),
+        pools=[PoolDescriptor(CXL, dax=dax)] if pools else [],
+    )
+
+
+@pytest.fixture
+def attached(client):
+    client.pools = PoolMaps(pin_pools=False, map_dax=lambda info, dax: FakeMapping())
+    client._take_attach(AttachConn(), attach_response("e1"), [], first=True)
+    yield client
+    client.pools.close()
+
+
+def notice():
+    return Notify(kind=NotifyKind.POOL_REMOVE, pool_id=CXL.pool_id, pool_generation=1)
+
+
+def test_a_delayed_notice_is_not_taken_for_the_new_runs(attached, monkeypatch):
+    client = attached
+    started = []
+
+    class Deferred:
+        def __init__(self, target, args, **kwargs):
+            started.append((target, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(maru_client.threading, "Thread", Deferred)
+    client._on_notify(notice())  # arrives on the e1 connection
+    monkeypatch.undo()
+    old_conn = client._storage
+    old_conn.closed = True
+    client._on_lost(old_conn)
+    client._unmap_on_loss()
+    assert client.pools.flush(5)
+    new_conn = AttachConn()
+    client._take_attach(new_conn, attach_response("e2"), [], first=False)
+    new = client.pools.get(CXL.pool_id)
+    assert new is not None and new.node_epoch == "e2"
+    target, args = started[0]
+    target(*args)  # the thread runs late
+    assert client.pools.get(CXL.pool_id) is new and not new.mapping.closed
+    assert not new_conn.sent
+
+
+def test_no_ack_while_a_detached_mapping_is_still_closing(attached, monkeypatch):
+    client = attached
+    monkeypatch.setattr(maru_client, "CLOSE_TIMEOUT_S", 0.2)
+    entered, resume = threading.Event(), threading.Event()
+    old = client.pools.get(CXL.pool_id)
+    real_close = old.mapping.close
+
+    def blocked_close():
+        entered.set()
+        assert resume.wait(5)
+        real_close()
+
+    old.mapping.close = blocked_close
+    old_conn = client._storage
+    old_conn.closed = True
+    client._on_lost(old_conn)
+    client._unmap_on_loss()
+    try:
+        assert entered.wait(5)
+        conn = AttachConn()
+        client._take_attach(conn, attach_response("e1", pools=False), [], first=False)
+        args = (notice(), client.node_epoch, client._storage, None)
+        client._pool_remove(*args)
+        assert not conn.sent  # the detached mapping is not closed yet
+        resume.set()
+        assert client.pools.flush(5)
+        client._pool_remove(*args)
+        assert conn.sent == [NodeMessageType.UNMAP_ACK]
+    finally:
+        resume.set()

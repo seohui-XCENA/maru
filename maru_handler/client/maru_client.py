@@ -64,7 +64,13 @@ from maru_common.storage_types import (
 from ..storage.cpu import CpuReadLease
 from .credit_cache import CreditCache
 from .pin_table import PinTable
-from .pool_maps import LocationError, PoolMaps, RegionHolder, StaleRunError
+from .pool_maps import (
+    LocationError,
+    MappedPool,
+    PoolMaps,
+    RegionHolder,
+    StaleRunError,
+)
 from .server_conn import ServerConn, WorkerIdentity
 from .storage_conn import (
     AttachRefusedError,
@@ -1664,9 +1670,21 @@ class MaruClient:
             if credits:
                 self._return_credits(credits)
         elif notify.kind == NotifyKind.POOL_REMOVE:
+            with self._lock:
+                # What the notice is about, as it arrives: this run, this
+                # connection, this mapping (an old run's is left to the
+                # old-pool cleanup)
+                epoch, storage = self.node_epoch, self._storage
+                mapped = (
+                    self.pools.get(notify.pool_id)
+                    if notify.pool_id is not None
+                    else None
+                )
+                if mapped is not None and mapped.node_epoch != epoch:
+                    mapped = None
             threading.Thread(
                 target=self._pool_remove,
-                args=(notify,),
+                args=(notify, epoch, storage, mapped),
                 name="maru-pool-remove",
                 daemon=True,
             ).start()
@@ -1676,19 +1694,24 @@ class MaruClient:
                 notify.pool.pool.pool_id if notify.pool else None,
             )
 
-    def _pool_remove(self, notify: Notify) -> None:
+    def _pool_remove(
+        self,
+        notify: Notify,
+        epoch: str | None,
+        storage: StorageConn | None,
+        mapped: MappedPool | None,
+    ) -> None:
+        """``epoch``, ``storage`` and ``mapped``: the run, connection and
+        mapping the notice arrived for."""
         pool_id, generation = notify.pool_id, notify.pool_generation
         if pool_id is None or generation is None:
             logger.warning("NOTIFY pool_remove without pool_id or generation; ignored")
             return
         with self._lock:
-            # What the notice is about: this run, this connection, this mapping
-            epoch, storage = self.node_epoch, self._storage
-            mapped = self.pools.get(pool_id)
-            if mapped is not None and mapped.node_epoch != epoch:
-                mapped = None  # an old run's: left to the old-pool cleanup
-        # Its credit at hand goes back first: no new write starts in it
-        credits = self.credits.remove_pool(pool_id)
+            if self.node_epoch != epoch or self._storage is not storage:
+                return  # a new run or connection owns the pool_id now
+            # Its credit at hand goes back first: no new write starts in it
+            credits = self.credits.remove_pool(pool_id)
         if credits:
             self._return_credits(credits)
         with self._lock:
@@ -1710,10 +1733,9 @@ class MaruClient:
             credits = self.credits.remove_pool(pool_id)
         if credits:
             self._return_credits(credits)
-        if mapped is not None and (
-            not self.pools.remove(pool_id, expected=mapped)
-            or not self.pools.wait_closed(pool_id, CLOSE_TIMEOUT_S)
-        ):
+        if (
+            mapped is not None and not self.pools.remove(pool_id, expected=mapped)
+        ) or not self.pools.wait_closed(pool_id, CLOSE_TIMEOUT_S):
             logger.warning(
                 "pool %s is still in use by the caller; not unmapped", pool_id
             )
