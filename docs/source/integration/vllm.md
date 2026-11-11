@@ -820,6 +820,8 @@ With several groups every load is parked, and Maru reports a failed parked load 
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
+A load whose GPU copies cannot be confirmed finished (a CUDA error, or a failed wait on the load stream or event) is not reported as failed, as vLLM would compute into blocks the copies may still write. The worker stops instead: the next connector call vLLM makes raises, vLLM fails the engine, and the load's pool pages and pins stay held until the process ends. A load that fails before its copies start (a miss, an unreadable location) is reported as above.
+
 (vllm-hybrid-one-group)=
 ### Running a hybrid model as one group
 

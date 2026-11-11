@@ -13,7 +13,12 @@ pytest.importorskip("torch")
 pytest.importorskip("vllm")
 import torch
 
-from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
+from maru_vllm.connector import (
+    MaruConnectorMetadata,
+    MaruReqMeta,
+    _req_chunk_keys,
+    _UnconfirmedLoadError,
+)
 from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
@@ -391,14 +396,41 @@ def test_a_pipelined_miss_fails_from_its_batch_after_the_earlier_copies(monkeypa
     assert worker.take_failed_load_blocks() == {2, 3, 4, 5}
 
 
-def test_unconfirmed_pipelined_copies_keep_their_slots(monkeypatch):
-    # Waiting on a batch's event failed: its copies may still read the slots,
-    # and the request is recomputed from that batch.
+def _stopped(worker):
+    """Every call vLLM makes next raises: the worker stops."""
+    for call in (
+        worker.get_finished_loading,
+        worker.take_failed_load_blocks,
+        lambda: worker.start_load_kv(None, MaruConnectorMetadata()),
+    ):
+        with pytest.raises(_UnconfirmedLoadError, match="req load"):
+            call()
+    return True
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unconfirmed_pipelined_copies_stop_the_worker(monkeypatch, deferred):
+    # Waiting on a batch's event failed: its copies may still write the
+    # request's blocks, so it is not recomputed into them; nor are the slots
+    # they read given back.
     log = []
-    worker, _ = _pipelined(monkeypatch, log, stream_fails=True)
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, deferred=deferred)
     assert "release 1" not in log
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert "load" not in worker._deferred_done
+    assert not worker._failed_load_blocks
     assert not worker._loaded_request_keys["load"][1]
+    assert worker._unconfirmed
+    assert _stopped(worker)
+
+
+def test_a_miss_is_recomputed_even_on_a_stream_that_cannot_be_waited_for(
+    monkeypatch,
+):
+    # No copy was queued: a plain miss, whatever the stream.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, missing=0)
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert worker._load_stopped is None
 
 
 def test_a_short_staging_waits_for_the_oldest_batch(monkeypatch):
@@ -439,14 +471,15 @@ def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
 
 def test_an_undrained_failed_copy_keeps_every_unconfirmed_slot(monkeypatch):
     # The stream could not be drained: no batch is known to be done, so all
-    # keep their slots and the request is recomputed from its first batch.
+    # keep their slots and the worker stops.
     def stuck(stream):
         stream.fail_sync = True
 
     log = []
     worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2, then=stuck))
     assert "release 1" not in log
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    # The failed chunk's own blocks were noted, but vLLM never takes them
+    assert _stopped(worker)
 
 
 def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):
@@ -456,7 +489,8 @@ def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):
     log = []
     worker, _ = _pipelined(monkeypatch, log, setup=stuck)
     assert log == ["read 0", "kernel"]
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
 
 
 def test_an_event_that_cannot_be_recorded_drains_and_releases(monkeypatch):
@@ -511,14 +545,19 @@ def test_a_copy_error_waits_for_queued_copies_before_releasing(monkeypatch):
     worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
     assert log[-2:] == ["load sync", "release 3"]
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert worker._load_stopped is None
 
 
-def test_slots_stay_taken_if_queued_copies_cannot_be_waited_for(monkeypatch):
+def test_an_inline_load_that_cannot_be_waited_for_stops_the_step(monkeypatch):
+    # The forward would read blocks the copies may still write: start_load_kv
+    # raises, and the slots stay taken.
     log = []
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log, stream_fails=True)
-    worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    with pytest.raises(_UnconfirmedLoadError, match="req load"):
+        worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
     assert log[-1] == "release 0"  # nothing given back
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
 
 
 def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):

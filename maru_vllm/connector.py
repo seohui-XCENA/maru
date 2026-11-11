@@ -246,17 +246,25 @@ def _emit_timing(msg: str) -> None:
     print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
 
 
-def _drain_events(events: Iterable[Any]) -> None:
+def _drain_events(events: Iterable[Any]) -> Exception | None:
     """Wait out queued copies whose destination blocks are being reclaimed.
 
-    Best effort: a device already torn down raises here, and there is nothing
-    left to protect in that case.
+    Returns:
+        The first error a wait raised (those copies are not confirmed
+        finished), or None.
     """
+    error = None
     for event in events:
         try:
             event.synchronize()
         except Exception as e:
-            logger.warning("Maru: could not drain a queued layer copy: %s", e)
+            error = error or e
+    return error
+
+
+def _req_ids(entries: Iterable[Any]) -> str:
+    """The request ids of load entries (a request, or a tuple led by one)."""
+    return ", ".join((e[0] if isinstance(e, tuple) else e).req_id for e in entries)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -437,6 +445,12 @@ class _QueuedCopyError(RuntimeError):
 class _UnconfirmedCopyError(RuntimeError):
     """A store's GPU copies could not be waited for. What they use is kept,
     and the step must not go on: vLLM would reuse blocks they may still read."""
+
+
+class _UnconfirmedLoadError(RuntimeError):
+    """A GPU load copy could not be confirmed finished. vLLM must not compute
+    into blocks it may still write, so the worker stops; the pool pages and
+    pins of the load are kept."""
 
 
 class _CopyAhead:
@@ -3922,6 +3936,9 @@ class MaruWorkerConnector:
         # pinned reads, its inputs): never freed or released here, so the
         # space is reused only after the process ends
         self._unconfirmed: list[Any] = []
+        # Why the worker stopped: a load copy could not be confirmed finished
+        self._load_stopped: str | None = None
+        self._stop_lock = threading.Lock()
         self._store_key_waiters: dict[str, set[str]] = {}
         self._request_pending_store_keys: dict[str, set[str]] = {}
         self._finished_store_requests: set[str] = set()
@@ -4320,7 +4337,21 @@ class MaruWorkerConnector:
         chunks) instead of one RPC per ``(layer, chunk)``. This collapses
         ``num_layers x num_chunks`` single retrieves into a few batched
         calls; that per-op RPC round-trip dominated cache-hit TTFT/TPOT.
+
+        Raises:
+            _UnconfirmedLoadError: Once a load copy could not be confirmed
+                finished: vLLM must stop rather than compute into its blocks.
         """
+        self._raise_if_load_stopped()
+        self._start_loads(forward_context, metadata)
+        self._raise_if_load_stopped()
+
+    def _start_loads(
+        self,
+        forward_context: ForwardContext,
+        metadata: MaruConnectorMetadata,
+    ) -> None:
+        """start_load_kv's loads."""
         # Step boundary: per-step store state must not leak into this step,
         # even when this method bails out early below. A carried-over
         # _store_layers_seen would let a later step's packed store fire before
@@ -4504,11 +4535,17 @@ class MaruWorkerConnector:
         # per-(layer,chunk) copies. See design note "P6 v2 시도 2".
         if not self._use_layerwise:
             _t0 = time.monotonic()
+            confirmed = False
             try:
                 self._load_packed(layers, prepared_requests, attn_metadata)
+                confirmed = True
             finally:
-                if self._cpu_mode:
-                    for _, _, _, infos in prepared_requests:
+                held = [infos for *_, infos in prepared_requests]
+                if self._cpu_mode and (
+                    confirmed
+                    or self._drain_load_stream(None, _req_ids(prepared_requests), held)
+                ):
+                    for infos in held:
                         self._handler.release_retrieved(infos)
             if self._timing:
                 _emit_timing(
@@ -4623,7 +4660,7 @@ class MaruWorkerConnector:
             # The forward reads these blocks next, and the CXL views in
             # `retained` must outlive the copies.
             if stream is not None:
-                stream.synchronize()
+                self._drain_load_stream(stream, _req_ids(inline), retained)
 
     def _try_submit_group_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a parked request's group load to the loader thread.
@@ -4706,12 +4743,11 @@ class MaruWorkerConnector:
             )
         except Exception as e:
             # Copies may be queued against the CXL views; drain them first.
-            if self._deferred_stream is not None:
-                try:
-                    self._deferred_stream.synchronize()
-                except Exception:
-                    pass
-            self._fail_load(req_meta, e)
+            stream = self._deferred_stream
+            if stream is None or self._drain_load_stream(
+                stream, req_meta.req_id, objects
+            ):
+                self._fail_load(req_meta, e)
         finally:
             with self._deferred_lock:
                 self._inflight_deferred_req_ids.discard(req_meta.req_id)
@@ -4806,9 +4842,9 @@ class MaruWorkerConnector:
         briefly for one, and its slabs are staged on the device first (see
         ``_place_chunk``). All or nothing, as ``_retrieve_group_objects``: a
         batch that cannot be read or placed fails the request, and vLLM
-        recomputes it over every block of the load. The leases of a batch
-        whose copies cannot be waited for are kept, as a copy may still read
-        them.
+        recomputes it over every block of the load. A batch whose copies
+        cannot be waited for stops the worker and keeps its leases, as a copy
+        may still read them.
 
         Returns:
             ``(hit chunks, objects placed)``, or None after reporting the
@@ -4847,8 +4883,9 @@ class MaruWorkerConnector:
                 if stream is not None:
                     stream.synchronize()
             except Exception as e:
-                if self._drain_load_stream(stream):
-                    handler.release_retrieved(infos)
+                if not self._drain_load_stream(stream, req_meta.req_id, infos):
+                    return None  # the worker stops; nothing is reported
+                handler.release_retrieved(infos)
                 self._fail_load(req_meta, e)
                 return None
             handler.release_retrieved(infos)
@@ -5155,6 +5192,8 @@ class MaruWorkerConnector:
                 events = self._issue_layerwise_copies_offthread(
                     req_meta, num_chunks, slot_mapping, payload, layers, device
                 )
+                if events is None and self._load_stopped is not None:
+                    return  # copies not confirmed: the worker stops
                 if events is None and (self._state_shard.parts > 1 or self._node_mode):
                     # The resumed forward would issue the copies in the step
                     # that computes the request, where a rank whose copies
@@ -5211,7 +5250,10 @@ class MaruWorkerConnector:
                         "Maru: draining abandoned layerwise load for req %s",
                         req_meta.req_id,
                     )
-                    _drain_events(events.values() if events else ())
+                    error = _drain_events(events.values() if events else ())
+                    if error is not None:
+                        self._stop_on_unconfirmed_load(req_meta.req_id, error, infos)
+                        return
                     if events is None:
                         # Never queued: nothing reads them (queued copies hold
                         # theirs until their own event, _active_load_refs)
@@ -5315,17 +5357,14 @@ class MaruWorkerConnector:
             streams = [self._deferred_stream]
             if self._node_mode:
                 streams += self._layerwise_streams
-            drained = True
-            for stream in streams:
-                if stream is not None:
-                    try:
-                        stream.synchronize()
-                    except Exception:
-                        drained = False
-            if drained:
+            if all(
+                stream is None
+                or self._drain_load_stream(stream, req_meta.req_id, infos)
+                for stream in streams
+            ):
                 # Releasing twice does nothing, so refs held elsewhere are fine
                 self._release_held(infos)
-            self._fail_deferred_load(req_meta)
+                self._fail_deferred_load(req_meta)
         finally:
             # This load is accounted for now, however it ended. An abort
             # arriving after this point finds the queued copies themselves.
@@ -5449,7 +5488,8 @@ class MaruWorkerConnector:
         Returns:
             layer_name -> event, or None when the copies could not be queued.
             On None the caller retains the CXL views so the resumed forward
-            issues them the old way, or under TP fails the load.
+            issues them the old way, or under TP fails the load; unless the
+            copies queued could not be waited for, which stops the worker.
         """
         stream: torch.cuda.Stream | None = None
         try:
@@ -5503,10 +5543,7 @@ class MaruWorkerConnector:
                 e,
             )
             if stream is not None:
-                try:
-                    stream.synchronize()
-                except Exception:
-                    pass
+                self._drain_load_stream(stream, req_meta.req_id, infos)
             return None
 
     def _schedule_deferred_layerwise_loads(
@@ -5653,12 +5690,10 @@ class MaruWorkerConnector:
                     issued[layer_name] = event
         except Exception as e:
             logger.error("Maru layerwise-overlap activation failed: %s", e)
-            try:
-                load_stream.synchronize()
-            except Exception:
-                pass
-            else:
-                self._release_held([infos for *_, infos in entries])
+            held = [infos for *_, infos in entries]
+            if not self._drain_load_stream(load_stream, _req_ids(entries), held):
+                return  # the worker stops
+            self._release_held(held)
             for req_meta, *_ in entries:
                 # Resumed already: not reported finished a second time
                 self._fail_load(replace(req_meta, deferred_load=False), e)
@@ -5864,8 +5899,10 @@ class MaruWorkerConnector:
         batch's copies have completed before its leases are released. A batch
         that cannot be read or copied fails the request
         from that batch on, and the later batches are not read; vLLM
-        recomputes those tokens. A deferred request is reported finished only
-        after its last batch, or with its failure.
+        recomputes those tokens. Copies that cannot be waited for stop the
+        worker instead, and their batches keep their slots. A deferred
+        request is reported finished only after its last batch, or with its
+        failure.
 
         Args:
             layers: ``(name, kv_cache, layer index)`` per attention layer.
@@ -5903,45 +5940,43 @@ class MaruWorkerConnector:
             step = min(step, _LOAD_PIPELINE_CHUNKS)
             # Pinned once here, not once per batch in _load_packed.
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-        pending: deque[tuple[Any, list[Any], MaruReqMeta]] = deque()
+        pending: deque[tuple[Any, list[Any]]] = deque()
 
-        def settle(block: bool, oldest: bool = False) -> MaruReqMeta | None:
+        def settle(block: bool, oldest: bool = False) -> bool:
             """Give back the batches whose copies ended (all of them if
-            ``block``, only the oldest if ``oldest`` too). Returns the range to
-            recompute if waiting failed; the slots of the batches not
-            confirmed then stay taken."""
+            ``block``, only the oldest if ``oldest`` too). False if waiting
+            failed: the worker stops, and the batches not confirmed keep
+            their slots."""
             while pending:
-                event, held, from_here = pending[0]
+                event, held = pending[0]
                 try:
                     if not block and not event.query():
-                        return None
+                        return True
                     event.synchronize()
-                except Exception:
-                    logger.error(
-                        "Maru: could not wait for queued load copies", exc_info=True
-                    )
+                except Exception as e:
+                    self._stop_on_unconfirmed_load(req_meta.req_id, e, list(pending))
                     pending.clear()
-                    return from_here
+                    return False
                 handler.release_retrieved(held)
                 pending.popleft()
                 if oldest:
-                    return None
-            return None
+                    return True
+            return True
 
-        def make_room(n: int) -> MaruReqMeta | None:
+        def make_room(n: int) -> bool:
             """Wait for the oldest batches until ``n`` slots are free or none
             of this request's batches is left; same return as settle()."""
             while pending:
                 capacity = handler.retrieve_capacity()
                 if capacity is None or capacity >= n:
-                    return None
-                if (unconfirmed := settle(True, oldest=True)) is not None:
-                    return unconfirmed
-            return None
+                    return True
+                if not settle(True, oldest=True):
+                    return False
+            return True
 
         def fail(rest: MaruReqMeta) -> None:
-            unconfirmed = settle(True)
-            self._fail_deferred_load(unconfirmed or rest)
+            if settle(True):
+                self._fail_deferred_load(rest)
 
         b = 0
         batches = 0
@@ -5951,9 +5986,7 @@ class MaruWorkerConnector:
                 if pending:
                     # The batches still copying hold their slots: wait for
                     # the oldest ones rather than read a short batch.
-                    unconfirmed = settle(False) or make_room(n)
-                    if unconfirmed is not None:
-                        self._fail_deferred_load(unconfirmed)
+                    if not (settle(False) and make_room(n)):
                         return
                 if b > 0:
                     capacity = handler.retrieve_capacity()
@@ -6010,7 +6043,7 @@ class MaruWorkerConnector:
                                 wait=not pipelined,
                             )
                             if pipelined and not failed:
-                                pending.append((stream.record_event(), infos, rest))
+                                pending.append((stream.record_event(), infos))
                                 queued = True
                             elif pipelined:
                                 # _load_packed logged it; copies of the batch's
@@ -6025,14 +6058,13 @@ class MaruWorkerConnector:
                                     req_meta.req_id,
                                     e,
                                 )
-                            if not self._drain_load_stream(stream):
-                                # Keep the slots, as a copy may still read
-                                # them, and recompute from the first batch not
-                                # confirmed.
+                            if not self._drain_load_stream(
+                                stream, req_meta.req_id, [infos, list(pending)]
+                            ):
+                                # Keep the slots, as a copy may still read them
                                 infos = []
-                                if pending:
-                                    rest = pending[0][2]
                                 pending.clear()
+                                return
                             failed = {req_meta.req_id}
                 finally:
                     if not queued:
@@ -6042,7 +6074,7 @@ class MaruWorkerConnector:
                     # later batches are not worth reading.
                     fail(rest)
                     return
-            unconfirmed = settle(True)
+            confirmed = settle(True)
         except BaseException:
             # Whatever escaped, give back the batches whose copies ended; the
             # caller drains the stream and recomputes the request.
@@ -6051,8 +6083,7 @@ class MaruWorkerConnector:
             except Exception:
                 logger.error("Maru: could not release load batches", exc_info=True)
             raise
-        if unconfirmed is not None:
-            self._fail_deferred_load(unconfirmed)
+        if not confirmed:
             return
         # Every READ and GPU copy succeeded. Boundary chunks were loaded
         # only in part; leave them eligible for the existing store path.
@@ -6088,20 +6119,57 @@ class MaruWorkerConnector:
                 return int(capacity)
             time.sleep(0.01)
 
-    def _drain_load_stream(self, stream: Any) -> bool:
-        """Wait for the copies queued on a load stream; False if that failed."""
+    def _drain_load_stream(
+        self, stream: Any, req_id: str | None, held: Any = None
+    ) -> bool:
+        """Wait for the copies queued on a load stream (None: the load stream).
+
+        Returns:
+            False if waiting failed: the copies are not confirmed finished,
+            so the worker stops and keeps ``held`` (_stop_on_unconfirmed_load).
+        """
         target = stream if stream is not None else self._load_stream
         if target is None:
             return True
         try:
             target.synchronize()
-        except Exception:
-            logger.error("Maru: could not wait for queued load copies", exc_info=True)
+        except Exception as e:
+            self._stop_on_unconfirmed_load(req_id, e, held)
             return False
         return True
 
+    def _stop_on_unconfirmed_load(
+        self, req_id: str | None, error: BaseException, held: Any = None
+    ) -> None:
+        """Stop the worker: load copies of ``req_id`` may still write their
+        blocks, and vLLM would recompute into them. ``held`` (the load's pool
+        pages and pins) is kept. The next connector call vLLM makes raises
+        _UnconfirmedLoadError; nothing of the load is reported meanwhile."""
+        if held is not None:
+            self._keep_unconfirmed(held)
+        of = f" of req {req_id}" if req_id else ""
+        with self._stop_lock:
+            if self._load_stopped is not None:
+                return
+            self._load_stopped = (
+                f"GPU load copies{of} could not be confirmed finished ({error})"
+            )
+        logger.error(
+            "Maru: %s; stopping the worker, as vLLM would compute into blocks "
+            "they may still write (their pool pages and pins are kept)",
+            self._load_stopped,
+        )
+
+    def _raise_if_load_stopped(self) -> None:
+        if self._load_stopped is not None:
+            raise _UnconfirmedLoadError(self._load_stopped)
+
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
+
+        Only for a load whose copies ended or never started: one whose copies
+        cannot be confirmed finished stops the worker instead
+        (``_stop_on_unconfirmed_load``).
 
         The request's blocks are reported through
         ``get_block_ids_with_load_errors`` (vLLM resets its computed-token
@@ -6344,8 +6412,9 @@ class MaruWorkerConnector:
                     event = torch.cuda.Event()
                     event.record(load_stream)
             except Exception as e:
-                if self._node_mode and self._drain_load_stream(load_stream):
-                    self._release_held(infos)
+                if not self._drain_load_stream(load_stream, req_meta.req_id, infos):
+                    return  # the worker stops
+                self._release_held(infos)
                 self._fail_load(req_meta, e)
                 continue
             with self._deferred_lock:
@@ -6365,7 +6434,13 @@ class MaruWorkerConnector:
             )
 
     def get_finished_loading(self) -> set[str] | None:
-        """Return req ids whose deferred loads completed since the last call."""
+        """Return req ids whose deferred loads completed since the last call.
+
+        Raises:
+            _UnconfirmedLoadError: Once a load copy could not be confirmed
+                finished.
+        """
+        self._raise_if_load_stopped()
         # Also when no step loads: a pin is released once its copies end
         self._release_completed_load_refs()
         released = []
@@ -6373,7 +6448,7 @@ class MaruWorkerConnector:
             done = set(self._deferred_done)
             self._deferred_done.clear()
             for req_id, event in list(self._deferred_events.items()):
-                if event.query():
+                if self._copies_ended(event, req_id):
                     done.add(req_id)
                     del self._deferred_events[req_id]
                     released.append(self._deferred_refs.pop(req_id, None))
@@ -6431,7 +6506,12 @@ class MaruWorkerConnector:
         Metadata registration may continue in the background because it no
         longer reads the GPU cache. Only the store stream must be complete at
         this boundary.
+
+        Raises:
+            _UnconfirmedLoadError: Once a load copy could not be confirmed
+                finished, here too if one that writes reclaimed blocks cannot.
         """
+        self._raise_if_load_stopped()
         # Parked receives have no new store reads; stores from before a
         # preemption were drained at that preemption. Do not synchronize the
         # shared store stream for recv-only aborts (it may serve other requests).
@@ -6501,7 +6581,11 @@ class MaruWorkerConnector:
                 if report and self._deferred_events.pop(req_id, None) is not None:
                     released.append(self._deferred_refs.pop(req_id, None))
                     owed.add(req_id)
-        _drain_events(drain)
+        error = _drain_events(drain)
+        if error is not None:
+            # The blocks go to other requests: stop before vLLM runs them
+            self._stop_on_unconfirmed_load(", ".join(sorted(req_ids)), error, released)
+            self._raise_if_load_stopped()
         self._release_held(released)
         if owed:
             with self._deferred_lock:
@@ -6509,6 +6593,7 @@ class MaruWorkerConnector:
 
     def take_failed_load_blocks(self) -> set[int]:
         """Return (and clear) block ids whose load failed."""
+        self._raise_if_load_stopped()
         with self._deferred_lock:
             failed = self._failed_load_blocks
             self._failed_load_blocks = set()
@@ -6522,6 +6607,7 @@ class MaruWorkerConnector:
         with the completion that follows: vLLM wants a failed request in
         the same report as its completion.
         """
+        self._raise_if_load_stopped()
         with self._deferred_lock:
             failed = self._failed_recv_req_ids & finished
             self._failed_recv_req_ids -= failed
@@ -7096,9 +7182,19 @@ class MaruWorkerConnector:
                 return
             keep: list[tuple[torch.cuda.Event, list[Any]]] = []
             for entry in self._active_load_refs:
-                (done if entry[0].query() else keep).append(entry)
+                ended = self._copies_ended(entry[0], None)
+                (done if ended else keep).append(entry)
             self._active_load_refs = keep
         self._release_held([refs for _, refs in done])
+
+    def _copies_ended(self, event: Any, req_id: str | None) -> bool:
+        """Whether the load copies before ``event`` ended; if asking fails,
+        the worker stops (_UnconfirmedLoadError)."""
+        try:
+            return bool(event.query())
+        except Exception as e:
+            self._stop_on_unconfirmed_load(req_id, e)
+            raise _UnconfirmedLoadError(self._load_stopped) from e
 
     def _release_held(self, refs: Any) -> None:
         """Give back the read pins in ``refs`` (nested lists, tuples and dicts

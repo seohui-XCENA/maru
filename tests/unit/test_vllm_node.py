@@ -7,6 +7,7 @@ a StorageService and the fake MaruServer. CPU tensors only: loads and stores
 take their per-layer paths (the GPU kernels run in the GPU smoke test).
 """
 
+import contextlib
 import dataclasses
 import threading
 import time
@@ -39,6 +40,7 @@ from maru_vllm.connector import (
     _chunk_keys,
     _node_engine_config,
     _node_transfer_defaults,
+    _UnconfirmedLoadError,
     _validate_storage_config,
 )
 from maru_vllm.kv_groups import describe_kv_groups, group_object_key
@@ -80,6 +82,7 @@ from tests.unit.test_vllm_tp import (
     rank_kv,
 )
 from tests.unit.vllm_connector_helpers import (
+    FailingSyncStream,
     make_flash_attn_metadata,
     make_scheduler,
     make_worker,
@@ -1386,6 +1389,32 @@ def test_a_failed_overlap_activation_on_cuda_reports_its_external_blocks_once(
     assert "r1" in worker._unsound_kv_req_ids
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_an_overlap_activation_that_cannot_be_drained_stops_the_worker(monkeypatch):
+    worker = pinning_worker()
+    device = torch.device("cuda")
+    dst = [layer.to(device) for layer in sentinel_kv()]
+    layers = [
+        (name, layer, i)
+        for i, (name, layer) in enumerate(zip(LAYER_NAMES, dst, strict=True))
+    ]
+    meta = external_meta(True, layerwise_load=True)
+    slots = worker._build_slot_mapping(meta.block_ids, PROMPT - BLOCK)
+    worker._deferred_layerwise_loads["r1"] = (meta, 2, slots, [lease("a"), lease("b")])
+    worker._load_stream_device = dst[0].device
+    worker._load_stream = FailingSyncStream(torch.cuda.Stream(dst[0].device))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(worker, "_copy_chunkwise_layer_to_device", boom)
+    worker._num_layers = NUM_LAYERS
+    worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+    worker._handler.release_retrieved.assert_not_called()
+    assert not worker._failed_load_blocks
+    assert stopped(worker, "req r1")
+
+
 def test_a_node_load_retrieves_its_keys_in_one_call():
     worker = pinning_worker()
     worker._handler.batch_retrieve.side_effect = lambda keys, **_: [None] * len(keys)
@@ -1401,6 +1430,116 @@ def test_finished_loads_release_the_reads_of_completed_copies():
     worker.get_finished_loading()
     assert released(worker) == [read]
     assert worker._active_load_refs == []
+
+
+# =============================================================================
+# A load copy that cannot be confirmed finished stops the worker
+# =============================================================================
+
+
+class FailedQuery(Done):
+    def query(self):
+        raise RuntimeError("CUDA error")
+
+
+def stopped(worker, match: str = "") -> bool:
+    """Every connector call vLLM makes next raises, so vLLM never computes
+    into blocks the copy may still write."""
+    calls = (
+        lambda: worker.start_load_kv(None, MaruConnectorMetadata()),
+        lambda: worker.handle_preemptions(MaruConnectorMetadata()),
+        worker.get_finished_loading,
+        worker.take_failed_load_blocks,
+        lambda: worker.take_failed_recv_req_ids({"r1"}),
+    )
+    for call in calls:
+        with pytest.raises(_UnconfirmedLoadError, match=match):
+            call()
+    return True
+
+
+def group_meta(**kwargs) -> MaruReqMeta:
+    return MaruReqMeta(
+        "r1",
+        list(range(PROMPT)),
+        [1, 2],
+        False,
+        num_matched_chunks=1,
+        group_block_ids=[[1, 2]],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("parked", [True, False], ids=["parked", "layerwise"])
+def test_copies_that_cannot_be_asked_about_stop_the_worker(parked):
+    worker = pinning_worker()
+    read = lease("a")
+    if parked:
+        worker._deferred_events["r1"] = FailedQuery()
+        worker._deferred_refs["r1"] = [[read]]
+    else:
+        worker._active_load_refs = [(FailedQuery(), [[read]])]
+    with pytest.raises(_UnconfirmedLoadError):
+        worker.get_finished_loading()
+    worker._handler.release_retrieved.assert_not_called()
+    assert stopped(worker, "req r1" if parked else "")
+
+
+def test_an_undrained_copy_into_reclaimed_blocks_stops_the_worker():
+    """A request aborted while its layers load: its blocks go back to vLLM
+    only once its copies are known to have ended."""
+    worker = pinning_worker()
+    worker._layerwise_overlap = True
+    worker._deferred_layerwise_events["r1"] = {"layer": FailedWait()}
+    worker._deferred_events["r1"] = Pending()
+    worker._deferred_refs["r1"] = [[lease("a")]]
+    with pytest.raises(_UnconfirmedLoadError, match="req r1"):
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+    worker._handler.release_retrieved.assert_not_called()
+    assert "r1" not in worker._deferred_done
+    assert stopped(worker, "req r1")
+
+
+def test_a_group_batch_whose_copies_cannot_be_waited_for_keeps_its_reads(
+    monkeypatch,
+):
+    worker = pinning_worker()
+    reads = [lease("a"), lease("b")]
+    worker._handler.retrieve_capacity.return_value = None
+    monkeypatch.setattr(worker, "_group_load_plan", lambda m: (1, [0, 1], ["a", "b"]))
+    monkeypatch.setattr(worker, "_batch_retrieve_all", lambda keys, **r: list(reads))
+    monkeypatch.setattr(worker, "_place_group_objects", lambda *a, **k: None)
+    loaded = worker._load_group_leased(
+        group_meta(), torch.device("cpu"), FailedWait(), offthread=True
+    )
+    assert loaded is None
+    worker._handler.release_retrieved.assert_not_called()
+    assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
+    assert any(held is not None for held in worker._unconfirmed)
+    assert stopped(worker, "req r1")
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
+    monkeypatch, drained
+):
+    """A load that failed before its copies, or whose copies ended, is a plain
+    recompute; one whose copies cannot be waited for stops the worker."""
+    worker = pinning_worker()
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    worker._deferred_stream = Done() if drained else FailedWait()
+    worker._deferred_stream.wait_event = lambda event: None
+    worker._deferred_stream_device = torch.device("cpu")
+    worker._load_group_leased = MagicMock(side_effect=RuntimeError("copy failed"))
+    worker._group_load_job(group_meta(deferred_load=True), torch.device("cpu"), Done())
+    if drained:
+        assert worker._failed_recv_req_ids == {"r1"}
+        assert worker._deferred_done == {"r1"}
+        assert worker._load_stopped is None
+    else:
+        assert not worker._failed_recv_req_ids and not worker._deferred_done
+        assert stopped(worker, "req r1")
 
 
 # =============================================================================
