@@ -3,9 +3,11 @@
 """ServerConn: the worker session with MaruServer.
 
 Reopening with the same incarnation keeps pins unless the server epoch
-changed. A lookup with an unknown result is resent with the same op in the
-background and its pins released. While MaruServer is down or refused to
-reopen the session, lookups answer at once without an RPC.
+changed. A lookup or probe never waits for a reopen and is never resent: on
+EPOCH it misses, and the heartbeat thread reopens the session. A lookup with
+an unknown result is resent with the same op in the background and its pins
+released. While MaruServer is down, or the session is to reopen or was
+refused, lookups and probes answer at once without an RPC.
 """
 
 import dataclasses
@@ -40,9 +42,9 @@ from maru_common.storage_types import (
 logger = logging.getLogger(__name__)
 
 MAX_UNRESOLVED_LOOKUPS = 32
-# How long a node may take to resume before a worker warns (used until a
-# WORKER_OPEN told the session TTL)
-RESUME_WARN_S = 30.0
+# How long a worker waits quietly for MaruServer to know its node run (until
+# a WORKER_OPEN told the session TTL)
+NODE_RUN_WARN_S = 30.0
 # Heartbeat interval while MaruServer does not answer
 DOWN_POLL_S = 0.5
 
@@ -56,9 +58,9 @@ class WorkerIdentity:
     namespace: str
 
 
-class NodeResumingError(StorageUnavailableError):
-    """A restarted MaruServer does not know this node's run yet: it is
-    resuming; the session opens once it has."""
+class NodeRunUnknownError(StorageUnavailableError):
+    """A new MaruServer does not know the node run this worker is attached
+    to yet; the session opens once the node opens its run there."""
 
 
 class ServerConn:
@@ -122,8 +124,8 @@ class ServerConn:
 
     def open(self) -> None:
         """WORKER_OPEN; StorageUnavailableError if unreachable or refused
-        (NodeResumingError while a restarted MaruServer waits for the node).
-        Opens run one at a time, so a late answer never takes the server
+        (NodeRunUnknownError while a new MaruServer does not know the node
+        run yet). Opens run one at a time, so a late answer never takes the server
         epoch back."""
         with self._open_lock:
             self._open()
@@ -166,15 +168,15 @@ class ServerConn:
             with self._lock:
                 self._refused = True
                 # A MaruServer other than ours, and our node run is still the
-                # one attached: the node has not resumed there yet
-                resuming = (
+                # one attached: the node has not opened its run there yet
+                unknown_run = (
                     response.status == Status.EPOCH
                     and bool(response.server_epoch)
                     and response.server_epoch != self.server_epoch
                     and self.node_epoch == request.node_epoch
                 )
             self._poll_soon()
-            error = NodeResumingError if resuming else StorageUnavailableError
+            error = NodeRunUnknownError if unknown_run else StorageUnavailableError
             raise error(f"WORKER_OPEN refused: {response.status} {response.error}")
         with self._lock:
             self._reopen = self._refused = False
@@ -207,8 +209,8 @@ class ServerConn:
             self._reopen = True
         try:
             self.open()
-        except NodeResumingError as e:
-            logger.info("the node is resuming at MaruServer: %s", e)
+        except NodeRunUnknownError as e:
+            logger.info("the node run is not open at MaruServer yet: %s", e)
         except StorageUnavailableError as e:
             logger.warning("reopening the worker session: %s", e)
 
@@ -266,7 +268,7 @@ class ServerConn:
         """Heartbeat only; lookups and UNPINs are resolved on their own thread.
         Polls faster while MaruServer is down or the session is to reopen."""
         failing = False
-        resuming_since: float | None = None  # waiting for the node since
+        unknown_since: float | None = None  # MaruServer has not known the run since
         warned = False
         while True:
             self._beat.wait(
@@ -281,7 +283,7 @@ class ServerConn:
                 if self._reopen:
                     self.open()
                 failing = False
-                resuming_since, warned = None, False
+                unknown_since, warned = None, False
                 session, epoch = self._ids()
                 try:
                     response = self._rpc.call(
@@ -297,19 +299,19 @@ class ServerConn:
                         self._reopen = True
                     self.open()  # expired, or MaruServer restarted
             except (RpcUnknownError, StorageUnavailableError) as e:
-                if isinstance(e, NodeResumingError):
+                if isinstance(e, NodeRunUnknownError):
                     now = time.monotonic()
-                    if resuming_since is None:
-                        resuming_since = now
-                        logger.info("waiting for the node to resume: %s", e)
-                    elif not warned and now - resuming_since > (
-                        self.session_ttl_s or RESUME_WARN_S
+                    if unknown_since is None:
+                        unknown_since = now
+                        logger.info("waiting for the node run at MaruServer: %s", e)
+                    elif not warned and now - unknown_since > (
+                        self.session_ttl_s or NODE_RUN_WARN_S
                     ):
                         warned = True
                         logger.warning(
-                            "the node has not resumed at MaruServer for %.0f s; "
+                            "the node run has not opened at MaruServer for %.0f s; "
                             "lookups miss until it does",
-                            now - resuming_since,
+                            now - unknown_since,
                         )
                 elif not self._down and not failing:
                     logger.warning("worker heartbeat: %s", e)
@@ -377,11 +379,19 @@ class ServerConn:
                 logger.exception("resolving lookups failed")
 
     def _reopen_after_epoch(self, epoch: str) -> bool:
-        """Reopen after EPOCH to a request of ``epoch``; whether the session
-        is at that server epoch still (it may have moved meanwhile)."""
+        """Reopen after EPOCH to a background request of ``epoch``; whether
+        the session is at that server epoch still (it may have moved
+        meanwhile)."""
         self.open()
         with self._lock:
             return self.server_epoch == epoch
+
+    def _reopen_soon(self) -> None:
+        """EPOCH to a lookup or probe: the heartbeat thread reopens the
+        session; until then they miss without an RPC."""
+        with self._lock:
+            self._reopen = True
+        self._poll_soon()
 
     # ----------------------------------------------------------------- lookup
 
@@ -390,11 +400,11 @@ class ServerConn:
     ) -> tuple[list[ItemOutcome], str, str | None] | None:
         """One LOOKUP_AND_PIN: the outcomes, the server epoch whose pins they
         hold and the node run they were answered under; None when unknown or
-        unavailable."""
+        unavailable. One RPC at most: never resent, never waits for a reopen."""
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a lookup carries 1..{MAX_BATCH}")
         with self._lock:
-            if self._down or self._refused:
+            if self._down or self._refused or self._reopen:
                 return None
             if len(self._unresolved) >= MAX_UNRESOLVED_LOOKUPS:
                 # MaruServer is not answering: no new ops until these resolve
@@ -411,11 +421,17 @@ class ServerConn:
                     items=list(keys),
                 )
             )
-        return self._send_lookup(origin, request, node_epoch)
+        return self._send_lookup(origin, request, node_epoch, background=False)
 
     def _send_lookup(
-        self, origin: OpOrigin, request: LookupAndPinRequest, node_epoch: str | None
+        self,
+        origin: OpOrigin,
+        request: LookupAndPinRequest,
+        node_epoch: str | None,
+        background: bool,
     ) -> tuple[list[ItemOutcome], str, str | None] | None:
+        """Send a lookup; only a ``background`` resend reopens the session on
+        EPOCH and sends it again."""
         seq = request.op.seq
         for _ in range(2):
             try:
@@ -429,11 +445,16 @@ class ServerConn:
                         self._unresolved[seq] = request
                 self._set_down(True, e)
                 return None
+            if response.status == Status.EPOCH and not background:
+                # Not run, so it holds no pins
+                origin.resolved(seq)
+                self._reopen_soon()
+                return None
             if response.status == Status.EPOCH:
                 try:
                     self._reopen_after_epoch(request.server_epoch)
                 except StorageUnavailableError as e:
-                    if isinstance(e, NodeResumingError):
+                    if isinstance(e, NodeRunUnknownError):
                         logger.debug("reopening the worker session: %s", e)
                     else:
                         logger.warning("reopening the worker session: %s", e)
@@ -503,7 +524,7 @@ class ServerConn:
                         server_epoch=epoch,
                     )
                 )
-            answered = self._send_lookup(origin, request, node_epoch)
+            answered = self._send_lookup(origin, request, node_epoch, background=True)
             if answered is None:
                 return  # still no answer; try again next beat
             pins = [
@@ -520,35 +541,31 @@ class ServerConn:
             return len(self._unresolved)
 
     def probe(self, keys: list[Key]) -> list[ItemOutcome] | None:
-        """PROBE (no pins); None when unavailable."""
+        """PROBE (no pins); None when unavailable. One RPC at most: never
+        resent, never waits for a reopen."""
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a probe carries 1..{MAX_BATCH}")
-        for _ in range(2):
-            if self._down or self._refused:
-                return None
-            try:
-                session, epoch = self._ids()
-                response: ProbeResponse = self._rpc.call(
-                    MessageType.PROBE,
-                    ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
-                )
-            except RpcUnknownError as e:
-                self._set_down(True, e)
-                return None
-            except StorageUnavailableError as e:
-                logger.warning("PROBE: %s", e)
-                return None
-            if response.status == Status.EPOCH:
-                try:
-                    self._reopen_after_epoch(epoch)
-                except StorageUnavailableError:
-                    return None
-                continue
-            if response.status != Status.OK or len(response.items) != len(keys):
-                logger.error("PROBE: %s %s", response.status, response.error)
-                return None
-            return response.items
-        return None
+        if self._down or self._refused or self._reopen:
+            return None
+        try:
+            session, epoch = self._ids()
+            response: ProbeResponse = self._rpc.call(
+                MessageType.PROBE,
+                ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
+            )
+        except RpcUnknownError as e:
+            self._set_down(True, e)
+            return None
+        except StorageUnavailableError as e:
+            logger.warning("PROBE: %s", e)
+            return None
+        if response.status == Status.EPOCH:
+            self._reopen_soon()
+            return None
+        if response.status != Status.OK or len(response.items) != len(keys):
+            logger.error("PROBE: %s %s", response.status, response.error)
+            return None
+        return response.items
 
     # ------------------------------------------------------------------ unpin
 

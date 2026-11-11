@@ -21,7 +21,7 @@ from maru_common.node_protocol import (
     NodeMessageType,
     Notify,
 )
-from maru_common.protocol import MessageType, RecoverItem
+from maru_common.protocol import LookupAndPinRequest, MessageType, RecoverItem
 from maru_common.storage_types import (
     BlockRequest,
     CloseMode,
@@ -1786,11 +1786,68 @@ class TestClientLifecycle:
         old = conn.session
         with fake._lock:
             fake.workers[old].open = False  # expired at MaruServer
-        again = h.retrieve("k")  # EPOCH, reopened with the same incarnation
-        assert again is not None and conn.session != old
-        assert fake.pin_count(h._cpu.identity.incarnation) == 2  # the pins moved
+        sent = len(fake.requests(MessageType.LOOKUP_AND_PIN))
+        # EPOCH: a miss at once, not resent; the heartbeat thread reopens
+        assert h.retrieve("k") is None
+        assert h._cpu.stats["retrieve_unavailable"] == 1
+        assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == sent + 1
+        assert not conn.unresolved_lookups()
+        wait_until(lambda: conn.session not in (None, old), what="reopened")
+        again = h.retrieve("k")  # same incarnation: the first pin moved
+        assert again is not None
+        assert fake.pin_count(h._cpu.identity.incarnation) == 2
         h.release_retrieved([read, again])
         wait_until(lambda: fake.pin_count() == 0, what="both unpinned")
+
+    def test_a_background_resend_reopens_and_sends_the_same_op(
+        self, fake, nodes, handlers
+    ):
+        node = nodes()
+        h = handlers(node)
+        assert put(h, "k")
+        conn = h._cpu.server_conn
+        origin = conn._origin
+        request = origin.stamp(
+            LookupAndPinRequest(
+                session=conn.session,
+                server_epoch=conn.server_epoch,
+                op=PLACEHOLDER_OP,
+                items=[Key(NS, "k")],
+            )
+        )
+        old = conn.session
+        with fake._lock:
+            fake.workers[old].open = False
+        answered = conn._send_lookup(
+            origin, request, conn.session_node_epoch, background=True
+        )
+        assert answered is not None and answered[0][0].result == ItemResult.HIT
+        assert conn.session != old
+        sent = [
+            r
+            for r in fake.requests(MessageType.LOOKUP_AND_PIN)
+            if r.op.seq == request.op.seq
+        ]
+        assert len(sent) == 2 and sent[1].op.digest == request.op.digest
+        conn.unpin([answered[0][0].pin_id])
+        wait_until(lambda: fake.pin_count() == 0, what="unpinned")
+
+    def test_a_probe_on_an_expired_session_misses_and_is_not_resent(
+        self, fake, nodes, handlers
+    ):
+        node = nodes()
+        h = handlers(node)
+        assert put(h, "k")
+        conn = h._cpu.server_conn
+        old = conn.session
+        with fake._lock:
+            fake.workers[old].open = False
+        sent = len(fake.requests(MessageType.PROBE))
+        assert h.batch_exists(["k"]) == [False]
+        assert h._cpu.stats["probe_unavailable"] == 1
+        assert len(fake.requests(MessageType.PROBE)) == sent + 1
+        wait_until(lambda: conn.session not in (None, old), what="reopened")
+        assert h.batch_exists(["k"]) == [True]
 
     def test_stored_handle_is_not_freed_again(self, nodes, handlers):
         node = nodes()
@@ -1891,10 +1948,12 @@ class TestStaleRuns:
         with fake._lock:  # the session stands on an older run of the node
             fake.workers[conn.session].node_epoch = "older-run"
         conn.node_epoch = "older-run"
-        read = h.retrieve("k")  # EPOCH; WORKER_OPEN refused; reopened on the run
+        assert h.retrieve("k") is None  # EPOCH: a miss; reopened in the background
+        # WORKER_OPEN refused for the older run; reopened on the attached one
+        wait_until(lambda: conn.node_epoch == current and not conn._reopen, what="open")
+        read = h.retrieve("k")
         assert read is not None and bytes(read.view) == b"k"
-        assert conn.node_epoch == current
-        assert h._cpu.stats["retrieve_unavailable"] == 0
+        assert h._cpu.stats["retrieve_unavailable"] == 1
         h.release_retrieved([read])
 
     def test_resends_on_one_connection_all_get_the_result(self, fake, nodes, handlers):

@@ -541,7 +541,9 @@ def test_a_lookup_of_the_ended_server_is_not_sent_to_the_new_one(fake, runs, han
     )
     fake.restart()
     attached_to(h, new_run(node, first), fake)
-    assert server._send_lookup(origin, request, first.node_epoch) is None
+    assert (
+        server._send_lookup(origin, request, first.node_epoch, background=True) is None
+    )
     assert not [
         r
         for r in fake.requests(MessageType.LOOKUP_AND_PIN)
@@ -609,7 +611,7 @@ def test_a_node_that_does_not_open_is_warned_about_once(fake, nodes, handlers, c
     warnings = [
         r
         for r in caplog.records
-        if r.levelname == "WARNING" and "has not resumed" in r.getMessage()
+        if r.levelname == "WARNING" and "has not opened" in r.getMessage()
     ]
     assert len(warnings) == 1
     opens = [
