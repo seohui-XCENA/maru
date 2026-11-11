@@ -824,6 +824,8 @@ A load whose GPU copies cannot be confirmed finished (a CUDA error, or a failed 
 
 A load that fails after some of its copies were queued is reported only once those copies are known to have ended, on every backend. Until then vLLM gets neither its failed blocks nor its completion. Once the worker stops it reads, copies and stores nothing more and asks for no credit: the load hooks, the store hooks and `get_finished` all raise.
 
+Held until the process ends means the connector never frees, unpins or closes them, nor the handler that maps them, even if a later wait succeeds or the worker shuts down. It does not mean the pins outlive a MaruServer restart. A store copy whose end is unknown keeps its pages, staging and the requests' blocks the same way; if vLLM preempts a request while such copies may still read its blocks, the step raises.
+
 (vllm-hybrid-one-group)=
 ### Running a hybrid model as one group
 

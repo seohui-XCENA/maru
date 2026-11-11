@@ -55,6 +55,7 @@ from maru_common.kv_shard import (
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_handler.client import CreditUnavailableError
 from maru_handler.storage.lease import ReadLease
+from maru_vllm.copy_tracker import CopyRecord, CopyTracker
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
@@ -3991,10 +3992,9 @@ class MaruWorkerConnector:
             str, tuple[Any, dict[int, tuple[str, Any]]]
         ] = {}
         self._store_completion = _StoreCompletion()
-        # What a copy whose completion is unknown may still touch (pages,
-        # pinned reads, its inputs): never freed or released here, so the
-        # space is reused only after the process ends
-        self._unconfirmed: list[Any] = []
+        # Owners of copies, each released once or, if a copy's end is
+        # unknown, kept with the handler until the process ends
+        self._copies = CopyTracker()
         # Why the worker stopped: a load copy could not be confirmed finished
         self._load_stopped: str | None = None
         self._stop_lock = threading.Lock()
@@ -6244,7 +6244,7 @@ class MaruWorkerConnector:
         pages and pins) is kept. The next connector call vLLM makes raises
         _UnconfirmedLoadError; nothing of the load is reported meanwhile."""
         if held is not None:
-            self._keep_unconfirmed(held)
+            self._keep_unconfirmed(held, req_ids=req_id)
         of = f" of req {req_id}" if req_id else ""
         with self._stop_lock:
             if self._load_stopped is not None:
@@ -6610,6 +6610,8 @@ class MaruWorkerConnector:
         Raises:
             _UnconfirmedLoadError: Once a load copy could not be confirmed
                 finished, here too if one that writes reclaimed blocks cannot.
+            _UnconfirmedCopyError: The store copies could not be waited for;
+                the staging they read and the handler are kept.
         """
         self._raise_if_load_stopped()
         # Parked receives have no new store reads; stores from before a
@@ -6632,7 +6634,15 @@ class MaruWorkerConnector:
             and metadata.preempted_req_ids
             and self._store_stream is not None
         ):
-            self._store_stream.synchronize()
+            try:
+                self._store_stream.synchronize()
+            except Exception as e:
+                # They may still read the preempted blocks
+                self._keep_unconfirmed(self._store_staging)
+                self._store_staging = None
+                raise _UnconfirmedCopyError(
+                    f"store copies of preempted requests unconfirmed: {e}"
+                ) from e
 
         if not self._layerwise_overlap:
             return
@@ -7630,7 +7640,9 @@ class MaruWorkerConnector:
                     ).copy_(kv)
                 except Exception as e:
                     self._note_store_skip(base_key, e, "layerwise save")
-                    if handle is not None:
+                    if handle is not None and self._store_copy_ended(
+                        kv_layer.device, handle
+                    ):
                         self._free_handles_best_effort([handle])
                     self._drop_layer_objects(base_key)
                     continue
@@ -7860,7 +7872,15 @@ class MaruWorkerConnector:
                     written.add(layer_idx)
                 except Exception as e:
                     self._note_store_skip(base_key, e)
-                    self._discard_pending_slab(base_key)
+                    pending = self._pending_slabs.get(base_key)
+                    if (
+                        self._node_mode
+                        and pending is not None
+                        and not self._store_copy_ended(kv_layer.device, pending[0])
+                    ):
+                        del self._pending_slabs[base_key]  # kept, never freed
+                    else:
+                        self._discard_pending_slab(base_key)
                     continue
 
                 if len(written) >= self._num_layers:
@@ -8559,6 +8579,11 @@ class MaruWorkerConnector:
         # maru_node: chunks without credit wait on the device for the
         # write-behind thread to find some (_store_after_credit)
         deferred: list[tuple[str, torch.Tensor, dict[str, str]]] = []
+        # maru_node: pages of failed chunks, which a queued copy may write
+        dropped: list[Any] = []
+        record = self._copies.register(
+            (ready_handles, slot_refs, deferred, dropped, handler)
+        )
         with torch.cuda.stream(store_stream):
             for base_key, chunk_slots, route in to_schedule:
                 handle = None
@@ -8635,7 +8660,9 @@ class MaruWorkerConnector:
                         logger.error(
                             "Maru write-behind prepare error: %s: %s", base_key, e
                         )
-                    if handle is not None:
+                    if handle is not None and self._node_mode:
+                        dropped.append(handle)  # freed once the batch's copies end
+                    elif handle is not None:
                         try:
                             handler.free(handle)
                         except Exception:
@@ -8645,17 +8672,26 @@ class MaruWorkerConnector:
                 ready_keys.append(base_key)
                 ready_handles.append(handle)
 
-            if not ready_keys and not deferred:
+            if not (ready_keys or deferred or dropped):
                 return
+            if self._store_staging is not None:
+                slot_refs.append(self._store_staging)  # read by the D2H copies
             try:
                 event = torch.cuda.Event()
                 event.record(store_stream)
             except Exception as e:
                 logger.error("Maru write-behind cannot track its copies: %s", e)
                 self._abandon_write_behind(
-                    store_stream, ready_keys, ready_handles, slot_refs, deferred
+                    store_stream,
+                    ready_keys,
+                    ready_handles,
+                    slot_refs,
+                    deferred,
+                    dropped,
+                    record,
                 )
                 return
+            self._copies.seal(record, event)
 
         if self._store_executor is None:
             self._store_executor = ThreadPoolExecutor(
@@ -8670,12 +8706,14 @@ class MaruWorkerConnector:
                 slot_refs,
                 None,
                 deferred,
+                dropped,
+                record,
             )
         except Exception as e:
             # Executor creation/submission failures are exceptional
             logger.error("Maru write-behind submit failed: %s", e)
             self._abandon_write_behind(
-                event, ready_keys, ready_handles, slot_refs, deferred
+                event, ready_keys, ready_handles, slot_refs, deferred, dropped, record
             )
 
     def _abandon_write_behind(
@@ -8685,6 +8723,8 @@ class MaruWorkerConnector:
         handles: list[Any],
         refs: list[Any],
         deferred: list[tuple[str, torch.Tensor, dict[str, str]]],
+        dropped: Sequence[Any] = (),
+        record: CopyRecord | None = None,
     ) -> None:
         """Fail a write-behind batch: wait for its copies (``copies``: an event
         or a stream, None if there are none), then give its pages back and let
@@ -8693,9 +8733,11 @@ class MaruWorkerConnector:
             if copies is not None:
                 copies.synchronize()
         except Exception as e:
-            self._keep_write_behind(e, keys, handles, refs, deferred)
+            self._keep_write_behind(e, keys, handles, refs, deferred, dropped, record)
             return
-        self._free_handles_best_effort(handles)
+        if record is not None:
+            self._copies.confirm(record, True)
+        self._free_handles_best_effort([*handles, *dropped])
         keys = keys + self._drop_deferred(deferred)
         self._complete_write_behind_keys(keys, [False] * len(keys))
 
@@ -8706,16 +8748,30 @@ class MaruWorkerConnector:
         handles: list[Any],
         refs: list[Any],
         deferred: list[tuple[str, torch.Tensor, dict[str, str]]],
+        dropped: Sequence[Any] = (),
+        record: CopyRecord | None = None,
     ) -> None:
         """Fail a write-behind batch whose copies could not be waited for. They
-        may still read the requests' GPU blocks and write the pages and device
-        slabs: all of them are kept, and the requests never finish."""
-        logger.error(
-            "Maru write-behind copies unconfirmed; their pages and GPU blocks "
-            "are kept: %s",
-            exc,
-        )
-        self._keep_unconfirmed(handles, list(refs), list(deferred))
+        may still read the requests' GPU blocks and write the pages, device
+        slabs and staging: all of them are kept with the handler, and the
+        requests never finish."""
+        if record is None:
+            record = self._copies.register(
+                (handles, list(refs), list(deferred), dropped, self._handler)
+            )
+        first = not self._copies.kept
+        if self._copies.keep(record, exc):
+            if first:
+                logger.error(
+                    "Maru write-behind copies unconfirmed; their pages and GPU "
+                    "blocks are kept: %s",
+                    exc,
+                )
+            else:
+                self._log_store_skip(exc)
+        # No later batch writes the staging these copies may still read
+        if any(ref is self._store_staging for ref in refs):
+            self._store_staging = None
         keys = keys + [key for key, *_ in deferred]
         self._complete_write_behind_keys(
             keys, [False] * len(keys), copy_confirmed=False
@@ -8729,25 +8785,35 @@ class MaruWorkerConnector:
         refs: list[Any],
         on_done: Callable[[list[str], list[bool]], None] | None = None,
         deferred: list[tuple[str, torch.Tensor, dict[str, str]]] | None = None,
+        dropped: Sequence[Any] = (),
+        record: CopyRecord | None = None,
     ) -> None:
         """Wait for D2H and register a write-behind batch off-thread.
 
         ``event`` is None for objects the engine thread already copied.
         ``deferred``: chunks gathered to the device for want of credit.
+        ``dropped``: pages of failed chunks, freed once the copies ended.
+        ``record``: the batch's owner, confirmed or kept here.
         """
         handler = self._handler
         deferred = deferred or []
         later = [key for key, *_ in deferred]
         if handler is None:
             logger.error("Maru write-behind completion: handler unavailable")
-            self._abandon_write_behind(event, keys, handles, refs, deferred)
+            self._abandon_write_behind(
+                event, keys, handles, refs, deferred, dropped, record
+            )
             return
         try:
             if event is not None:
                 event.synchronize()
         except Exception as e:
-            self._keep_write_behind(e, keys, handles, refs, deferred)
+            self._keep_write_behind(e, keys, handles, refs, deferred, dropped, record)
             return
+        if record is not None:
+            self._copies.confirm(record, True)
+        if dropped:
+            self._free_handles_best_effort(list(dropped))
         refs.clear()  # safe to release stream inputs after the event
         if self._node_mode:
             # The blocks are read: their requests need not wait for MaruServer
@@ -8797,7 +8863,8 @@ class MaruWorkerConnector:
         thread): wait up to ``_STORE_CREDIT_WAIT_S`` in all for credit, copy
         each from the device to its page and publish them; skip the rest. A
         wait that times out skips such chunks until credit comes again, and
-        nothing waits once shutdown started."""
+        nothing waits once shutdown started. A copy that fails may still
+        write its page from the slab: both and their room are kept."""
         deadline = time.monotonic() + _STORE_CREDIT_WAIT_S
         keys: list[str] = []
         handles: list[Any] = []
@@ -8807,12 +8874,14 @@ class MaruWorkerConnector:
             with self._credit_wait_lock:
                 hurry = self._credit_drought or self._stores_closing
             handle = None
+            record = None
             try:
                 handle = handler.alloc(
                     nbytes,
                     wait_s=0.0 if hurry else max(0.0, deadline - time.monotonic()),
                     **route,
                 )
+                record = self._copies.register((handle, slab, handler), base_key)
                 torch.frombuffer(handle.buf[:nbytes], dtype=slab.dtype).view(
                     slab.shape
                 ).copy_(slab)
@@ -8820,10 +8889,13 @@ class MaruWorkerConnector:
                 if isinstance(e, CreditUnavailableError):
                     self._set_credit_drought(True)
                 self._log_store_skip(e)
-                if handle is not None:
+                if record is not None and self._copies.keep(record, e):
+                    nbytes = 0  # its room stays taken with the slab
+                elif handle is not None:
                     self._free_handles_best_effort([handle])
                 self._complete_write_behind_keys([base_key], [False], reported=True)
             else:
+                self._copies.confirm(record, True)
                 self._set_credit_drought(False)
                 keys.append(base_key)
                 handles.append(handle)
@@ -9031,9 +9103,24 @@ class MaruWorkerConnector:
             except Exception:
                 pass
 
-    def _keep_unconfirmed(self, *held: Any) -> None:
-        """Keep what a copy that could not be waited for may still use."""
-        self._unconfirmed.append(held)
+    def _store_copy_ended(self, device: torch.device, *held: Any) -> bool:
+        """After a blocking store copy on ``device`` raised: whether the work
+        queued on its stream ended. If that is unknown, ``held`` is kept."""
+        if device.type != "cuda":
+            return True
+        record = self._copies.register((*held, self._handler))
+        try:
+            torch.cuda.current_stream(device).synchronize()
+        except Exception as e:
+            logger.error("Maru store copy unconfirmed; its page is kept: %s", e)
+            self._copies.keep(record, e)
+            return False
+        return self._copies.confirm(record, True)
+
+    def _keep_unconfirmed(self, *held: Any, req_ids: str | None = None) -> None:
+        """Keep what a copy that could not be waited for may still use, and
+        the handler mapping it, until the process exits."""
+        self._copies.keep(self._copies.register((*held, self._handler), req_ids))
 
     def _is_stored(self, key: str) -> bool:
         # A session or node pool may drop a key: ask, never remember
@@ -9091,9 +9178,6 @@ class MaruWorkerConnector:
         if self._credit_executor is not None:
             self._credit_executor.shutdown(wait=True)
             self._credit_executor = None
-        # Chunks whose layers never all came: their pages go back
-        for base_key in list(self._pending_layer_objects):
-            self._drop_layer_objects(base_key)
         self._wait_node_stores(_NODE_STORE_DRAIN_S)
 
         def drain(stream: Any, what: str) -> bool:
@@ -9108,7 +9192,6 @@ class MaruWorkerConnector:
         if self._store_stream is not None:
             drained &= drain(self._store_stream, "store")
             self._store_stream = None
-            self._store_staging = None
         if self._sync_store_stream is not None:
             drained &= drain(self._sync_store_stream, "sync store")
             self._sync_store_stream = None
@@ -9132,22 +9215,30 @@ class MaruWorkerConnector:
         self._layerwise_streams = []
         self._layerwise_stream_device = None
         self._layer_load_events.clear()
-        if not drained:
-            # A copy may still use the pinned objects or store pages: keep
-            # them, their pins and the mappings until the process ends
-            logger.error(
-                "Maru: queued copies did not finish; pins, pages and mappings "
-                "are left to the process exit"
-            )
-            self._keep_unconfirmed(
-                self._active_load_refs,
-                self._deferred_refs,
-                self._deferred_layerwise_loads,
-                self._handler,
-                self._node_handler,
-            )
+        if not drained or self._copies.kept:
+            # A copy may still use the pinned objects or store pages, now or
+            # since one was kept: keep them, their pins and the mappings until
+            # the process ends. A later shutdown has nothing new to keep.
+            if not (drained and self._handler is None and self._node_handler is None):
+                logger.error(
+                    "Maru: queued copies are not known to have finished; pins, "
+                    "pages and mappings are left to the process exit"
+                )
+                self._keep_unconfirmed(
+                    self._active_load_refs,
+                    self._deferred_refs,
+                    self._deferred_layerwise_loads,
+                    self._pending_layer_objects,
+                    self._store_staging,
+                    self._node_handler,
+                )
+            self._store_staging = None
             self._handler = self._node_handler = None
             return
+        self._store_staging = None
+        # Chunks whose layers never all came: their pages go back
+        for base_key in list(self._pending_layer_objects):
+            self._drop_layer_objects(base_key)
         # Every stream is drained: no copy reads the pinned objects any more
         self._release_held(
             [

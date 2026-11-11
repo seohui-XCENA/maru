@@ -420,7 +420,7 @@ def test_unconfirmed_pipelined_copies_stop_the_worker(monkeypatch, deferred):
     assert "load" not in worker._deferred_done
     assert not worker._failed_load_blocks
     assert not worker._loaded_request_keys["load"][1]
-    assert worker._unconfirmed
+    assert worker._copies.kept
     assert _stopped(worker)
 
 

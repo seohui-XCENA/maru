@@ -4660,7 +4660,7 @@ class TestPackedStorage:
         assert store == {}
         assert worker._stored_keys == set()
         assert freed == []
-        assert [h for held in worker._unconfirmed for h in held[0]] == allocated
+        assert [h for r in worker._copies.kept for h in r.owner[0]] == allocated
 
     def test_kernel_store_writes_kv2ltd_slab_roundtrip(self):
         """_store_packed_slabs: one kernel D2H per chunk, one key per chunk,

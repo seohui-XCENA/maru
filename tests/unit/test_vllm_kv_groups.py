@@ -1673,7 +1673,7 @@ def test_kernel_store_registers_no_group_object_whose_copy_failed(version):
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
     assert set(store) == {group_object_key(k1, g, TINY_BLOCK) for g in range(3)}
     worker._handler.free.assert_not_called()
-    kept = [h for held in worker._unconfirmed for h in held[0]]
+    kept = [h for r in worker._copies.kept for h in r.owner[0]]
     assert len(kept) == 2  # the two attention slabs
 
 

@@ -40,9 +40,11 @@ from maru_vllm.connector import (
     _chunk_keys,
     _node_engine_config,
     _node_transfer_defaults,
+    _UnconfirmedCopyError,
     _UnconfirmedLoadError,
     _validate_storage_config,
 )
+from maru_vllm.copy_tracker import _PROCESS_KEPT
 from maru_vllm.kv_groups import describe_kv_groups, group_object_key
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
@@ -825,7 +827,7 @@ def test_chunks_waiting_for_credit_stay_with_an_unconfirmed_batch():
     )
     assert worker.get_finished_saving({"r", "r2"}) is None
     worker._release_deferred.assert_not_called()
-    assert any(s is slab for held in worker._unconfirmed for _, s, _ in held[2])
+    assert any(s is slab for r in worker._copies.kept for _, s, _ in r.owner[2])
 
 
 @pytest.mark.parametrize("ended", [True, False])
@@ -865,6 +867,62 @@ def test_a_failed_shutdown_wait_keeps_reads_and_mappings():
     worker.shutdown()
     handler.release_retrieved.assert_not_called()
     handler.close.assert_not_called()
+
+
+def test_a_kept_copy_outlives_later_drains_shutdowns_and_the_worker():
+    """Once a copy's end is unknown, a later wait that succeeds does not give
+    back what it may use: no free, no unpin, no close of the handler."""
+    worker = write_behind_worker()
+    handler = worker._handler
+    handle = page()
+    wait_on(worker, "r", "k")
+    worker._finish_write_behind_store(FailedWait(), ["k"], [handle], [])
+    worker._active_load_refs = [(Done(), [[lease("read")]])]
+    worker.shutdown()  # every stream drains now
+    kept = len(_PROCESS_KEPT)
+    worker.shutdown()
+    assert len(_PROCESS_KEPT) == kept  # nothing new to keep
+    handler.free.assert_not_called()
+    handler.release_retrieved.assert_not_called()
+    handler.close.assert_not_called()
+    record = worker._copies.kept[0]
+    assert record.owner[0] == [handle] and record.owner[-1] is handler
+    del worker
+    assert any(r is record for r in _PROCESS_KEPT)
+
+
+def test_store_copies_of_preempted_requests_that_cannot_be_waited_for_are_fatal():
+    worker = write_behind_worker()
+    staging = torch.zeros(4)
+    worker._store_staging = staging
+    worker._store_stream = FailedWait()
+    with pytest.raises(_UnconfirmedCopyError):
+        worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r"}))
+    assert worker._store_staging is None  # never written again
+    assert any(r.owner[0] is staging for r in worker._copies.kept)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_layer_copy_that_cannot_be_waited_for_keeps_its_page(monkeypatch):
+    worker = pinning_worker()
+    worker._num_layers = NUM_LAYERS
+    worker._handler.has_local.return_value = False
+    marker = page()
+    short = SimpleNamespace(buf=memoryview(bytearray(4)))  # the copy fails
+    pages = iter([marker, short])
+    worker._handler.alloc.side_effect = lambda *a, **k: next(pages)
+    monkeypatch.setattr(worker, "_extract_kv_from_layer", lambda *a: torch.zeros(8))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: FailedWait())
+    one_chunk = dataclasses.replace(store_meta("r", 0), token_ids=list(range(CHUNK)))
+    worker._save_layer_on_node(
+        LAYER_NAMES[0],
+        torch.zeros(1, device="cuda"),
+        None,
+        MaruConnectorMetadata(requests=[one_chunk]),
+    )
+    # The marker page was never copied to; the layer's page may be
+    assert [c.args[0] for c in worker._handler.free.call_args_list] == [marker]
+    assert any(r.owner[0] is short for r in worker._copies.kept)
 
 
 def test_other_backends_hold_no_pins():
@@ -1545,7 +1603,7 @@ def test_a_group_batch_whose_copies_cannot_be_waited_for_keeps_its_reads(
     assert loaded is None
     worker._handler.release_retrieved.assert_not_called()
     assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
-    assert any(held is not None for held in worker._unconfirmed)
+    assert worker._copies.kept
     assert stopped(worker, "req r1")
 
 
@@ -2347,6 +2405,86 @@ def test_chunks_wait_for_credit_on_the_device(monkeypatch):
     assert first[0, 0].tolist() == list(range(8))  # the chunk's own slots
     assert worker._deferred_bytes == 0
     worker.shutdown()
+
+
+def test_write_behind_adds_no_wait_on_the_engine_thread(monkeypatch):
+    """Only the completion thread waits for a batch's copies."""
+    worker, kernel, credit, published = wait_worker(monkeypatch)
+    credit.at_hand.set()
+    waits = []
+
+    class Event:
+        def record(self, stream=None):
+            pass
+
+        def synchronize(self):
+            waits.append(threading.get_ident())
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    stream = torch.cuda.current_stream()
+    stream.synchronize = lambda: waits.append(threading.get_ident())
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    drain_behind(worker)
+    assert len(waits) == 1 and threading.get_ident() not in waits
+    assert len(published) == 2
+    assert worker.get_finished_saving({"r1"}) == {"r1"}
+    assert len(waits) == 1
+    worker.shutdown()
+
+
+@pytest.mark.parametrize("ended", [True, False])
+def test_a_failed_chunk_keeps_its_page_until_the_batch_copies_end(monkeypatch, ended):
+    """Its D2H may be queued: the page goes back with the batch's event, and
+    if that cannot be waited for it is kept, with the staging."""
+    worker, kernel, credit, published = wait_worker(monkeypatch)
+    credit.at_hand.set()
+    gathers = []
+
+    def gather(dst, *args, **kwargs):
+        gathers.append(dst)
+        if len(gathers) == 1:
+            raise RuntimeError("copy failed")
+
+    kernel[0].multi_layer_kv_transfer = gather
+    if not ended:
+
+        class Unknown:
+            def record(self, stream=None):
+                pass
+
+            def synchronize(self):
+                raise RuntimeError("CUDA error")
+
+        monkeypatch.setattr(torch.cuda, "Event", Unknown)
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    drain_behind(worker)
+    failed, stored = credit.pages
+    freed = [c.args[0] for c in worker._handler.free.call_args_list]
+    if ended:
+        assert freed == [failed] and len(published) == 1
+        assert worker.get_finished_saving({"r1"}) == {"r1"}
+    else:
+        assert freed == [] and published == []
+        owner = worker._copies.kept[0].owner
+        assert owner[3] == [failed] and owner[0] == [stored]
+        assert worker._store_staging is None  # the next batch takes a new one
+        assert worker.get_finished_saving({"r1"}) is None
+    worker.shutdown()
+
+
+def test_a_failed_credit_copy_keeps_its_page_slab_and_room():
+    """The first gather ended, so the request's blocks went back; the copy
+    from its device slab to the page did not."""
+    worker = write_behind_worker()
+    slab = torch.zeros(4)
+    worker._deferred_bytes = 16
+    short = SimpleNamespace(buf=memoryview(bytearray(8)))  # the copy fails
+    worker._handler.alloc.return_value = short
+    worker._store_after_credit(worker._handler, [("k", slab, {})])
+    worker._handler.free.assert_not_called()
+    assert worker._deferred_bytes == 16
+    owner = worker._copies.kept[0].owner
+    assert owner[0] is short and owner[1] is slab
 
 
 # =============================================================================
