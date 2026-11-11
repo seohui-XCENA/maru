@@ -63,7 +63,7 @@ class StorageConn:
         self,
         path: str,
         *,
-        on_notify: Callable[[Notify], None],
+        on_notify: Callable[[Notify, "StorageConn"], None],
         on_lost: Callable[["StorageConn"], None],
     ):
         self.path = path
@@ -252,7 +252,7 @@ class StorageConn:
                     return
                 notify = self._notices.popleft()
             try:
-                self._on_notify(notify)
+                self._on_notify(notify, self)
             except Exception:
                 logger.exception("handling NOTIFY %s failed", notify.kind)
 

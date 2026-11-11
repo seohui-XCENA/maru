@@ -108,7 +108,7 @@ def put(handler, key: str) -> bool:
 
 def attach(path: str, role: SessionRole, incarnation: str | None = None):
     """One ATTACH by hand; returns (conn, reply, fds)."""
-    conn = StorageConn(path, on_notify=lambda n: None, on_lost=lambda c: None)
+    conn = StorageConn(path, on_notify=lambda n, c: None, on_lost=lambda c: None)
     pid = os.getpid()
     request = AttachRequest(
         engine_id="eng",

@@ -1664,17 +1664,25 @@ class MaruClient:
 
     # ----------------------------------------------------------------- notify
 
-    def _on_notify(self, notify: Notify) -> None:
+    def _on_notify(self, notify: Notify, conn: StorageConn) -> None:
+        """A notice of ``conn``; one that acts on pools or credits counts only
+        while ``conn`` is the live connection (a late callback of an ended
+        run's connection must not touch the new run's)."""
         if notify.kind == NotifyKind.CREDIT_RETURN:
-            credits = self.credits.take_bytes(notify.bytes or 0)
+            with self._lock:
+                if conn is not self._storage or conn.closed:
+                    return
+                credits = self.credits.take_bytes(notify.bytes or 0)
             if credits:
                 self._return_credits(credits)
         elif notify.kind == NotifyKind.POOL_REMOVE:
             with self._lock:
+                if conn is not self._storage or conn.closed:
+                    return
                 # What the notice is about, as it arrives: this run, this
                 # connection, this mapping (an old run's is left to the
                 # old-pool cleanup)
-                epoch, storage = self.node_epoch, self._storage
+                epoch, storage = self.node_epoch, conn
                 mapped = (
                     self.pools.get(notify.pool_id)
                     if notify.pool_id is not None

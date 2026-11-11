@@ -772,14 +772,17 @@ class TestClientNotify:
         client = h._cpu
         wait_credit(h, 2)
         held = node.pools.held_bytes(client.identity.incarnation)
-        client._on_notify(Notify(kind=NotifyKind.CREDIT_RETURN, bytes=PAGE))
+        client._on_notify(
+            Notify(kind=NotifyKind.CREDIT_RETURN, bytes=PAGE), client._storage
+        )
         wait_until(
             lambda: node.pools.held_bytes(client.identity.incarnation) < held,
             what="credit returned",
         )
         pool_id = node.dram.pool_id
         client._on_notify(
-            Notify(kind=NotifyKind.POOL_REMOVE, pool_id=pool_id, pool_generation=1)
+            Notify(kind=NotifyKind.POOL_REMOVE, pool_id=pool_id, pool_generation=1),
+            client._storage,
         )
         wait_until(
             lambda: (client.identity.incarnation, pool_id, 1) in node.manager._unmapped,

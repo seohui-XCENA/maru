@@ -140,7 +140,9 @@ class RawWorker:
         self.incarnation = incarnation or os.urandom(16).hex()
         self.notices = []
         self.lost = False
-        self.conn = StorageConn(path, on_notify=self.notices.append, on_lost=self._lost)
+        self.conn = StorageConn(
+            path, on_notify=lambda n, c: self.notices.append(n), on_lost=self._lost
+        )
         self.origin = OpOrigin(self.incarnation)
         self.response = None
         self.fds: list[int] = []

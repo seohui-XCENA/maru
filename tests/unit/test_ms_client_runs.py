@@ -214,7 +214,7 @@ def test_a_delayed_notice_is_not_taken_for_the_new_runs(attached, monkeypatch):
             pass
 
     monkeypatch.setattr(maru_client.threading, "Thread", Deferred)
-    client._on_notify(notice())  # arrives on the e1 connection
+    client._on_notify(notice(), client._storage)  # on the e1 connection
     monkeypatch.undo()
     old_conn = client._storage
     old_conn.closed = True
@@ -261,3 +261,43 @@ def test_no_ack_while_a_detached_mapping_is_still_closing(attached, monkeypatch)
         assert conn.sent == [NodeMessageType.UNMAP_ACK]
     finally:
         resume.set()
+
+
+def test_a_late_callback_of_an_ended_connection_is_ignored(client, monkeypatch):
+    from maru_handler.client.storage_conn import StorageConn
+
+    client.pools = PoolMaps(pin_pools=False, map_dax=lambda info, dax: FakeMapping())
+    entered, resume = threading.Event(), threading.Event()
+
+    def delayed(notify, conn):
+        entered.set()  # the notifier took the notice, nothing captured yet
+        assert resume.wait(5)
+        client._on_notify(notify, conn)
+
+    old_conn = StorageConn(
+        "/nonexistent/node.sock", on_notify=delayed, on_lost=client._on_lost
+    )
+    client._take_attach(old_conn, attach_response("e1"), [], first=True)
+    old_conn._notices.append(notice())
+    notifier = threading.Thread(target=old_conn._notify_loop)
+    try:
+        notifier.start()
+        assert entered.wait(5)
+        old_conn._fail("simulated receiver EOF")
+        assert old_conn.closed and client._storage is None
+        client._unmap_on_loss()
+        assert client.pools.flush(5)
+        new_conn = AttachConn()
+        client._take_attach(new_conn, attach_response("e2"), [], first=False)
+        new = client.pools.get(CXL.pool_id)
+        assert new is not None and new.node_epoch == "e2"
+        resume.set()
+        notifier.join(5)
+        assert not notifier.is_alive()
+        assert client.pools.flush(5)
+        assert client.pools.get(CXL.pool_id) is new and not new.mapping.closed
+        assert not new_conn.sent
+    finally:
+        resume.set()
+        notifier.join(5)
+        client.pools.close()
