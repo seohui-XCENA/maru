@@ -4959,6 +4959,9 @@ class MaruWorkerConnector:
             infos: list[Any] = []
             try:
                 infos = list(self._batch_retrieve_all(keys[batch], **route))
+                if self._load_stopped is not None:
+                    handler.release_retrieved(infos)  # never queued
+                    return None
                 missing = n - sum(info is not None for info in infos)
                 if len(infos) != n or missing:
                     raise RuntimeError(f"{missing} of {n} objects missing")
@@ -5378,6 +5381,9 @@ class MaruWorkerConnector:
 
             if self._load_admission_window > 0:
                 self._wait_for_load_admission(req_meta.req_id)
+            if self._load_stopped is not None:
+                self._release_held(infos)  # never queued
+                return
 
             attn = self._last_attn_metadata
             # Content-identical to _packed_load_kernel_ctx, but built from the

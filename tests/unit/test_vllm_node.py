@@ -11,7 +11,7 @@ import contextlib
 import dataclasses
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1705,6 +1705,104 @@ def test_a_queued_load_job_reads_nothing_once_the_worker_stopped():
     worker._batch_retrieve_all.assert_not_called()
     worker._load_group_leased.assert_not_called()
     assert not worker._inflight_deferred_req_ids and not worker._deferred_done
+
+
+def test_a_group_load_stopped_during_retrieve_releases_without_placing(monkeypatch):
+    worker = pinning_worker()
+    worker._handler.retrieve_capacity.return_value = None
+    reads = [lease("held")]
+    monkeypatch.setattr(
+        worker, "_group_load_plan", lambda meta: (1, [(None, 0)], ["key"])
+    )
+    entered, resume = threading.Event(), threading.Event()
+
+    def retrieve(keys, **route):
+        entered.set()
+        assert resume.wait(5)
+        return reads
+
+    monkeypatch.setattr(worker, "_batch_retrieve_all", retrieve)
+    worker._place_group_objects = MagicMock()
+    stream = MagicMock()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        load = executor.submit(
+            worker._load_group_leased,
+            group_meta(),
+            torch.device("cpu"),
+            stream,
+            offthread=True,
+        )
+        try:
+            assert entered.wait(5)
+            worker._stop_on_unconfirmed_load("other", RuntimeError("unknown copy"))
+        finally:
+            resume.set()
+        loaded = load.result(5)
+
+    assert worker._load_stopped is not None
+    worker._handler.release_retrieved.assert_called_once_with(reads)
+    worker._place_group_objects.assert_not_called()
+    stream.synchronize.assert_not_called()
+    assert loaded is None
+    assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
+
+
+def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeypatch):
+    worker = pinning_worker()
+    worker._node_mode = worker._leased_mode = False
+    worker._load_admission_window = 1
+    worker._packed_store_kernel_ctx = lambda attn: None
+    worker._deferred_stream = Done()
+    worker._deferred_stream_device = torch.device("cpu")
+    worker._inject_slab_layers = MagicMock()
+    worker._release_held = MagicMock(wraps=worker._release_held)
+    worker._inflight_deferred_req_ids.add("r1")
+    entered, resume = threading.Event(), threading.Event()
+
+    class Admission:
+        ended = False
+
+        def query(self):
+            return self.ended
+
+        def synchronize(self):
+            entered.set()
+            assert resume.wait(5)
+            self.ended = True
+
+    worker._deferred_events["other"] = Admission()
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    event = MagicMock()
+    monkeypatch.setattr(torch.cuda, "Event", event)
+    reads = []
+
+    def retrieve(keys, **route):
+        reads.extend(SimpleNamespace(view=memoryview(bytearray(64))) for _ in keys)
+        return reads
+
+    monkeypatch.setattr(worker, "_batch_retrieve_all", retrieve)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        load = executor.submit(
+            worker._deferred_load_job,
+            external_meta(True),
+            [("layer", torch.zeros(1), 0)],
+            torch.device("cpu"),
+        )
+        try:
+            assert entered.wait(5)
+            worker._stop_on_unconfirmed_load("other", RuntimeError("unknown copy"))
+        finally:
+            resume.set()
+        load.result(5)
+
+    assert worker._load_stopped is not None
+    worker._release_held.assert_called_once_with(reads)
+    worker._inject_slab_layers.assert_not_called()
+    event.assert_not_called()
+    assert "r1" not in worker._deferred_events and "r1" not in worker._deferred_refs
+    assert not worker._inflight_deferred_req_ids and not worker._deferred_done
+    assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
 
 
 def cuda_load_stream(monkeypatch, worker, stream) -> torch.device:
