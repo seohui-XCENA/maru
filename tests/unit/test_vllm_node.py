@@ -1442,15 +1442,24 @@ class FailedQuery(Done):
         raise RuntimeError("CUDA error")
 
 
-def stopped(worker, match: str = "") -> bool:
+UNCONFIRMED = "could not be confirmed finished"
+
+
+def stopped(worker, match: str) -> bool:
     """Every connector call vLLM makes next raises, so vLLM never computes
-    into blocks the copy may still write."""
+    into blocks the copy may still write, nor issues new copies."""
+    empty = MaruConnectorMetadata()
     calls = (
-        lambda: worker.start_load_kv(None, MaruConnectorMetadata()),
-        lambda: worker.handle_preemptions(MaruConnectorMetadata()),
+        lambda: worker.start_load_kv(None, empty),
+        lambda: worker.handle_preemptions(empty),
         worker.get_finished_loading,
         worker.take_failed_load_blocks,
         lambda: worker.take_failed_recv_req_ids({"r1"}),
+        lambda: worker.get_finished_saving({"r1"}),
+        lambda: worker.want_step_credit(empty),
+        lambda: worker.wait_for_layer_load(LAYER_NAMES[0]),
+        lambda: worker.save_kv_layer(LAYER_NAMES[0], torch.zeros(1), None, empty),
+        lambda: worker.wait_for_save(empty),
     )
     for call in calls:
         with pytest.raises(_UnconfirmedLoadError, match=match):
@@ -1482,7 +1491,12 @@ def test_copies_that_cannot_be_asked_about_stop_the_worker(parked):
     with pytest.raises(_UnconfirmedLoadError):
         worker.get_finished_loading()
     worker._handler.release_retrieved.assert_not_called()
-    assert stopped(worker, "req r1" if parked else "")
+    worker._write_behind = True
+    worker._queued_store_batches = [("kernel", MaruConnectorMetadata())]
+    worker._store_packed_slabs_write_behind = MagicMock()
+    assert stopped(worker, "req r1" if parked else UNCONFIRMED)
+    # Nor does a stopped worker issue the stores the step queued
+    worker._store_packed_slabs_write_behind.assert_not_called()
 
 
 def test_an_undrained_copy_into_reclaimed_blocks_stops_the_worker():
@@ -1539,6 +1553,134 @@ def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
         assert worker._load_stopped is None
     else:
         assert not worker._failed_recv_req_ids and not worker._deferred_done
+        assert stopped(worker, "req r1")
+
+
+def stop_at_r1(worker, calls: list):
+    """A load that stops the worker at r1 and notes every request it gets."""
+
+    def load(*args, **kwargs):
+        req_meta = next(a for a in args if isinstance(a, MaruReqMeta))
+        calls.append(req_meta.req_id)
+        if req_meta.req_id == "r1":
+            worker._stop_on_unconfirmed_load("r1", RuntimeError("CUDA error"))
+
+    return load
+
+
+def three(meta: MaruReqMeta) -> MaruConnectorMetadata:
+    return MaruConnectorMetadata(
+        requests=[dataclasses.replace(meta, req_id=r) for r in ("r1", "r2", "r3")]
+    )
+
+
+def test_a_stop_leaves_the_later_loads_of_the_step_unread():
+    worker = pinning_worker()
+    calls = []
+    worker._load_leased_request = stop_at_r1(worker, calls)
+    with pytest.raises(_UnconfirmedLoadError, match="req r1"):
+        worker.start_load_kv(forward_of(sentinel_kv()), three(external_meta(False)))
+    assert calls == ["r1"]
+
+
+def test_a_stop_leaves_the_later_group_loads_of_the_step_unread():
+    worker = pinning_worker()
+    worker._group_caches = [SimpleNamespace(tensors=[torch.zeros(1)])]
+    calls = []
+    worker._load_group_leased = stop_at_r1(worker, calls)
+    worker._start_group_loads(three(group_meta()))
+    assert calls == ["r1"]
+    assert stopped(worker, "req r1")
+
+
+def test_an_inline_parked_group_load_is_done_once_its_batches_ended():
+    worker = pinning_worker()
+    worker._group_caches = [SimpleNamespace(tensors=[torch.zeros(1)])]
+    worker._load_group_leased = MagicMock(return_value=(1, 2))
+    meta = group_meta(deferred_load=True)
+    worker._start_group_loads(MaruConnectorMetadata(requests=[meta]))
+    assert worker._deferred_done == {"r1"}
+
+
+def test_a_queued_load_job_reads_nothing_once_the_worker_stopped():
+    worker = pinning_worker()
+    worker._stop_on_unconfirmed_load("r0", RuntimeError("CUDA error"))
+    worker._batch_retrieve_all = MagicMock()
+    worker._load_group_leased = MagicMock()
+    worker._inflight_deferred_req_ids.add("r1")
+    worker._deferred_load_job(external_meta(True), [], torch.device("cpu"))
+    worker._group_load_job(group_meta(deferred_load=True), torch.device("cpu"), Done())
+    worker._batch_retrieve_all.assert_not_called()
+    worker._load_group_leased.assert_not_called()
+    assert not worker._inflight_deferred_req_ids and not worker._deferred_done
+
+
+def cuda_load_stream(monkeypatch, worker, stream) -> torch.device:
+    """Have ``worker`` load on ``stream`` as if on a CUDA device."""
+    device = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: Done())
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    stream.wait_stream = lambda other: None
+    worker._load_stream, worker._load_stream_device = stream, device
+    return device
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_a_failed_group_placement_is_reported_only_once_drained(monkeypatch, drained):
+    """Its first objects may be copying: vLLM recomputes into the blocks only
+    once they ended, and never if they cannot be waited for."""
+    worker = make_worker(BLOCK, CHUNK, {})
+    worker._handler = MagicMock()
+    device = cuda_load_stream(monkeypatch, worker, Done() if drained else FailedWait())
+    worker._group_caches = [SimpleNamespace(tensors=[SimpleNamespace(device=device)])]
+    worker._retrieve_group_objects = lambda meta: (1, [])
+    worker._place_group_objects = MagicMock(side_effect=RuntimeError("place failed"))
+    worker._start_group_loads(MaruConnectorMetadata(requests=[group_meta()]))
+    if drained:
+        assert worker.take_failed_load_blocks() == {1, 2}
+    else:
+        assert not worker._failed_load_blocks
+        assert stopped(worker, "req r1")
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_an_overlap_load_failing_after_its_copies_drains_them_first(drained):
+    """On cxl too: a parked load that fails once its layer copies are queued
+    is reported only after them."""
+    worker = make_worker(BLOCK, CHUNK, {})
+    worker._handler = MagicMock()
+    worker._batch_retrieve_all = lambda keys, **route: [lease(k) for k in keys]
+    worker._issue_layerwise_copies_offthread = lambda *a: {LAYER_NAMES[0]: Done()}
+    worker._unpark_gate_event = MagicMock(side_effect=RuntimeError("no gate"))
+    worker._layerwise_streams = [Done() if drained else FailedWait()]
+    worker._inflight_deferred_req_ids.add("r1")
+    layers = [(name, None, i) for i, name in enumerate(LAYER_NAMES)]
+    meta = external_meta(True, layerwise_load=True)
+    worker._deferred_load_job(meta, layers, torch.device("cpu"))
+    if drained:
+        assert worker._deferred_done == {"r1"} and worker._failed_load_blocks
+    else:
+        assert not worker._deferred_done and not worker._failed_load_blocks
+        assert stopped(worker, "req r1")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("drained", [True, False])
+def test_a_failed_inline_layerwise_load_waits_for_its_injects(monkeypatch, drained):
+    worker = pinning_worker()
+    layers = [(LAYER_NAMES[0], torch.zeros(4, device="cuda"), 0)]
+    stream = Done() if drained else FailedWait()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    worker._inject_kv_into_layer = MagicMock(side_effect=RuntimeError("inject failed"))
+    load = [(external_meta(False), 2, torch.arange(PROMPT), [lease("a"), lease("b")])]
+    if drained:
+        worker._load_sync(layers, load, None)
+        assert worker.take_failed_load_blocks()
+    else:
+        with pytest.raises(_UnconfirmedLoadError, match="req r1"):
+            worker._load_sync(layers, load, None)
+        assert not worker._failed_load_blocks
         assert stopped(worker, "req r1")
 
 

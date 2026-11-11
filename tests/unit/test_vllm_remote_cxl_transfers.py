@@ -4,6 +4,7 @@ copy kernel over the staging buffer (design note 3.11)."""
 
 import contextlib
 import itertools
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -478,7 +479,50 @@ def test_an_undrained_failed_copy_keeps_every_unconfirmed_slot(monkeypatch):
     log = []
     worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2, then=stuck))
     assert "release 1" not in log
-    # The failed chunk's own blocks were noted, but vLLM never takes them
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
+
+
+def test_a_failed_copy_is_reported_only_once_its_stream_drained(monkeypatch):
+    """The engine thread finds no failed block while the loader still drains
+    the copies queued before the failure."""
+    draining, resume = threading.Event(), threading.Event()
+
+    def held(stream):
+        def synchronize():
+            draining.set()
+            resume.wait(10)
+
+        stream.synchronize = synchronize
+
+    workers = []
+    fail = _fail_copy(2, then=held)
+
+    def setup(worker, ops, stream):
+        workers.append(worker)
+        fail(worker, ops, stream)
+
+    loader = threading.Thread(
+        target=_pipelined, args=(monkeypatch, []), kwargs={"setup": setup}
+    )
+    loader.start()
+    try:
+        assert draining.wait(10)
+        assert workers[0].take_failed_load_blocks() == set()
+    finally:
+        resume.set()
+        loader.join(10)
+    assert workers[0].take_failed_load_blocks() == {4, 5}
+
+
+def test_a_cxl_load_that_cannot_be_waited_for_stops_the_worker(monkeypatch):
+    log = []
+    worker, cache, meta, _ = _kernel_worker(monkeypatch, log, stream_fails=True)
+    # The cxl backend: no session and no read leases
+    worker._cpu_mode = worker._remote_cxl_mode = worker._leased_mode = False
+    with pytest.raises(_UnconfirmedLoadError, match="req load"):
+        worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    assert not worker._failed_load_blocks
     assert _stopped(worker)
 
 

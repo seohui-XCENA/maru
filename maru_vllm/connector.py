@@ -4418,6 +4418,8 @@ class MaruWorkerConnector:
                 )
 
         for req_meta in metadata.requests:
+            if self._load_stopped is not None:
+                break
             if req_meta.is_store:
                 continue
             if req_meta.num_matched_chunks == 0:
@@ -4526,6 +4528,12 @@ class MaruWorkerConnector:
             # infos). Layerwise: infos are already per-(layer,chunk).
             prepared_requests.append((req_meta, num_chunks, slot_mapping, infos))
 
+        if self._load_stopped is not None:
+            # Never queued: nothing reads them
+            if self._cpu_mode or self._node_mode:
+                for *_, infos in prepared_requests:
+                    self._handler.release_retrieved(infos)
+            self._raise_if_load_stopped()
         if not prepared_requests:
             return
 
@@ -4543,7 +4551,12 @@ class MaruWorkerConnector:
                 held = [infos for *_, infos in prepared_requests]
                 if self._cpu_mode and (
                     confirmed
-                    or self._drain_load_stream(None, _req_ids(prepared_requests), held)
+                    or (
+                        self._load_stopped is None
+                        and self._drain_load_stream(
+                            None, _req_ids(prepared_requests), held
+                        )
+                    )
                 ):
                     for infos in held:
                         self._handler.release_retrieved(infos)
@@ -4597,6 +4610,8 @@ class MaruWorkerConnector:
         """
         inline: list[MaruReqMeta] = []
         for req_meta in metadata.requests:
+            if self._load_stopped is not None:
+                return
             if req_meta.is_store:
                 continue
             if req_meta.num_matched_chunks == 0:
@@ -4624,9 +4639,14 @@ class MaruWorkerConnector:
 
             stream_ctx = contextlib.nullcontext()
         retained: list[Any] = []
+        # Reported only once the copies queued before them have ended
+        failures: list[tuple[MaruReqMeta, Exception]] = []
+        ready: list[str] = []
         try:
             with stream_ctx:
                 for req_meta in inline:
+                    if self._load_stopped is not None:
+                        break
                     if self._cpu_mode or self._node_mode:
                         loaded = self._load_group_leased(
                             req_meta, device, stream, offthread=False
@@ -4644,12 +4664,11 @@ class MaruWorkerConnector:
                                 req_meta, objects, device, stage=False
                             )
                         except Exception as e:
-                            self._fail_load(req_meta, e)
+                            failures.append((req_meta, e))
                             continue
                         hit, count = objects[0], len(objects[1])
                     if req_meta.deferred_load:
-                        with self._deferred_lock:
-                            self._deferred_done.add(req_meta.req_id)
+                        ready.append(req_meta.req_id)
                     logger.info(
                         "Maru: loaded %d objects (%d chunks) for req %s",
                         count,
@@ -4659,8 +4678,15 @@ class MaruWorkerConnector:
         finally:
             # The forward reads these blocks next, and the CXL views in
             # `retained` must outlive the copies.
-            if stream is not None:
-                self._drain_load_stream(stream, _req_ids(inline), retained)
+            drained = stream is None or self._drain_load_stream(
+                stream, _req_ids(inline), retained
+            )
+        if drained:
+            for req_meta, e in failures:
+                self._fail_load(req_meta, e)
+            if ready:
+                with self._deferred_lock:
+                    self._deferred_done.update(ready)
 
     def _try_submit_group_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a parked request's group load to the loader thread.
@@ -4701,6 +4727,8 @@ class MaruWorkerConnector:
         """
         try:
             objects = None
+            if self._load_stopped is not None:
+                return
             if not (self._cpu_mode or self._node_mode):
                 objects = self._retrieve_group_objects(req_meta)
                 if objects is None:
@@ -4712,6 +4740,8 @@ class MaruWorkerConnector:
             stream = self._deferred_stream
             if self._load_admission_window > 0:
                 self._wait_for_load_admission(req_meta.req_id)
+            if self._load_stopped is not None:
+                return
             stream.wait_event(queued)
             if objects is None:
                 with torch.cuda.stream(stream):
@@ -4859,6 +4889,8 @@ class MaruWorkerConnector:
         route = self._route(req_meta)
         start = 0
         while start < len(keys):
+            if self._load_stopped is not None:
+                return None
             n = min(
                 self._leased_batch_size(handler, len(keys) - start, offthread),
                 len(keys) - start,
@@ -5086,6 +5118,8 @@ class MaruWorkerConnector:
         """
         infos: list[Any] = []
         try:
+            if self._load_stopped is not None:
+                return
             handler = self._handler
             if self._leased_load(req_meta):
                 # Batches of leased staging slots: each batch is released once
@@ -5172,6 +5206,9 @@ class MaruWorkerConnector:
                 )
                 self._release_held(infos)
                 self._fail_deferred_load(req_meta)
+                return
+            if self._load_stopped is not None:
+                self._release_held(infos)  # never queued
                 return
 
             if req_meta.layerwise_load:
@@ -5353,15 +5390,13 @@ class MaruWorkerConnector:
         except Exception as e:
             logger.error("Maru deferred load failed for req %s: %s", req_meta.req_id, e)
             # Copies may already be queued referencing the CXL views; drain
-            # the stream before dropping them so no kernel reads freed memory.
-            streams = [self._deferred_stream]
-            if self._node_mode:
-                streams += self._layerwise_streams
-            if all(
+            # every stream before dropping them so no kernel reads freed memory.
+            drained = [
                 stream is None
                 or self._drain_load_stream(stream, req_meta.req_id, infos)
-                for stream in streams
-            ):
+                for stream in [self._deferred_stream, *self._layerwise_streams]
+            ]
+            if all(drained):
                 # Releasing twice does nothing, so refs held elsewhere are fine
                 self._release_held(infos)
                 self._fail_deferred_load(req_meta)
@@ -5491,6 +5526,8 @@ class MaruWorkerConnector:
             issues them the old way, or under TP fails the load; unless the
             copies queued could not be waited for, which stops the worker.
         """
+        if self._load_stopped is not None:
+            return None
         stream: torch.cuda.Stream | None = None
         try:
             torch.cuda.set_device(device)
@@ -5563,6 +5600,8 @@ class MaruWorkerConnector:
         transfer queued in parallel with layer k compute. No device-wide
         synchronize is used.
         """
+        if self._load_stopped is not None:
+            return
         entries: list[
             tuple[MaruReqMeta, int, torch.Tensor, list[Any] | dict[int, list[Any]]]
         ] = []
@@ -6058,7 +6097,10 @@ class MaruWorkerConnector:
                                     req_meta.req_id,
                                     e,
                                 )
-                            if not self._drain_load_stream(
+                            # _load_packed already kept what it could not wait for
+                            if isinstance(
+                                e, _UnconfirmedLoadError
+                            ) or not self._drain_load_stream(
                                 stream, req_meta.req_id, [infos, list(pending)]
                             ):
                                 # Keep the slots, as a copy may still read them
@@ -6277,6 +6319,7 @@ class MaruWorkerConnector:
         """Ask the node, before the step's forward pass, for the pages its
         stores take, so the credit is at hand when they come (maru_node).
         Write-behind stores a prompt's chunks in the step that completes it."""
+        self._raise_if_load_stopped()
         if not self._node_mode or self._handler is None or not self._stores_anything():
             return
         ct = self._kv_chunk_tokens
@@ -6380,6 +6423,8 @@ class MaruWorkerConnector:
         load_stream = self._load_stream
 
         for req_meta, num_chunks, slot_mapping, infos in entries:
+            if self._load_stopped is not None:
+                return
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             try:
                 with torch.cuda.stream(load_stream):
@@ -6465,7 +6510,12 @@ class MaruWorkerConnector:
         release the request: they make that cache entry unavailable, but must
         never leak GPU blocks. The exception is a copy that could not be waited
         for: it may still read the blocks, so its requests never finish.
+
+        Raises:
+            _UnconfirmedLoadError: Once a load copy could not be confirmed
+                finished; no queued store is issued then.
         """
+        self._raise_if_load_stopped()
         recv_only = self._recv_only_finished_req_ids & finished_req_ids
         self._recv_only_finished_req_ids.difference_update(recv_only)
         finished_req_ids = finished_req_ids - recv_only
@@ -6658,6 +6708,16 @@ class MaruWorkerConnector:
                             rows=(a, b) if self._node_mode else None,
                         )
             except Exception as e:
+                # Injects already queued may still write the blocks
+                devices = {kv.device for _, kv, _ in layers if kv.device.type == "cuda"}
+                drained = [
+                    self._drain_load_stream(
+                        torch.cuda.current_stream(device), req_meta.req_id, infos
+                    )
+                    for device in devices
+                ]
+                if not all(drained):
+                    self._raise_if_load_stopped()
                 self._fail_load(req_meta, e)
 
     def _load_packed(
@@ -6699,8 +6759,13 @@ class MaruWorkerConnector:
                 pipelines its batches passes False and waits on an event.
 
         Returns:
-            Ids of the requests whose copy failed (already reported for
-            recompute through ``_fail_load``).
+            Ids of the requests whose copy failed. With ``wait`` they are
+            reported here once the copies ended; otherwise the caller reports
+            them after its own drain.
+
+        Raises:
+            _UnconfirmedLoadError: The copies could not be waited for; the
+                worker stops and keeps the slabs.
         """
         assert wait or not any(r.deferred_load for r, *_ in prepared_requests)
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
@@ -6739,6 +6804,9 @@ class MaruWorkerConnector:
 
         dtype = layers[0][1].dtype
         failed: set[str] = set()
+        # Reported only once the copies queued before them have ended
+        failures: list[tuple[MaruReqMeta, Exception]] = []
+        ready: list[str] = []
         staged_chunks: dict[str, int] = {}
         ahead_chunks: dict[str, int] = {}
         copied_ahead: set[_CopyAhead] = set()
@@ -6815,23 +6883,38 @@ class MaruWorkerConnector:
                                     ahead_chunks.get(req_meta.req_id, 0) + 1
                                 )
                 except Exception as e:
-                    self._fail_load(req_meta, e)
+                    failures.append((req_meta, e))
                     failed.add(req_meta.req_id)
                     continue
                 if req_meta.deferred_load:
-                    with self._deferred_lock:
-                        self._deferred_done.add(req_meta.req_id)
-        if not use_stream:
-            # Nothing waits for these copies on the stream the caller syncs
-            # (if any), and the caller releases the host slabs on return,
-            # those of the requests whose injects failed too.
-            for ahead in copied_ahead:
-                ahead.synchronize()
-        if use_stream and wait:
-            # Loads must complete before the forward pass reads the paged cache
-            # (packed makes wait_for_layer_load a no-op).
-            assert load_stream is not None
-            load_stream.synchronize()
+                    ready.append(req_meta.req_id)
+        try:
+            if not use_stream or failures:
+                # Nothing waits for these copies on the stream the caller
+                # syncs (if any), or a failed stage left one unlinked; the
+                # caller releases the host slabs on return.
+                for ahead in copied_ahead:
+                    ahead.synchronize()
+            if use_stream and wait:
+                # Loads must complete before the forward pass reads the paged
+                # cache (packed makes wait_for_layer_load a no-op).
+                assert load_stream is not None
+                load_stream.synchronize()
+        except Exception as e:
+            self._stop_on_unconfirmed_load(
+                _req_ids(prepared_requests),
+                e,
+                [infos for *_, infos in prepared_requests],
+            )
+            raise _UnconfirmedLoadError(self._load_stopped) from e
+        for req_meta, e in failures:
+            if wait:
+                self._fail_load(req_meta, e)
+            else:
+                logger.error("Maru load copy failed for req %s: %s", req_meta.req_id, e)
+        if ready:
+            with self._deferred_lock:
+                self._deferred_done.update(ready)
 
         for req_meta, num_chunks, _, _ in prepared_requests:
             staged = staged_chunks.get(req_meta.req_id, 0)
@@ -7158,6 +7241,7 @@ class MaruWorkerConnector:
         copy itself, which is what lets this path run with several requests
         loading at once.
         """
+        self._raise_if_load_stopped()
         events = self._layer_load_events.get(layer_name)
         if not events:
             return
@@ -7289,6 +7373,7 @@ class MaruWorkerConnector:
         metadata: MaruConnectorMetadata,
     ) -> None:
         """Save KV cache to Maru CXL in chunk granularity."""
+        self._raise_if_load_stopped()
         self._ensure_handler()
         if self._handler is None:
             return
@@ -7769,6 +7854,7 @@ class MaruWorkerConnector:
         writes the staged objects by RDMA, runs on the write-behind thread
         (``_register_objects_behind``).
         """
+        self._raise_if_load_stopped()
         if not self._multi_group or not self._group_caches:
             return
         if not self._store_entries(metadata):
