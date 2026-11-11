@@ -3,9 +3,10 @@
 """MaruClient: the storage client behind MaruHandler on maru_node.
 
 ATTACH to the node, map its pools, open the worker session with the node-view
-pid, keep credit at hand. On a UDS break it attaches again: to the same run it
-keeps credit and resends unresolved ops; to a new run it drops them and unmaps
-the old run's pools once unused. A read goes only through the mapping of the
+pid, keep credit at hand. On a UDS break it unmaps the pools once unused (a
+new run may need their memory) and attaches again: to the same run it maps
+them again, keeps credit and resends unresolved ops; to a new run it drops
+them. A read goes only through the mapping of the
 run its lookup was answered under. If the node refuses the attach after the
 start, the client turns off: no loads, no stores, no retries. After a
 MaruServer restart it drops the pins of the ended epoch. A metadata-only
@@ -518,34 +519,32 @@ class MaruClient:
                         response.page_size,
                     )
             same_run = response.node_epoch == self.node_epoch
-            if same_run:
-                close_fds(fds)  # the pools of this run are mapped already
-            else:
+            if not same_run:
                 self._credit_kind = None
-                for descriptor in response.pools:
-                    if descriptor.dax is not None:
-                        try:
-                            self.pools.add_dax(descriptor, response.node_epoch)
-                        except (OSError, RuntimeError, ValueError) as e:
-                            # Its locations fail to read and are recomputed;
-                            # with a DRAM pool, credit comes from DRAM only
-                            logger.error(
-                                "cannot map CXL pool %s: %s",
-                                descriptor.pool.pool_id,
-                                e,
-                            )
-                            if any(
-                                d.pool.kind == PoolKind.DRAM for d in response.pools
-                            ):
-                                self._credit_kind = PoolKind.DRAM
-                            continue
-                    elif descriptor.memfd is not None:
-                        # pools.add closes the fd, also on failure
-                        fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
-                        self.pools.add(descriptor, fd, response.node_epoch)
-                    else:
-                        continue  # not mapped by workers (SSD)
-                    added.append(descriptor.pool.pool_id)
+            for descriptor in response.pools:
+                mapped = self.pools.get(descriptor.pool.pool_id)
+                if same_run and mapped and mapped.node_epoch == response.node_epoch:
+                    continue  # still mapped
+                if descriptor.dax is not None:
+                    try:
+                        self.pools.add_dax(descriptor, response.node_epoch)
+                    except (OSError, RuntimeError, ValueError) as e:
+                        # Its locations fail to read and are recomputed;
+                        # with a DRAM pool, credit comes from DRAM only
+                        logger.error(
+                            "cannot map CXL pool %s: %s", descriptor.pool.pool_id, e
+                        )
+                        if any(d.pool.kind == PoolKind.DRAM for d in response.pools):
+                            self._credit_kind = PoolKind.DRAM
+                        continue
+                elif descriptor.memfd is not None:
+                    # pools.add closes the fd, also on failure
+                    fd, fds[descriptor.memfd] = fds[descriptor.memfd], -1
+                    self.pools.add(descriptor, fd, response.node_epoch)
+                else:
+                    continue  # not mapped by workers (SSD)
+                added.append(descriptor.pool.pool_id)
+            close_fds(fds)  # those of pools still mapped
         except BaseException:
             close_fds(fds)
             conn.close()
@@ -1331,7 +1330,8 @@ class MaruClient:
         if not keys:
             return []
         server = self._server
-        if server is None:
+        if server is None or not self.storage_connected:
+            # Without the node connection its pools are not mapped
             self._count("retrieve_unavailable", len(keys))
             return [None] * len(keys)
         answered = server.lookup_and_pin(
@@ -1385,6 +1385,10 @@ class MaruClient:
             server.unpin([outcome.pin_id])
             return None
         except LocationError as e:
+            if not self.storage_connected:  # unmapped with the connection
+                self._count("retrieve_unavailable")
+                server.unpin([outcome.pin_id])
+                return None
             # #59: never touch bytes outside a mapped pool
             logger.error("MaruServer gave %s for %s: %s", outcome.location, key, e)
             self._count("retrieve_bad_location")
@@ -1414,10 +1418,9 @@ class MaruClient:
         )
         read._release = functools.partial(self._release_reads, [read])
         with self._lock:
-            # Against a server drain (under this lock): it waits for this
-            # read, or it began before and the read is not handed out; and
-            # against Maru turning off, whose WORKER_CLOSE may have released
-            # the pin already
+            # Against a MaruServer restart, whose pins are gone, and against
+            # Maru turning off, whose WORKER_CLOSE may have released the pin
+            # already (both under this lock)
             off = self.off is not None
             ended = off or server_epoch in self._ended_epochs
             if not ended:
@@ -1534,6 +1537,7 @@ class MaruClient:
                 storage = self._storage
             if self._closing.is_set() or (storage is not None and not storage.closed):
                 continue
+            self._unmap_on_loss()
             try:
                 conn, response, fds = self._attach(
                     max(self.config.node_connect_timeout_s, self.rpc_timeout_s)
@@ -1609,6 +1613,17 @@ class MaruClient:
         )
         server.move_to(info.node_epoch, info.pid, info.pid_start)
 
+    def _unmap_on_loss(self) -> None:
+        """The node connection is gone: every pool is unmapped once unused (a
+        view still held keeps its pool until released), so a new run of the
+        node may take its memory; a same-run ATTACH maps them again."""
+        removed = self.pools.remove_all()
+        if removed:
+            logger.info(
+                "the StorageService connection is gone: unmapping %s once unused",
+                removed,
+            )
+
     def _unmap_unused_old_pools(self) -> None:
         """Unmap pools of ended runs once unused."""
         with self._lock:
@@ -1668,7 +1683,9 @@ class MaruClient:
         credits = self.credits.remove_pool(pool_id)
         if credits:
             self._return_credits(credits)
-        if not self.pools.remove(pool_id):
+        if not self.pools.remove(pool_id) or not self.pools.wait_closed(
+            pool_id, CLOSE_TIMEOUT_S
+        ):
             logger.warning(
                 "pool %s is still in use by the caller; not unmapped", pool_id
             )

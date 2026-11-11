@@ -3,9 +3,11 @@
 """PoolMaps: node pool mappings and their CUDA registration.
 
 Every location is checked against the mapped pools before a byte is touched
-(#59).
+(#59). A mapping taken out of use is closed (CUDA unregister, unmap, then its
+RM hold dropped) on a closer thread, never on the thread that let it go.
 """
 
+import collections
 import logging
 import mmap
 import os
@@ -262,7 +264,7 @@ class MappedPool:
     # Views handed out and not yet released (PEP 688 export count)
     views: int = 0
     removing: bool = False
-    # Replaced while views were held: the last released view unmaps it
+    # Taken out of use while views were held: the last released view closes it
     retired: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -270,7 +272,8 @@ class MappedPool:
 class _PoolSlice:
     """Part of a mapped pool; its views are counted until released or freed."""
 
-    def __init__(self, mapped: MappedPool, offset: int, length: int):
+    def __init__(self, maps: "PoolMaps", mapped: MappedPool, offset: int, length: int):
+        self._maps = maps
         self._mapped = mapped
         self._offset = offset
         self._length = length
@@ -290,7 +293,7 @@ class _PoolSlice:
             if close:
                 mapped.retired = False
         if close:
-            mapped.mapping.close()
+            self._maps._close_later(mapped)
 
 
 class PoolMaps:
@@ -308,7 +311,14 @@ class PoolMaps:
             lambda info, dax: CxlRegionMapping(info, dax, holder)
         )
         self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
         self._pools: dict[str, MappedPool] = {}
+        # Out of use and not closed yet: waiting for their last view, queued
+        # for the closer, or being closed
+        self._detached: set[MappedPool] = set()
+        self._closes: collections.deque[MappedPool] = collections.deque()
+        self._closing: MappedPool | None = None
+        self._closer: threading.Thread | None = None
 
     def add(self, descriptor: PoolDescriptor, fd: int, node_epoch: str) -> MappedPool:
         """Map a DRAM pool from its memfd; the fd is closed here."""
@@ -340,7 +350,7 @@ class PoolMaps:
             old = self._pools.get(info.pool_id)
             self._pools[info.pool_id] = mapped
         if old is not None:
-            _retire(old)
+            self._detach(old)
         logger.info(
             "mapped %s (%d MiB, page-locked: %s)",
             info.pool_id,
@@ -392,7 +402,7 @@ class PoolMaps:
                     f"{mapped.node_epoch}, not {node_epoch}"
                 )
             # Counted before the caller sees it
-            return memoryview(_PoolSlice(mapped, location.offset, n))
+            return memoryview(_PoolSlice(self, mapped, location.offset, n))
 
     def get(self, pool_id: str) -> MappedPool | None:
         with self._lock:
@@ -409,7 +419,8 @@ class PoolMaps:
         return bool(pools) and all(m.mapping.cuda_registered for m in pools)
 
     def remove(self, pool_id: str) -> bool:
-        """Unregister and unmap; False (nothing touched) while views are held."""
+        """Unregister and unmap on the closer thread (wait_closed tells when);
+        False (nothing touched) while views are held."""
         with self._lock:
             mapped = self._pools.get(pool_id)
             if mapped is None:
@@ -419,13 +430,34 @@ class PoolMaps:
                     return False
                 mapped.removing = True
             del self._pools[pool_id]
-        # No view is left, so the unmap after the CUDA unregister succeeds
-        mapped.mapping.close()
+            self._detached.add(mapped)
+            self._queue_close(mapped)
         return True
 
-    def close(self, keep: set[str] | frozenset[str] = frozenset()) -> None:
+    def remove_all(self) -> list[str]:
+        """Take every pool out of use: closed now if no view is held, else
+        once its last view is released. Returns their pool_ids."""
+        with self._lock:
+            pools, self._pools = list(self._pools.values()), {}
+        for mapped in pools:
+            self._detach(mapped)
+        return [m.info.pool_id for m in pools]
+
+    def wait_closed(self, pool_id: str, timeout: float) -> bool:
+        """Whether every mapping of ``pool_id`` taken out of use is closed
+        within ``timeout``."""
+        with self._cv:
+            return self._cv.wait_for(
+                lambda: all(m.info.pool_id != pool_id for m in self._detached),
+                timeout,
+            )
+
+    def close(
+        self, keep: set[str] | frozenset[str] = frozenset(), timeout: float = 10.0
+    ) -> None:
         """Unmap every pool but ``keep``, which stay mapped and registered
-        until the process ends; RuntimeError if views are still held."""
+        until the process ends, and wait up to ``timeout`` for the closes
+        queued; RuntimeError if views are still held."""
         errors = []
         for pool_id in self.pool_ids():
             if pool_id in keep:
@@ -433,10 +465,60 @@ class PoolMaps:
                     _KEPT_UNTIL_EXIT.append(self._pools.pop(pool_id))
             elif not self.remove(pool_id):
                 errors.append(pool_id)
+        self.flush(timeout)
         if errors:
             raise RuntimeError(
                 f"Release the buffers of {errors} before closing the handler"
             )
+
+    def flush(self, timeout: float) -> bool:
+        """Whether every close queued so far ended within ``timeout``."""
+        with self._cv:
+            return self._cv.wait_for(
+                lambda: not self._closes and self._closing is None, timeout
+            )
+
+    def _detach(self, mapped: MappedPool) -> None:
+        """Out of ``_pools`` already: closed now, or by its last view."""
+        with self._lock:
+            self._detached.add(mapped)
+        with mapped.lock:
+            mapped.removing = True
+            if mapped.views:
+                mapped.retired = True
+                return
+        self._close_later(mapped)
+
+    def _close_later(self, mapped: MappedPool) -> None:
+        with self._lock:
+            self._queue_close(mapped)
+
+    def _queue_close(self, mapped: MappedPool) -> None:
+        """Caller holds the lock."""
+        self._closes.append(mapped)
+        if self._closer is None:
+            self._closer = threading.Thread(
+                target=self._close_loop, name="maru-pool-close", daemon=True
+            )
+            self._closer.start()
+        self._cv.notify_all()
+
+    def _close_loop(self) -> None:
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: self._closes)
+                mapped = self._closing = self._closes.popleft()
+            try:
+                # No view is left, so the unmap after the CUDA unregister works
+                mapped.mapping.close()
+            except Exception:
+                logger.exception(
+                    "closing the mapping of %s failed", mapped.info.pool_id
+                )
+            with self._cv:
+                self._closing = None
+                self._detached.discard(mapped)
+                self._cv.notify_all()
 
     def views(self, pool_id: str) -> int:
         mapped = self.get(pool_id)
@@ -446,13 +528,3 @@ class PoolMaps:
 def _check_shape(info: PoolInfo) -> None:
     if info.capacity <= 0 or info.page_size <= 0 or info.capacity % info.page_size:
         raise LocationError(f"pool {info.pool_id}: bad capacity or page size")
-
-
-def _retire(mapped: MappedPool) -> None:
-    """Unmap a replaced mapping now, or when its last view is released."""
-    with mapped.lock:
-        mapped.removing = True
-        if mapped.views:
-            mapped.retired = True
-            return
-    mapped.mapping.close()

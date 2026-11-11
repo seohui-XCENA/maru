@@ -143,7 +143,7 @@ class WorkerRegistry:
     def attach_probe(
         self, conn: WorkerEndpoint, ident: AttachIdentity
     ) -> tuple[WorkerRecord | None, str]:
-        """Record a probe (a scheduler): no pidfd, credit or drain; it is
+        """Record a probe (a scheduler): no pidfd or credit; it is
         forgotten when its connection closes."""
         with self._lock:
             if ident.incarnation in self._workers:

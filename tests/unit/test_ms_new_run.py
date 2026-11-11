@@ -725,3 +725,54 @@ class TestMaruOffRaces:
             h.alloc(4)
         assert not client._handles and len(returned) == 1
         wait_until(lambda: client.server_conn is None, what="session ended")
+
+
+# =============================================================================
+# The worker unmaps its pools when the node connection is lost
+# =============================================================================
+
+
+def drop_connection(node) -> None:
+    """The node side closes every worker connection; the node goes on."""
+    for conn in node.local.connections():
+        conn.close()
+
+
+def test_a_lost_connection_unmaps_an_idle_pool_and_a_same_run_attach_maps_it(
+    fake, nodes, handlers
+):
+    node = nodes()
+    h = handlers(node)
+    client = h._cpu
+    assert put(h, "k")
+    pool_id = node.dram.pool_id
+    before = client.pools.get(pool_id)
+    drop_connection(node)
+    wait_until(lambda: before.mapping._closed, what="unmapped")
+    wait_until(
+        lambda: (m := client.pools.get(pool_id)) is not None and m is not before,
+        what="mapped again",
+    )
+    assert client.node_epoch == node.node_epoch  # the same run
+    assert read(h, "k") == b"k"
+    assert put(h, "k2") and read(h, "k2") == b"k2"
+
+
+def test_a_pool_busy_when_the_connection_is_lost_goes_with_its_last_read(
+    fake, nodes, handlers
+):
+    node = nodes()
+    h = handlers(node)
+    client = h._cpu
+    assert put(h, "k")
+    lease = h.retrieve("k")
+    before = client.pools.get(node.dram.pool_id)
+    drop_connection(node)
+    wait_until(
+        lambda: client.pools.get(node.dram.pool_id) not in (None, before),
+        what="mapped again",
+    )
+    assert not before.mapping._closed  # the read holds it
+    assert bytes(lease.view) == b"k"
+    h.release_retrieved([lease])
+    wait_until(lambda: before.mapping._closed, what="unmapped after the read")

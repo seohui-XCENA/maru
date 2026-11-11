@@ -485,7 +485,7 @@ def test_a_worker_maps_a_cxl_descriptor_through_its_rm():
     maps.add_dax(pool.descriptor(), "e1")
     assert seen == [(pool.pool_id, "127.0.0.1:9851", 1)]
     assert maps.get(pool.pool_id) is not None
-    assert maps.remove(pool.pool_id) and seen[-1] == "closed"
+    assert maps.remove(pool.pool_id) and maps.flush(5) and seen[-1] == "closed"
 
 
 def test_renewals_come_several_times_per_half_lease():
@@ -1035,11 +1035,11 @@ def holding_rm(monkeypatch):
     os.close(fd)
 
 
-def unheld(rm):
-    """The last RM call once every queued unhold went out."""
+def unheld(rm, maps):
+    """The last RM call once every queued close and unhold went out."""
     from maru_handler.client import pool_maps
 
-    assert pool_maps._HOLDS.unholds.flush(5)
+    assert maps.flush(5) and pool_maps._HOLDS.unholds.flush(5)
     return rm.calls[-1]
 
 
@@ -1070,7 +1070,7 @@ def test_a_worker_holds_a_region_before_mapping_and_unholds_after(holding_rm):
     maps.add_dax(descriptor, "e1")  # the same run maps it again: no new hold
     assert holding_rm.calls[-1] == ("access", 5)
     assert maps.remove(descriptor.pool.pool_id)
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
 
 
 def test_each_run_holds_apart_and_the_old_runs_hold_goes_with_its_mapping(
@@ -1088,9 +1088,9 @@ def test_each_run_holds_apart_and_the_old_runs_hold_goes_with_its_mapping(
     maps.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # retires the old mapping
     assert holding_rm.calls == [("hold", 5, "w1@e1", "e1"), ("hold", 5, "w1@e2", "e2")]
     view.release()  # the old mapping closes
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
     assert maps.remove(old.pool.pool_id)
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e2")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e2")
 
 
 def test_a_hold_name_fits_the_rm():
@@ -1127,7 +1127,7 @@ def test_a_mapping_still_in_use_keeps_its_hold(holding_rm):
     assert holding_rm.calls == [("hold", 5, "w1@e1", "e1")]
     view.release()
     assert maps.remove(descriptor.pool.pool_id)
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
 
 
 def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
@@ -1146,7 +1146,7 @@ def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
     maps.add_dax(second, "e1")  # retires the first mapping
     assert [c[0] for c in holding_rm.calls] == ["hold", "access"]
     assert maps.remove(first.pool.pool_id)
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
 
 
 def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
@@ -1159,7 +1159,7 @@ def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
     with pytest.raises(OSError):
         maps.add_dax(descriptor, "e1")
     assert maps.remove(descriptor.pool.pool_id)
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
 
 
 def test_a_forgotten_detached_worker_counts_as_settled():
@@ -1206,7 +1206,7 @@ def test_a_worker_drops_a_hold_off_the_releasing_thread_and_again_on_failure(
     assert maps.remove(descriptor.pool.pool_id)
     assert time.monotonic() - started < 1.0  # the RM is not waited on
     gate.set()
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, maps) == ("unhold", 5, "w1@e1")
     assert [c for c in holding_rm.calls if c[0] == "unhold"] == [
         ("unhold", 5, "w1@e1")
     ] * 2  # failed once, then confirmed
@@ -1237,8 +1237,10 @@ def test_a_hold_wanted_again_is_not_dropped(holding_rm):
     )
     maps.add_dax(other, "e1")
     assert maps.remove(other.pool.pool_id)  # its drop holds up the queue
+    assert maps.flush(5)
     maps.add_dax(descriptor, "e1")
     assert maps.remove(descriptor.pool.pool_id)  # queued behind it
+    assert maps.flush(5)
     maps.add_dax(descriptor, "e1")  # mapped again before it went out
     gate.set()
     assert pool_maps._HOLDS.unholds.flush(5)
@@ -1450,9 +1452,9 @@ def test_an_earlier_runs_mapping_keeps_its_hold_while_it_serves_a_read(holding_r
     assert read is not None
     client.pools.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # re-attached
     client.node_epoch = "e2"
-    assert unheld(holding_rm) == ("hold", 5, "w1@e2", "e2")  # e1's stays
+    assert unheld(holding_rm, client.pools) == ("hold", 5, "w1@e2", "e2")  # e1's stays
     client.release_retrieved([read])  # the old mapping closes
-    assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+    assert unheld(holding_rm, client.pools) == ("unhold", 5, "w1@e1")
 
 
 def test_a_drop_taken_back_goes_out_again_if_the_hold_fails(holding_rm):
@@ -1479,8 +1481,10 @@ def test_a_drop_taken_back_goes_out_again_if_the_hold_fails(holding_rm):
     )
     maps.add_dax(other, "e1")
     assert maps.remove(other.pool.pool_id)  # its drop holds up the queue
+    assert maps.flush(5)
     maps.add_dax(descriptor, "e1")
     assert maps.remove(descriptor.pool.pool_id)  # queued behind it
+    assert maps.flush(5)
     holding_rm.refuse = OSError("RM down")
     with pytest.raises(OSError):
         maps.add_dax(descriptor, "e1")  # takes the drop back, then fails

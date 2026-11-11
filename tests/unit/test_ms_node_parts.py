@@ -5,6 +5,7 @@
 import fcntl
 import mmap
 import os
+import threading
 import time
 
 import pytest
@@ -419,10 +420,12 @@ class TestPoolMaps:
             assert not first.mapping._closed
             assert first.mapping.cuda_registered == torch.cuda.is_available()
             view[:2] = b"ok"
-            view.release()  # the last view unmaps it
+            view.release()  # the last view has it unmapped
+            assert maps.flush(5)
             assert first.mapping._closed and not first.mapping.cuda_registered
             # no view held: the old mapping goes at once
             third = maps.add(descriptor, os.dup(pool.fd), "e")
+            assert maps.flush(5)
             assert second.mapping._closed and maps.get(pool.pool_id) is third
             assert maps.views(pool.pool_id) == 0
         finally:
@@ -456,6 +459,45 @@ class TestPoolMaps:
             kept.mapping.close()
             kept_pool.close()
             other_pool.close()
+
+    def test_a_release_never_closes_a_mapping_inline(self):
+        """Unregister and unmap run on the closer thread, not on the thread
+        that released the last view (a load thread)."""
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import PoolMaps
+
+        gate, closed = threading.Event(), []
+
+        class Mapping:
+            cuda_registered = False
+
+            def view(self, offset, length):
+                return memoryview(bytearray(length))
+
+            def page_lock(self):
+                pass
+
+            def close(self):
+                assert gate.wait(5)
+                closed.append(threading.current_thread().name)
+
+        info = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        maps = PoolMaps(pin_pools=False, map_memfd=lambda i, fd: Mapping())
+        try:
+            descriptor = PoolDescriptor(pool=info.info(), memfd=0)
+            maps.add(descriptor, os.dup(info.fd), "e1")
+            view = maps.view(Location(info.pool_id, "a", 1, 0, 8, PoolKind.DRAM))
+            maps.add(descriptor, os.dup(info.fd), "e2")  # retires the first
+            view.release()  # returns while the close waits
+            assert maps.remove(info.pool_id)  # nor does a remove wait
+            assert not closed and not maps.wait_closed(info.pool_id, 0.05)
+            gate.set()
+            assert maps.wait_closed(info.pool_id, 5)
+            assert closed == ["maru-pool-close"] * 2
+        finally:
+            gate.set()
+            maps.close()
+            info.close()
 
     def test_shared_prefault_never_writes(self, monkeypatch):
         import errno
