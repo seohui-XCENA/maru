@@ -140,6 +140,10 @@ class StorageManager:
             PoolKind.DRAM: TierTraits(PoolKind.DRAM, credit=True, evicts=True)
         }
         self.credit_kind = next(k for k, t in self.traits.items() if t.credit)
+        # Credit comes from the top tier, then from the fallback tiers in order
+        self.credit_kinds = [self.credit_kind] + [
+            k for k, t in self.traits.items() if t.credit_fallback
+        ]
         self.pools = pool_manager
         self.placement = placement
         # Copies for demotion; without it a tier that demotes drops instead
@@ -310,6 +314,8 @@ class StorageManager:
             "retire_results": retire,
             "demotions": demotions,
             "pending_moves": pending_moves,
+            "credit_short": dict(self.pools.credit_short),
+            "credit_short_bytes": dict(self.pools.credit_short_bytes),
         }
 
     # -------------------------------------------------------------- recovery
@@ -579,10 +585,10 @@ class StorageManager:
                 status=Status.REJECTED,
                 error="credit needs the worker_session of MaruServer",
             )
-        if req.kind not in (None, self.credit_kind):
+        if req.kind is not None and req.kind not in self.credit_kinds:
             return CreditResponse(
                 status=Status.REJECTED,
-                error=f"credit comes from the {self.credit_kind} tier, not {req.kind}",
+                error=f"credit comes from the {self.credit_kinds} tiers, not {req.kind}",
             )
         if req.want_bytes <= 0:
             return CreditResponse(
@@ -603,7 +609,9 @@ class StorageManager:
         def grant() -> tuple[list[Location], list[tuple[WorkerEndpoint, int]]]:
             rec.worker_session = req.worker_session
             credits = self.pools.credit(
-                rec.incarnation, req.want_bytes, self.credit_kind
+                rec.incarnation,
+                req.want_bytes,
+                self.credit_kinds if req.kind is None else req.kind,
             )
             asks = [
                 (conn, nbytes)
@@ -1043,7 +1051,10 @@ class StorageManager:
                 or info.kind != kind
                 or pool_id in invalid
                 or self.workers.is_adopted(pool_id)
-                or (traits.credit and not self.pools.creditable(pool_id))
+                or (
+                    (traits.credit or traits.credit_fallback)
+                    and not self.pools.creditable(pool_id)
+                )
             ):
                 continue
             pools.append(pool_id)

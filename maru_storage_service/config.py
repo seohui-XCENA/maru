@@ -10,7 +10,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,6 @@ CREDIT_MAX_PAGES = 16
 CREDIT_MAX_MIN_BYTES = 512 << 20
 CREDIT_TOTAL_FRACTION = 0.10
 CREDIT_REFILL_LOW_FRACTION = 0.25
-COMMIT_PENDING_FRACTION = 0.05
 TRANSFER_RESERVE_FRACTION = 0.05
 DEFAULT_FETCH_REQUEST_MAX = 1 << 30
 DEFAULT_FETCH_MAX_INFLIGHT = 4 << 30
@@ -81,6 +80,7 @@ _TIER_KEYS = {
         "region_size",
         "rm",
         "visibility",
+        "credit_fallback",
     },
     "ssd": {"store", "size", "demotion", "high_watermark", "low_watermark", "path"},
     "remote": {"store", "url", "rdma_device", "timeout_s"},
@@ -132,6 +132,8 @@ class TierConfig:
     url: tuple[str, ...] = ()
     rdma_device: str | None = None
     timeout_s: float | None = None
+    # A tier below the top that workers map gives the credit the top lacks
+    credit_fallback: bool = False
 
     @property
     def is_memory(self) -> bool:
@@ -147,6 +149,8 @@ class TierTraits:
     credit: bool  # workers get credit from it (the top tier)
     evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
     demotes_to: PoolKind | None = None  # write-back target (demotion "back")
+    # Workers get the credit the tiers above lack from it
+    credit_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,8 +170,6 @@ class NodeConfig:
     tiers: tuple[TierConfig, ...]
     budgets: Budgets
     remote_server: RemoteServerConfig | None = None
-    # Budget keys the config sets; the others are defaults
-    budget_keys: frozenset[str] = field(default=frozenset(), compare=False)
     # Group the socket is given to (mode 0660); None keeps the service's group
     socket_group: str | None = None
     source: str = field(default="", compare=False)
@@ -181,7 +183,8 @@ class NodeConfig:
 
     def traits(self) -> dict[PoolKind, TierTraits]:
         """Traits of each memory tier, by the kind of its pools. The top tier
-        gives credit. A tier with demotion "back" over a memory tier evicts by
+        gives credit, and a tier with credit_fallback the credit the tiers
+        above lack. A tier with demotion "back" over a memory tier evicts by
         moving its pages there; a tier that gets new pages (credit or
         demotion) and demotes nowhere evicts by dropping."""
         out: dict[PoolKind, TierTraits] = {}
@@ -192,18 +195,20 @@ class NodeConfig:
                 continue
             below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
             demotes = t.demotion == "back" and below is not None and below.is_memory
+            fallback = i > 0 and t.credit_fallback
             out[PoolKind(t.store)] = TierTraits(
                 kind=PoolKind(t.store),
                 credit=i == 0,
-                evicts=receives,
+                evicts=receives or fallback,
                 demotes_to=PoolKind(below.store) if demotes and below else None,
+                credit_fallback=fallback,
             )
             receives = demotes
         return out
 
     def transfer_defaults(self) -> TransferDefaults:
         """Workers park loads when a tier can only be fetched from; a store
-        ends in the top tier, so it needs no write-behind."""
+        ends in a tier workers map, so it needs no write-behind."""
         fetched = any(t.store not in MEMORY_STORES for t in self.tiers)
         return TransferDefaults(async_load=fetched, async_store=False)
 
@@ -341,6 +346,13 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
             )
         tier["region_size"] = region
         tier["rm"] = _str(raw, "rm", what, DEFAULT_RM)
+        if index == 0 and "credit_fallback" in raw:
+            raise NodeConfigError(
+                f"{what}.credit_fallback: only a tier below the top gives fallback credit"
+            )
+        tier["credit_fallback"] = index > 0 and _bool(
+            raw, "credit_fallback", what, True
+        )
         visibility = raw.get("visibility", Visibility.COHERENT.value)
         try:
             tier["visibility"] = Visibility(visibility)
@@ -359,34 +371,6 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
     return TierConfig(**tier)
 
 
-def worker_budgets(
-    budgets: Budgets, budget_keys: frozenset[str], page_size: int, step_objects: int
-) -> Budgets:
-    """A worker's budgets: its credit holds the ``step_objects`` pages it may
-    store in one step, if more than the default, within the node total and
-    in whole pages; refill marks follow it. A ``credit_max_bytes`` the config
-    sets applies to every worker, and refill marks it sets stay."""
-    if "credit_max_bytes" in budget_keys:
-        return budgets
-    want = max(budgets.credit_max_bytes, step_objects * page_size)
-    credit_max = max(
-        page_size,
-        min(want, budgets.credit_total_max_bytes) // page_size * page_size,
-    )
-    if credit_max == budgets.credit_max_bytes:
-        return budgets
-    return replace(
-        budgets,
-        credit_max_bytes=credit_max,
-        credit_refill_low=budgets.credit_refill_low
-        if "credit_refill_low" in budget_keys
-        else int(credit_max * CREDIT_REFILL_LOW_FRACTION),
-        credit_refill_high=budgets.credit_refill_high
-        if "credit_refill_high" in budget_keys
-        else credit_max,
-    )
-
-
 def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> Budgets:
     raw = _require_keys(raw if raw is not None else {}, _BUDGET_KEYS, "budgets")
     top = tiers[0]
@@ -402,25 +386,35 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
         return None if tier.size is None else int(tier.size * fraction)
 
     no_size = f"because tiers[0] ({top.store}) has no size"
+    credit_tiers = [t for i, t in enumerate(tiers) if i == 0 or t.credit_fallback]
+    sized = [t for t in credit_tiers if t.size is not None]
     credit_total = size_or(
-        "credit_total_max_bytes", share(top, CREDIT_TOTAL_FRACTION), no_size
+        "credit_total_max_bytes",
+        None
+        if top.size is None
+        else int(sum(t.size or 0 for t in sized) * CREDIT_TOTAL_FRACTION),
+        no_size,
     )
-    # Default: 16 pages or 512 MiB, whichever is more, in whole pages and
-    # within the node total so small tiers still start
-    default_credit_max = max(
-        page_size,
-        min(max(CREDIT_MAX_PAGES * page_size, CREDIT_MAX_MIN_BYTES), credit_total)
-        // page_size
-        * page_size,
+    # A worker may hold up to the node total: it asks for each step's stores
+    # when the step starts. What it keeps at hand between steps is 16 pages
+    # or 512 MiB, whichever is more, in whole pages and within its cap
+    credit_max = size_or(
+        "credit_max_bytes", max(page_size, credit_total // page_size * page_size)
     )
-    credit_max = size_or("credit_max_bytes", default_credit_max)
+    refill_high = size_or(
+        "credit_refill_high",
+        max(
+            page_size,
+            min(max(CREDIT_MAX_PAGES * page_size, CREDIT_MAX_MIN_BYTES), credit_max)
+            // page_size
+            * page_size,
+        ),
+    )
     refill_low = size_or(
-        "credit_refill_low", int(credit_max * CREDIT_REFILL_LOW_FRACTION)
+        "credit_refill_low", int(refill_high * CREDIT_REFILL_LOW_FRACTION)
     )
-    refill_high = size_or("credit_refill_high", credit_max)
-    commit_pending = size_or(
-        "commit_pending_max_bytes", share(top, COMMIT_PENDING_FRACTION), no_size
-    )
+    # Writes waiting for their commit come from credit: as much may wait
+    commit_pending = size_or("commit_pending_max_bytes", credit_total)
 
     memory_tiers = [t for t in tiers if t.is_memory]
     reserve_raw = raw.get("transfer_reserve_bytes")
@@ -469,11 +463,18 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
             f"<= fetch_max_inflight_bytes, got {fetch_batch}, {fetch_request}, {fetch_inflight}"
         )
     if top.size is not None:
-        used = credit_total + commit_pending + reserve.get(top.store, 0)
-        if used > top.size:
+        # Credit comes from the top tier and the fallback tiers, each less
+        # its transfer reserve
+        capacity = sum(t.size or 0 for t in sized)
+        used = (
+            credit_total + commit_pending + sum(reserve.get(t.store, 0) for t in sized)
+        )
+        if used > capacity:
+            names = " + ".join(t.store for t in sized)
             raise NodeConfigError(
                 f"budgets: credit_total_max_bytes + commit_pending_max_bytes + "
-                f"transfer_reserve_bytes of {top.store} ({used}) exceed tiers[0].size ({top.size})"
+                f"transfer_reserve_bytes ({used}) exceed the tiers credit comes "
+                f"from ({names}: {capacity})"
             )
     return Budgets(
         credit_max_bytes=credit_max,
@@ -559,9 +560,7 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         )
 
     budgets = _parse_budgets(raw.get("budgets"), page_size, tiers)
-    budget_keys = raw.get("budgets")
     return NodeConfig(
-        budget_keys=frozenset(budget_keys or ()),
         node_id=node_id,
         role=role,
         socket=socket_path,

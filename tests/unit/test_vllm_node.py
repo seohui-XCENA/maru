@@ -7,6 +7,7 @@ a StorageService and the fake MaruServer. CPU tensors only: loads and stores
 take their per-layer paths (the GPU kernels run in the GPU smoke test).
 """
 
+import dataclasses
 import threading
 import time
 from concurrent.futures import Future
@@ -458,6 +459,68 @@ def test_an_unavailable_maruserver_fails_the_load(fake, node, workers):
     assert reader.take_failed_load_blocks() == set(range(NUM_BLOCKS))
     counters = reader._handler.get_stats()["maru_node"]["counters"]
     assert counters["retrieve_unavailable"] == 2
+
+
+@pytest.mark.parametrize("start, layerwise", [(0, False), (CHUNK, False), (0, True)])
+def test_a_step_asks_for_its_stores_credit(workers, monkeypatch, start, layerwise):
+    """want_step_credit asks the node for the pages the step's stores take:
+    one per chunk the step completes, or one per layer and its marker."""
+    worker = workers(maru_use_layerwise=layerwise)
+    asked = []
+    monkeypatch.setattr(worker._handler, "want_credit", asked.append)
+    meta = MaruReqMeta(
+        req_id="r1",
+        token_ids=list(range(PROMPT)),
+        block_ids=list(range(NUM_BLOCKS)),
+        is_store=True,
+        num_scheduled_tokens=PROMPT - start,
+        num_computed_tokens=start,
+        store_start_token=start,
+    )
+    worker.want_step_credit(MaruConnectorMetadata(requests=[meta]))
+    chunks = (PROMPT - start) // CHUNK
+    assert asked == [chunks * (NUM_LAYERS + 1) if layerwise else chunks]
+    # a step that stores nothing asks for nothing; loads do not ask
+    asked.clear()
+    load_only = dataclasses.replace(meta, is_store=False)
+    worker.want_step_credit(MaruConnectorMetadata(requests=[load_only]))
+    dst = [torch.zeros_like(layer) for layer in rank_kv(0, 2)]
+    worker.start_load_kv(forward_of(dst), MaruConnectorMetadata(requests=[meta]))
+    assert asked == []
+
+
+def test_write_behind_asks_on_the_step_that_completes_the_prompt(workers, monkeypatch):
+    """Write-behind stores a chunked prefill's chunks in its last step."""
+    worker = workers(maru_async_store=True)
+    assert worker._write_behind
+    asked = []
+    monkeypatch.setattr(worker._handler, "want_credit", asked.append)
+
+    def step(computed: int, scheduled: int) -> None:
+        meta = MaruReqMeta(
+            req_id="r1",
+            token_ids=list(range(PROMPT)),
+            block_ids=list(range(NUM_BLOCKS)),
+            is_store=True,
+            num_scheduled_tokens=scheduled,
+            num_computed_tokens=computed,
+        )
+        worker.want_step_credit(MaruConnectorMetadata(requests=[meta]))
+
+    step(0, CHUNK)  # the prompt goes on: nothing stored yet
+    assert asked == []
+    step(CHUNK, PROMPT - CHUNK)  # completes it: every chunk at once
+    assert asked == [PROMPT // CHUNK]
+
+
+def test_the_connector_asks_when_vllm_binds_the_steps_metadata(monkeypatch):
+    advise(monkeypatch, TransferDefaults(False, False))
+    connector = MaruKVConnector(node_vllm_config(), KVConnectorRole.WORKER)
+    seen = []
+    monkeypatch.setattr(connector._worker, "want_step_credit", seen.append)
+    metadata = MaruConnectorMetadata(requests=[])
+    connector.bind_connector_metadata(metadata)
+    assert seen == [metadata]
 
 
 @pytest.mark.parametrize(("tp_size", "total_heads"), [(2, 4), (2, 1)])
@@ -1677,59 +1740,49 @@ def test_vllm_scheduler_limits_reach_the_worker(monkeypatch):
     assert (extra["_maru_step_tokens"], extra["_maru_step_seqs"]) == (8192, 256)
 
 
-def test_one_step_of_32_chunks_is_stored_on_its_own_credit(fake, monkeypatch):
-    """The default (16 pages, as at 32 MiB pages) holds half the step; the
-    credit the worker asks for at ATTACH holds all of it."""
+def test_one_step_of_32_chunks_is_stored_on_the_credit_it_asks_for(fake, monkeypatch):
+    """The credit at hand (16 pages, as at 32 MiB pages) holds half the step;
+    what the step asks for as it starts holds all of it before the stores."""
     import maru_storage_service.config as node_config_module
     from maru_storage_service.config import parse_node_config
 
     monkeypatch.setattr(node_config_module, "CREDIT_MAX_MIN_BYTES", 0)
     requests = [store_meta(f"r{i}", 1000 * i) for i in range(16)]  # 32 chunks
-    stored = {}
-    for hint in (True, False):
-        sockdir = short_tmpdir()
-        config = parse_node_config(
-            {
-                "node_id": "gpu-step",
-                "socket": f"{sockdir}/node.sock",
-                "server": fake.url,
-                "page_size": PAGE,
-                "tiers": [{"store": "dram", "size": 256 * PAGE, "hugepage": False}],
-                "budgets": {
-                    "credit_total_max_bytes": 64 * PAGE,
-                    "commit_pending_max_bytes": 64 * PAGE,
-                    "transfer_reserve_bytes": PAGE,
-                },
-            }
+    sockdir = short_tmpdir()
+    config = parse_node_config(
+        {
+            "node_id": "gpu-step",
+            "socket": f"{sockdir}/node.sock",
+            "server": fake.url,
+            "page_size": PAGE,
+            "tiers": [{"store": "dram", "size": 256 * PAGE, "hugepage": False}],
+            "budgets": {
+                "credit_total_max_bytes": 64 * PAGE,
+                "commit_pending_max_bytes": 64 * PAGE,
+                "transfer_reserve_bytes": PAGE,
+            },
+        }
+    )
+    service = start_node(config)
+    writer = make_worker(BLOCK, CHUNK, node_extra(config.socket), head_size=HEAD_SIZE)
+    writer._num_layers = NUM_LAYERS
+    writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
+    try:
+        writer._take_node_handler(wait=True)
+        client = writer._handler._cpu
+        wait_until(lambda: client.credits.unused_bytes == 16 * PAGE, what="credit")
+        writer.want_step_credit(MaruConnectorMetadata(requests=requests))
+        wait_until(
+            lambda: client.credits.unused_bytes == 32 * PAGE, what="the step's credit"
         )
-        service = start_node(config)
-        extra = (
-            {"_maru_step_tokens": 16 * PROMPT, "_maru_step_seqs": 16} if hint else {}
-        )
-        writer = make_worker(
-            BLOCK, CHUNK, node_extra(config.socket, **extra), head_size=HEAD_SIZE
-        )
-        writer._num_layers = NUM_LAYERS
-        writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS
-        try:
-            writer._take_node_handler(wait=True)
-            client = writer._handler._cpu
-            want = (46 if hint else 16) * PAGE
-            wait_until(
-                lambda c=client, w=want: c.credits.unused_bytes == w, what="credit"
-            )
-            save_step(writer, rank_kv(1, 2), requests)
-            drain(writer)
-            stored[hint] = (len(fake.keys()), client.stats["store_skipped_no_credit"])
-        finally:
-            writer.shutdown()
-            service.stop()
-            remove_tree(sockdir)
-        with fake._lock:
-            fake.catalog.clear()
-            fake.by_loc.clear()
-    assert stored[True] == (32, 0)
-    assert stored[False][0] < 32 and stored[False][1] > 0
+        save_step(writer, rank_kv(1, 2), requests)
+        drain(writer)
+        assert len(fake.keys()) == 32
+        assert client.stats["store_skipped_no_credit"] == 0
+    finally:
+        writer.shutdown()
+        service.stop()
+        remove_tree(sockdir)
 
 
 # =============================================================================
@@ -2004,12 +2057,9 @@ def test_chunks_wait_for_credit_on_the_device(monkeypatch):
 # =============================================================================
 
 
-def test_a_worker_works_with_a_node_that_ignores_its_step(fake, node, monkeypatch):
-    """An older node sizes no credit from ATTACH: the worker gets the node's
-    budgets and stores on them."""
-    import maru_storage_service.local_server as local_server
-
-    monkeypatch.setattr(local_server, "worker_budgets", lambda budgets, *_: budgets)
+def test_a_worker_stores_on_the_node_budgets_whatever_its_step(fake, node):
+    """The node sizes no credit from ATTACH: the worker gets the node's
+    budgets, asks for each step's stores, and stores on them."""
     writer = step_worker()
     writer._extra_config["maru_node"] = node.config.socket
     writer._page_size_bytes = 2 * CHUNK * 2 * HEAD_SIZE * 4 * NUM_LAYERS

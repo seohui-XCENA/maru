@@ -180,7 +180,6 @@ class StorageService:
             server_address=config.server,
             page_size=config.page_size,
             budgets=config.budgets,
-            budget_keys=config.budget_keys,
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
@@ -295,9 +294,14 @@ class StorageService:
                 )
                 self.adopted.append(pool.pool_id)
             else:
-                self.pools.add_pool(pool.info(), creditable=traits[PoolKind.CXL].credit)
+                cxl = traits[PoolKind.CXL]
+                self.pools.add_pool(
+                    pool.info(), creditable=cxl.credit or cxl.credit_fallback
+                )
         self.manager.start()
-        credit_kinds = {kind for kind, t in traits.items() if t.credit}
+        credit_kinds = {
+            kind for kind, t in traits.items() if t.credit or t.credit_fallback
+        }
         old = self._old_workers(opened)
         for holder in old.gone:  # dead since the reboot: nothing to wait for
             assert self.cxl is not None
@@ -463,9 +467,11 @@ class StorageService:
             self.manager.stop()
             stats = self.manager.stats()
             logger.info(
-                "this run removed pages: retire %s, demotion %s",
+                "this run removed pages: retire %s, demotion %s; credit came "
+                "short (by cause, MiB): %s",
                 stats["retire_results"] or "none",
                 stats["demotions"] or "none",
+                {k: v >> 20 for k, v in stats["credit_short_bytes"].items()} or "never",
             )
         if self.transfers is not None:
             self.transfers.close()  # unmapped before the regions may go back
@@ -487,8 +493,11 @@ class StorageService:
         if self.manager is None or self.local is None or not self.local.started:
             # No worker of this run mapped them; the run before may have
             return {p.pool_id for p in cxl.pools if not p.claimed}
-        # A new ATTACH maps none of them: its record exists before its reply
+        # A new ATTACH maps none of them: its record exists before its reply;
+        # and no credit comes from them any more
         self.local.pools = [(d, fd) for d, fd in self.local.pools if d.dax is None]
+        for pool in cxl.pools:
+            self.pools.disable_pool(pool.pool_id)
         timeout = self.unmap_timeout_s
         if self.lost is not None:  # the RM may free them once the lease ends
             timeout = min(timeout, cxl.time_left() / 2)

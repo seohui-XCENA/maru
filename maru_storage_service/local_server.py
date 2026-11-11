@@ -40,7 +40,6 @@ from maru_common.storage_types import (
     Status,
 )
 
-from .config import worker_budgets
 from .storage_manager import StorageManager
 from .worker_registry import AttachIdentity, WorkerRecord
 
@@ -202,7 +201,6 @@ class LocalServer:
         pools: list[tuple[PoolDescriptor, int | None]],
         transfer_defaults: TransferDefaults | None = None,
         socket_group: str | None = None,
-        budget_keys: frozenset[str] = frozenset(),
     ):
         self.path = path
         self.socket_group = socket_group
@@ -212,7 +210,6 @@ class LocalServer:
         self.server_address = server_address
         self.page_size = page_size
         self.budgets = budgets
-        self.budget_keys = budget_keys
         # (descriptor, fd or None); memfd indexes the fds sent with the reply
         self.pools = pools
         self.transfer_defaults = transfer_defaults or TransferDefaults()
@@ -471,12 +468,7 @@ class LocalServer:
         if rec is None:
             return reject(why)
         conn.worker = rec
-        budgets = None
-        if not probe:
-            budgets = worker_budgets(
-                self.budgets, self.budget_keys, self.page_size, req.step_objects
-            )
-            manager.pools.set_credit_max(req.incarnation, budgets.credit_max_bytes)
+        budgets = None if probe else self.budgets
         response = AttachResponse(
             status=Status.OK,
             node_id=self.node_id,
@@ -503,9 +495,8 @@ class LocalServer:
             node_pid,
             ""
             if budgets is None
-            else f"; credit up to {budgets.credit_max_bytes} bytes "
-            f"({budgets.credit_max_bytes // self.page_size} pages) for "
-            f"{req.step_objects or 'an unknown number of'} objects a step",
+            else f"; credit {budgets.credit_refill_high // self.page_size} pages "
+            f"at hand, up to {budgets.credit_max_bytes // self.page_size} pages",
         )
         if not probe:
             manager.workers.after_attach_reply(rec)

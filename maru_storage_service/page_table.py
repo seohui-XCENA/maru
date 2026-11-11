@@ -57,6 +57,8 @@ class Page:
     location: Location | None = None
     # QUARANTINED: why it waits (see the PoolManager's tags)
     tag: str | None = None
+    # TRANSFER, PENDING: a demotion copy, not a worker's write
+    copy: bool = False
 
 
 Transitions = collections.Counter[tuple[PageState, PageState]]
@@ -81,6 +83,8 @@ class PageTable:
         )
         self.bytes = dict.fromkeys(PageState, 0)
         self.bytes[state] = info.capacity
+        # PENDING bytes of demotion copies (the rest are workers' writes)
+        self.copy_pending = 0
         # allocation_id -> page index, for pages out of FREE
         self._by_allocation: dict[str, int] = {}
         self._transitions = transitions
@@ -113,6 +117,13 @@ class PageTable:
         self.bytes[src] -= self.page_size
         self.bytes[dst] += self.page_size
         self._transitions[(src, dst)] += 1
+        if page.copy:
+            if src == PageState.PENDING:
+                self.copy_pending -= self.page_size
+            if dst == PageState.PENDING:
+                self.copy_pending += self.page_size
+            elif dst != PageState.TRANSFER:
+                page.copy = False
 
     def free(self, page: Page, src: PageState) -> None:
         """``src`` -> FREE: the page and its allocation id can be given again."""
@@ -215,6 +226,13 @@ class PageTable:
             for p in self.pages
             if p.state != PageState.FREE and p.allocation_id
         }, pool_id
+        assert self.copy_pending == self.page_size * sum(
+            p.copy and p.state == PageState.PENDING for p in self.pages
+        ), pool_id
+        assert all(
+            not p.copy or p.state in (PageState.TRANSFER, PageState.PENDING)
+            for p in self.pages
+        ), pool_id
         held: collections.Counter[str] = collections.Counter()
         for page in self.pages:
             if page.state == PageState.CREDITED:

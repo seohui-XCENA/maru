@@ -6,6 +6,7 @@ outcome counters of MaruClient, on a StorageService and the fake MaruServer."""
 import dataclasses
 import os
 import threading
+import time
 
 import pytest
 
@@ -429,8 +430,8 @@ def test_probe_attach_from_another_thread_while_a_worker_writes(node, handlers):
 class TestStepCredit:
     @pytest.fixture
     def step_node(self, fake, monkeypatch):
-        """A node whose default credit is 16 pages (as with 32 MiB pages)
-        and whose total is 40."""
+        """A node whose credit at hand is 16 pages (as with 32 MiB pages)
+        and whose total, each worker's cap, is 40."""
         import maru_storage_service.config as node_config_module
 
         monkeypatch.setattr(node_config_module, "CREDIT_MAX_MIN_BYTES", 0)
@@ -449,31 +450,108 @@ class TestStepCredit:
                 },
             }
         )
-        assert config.budgets.credit_max_bytes == 16 * PAGE
+        assert config.budgets.credit_max_bytes == 40 * PAGE
+        assert config.budgets.credit_refill_high == 16 * PAGE
         service = start_node(config)
         yield service
         service.stop()
         remove_tree(sockdir)
 
-    @pytest.mark.parametrize("step_objects, pages", [(0, 16), (24, 24), (100, 40)])
-    def test_the_node_gives_a_worker_credit_for_its_step(
-        self, step_node, handlers_on, step_objects, pages, caplog
+    @pytest.mark.parametrize("step_objects", [0, 24, 100])
+    def test_a_worker_holds_the_credit_at_hand_whatever_its_step(
+        self, step_node, handlers_on, step_objects, caplog
     ):
         with caplog.at_level("INFO"):
             h = handlers_on(step_node, step_objects=step_objects)
-            wait_until(lambda: h._cpu.credits.unused_bytes == pages * PAGE)
-        assert h._cpu.attach_info.budgets.credit_max_bytes == pages * PAGE
+            wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
+        assert h._cpu.attach_info.budgets == step_node.config.budgets
         incarnation = h._cpu.identity.incarnation
-        assert step_node.pools.held_bytes(incarnation) == pages * PAGE
-        assert f"credit up to {pages * PAGE} bytes ({pages} pages)" in caplog.text
+        assert step_node.pools.held_bytes(incarnation) == 16 * PAGE
+        assert "credit 16 pages at hand, up to 40 pages" in caplog.text
+
+    def test_a_step_asks_for_its_stores_at_once(self, step_node, handlers_on):
+        h = handlers_on(step_node)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
+        h.want_credit(30)  # above the low mark, still asked for now
+        wait_until(lambda: h._cpu.credits.unused_bytes == 30 * PAGE)
+        handles = [h.alloc(8) for _ in range(30)]  # no wait, no skip
+        for handle in handles:
+            h.free(handle)  # back at hand
+        h.want_credit(100)  # capped at the node total
+        wait_until(lambda: h._cpu.credits.unused_bytes == 40 * PAGE)
+
+    def test_a_step_ask_refused_for_now_is_asked_again(
+        self, step_node, handlers_on, monkeypatch
+    ):
+        """The node answers the step's ask empty (its commits pending): the
+        worker asks again once credit frees, without a new step."""
+        from maru_common.node_protocol import CreditResponse
+        from maru_common.storage_types import Status
+
+        h = handlers_on(step_node)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
+        real = step_node.manager.credit
+        answered = []
+
+        def first_empty(rec, decoded):
+            if not answered:
+                answered.append(True)
+                return CreditResponse(status=Status.OK, credits=[])
+            return real(rec, decoded)
+
+        monkeypatch.setattr(step_node.manager, "credit", first_empty)
+        h.want_credit(30)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 30 * PAGE, timeout=2)
+        assert answered
+
+    def test_a_kind_the_node_does_not_credit_is_dropped(self, step_node, handlers_on):
+        h = handlers_on(step_node)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
+        h._cpu._credit_kind = PoolKind.CXL  # this node gives DRAM only
+        h.want_credit(30)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 30 * PAGE, timeout=2)
+        assert h._cpu._credit_kind is None
+
+    @pytest.mark.parametrize("delay, stored", [(0.005, 30), (0.3, 16)])
+    def test_a_store_waits_a_little_for_its_steps_credit(
+        self, step_node, handlers_on, monkeypatch, delay, stored
+    ):
+        """The step's CREDIT answers late: a store past the credit at hand
+        waits for it, at most credit_wait_s in the whole step."""
+        from maru_handler.client import CreditUnavailableError
+
+        h = handlers_on(step_node)
+        wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
+        real = step_node.manager.credit
+
+        def slow(rec, decoded):
+            time.sleep(delay)
+            return real(rec, decoded)
+
+        monkeypatch.setattr(step_node.manager, "credit", slow)
+        h.want_credit(30)
+        handles, started = [], time.monotonic()
+        for _ in range(30):
+            try:
+                handles.append(h.alloc(8))  # kept: a freed credit is reused
+            except CreditUnavailableError:
+                pass
+        took = time.monotonic() - started
+        for handle in handles:
+            h.free(handle)
+        got = len(handles)
+        assert got == stored
+        assert took < h._cpu.config.credit_wait_s + 0.1 + (delay if got == 30 else 0)
 
     def test_workers_capped_at_the_node_total_share_it(self, step_node, handlers_on):
-        """Each asks for the whole node total; the second gets its share back
+        """Both ask for the whole node total; the second gets its share back
         from the first."""
-        a = handlers_on(step_node, step_objects=100)
+        a = handlers_on(step_node)
+        a.want_credit(40)
         wait_until(lambda: a._cpu.credits.unused_bytes == 40 * PAGE)
-        b = handlers_on(step_node, step_objects=100, engine_id="b")
-        wait_until(lambda: b._cpu.credits.unused_bytes >= 20 * PAGE, timeout=10)
+        b = handlers_on(step_node, engine_id="b")
+        b.want_credit(40)
+        wait_until(lambda: b._cpu.credits.unused_bytes >= 16 * PAGE, timeout=10)
         held = {
             h: step_node.pools.held_bytes(h._cpu.identity.incarnation) for h in (a, b)
         }

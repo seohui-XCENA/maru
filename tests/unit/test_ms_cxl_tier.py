@@ -326,15 +326,27 @@ def cxl_node(fake, sockdir, rm, **kwargs):
     return start_node(config, region_source=rm, cxl_renew_s=0.02, **kwargs)
 
 
-def test_the_regions_are_registered_and_kept_off_credit(fake, sockdir):
+@pytest.mark.parametrize("fallback", [True, False])
+def test_the_regions_are_registered_as_fallback_credit(fake, sockdir, fallback):
     rm = FakeRm()
-    node = cxl_node(fake, sockdir, rm)
+    config = node_config(
+        fake.url,
+        f"{sockdir}/node.sock",
+        cxl_pages=4,
+        region_pages=2,
+        cxl_fallback=fallback,
+    )
+    node = start_node(
+        config, region_source=rm, cxl_renew_s=0.02, map_region=anon_region
+    )
     try:
         ids = [p.pool_id for p in node.cxl.pools]
         assert set(ids) <= set(fake.nodes["gpu-test"].pools)
         for pool_id in ids:
-            assert not node.pools.creditable(pool_id)
+            assert node.pools.creditable(pool_id) is fallback
             assert node.pools.bytes_in(PageState.FREE, pool_id) == 2 * PAGE
+        expected = [PoolKind.DRAM, PoolKind.CXL] if fallback else [PoolKind.DRAM]
+        assert node.manager.credit_kinds == expected
     finally:
         node.stop()
     assert rm.released == []  # restart keeps the regions
@@ -495,12 +507,14 @@ def _two_pool_manager(free_a: int, free_b: int, reserve: int = 0):
     return pm
 
 
-def test_credit_comes_from_the_pool_with_the_most_room():
+def test_each_page_comes_from_the_pool_with_the_most_room():
     pm = _two_pool_manager(2, 6)
+    a, b = cxl_pool_id(DOMAIN, ord("a")), cxl_pool_id(DOMAIN, ord("b"))
     got = pm.credit("w", 3 * PAGE, PoolKind.CXL)
-    assert {c.pool_id for c in got} == {cxl_pool_id(DOMAIN, ord("b"))}
-    got = pm.credit("w", 2 * PAGE, PoolKind.CXL)  # b has 3 left, a 2
-    assert {c.pool_id for c in got} == {cxl_pool_id(DOMAIN, ord("b"))}
+    assert [c.pool_id for c in got] == [b, b, b]
+    # b has 3 left and a 2: b, then a on the tie, then the rest
+    got = pm.credit("w", 5 * PAGE, PoolKind.CXL)
+    assert [c.pool_id for c in got] == [b, a, b, a, b]
     pm.check()
 
 
@@ -510,7 +524,9 @@ def test_the_transfer_reserve_is_the_tiers_over_all_its_pools():
     assert len(got) == 2  # 8 free in the tier, 6 kept for transfers
 
 
-def cxl_only_config(fake, sockdir, pages: int = 16, region_pages: int = 8):
+def cxl_only_config(
+    fake, sockdir, pages: int = 16, region_pages: int = 8, high=0.9, low=0.8
+):
     from maru_storage_service.config import parse_node_config
 
     return parse_node_config(
@@ -524,6 +540,8 @@ def cxl_only_config(fake, sockdir, pages: int = 16, region_pages: int = 8):
                     "store": "cxl",
                     "size": pages * PAGE,
                     "region_size": region_pages * PAGE,
+                    "high_watermark": high,
+                    "low_watermark": low,
                 }
             ],
             "budgets": {
@@ -587,28 +605,94 @@ def test_pressure_on_a_cxl_only_node_retires_its_pages(fake, sockdir):
         node.stop()
 
 
-def test_a_full_region_is_no_pressure_while_the_tier_has_room(fake, sockdir):
+def test_a_fuller_region_is_no_pressure_while_the_tier_has_room(fake, sockdir):
     from tests.unit.ms_node_helpers import RawWorker
 
     rm = FakeRm()
-    config = cxl_only_config(fake, sockdir, pages=32, region_pages=4)
+    # 8 regions of 4 pages; 12 pages put 2 in some regions (50%, past the
+    # 40% high watermark) while the tier is 37.5% used
+    config = cxl_only_config(fake, sockdir, pages=32, region_pages=4, high=0.4, low=0.3)
     node = start_node(config, region_source=rm, cxl_renew_s=0.02)
     try:
         worker = RawWorker(f"{sockdir}/node.sock")
         worker.attach()
-        credits = worker.credit(4 * PAGE).credits
-        # one region's every page: that region is full, the tier 1/8 used
-        assert len({c.pool_id for c in credits}) == 1 and len(credits) == 4
-        keys = [f"k{i}" for i in range(4)]
-        assert worker.write_done(credits, keys).status.value == "OK"
-        wait_until(
-            lambda: node.pools.bytes_in(PageState.READY) == 4 * PAGE, what="READY"
-        )
+        written = 0
+        while written < 12:
+            credits = worker.credit(4 * PAGE).credits
+            keys = [f"k{written + i}" for i in range(len(credits))]
+            assert worker.write_done(credits, keys).status.value == "OK"
+            written += len(credits)
+            wait_until(
+                lambda n=written: node.pools.bytes_in(PageState.READY) == n * PAGE,
+                what="READY",
+            )
+        per_region = [
+            node.pools.bytes_in(PageState.READY, p.pool_id) // PAGE
+            for p in node.cxl.pools
+        ]
+        assert max(per_region) == 2 and sum(per_region) == 12
         time.sleep(0.3)  # eviction passes run on every commit and on a timer
         assert not node.manager.retire_results
         worker.close()
     finally:
         node.stop()
+
+
+@pytest.mark.parametrize("fallback", [True, False])
+def test_credit_dram_lacks_comes_from_cxl(fake, sockdir, fallback):
+    from tests.unit.ms_node_helpers import RawWorker
+
+    config = node_config(
+        fake.url,
+        f"{sockdir}/node.sock",
+        pages=8,
+        high=1.0,  # nothing leaves DRAM in this test
+        low=0.9,
+        cxl_pages=8,
+        region_pages=4,
+        cxl_fallback=fallback,
+        budgets={
+            "credit_total_max_bytes": 4 * PAGE,
+            "commit_pending_max_bytes": 2 * PAGE,
+        },
+    )
+    node = start_node(
+        config, region_source=FakeRm(), cxl_renew_s=0.02, map_region=anon_region
+    )
+    try:
+        worker = RawWorker(f"{sockdir}/node.sock")
+        worker.attach()
+        first = worker.credit(4 * PAGE).credits
+        assert [c.kind for c in first] == [PoolKind.DRAM] * 4
+        assert (
+            worker.write_done(first, [f"k{i}" for i in range(4)]).status.value == "OK"
+        )
+        wait_until(lambda: node.pools.bytes_in(PageState.READY) == 4 * PAGE)
+        # DRAM has 4 free, less its reserve of 1
+        second = worker.credit(4 * PAGE).credits
+        expected = [PoolKind.DRAM] * 3 + ([PoolKind.CXL] if fallback else [])
+        assert [c.kind for c in second] == expected
+        if fallback:
+            keys = [f"c{i}" for i in range(4)]
+            assert worker.write_done(second, keys).status.value == "OK"
+            wait_until(lambda: node.pools.bytes_in(PageState.READY) == 8 * PAGE)
+            cxl_ready = sum(
+                node.pools.bytes_in(PageState.READY, p.pool_id) for p in node.cxl.pools
+            )
+            assert cxl_ready == PAGE
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_leave_gives_no_more_cxl_credit(fake, sockdir):
+    from maru_common.storage_types import CloseMode
+
+    node = cxl_node(fake, sockdir, FakeRm())
+    ids = [p.pool_id for p in node.cxl.pools]
+    assert all(node.pools.creditable(p) for p in ids)
+    node.stop(CloseMode.LEAVE)
+    assert not any(node.pools.creditable(p) for p in ids)
 
 
 class GoneWatcher:

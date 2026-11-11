@@ -605,6 +605,12 @@ class MaruHandler:
         self._record_stats("alloc", size, (time.monotonic() - t0) * 1e6)
         return handle
 
+    def want_credit(self, pages: int) -> None:
+        """maru_node: this engine step will store ``pages`` pages; the node is
+        asked for them now. Other backends ignore it."""
+        if self._cpu is not None and self._config.maru_node:
+            self._cpu.want_credit(pages)
+
     def free(self, handle: AllocHandle | CpuAllocation) -> None:
         """Free a page previously obtained via alloc().
 

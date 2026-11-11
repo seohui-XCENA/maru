@@ -106,6 +106,9 @@ class MaruConfig:
     maru_node: str | None = None
     # maru_node: how long store/batch_store wait for publication
     store_timeout_s: float = 10.0
+    # maru_node: how long a step's stores wait in all for the credit the
+    # step asked for when it started (0: never)
+    credit_wait_s: float = 0.02
     # maru_node: how long the first connect waits for the node to listen
     node_connect_timeout_s: float = 30.0
     # maru_node: this worker's data-parallel index and tensor-parallel rank
@@ -190,6 +193,8 @@ class MaruConfig:
                     raise ValueError(f"{name} must be an integer >= 0")
             if not 0 < self.store_timeout_s < float("inf"):
                 raise ValueError("store_timeout_s must be a positive number")
+            if not 0 <= self.credit_wait_s < float("inf"):
+                raise ValueError("credit_wait_s must be a number >= 0")
             if not 0 <= self.node_connect_timeout_s < float("inf"):
                 raise ValueError("node_connect_timeout_s must be a number >= 0")
         if self.read_hints and self.storage_backend != "remote_cxl":

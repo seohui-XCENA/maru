@@ -54,6 +54,7 @@ from maru_common.storage_types import (
     Location,
     MissReason,
     NotifyKind,
+    PoolKind,
     SessionRole,
     Status,
     StorageLocation,
@@ -79,6 +80,10 @@ logger = logging.getLogger(__name__)
 RECONNECT_S = 0.5
 REFILL_IDLE_S = 0.2
 REFILL_EMPTY_S = 0.05
+# A store waiting for its step's CREDIT looks again this often; a step's ask
+# not met is asked again until this long after the step began
+DEMAND_POLL_S = 0.005
+DEMAND_TTL_S = 1.0
 # Longest pause between attempts of a background connect
 CONNECT_RETRY_MAX_S = 1.0
 # Wait for DETACH and the last requests of close()
@@ -221,6 +226,17 @@ class MaruClient:
         self._drained_eras: dict[str, int] = {}
         self._lost = threading.Event()
         self._credit_op: tuple[OpTracker, int] | None = None
+        # The current step's ask (bytes, 0 once answered), its number, and how
+        # long the step's stores may still wait for the answer
+        self._demand = 0
+        self._demand_seq = 0
+        self._demand_wait = 0.0
+        self._demand_until = 0.0
+        # Credit the step took since its ask: the ask shrinks by it
+        self._demand_taken = 0
+        # Credit only of this kind (DRAM) once a CXL pool failed to map here;
+        # None: of any tier the node gives
+        self._credit_kind: PoolKind | None = None
         self._sends: collections.deque = collections.deque()
         self._sends_cv = threading.Condition()
         # Outcomes by class: unavailable, not_found and fetch apart
@@ -495,12 +511,11 @@ class MaruClient:
                 if response.budgets is None:
                     raise StorageUnavailableError("the ATTACH reply has no budgets")
                 if first and self._writes:
-                    credit_max = response.budgets.credit_max_bytes
+                    b = response.budgets
                     logger.info(
-                        "credit up to %d bytes (%d pages) for %s objects a step",
-                        credit_max,
-                        credit_max // response.page_size,
-                        self.config.step_objects or "an unknown number of",
+                        "credit: %d pages at hand, up to %d pages a step asks for",
+                        b.credit_refill_high // response.page_size,
+                        b.credit_max_bytes // response.page_size,
                     )
                 if first and 2 * self.config.chunk_size_bytes <= response.page_size:
                     logger.warning(
@@ -514,17 +529,23 @@ class MaruClient:
             if same_run:
                 close_fds(fds)  # the pools of this run are mapped already
             else:
+                self._credit_kind = None
                 for descriptor in response.pools:
                     if descriptor.dax is not None:
                         try:
                             self.pools.add_dax(descriptor, response.node_epoch)
                         except (OSError, RuntimeError, ValueError) as e:
-                            # Its locations fail to read and are recomputed
+                            # Its locations fail to read and are recomputed;
+                            # with a DRAM pool, credit comes from DRAM only
                             logger.error(
                                 "cannot map CXL pool %s: %s",
                                 descriptor.pool.pool_id,
                                 e,
                             )
+                            if any(
+                                d.pool.kind == PoolKind.DRAM for d in response.pools
+                            ):
+                                self._credit_kind = PoolKind.DRAM
                             continue
                     elif descriptor.memfd is not None:
                         # pools.add closes the fd, also on failure
@@ -769,6 +790,8 @@ class MaruClient:
         if taken is None and wait_s > 0:
             self._refill_wake.set()
             taken = self.credits.take(wait_s)
+        elif taken is None:
+            taken = self._wait_step_credit()
         if taken is None:
             self._count(
                 "store_deferred_no_credit" if retry_later else "store_skipped_no_credit"
@@ -776,11 +799,17 @@ class MaruClient:
             self._refill_wake.set()
             raise CreditUnavailableError("no credit at hand; skipping this store")
         credit, node_epoch, era = taken
+        with self._lock:
+            if self._demand:
+                self._demand_taken += credit.length
         try:
             view = self.pools.view(credit, size)
-        except LocationError:
-            logger.exception("a credit outside the mapped pools")
-            raise
+        except LocationError as e:
+            # Given back: the node may give it to a worker that maps it
+            logger.error("a credit outside the mapped pools: %s", e)
+            self._return_credits([credit])
+            self._count("store_skipped_unmapped")
+            raise CreditUnavailableError(f"credit of an unmapped pool: {e}") from e
         handle = CreditHandle(
             buf=view, location=credit, node_epoch=node_epoch, size=size, era=era
         )
@@ -1145,9 +1174,15 @@ class MaruClient:
             return False  # one CREDIT at a time; that one is resent until known
         budgets = info.budgets
         unused = self.credits.unused_bytes
-        if unused >= budgets.credit_refill_low and unused > 0:
+        with self._lock:
+            demand = max(0, self._demand - self._demand_taken)
+            demand_seq = self._demand_seq
+        if demand <= unused:
+            self._demand_answered(demand_seq)
+            demand = 0
+        if not demand and unused >= budgets.credit_refill_low and unused > 0:
             return False
-        want = budgets.credit_refill_high - unused
+        want = max(budgets.credit_refill_high, demand) - unused
         if want <= 0:
             return False
         request = ops.origin.stamp(
@@ -1155,7 +1190,7 @@ class MaruClient:
                 op=PLACEHOLDER_OP,
                 worker_session=server.session,
                 want_bytes=want,
-                kind=None,
+                kind=self._credit_kind,
             )
         )
         epoch = ops.node_epoch
@@ -1167,22 +1202,93 @@ class MaruClient:
         def on_result(response) -> None:
             if response.status != Status.OK:
                 logger.warning("CREDIT: %s %s", response.status, response.error)
+                if response.status == Status.REJECTED and request.kind is not None:
+                    # Not a credit tier of this node: ask for any, and give
+                    # back what lands in a pool not mapped here
+                    self._credit_kind = None
                 return
             if not response.credits:
                 return
-            if self.credits.put(response.credits, epoch, era):
-                got.extend(response.credits)
+            mapped = [c for c in response.credits if self.pools.get(c.pool_id)]
+            if len(mapped) < len(response.credits):
+                # A pool this worker could not map: given back at once
+                self._return_credits(
+                    [c for c in response.credits if not self.pools.get(c.pool_id)]
+                )
+                self._count("credit_unmapped")
+            if not mapped:
+                return
+            if self.credits.put(mapped, epoch, era):
+                got.extend(mapped)
             elif epoch == self.credits.node_epoch:
                 # asked before a MaruServer restart: the node may not have
                 # quarantined it, so it goes back
-                self._return_credits(response.credits)
+                self._return_credits(mapped)
 
         reply = self._send_op(NodeMessageType.CREDIT, request, on_result, ops)
         try:
             reply.result(self.rpc_timeout_s * 5)
         except Exception:
             return False
+        if demand:
+            if self.credits.unused_bytes >= demand:
+                self._demand_answered(demand_seq)
+            else:
+                # Answered short: the stores stop waiting; the ask goes on
+                # in the background while credit frees
+                with self._lock:
+                    if self._demand_seq == demand_seq:
+                        self._demand_wait = 0.0
         return bool(got)
+
+    def want_credit(self, pages: int) -> None:
+        """This step stores ``pages`` pages: ask the node now, not at the low
+        mark, so the credit is at hand when the stores come. A store may wait
+        up to ``credit_wait_s`` in the step for that answer."""
+        if pages <= 0 or not self._writes or self.off is not None:
+            return
+        info = self.attach_info
+        if info is None or info.budgets is None:
+            return
+        nbytes = min(pages * info.page_size, info.budgets.credit_max_bytes)
+        enough = self.credits.unused_bytes >= nbytes
+        with self._lock:
+            self._demand_seq += 1
+            self._demand = 0 if enough else nbytes
+            self._demand_wait = 0.0 if enough else self.config.credit_wait_s
+            self._demand_until = time.monotonic() + DEMAND_TTL_S
+            self._demand_taken = 0
+        if not enough:
+            self._refill_wake.set()
+
+    def _demand_answered(self, seq: int) -> None:
+        with self._lock:
+            if self._demand_seq == seq:
+                self._demand = 0
+
+    def _demand_unmet(self) -> bool:
+        """What the step still needs is not at hand, and its ask is current."""
+        with self._lock:
+            if self._demand and time.monotonic() >= self._demand_until:
+                self._demand = 0
+            need = self._demand - self._demand_taken
+        return need > self.credits.unused_bytes
+
+    def _wait_step_credit(self) -> tuple[Location, str, int] | None:
+        """Credit while this step's ask is unmet, within the step's
+        ``credit_wait_s``; None once met or out of time."""
+        while not self._closing.is_set() and not self.credits.closed:
+            with self._lock:
+                if self._demand <= 0 or self._demand_wait <= 0:
+                    return None
+                budget = min(self._demand_wait, DEMAND_POLL_S)
+            started = time.monotonic()
+            taken = self.credits.take(budget)
+            with self._lock:
+                self._demand_wait -= time.monotonic() - started
+            if taken is not None:
+                return taken
+        return None
 
     def _refill_loop(self) -> None:
         while not self._closing.is_set():
@@ -1193,8 +1299,10 @@ class MaruClient:
             try:
                 # A CREDIT sent after a WRITE_DONE sees the credit it freed
                 self._credit_freed.clear()
-                if not self._refill_once() and self.credits.unused_bytes == 0:
-                    # Ask again as soon as a WRITE_DONE frees credit
+                got = self._refill_once()
+                if (not got and self.credits.unused_bytes == 0) or self._demand_unmet():
+                    # Ask again as soon as a WRITE_DONE frees credit (the
+                    # node's commit-pending budget, or credit of its own)
                     self._credit_freed.wait(REFILL_EMPTY_S)
                     self._refill_wake.set()
             except Exception:
@@ -1640,6 +1748,10 @@ class MaruClient:
         if pool_id is None or generation is None:
             logger.warning("NOTIFY pool_remove without pool_id or generation; ignored")
             return
+        # Its credit at hand goes back first: no new write starts in it
+        credits = self.credits.remove_pool(pool_id)
+        if credits:
+            self._return_credits(credits)
         with self._lock:
             self._cv.wait_for(
                 lambda: (

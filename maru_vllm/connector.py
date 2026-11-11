@@ -1378,6 +1378,7 @@ def _create_node_handler(
         step_objects=0
         if metadata_only
         else int(extra_config.get("_maru_step_objects", 0)),
+        credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 20)) / 1000,
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)
@@ -2191,6 +2192,15 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         self._worker.register_kv_caches(
             kv_caches, getattr(compilation, "static_forward_context", None)
         )
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """vLLM binds each step's metadata before its forward pass (0.29+ may
+        start the loads after it): the step's credit is asked for here."""
+        super().bind_connector_metadata(connector_metadata)
+        if self._worker is not None and isinstance(
+            connector_metadata, MaruConnectorMetadata
+        ):
+            self._worker.want_step_credit(connector_metadata)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -6194,6 +6204,45 @@ class MaruWorkerConnector:
             if req_meta.req_id in self._inflight_deferred_req_ids:
                 return
         self._unsound_kv_req_ids.add(req_meta.req_id)
+
+    def want_step_credit(self, metadata: MaruConnectorMetadata) -> None:
+        """Ask the node, before the step's forward pass, for the pages its
+        stores take, so the credit is at hand when they come (maru_node).
+        Write-behind stores a prompt's chunks in the step that completes it."""
+        if not self._node_mode or self._handler is None or not self._stores_anything():
+            return
+        ct = self._kv_chunk_tokens
+        step = behind = requests = 0
+        for req_meta in self._store_entries(metadata):
+            total = len(req_meta.token_ids) // ct
+            chunks = _step_chunks(req_meta, ct, total)
+            step += len(chunks)
+            requests += len(chunks) > 0
+            if chunks and chunks.stop >= total:
+                behind += max(0, chunks.stop - req_meta.store_start_token // ct)
+
+        # Write-behind holds a prompt's chunks for its last step on the store
+        # kernel only; the per-layer path stores each step's chunks
+        behind_ok = self._write_behind and not self._store_kernel_unusable
+
+        def count(full: bool) -> int:
+            return behind if behind_ok and full else step
+
+        if self._multi_group:
+            pages = sum(
+                requests if g.kind == GROUP_MAMBA else count(g.kind == GROUP_FULL)
+                for g in self._kv_groups
+                if g.kind == GROUP_MAMBA or self._stores(g)
+            )
+        elif self._use_layerwise:
+            pages = step * (self._num_layers + 1)
+        else:
+            pages = count(True)
+        if pages:
+            try:
+                self._handler.want_credit(pages)
+            except Exception:
+                logger.debug("asking for the step's credit failed", exc_info=True)
 
     def _store_entries(self, metadata: MaruConnectorMetadata) -> list[MaruReqMeta]:
         """The store entries of ``metadata``, but none of a request whose load

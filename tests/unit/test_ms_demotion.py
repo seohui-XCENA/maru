@@ -863,3 +863,50 @@ def test_a_finalize_move_refused_as_a_whole_releases_and_moves_later(
         )
     wait_until(lambda: fake.pin_count() == 0, what="no finalizer left")
     node.pools.check()
+
+
+# =============================================================================
+# Credit from CXL when DRAM lacks room
+# =============================================================================
+
+
+def test_a_worker_that_cannot_map_cxl_takes_dram_credit_only(
+    nodes, handlers, monkeypatch
+):
+    node = nodes(pages=8, cxl_pages=16, region_pages=8)
+
+    def no_dax(*args, **kwargs):
+        raise OSError("no dax in this container")
+
+    monkeypatch.setattr(pool_maps, "CxlRegionMapping", no_dax)
+    h = handlers(node)
+    client = h._cpu
+    assert client._credit_kind == PoolKind.DRAM
+    client.want_credit(8)  # past the 2-page cap: DRAM only, whatever is short
+    wait_until(lambda: client.credits.unused_bytes == 2 * PAGE, what="credit")
+    assert {c.kind for c in client.credits.take_all()} == {PoolKind.DRAM}
+
+
+def test_credit_of_a_pool_the_worker_did_not_map_goes_back(
+    nodes, handlers, monkeypatch
+):
+    # DRAM gives 1 page past its reserve of 1: the rest is CXL
+    node = nodes(pages=2, cxl_pages=16, region_pages=8)
+
+    def no_dax(*args, **kwargs):
+        raise OSError("no dax in this container")
+
+    monkeypatch.setattr(pool_maps, "CxlRegionMapping", no_dax)
+    h = handlers(node)
+    client = h._cpu
+    client._credit_kind = None  # as a node of only fallback tiers would ask
+    client.want_credit(2)
+    wait_until(lambda: client.stats["credit_unmapped"] >= 1, what="a return")
+    assert {c.kind for c in client.credits.take_all()} <= {PoolKind.DRAM}
+    incarnation = client.identity.incarnation
+    cxl = [p.pool_id for p in node.cxl.pools]
+    wait_until(
+        lambda: sum(node.pools.bytes_in(PageState.CREDITED, p) for p in cxl) == 0,
+        what="the CXL credit back",
+    )
+    assert node.pools.held_bytes(incarnation) <= PAGE

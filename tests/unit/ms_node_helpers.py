@@ -76,6 +76,7 @@ def node_config(
     hugepage: bool = False,
     cxl_pages: int | None = None,
     region_pages: int = 4,
+    cxl_fallback: bool = True,
 ):
     default_budgets = {
         "credit_max_bytes": 4 * page_size,
@@ -109,6 +110,7 @@ def node_config(
                         "store": "cxl",
                         "size": cxl_pages * page_size,
                         "region_size": region_pages * page_size,
+                        "credit_fallback": cxl_fallback,
                     }
                 ]
             ),

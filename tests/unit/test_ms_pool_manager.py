@@ -172,6 +172,95 @@ class TestCredit:
         pm.stop_credit("safe state")
         assert pm.credit("w", PS) == []
         assert pm.credit_stopped == "safe state"
+        assert pm.credit_short["stopped"] == 1
+
+    def test_demotion_copies_are_not_commit_pending(self):
+        pm = manager()
+        copies = pm.reserve_transfer("dram:n:e", 3)
+        for i, ref in enumerate(copies):
+            pm.transfer_done(ref, Key("ns", f"c{i}"), 10)
+        assert pm.bytes_in(PageState.PENDING) == 3 * PS  # at the cap in bytes
+        assert pm.write_pending_bytes() == 0
+        assert len(pm.credit("w", PS)) == 1
+        pm.commit_added(copies[0])
+        pm.commit_freed(copies[1])
+        pm.check()
+
+    def test_a_short_grant_names_the_limit(self):
+        pm = manager()  # cap 4 pages a worker, 8 in all, 14 free past the reserve
+        assert len(pm.credit("w", 6 * PS)) == 4
+        assert dict(pm.credit_short) == {"worker_cap": 1}
+        assert dict(pm.credit_short_bytes) == {"worker_cap": 2 * PS}
+        pm.credit("x", 4 * PS)
+        assert len(pm.credit("y", 4 * PS)) == 0
+        assert pm.credit_short["node_cap"] == 1
+
+
+def cxl(pool_id: str, pages: int) -> PoolInfo:
+    return dataclasses.replace(dram(pool_id, pages), kind=PoolKind.CXL)
+
+
+class TestCreditAcrossTiers:
+    def two_tiers(self, **overrides) -> PoolManager:
+        values = {
+            "credit_max_bytes": 32 * PS,
+            "credit_total_max_bytes": 32 * PS,
+            "commit_pending_max_bytes": 32 * PS,
+            "transfer_reserve_bytes": {"dram": 2 * PS, "cxl": 3 * PS},
+        }
+        values.update(overrides)
+        pm = PoolManager(budgets(**values), PS)
+        pm.add_pool(dram(pages=8))
+        pm.add_pool(cxl("cxl:d:1", 4))
+        pm.add_pool(cxl("cxl:d:2", 6))
+        pm.set_epoch_seq(3)
+        return pm
+
+    def test_the_top_tier_first_and_the_rest_below(self):
+        pm = self.two_tiers()
+        got = pm.credit("w", 9 * PS, [PoolKind.DRAM, PoolKind.CXL])
+        kinds = [c.kind for c in got]
+        # DRAM gives 6 (8 less its reserve of 2), CXL the 3 it lacks
+        assert kinds == [PoolKind.DRAM] * 6 + [PoolKind.CXL] * 3
+        # the roomiest CXL region gives each page: 6 and 5 free, then a tie
+        # at 4 that the first region takes
+        assert [c.pool_id for c in got[6:]] == ["cxl:d:2", "cxl:d:2", "cxl:d:1"]
+        assert not pm.credit_short
+        pm.check()
+
+    def test_each_tier_keeps_its_reserve(self):
+        pm = self.two_tiers()
+        got = pm.credit("w", 32 * PS, [PoolKind.DRAM, PoolKind.CXL])
+        assert len(got) == 6 + 7  # 10 CXL pages less its reserve of 3
+        assert pm.credit_short["space"] == 1
+        assert (
+            len(pm.reserve_transfer("cxl:d:1", 4))
+            + len(pm.reserve_transfer("cxl:d:2", 4))
+            == 3
+        )
+        pm.check()
+
+    def test_only_the_tiers_asked_for(self):
+        pm = self.two_tiers()
+        got = pm.credit("w", 9 * PS, [PoolKind.DRAM])
+        assert [c.kind for c in got] == [PoolKind.DRAM] * 6
+        assert pm.credit("w", PS, PoolKind.CXL)[0].kind == PoolKind.CXL
+
+    def test_a_pool_off_credit_gives_none(self):
+        pm = self.two_tiers()
+        pm.disable_pool("cxl:d:2")
+        got = pm.credit("w", 32 * PS, [PoolKind.DRAM, PoolKind.CXL])
+        # cxl:d:1 alone: 4 free, and the tier's reserve of 3 still kept
+        assert [c.pool_id for c in got[6:]] == ["cxl:d:1"]
+
+    def test_workers_writes_below_count_as_pending(self):
+        pm = self.two_tiers(commit_pending_max_bytes=2 * PS)
+        got = pm.credit("w", 8 * PS, [PoolKind.DRAM, PoolKind.CXL])
+        for i, c in enumerate(got[6:]):
+            pm.write_done("w", c, Key("ns", f"k{i}"), 10)
+        assert pm.write_pending_bytes() == 2 * PS
+        assert pm.credit("w", PS, [PoolKind.DRAM, PoolKind.CXL]) == []
+        assert pm.credit_short["pending"] == 1
 
     def test_generation_counter_exhaustion_stops_credit(self):
         pm = manager()
@@ -468,7 +557,7 @@ class LedgerMachine(RuleBasedStateMachine):
         want=st.integers(min_value=1, max_value=6 * PS),
     )
     def credit(self, worker, want):
-        pending_before = self.pm.bytes_in(PageState.PENDING)
+        pending_before = self.pm.write_pending_bytes()
         held = self.pm.held_bytes(worker)
         got = self.pm.credit(worker, want)
         if pending_before >= self.pm.budgets.commit_pending_max_bytes:

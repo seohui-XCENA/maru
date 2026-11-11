@@ -8,11 +8,12 @@ a wrong transition asked by the service is a bug (InvalidTransitionError).
 """
 
 import collections
+import heapq
 import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 
 from maru_common.node_protocol import Budgets
@@ -75,10 +76,8 @@ class PoolManager:
         self._epoch_seq: int | None = None
         self._counter = 0
         self._credit_stopped: str | None = None
-        # Credited bytes per holder (worker incarnation), and the cap of
-        # each holder whose ATTACH sized it
+        # Credited bytes per holder (worker incarnation)
         self._held: collections.Counter[str] = collections.Counter()
-        self._credit_max: dict[str, int] = {}
         # Holders below their fair share, short by the node-total budget:
         # bytes still owed and when they last asked
         self._waiting: dict[str, tuple[int, float]] = {}
@@ -89,6 +88,10 @@ class PoolManager:
         self._hold: tuple[str, int] | None = None
         # How many times each transition ran, for tests and metrics
         self.transitions: Transitions = collections.Counter()
+        # CREDITs answered short, and the bytes they lacked, by the limit
+        # that bound them: space, worker_cap, node_cap, pending, stopped
+        self.credit_short: collections.Counter[str] = collections.Counter()
+        self.credit_short_bytes: collections.Counter[str] = collections.Counter()
 
     # ------------------------------------------------------------------ pools
 
@@ -192,83 +195,132 @@ class PoolManager:
     # ----------------------------------------------------------------- credit
 
     def credit(
-        self, holder: str, want_bytes: int, kind: PoolKind | None = None
+        self,
+        holder: str,
+        want_bytes: int,
+        kinds: PoolKind | Sequence[PoolKind] | None = None,
     ) -> list[Location]:
-        """FREE pages for ``holder`` within every budget; empty when
-        credit is stopped or the credit tier's commit-pending bytes reached
-        their cap."""
+        """FREE pages for ``holder`` within every budget, from the tiers of
+        ``kinds`` in order (all creditable pools when None): the first tier's
+        pages come first, and within a tier the roomiest pool gives each page.
+        Each tier keeps its transfer reserve. Empty when credit is stopped or
+        the workers' commit-pending bytes reached their cap. A short grant
+        counts its cause in ``credit_short``."""
         if want_bytes <= 0:
             return []
+        ps = self.page_size
+        want = math.ceil(want_bytes / ps)
         with self._lock:
             if self._credit_stopped is not None or self._epoch_seq is None:
+                self._short("stopped", want)
                 return []
-            table = self._credit_pool(kind)
-            if table is None:
+            if self._write_pending() >= self.budgets.commit_pending_max_bytes:
+                self._short("pending", want)
                 return []
-            # The credit tier's writes only: demotion copies wait elsewhere
-            pending = sum(
-                t.bytes[PageState.PENDING]
-                for t in self._tables.values()
-                if t.info.kind == table.info.kind
-            )
-            if pending >= self.budgets.commit_pending_max_bytes:
-                return []
-            ps = table.page_size
-            # The transfer reserve is the tier's, over all its pools
-            reserve = self.budgets.transfer_reserve_bytes.get(table.info.kind.value, 0)
-            tier_free = sum(
-                t.bytes[PageState.FREE]
-                for pool_id, t in self._tables.items()
-                if t.info.kind == table.info.kind and pool_id in self._creditable
-            )
+            tiers = self._credit_tiers(kinds)
+            space = sum(room for _, room in tiers)
             now = time.monotonic()
             self._waiting = {
                 h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
             }
             # Room owed to other waiting holders is not given away
             owed = sum(w[0] for h, w in self._waiting.items() if h != holder)
-            uncapped = min(
-                math.ceil(want_bytes / ps),
-                (
-                    self._credit_max.get(holder, self.budgets.credit_max_bytes)
-                    - self._held[holder]
-                )
-                // ps,
-                (tier_free - reserve) // ps,
-                table.free_count(),
-            )
-            count = min(
-                uncapped,
-                (
-                    self.budgets.credit_total_max_bytes
-                    - self._bytes(PageState.CREDITED)
-                    - owed
-                )
-                // ps,
-            )
-            granted = max(count, 0)
+            held = self._held[holder]
+            worker_room = (self.budgets.credit_max_bytes - held) // ps
+            node_room = (
+                self.budgets.credit_total_max_bytes
+                - self._bytes(PageState.CREDITED)
+                - owed
+            ) // ps
+            uncapped = min(want, worker_room, space)
+            granted = max(min(uncapped, node_room), 0)
             self._note_waiting(
-                holder, (uncapped - granted) * ps, self._held[holder] + granted * ps, ps
+                holder, (uncapped - granted) * ps, held + granted * ps, ps
             )
-            if count <= 0:
+            if granted < want:
+                limits = {
+                    "space": space,
+                    "worker_cap": worker_room,
+                    "node_cap": node_room,
+                }
+                self._short(min(limits, key=limits.__getitem__), want - granted)
+            if granted <= 0:
                 return []
             left = GENERATION_COUNTER_MAX - self._counter + 1
-            if count > left:
-                count = left
-                if count <= 0:
+            if granted > left:
+                self._short("stopped", granted - max(left, 0))
+                granted = left
+                if granted <= 0:
                     self._credit_stopped = (
                         "the generation counter is exhausted; restart the "
                         "StorageService"
                     )
                     logger.error("New credit stopped: %s", self._credit_stopped)
                     return []
-            out = []
-            for _ in range(count):
-                page = table.take(PageState.CREDITED, self._next_generation())
-                page.holder = holder
-                self._held[holder] += ps
-                out.append(table.location(page))
+            out: list[Location] = []
+            for tables, room in tiers:
+                # Roomiest pool first, the earlier one on a tie
+                heap = [(-t.free_count(), i) for i, t in enumerate(tables)]
+                heapq.heapify(heap)
+                for _ in range(min(room, granted - len(out))):
+                    free, i = heapq.heappop(heap)
+                    table = tables[i]
+                    page = table.take(PageState.CREDITED, self._next_generation())
+                    page.holder = holder
+                    self._held[holder] += ps
+                    out.append(table.location(page))
+                    heapq.heappush(heap, (free + 1, i))
+                if len(out) >= granted:
+                    break
             return out
+
+    def _credit_tiers(
+        self, kinds: PoolKind | Sequence[PoolKind] | None
+    ) -> list[tuple[list[PageTable], int]]:
+        """Caller holds the lock. Per tier in credit order: its creditable
+        pools and the pages it may give (FREE less its transfer reserve)."""
+        if kinds is None:
+            order = list(
+                dict.fromkeys(
+                    t.info.kind
+                    for p, t in self._tables.items()
+                    if p in self._creditable
+                )
+            )
+        elif isinstance(kinds, PoolKind):
+            order = [kinds]
+        else:
+            order = list(kinds)
+        out = []
+        for kind in order:
+            tables = [
+                t
+                for p, t in self._tables.items()
+                if p in self._creditable and t.info.kind == kind
+            ]
+            if not tables:
+                continue
+            reserve = self.budgets.transfer_reserve_bytes.get(kind.value, 0)
+            free = sum(t.bytes[PageState.FREE] for t in tables)
+            out.append((tables, max(0, (free - reserve) // self.page_size)))
+        return out
+
+    def write_pending_bytes(self) -> int:
+        """PENDING bytes of workers' writes: the commit-pending budget counts
+        these, not demotion copies."""
+        with self._lock:
+            return self._write_pending()
+
+    def _write_pending(self) -> int:
+        """Caller holds the lock."""
+        return sum(
+            t.bytes[PageState.PENDING] - t.copy_pending for t in self._tables.values()
+        )
+
+    def _short(self, cause: str, pages: int) -> None:
+        """Caller holds the lock."""
+        self.credit_short[cause] += 1
+        self.credit_short_bytes[cause] += pages * self.page_size
 
     def _fair_share(self, holder: str, ps: int) -> int:
         """The node-total budget split among holders and waiting holders."""
@@ -310,23 +362,6 @@ class PoolManager:
                     asks.append((other, ask))
             return asks
 
-    def _credit_pool(self, kind: PoolKind | None) -> PageTable | None:
-        """The pool credit comes from: the creditable one of ``kind`` with
-        the most FREE pages (the first of them on a tie)."""
-        best = None
-        for pool_id, table in self._tables.items():
-            if pool_id in self._creditable and (
-                kind is None or table.info.kind == kind
-            ):
-                if best is None or table.free_count() > best.free_count():
-                    best = table
-        return best
-
-    def set_credit_max(self, holder: str, nbytes: int) -> None:
-        """``holder``'s own credit cap (the default otherwise)."""
-        with self._lock:
-            self._credit_max[holder] = nbytes
-
     def held_bytes(self, holder: str) -> int:
         with self._lock:
             return self._held[holder]
@@ -337,7 +372,6 @@ class PoolManager:
             if self._held[holder]:
                 return False
             del self._held[holder]
-            self._credit_max.pop(holder, None)
             self._waiting.pop(holder, None)
             self._asked.pop(holder, None)
             return True
@@ -497,7 +531,6 @@ class PoolManager:
                         out.append(table.ref(page))
             if self._held[holder] == 0:
                 del self._held[holder]
-            self._credit_max.pop(holder, None)
             self._waiting.pop(holder, None)
             self._asked.pop(holder, None)
             return out
@@ -596,6 +629,7 @@ class PoolManager:
             out = []
             for _ in range(max(0, count)):
                 page = table.take(PageState.TRANSFER, self._next_generation())
+                page.copy = True
                 out.append(table.ref(page))
             return out
 

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from maru_common.storage_types import Visibility
+from maru_common.storage_types import PoolKind, Visibility
 from maru_storage_service.cli import EXIT_CONFIG, EXIT_NOT_SERVING, main
 from maru_storage_service.config import (
     DEFAULT_RM,
@@ -15,7 +15,6 @@ from maru_storage_service.config import (
     load_node_config,
     parse_node_config,
     parse_size,
-    worker_budgets,
 )
 
 M = 1 << 20
@@ -117,10 +116,12 @@ class TestExamples:
 
     def test_budget_defaults(self):
         b = parse_node_config(GPU_NODE).budgets
-        assert b.credit_max_bytes == 16 * 32 * M
-        assert b.credit_total_max_bytes == int(64 * G * 0.10)
+        # credit comes from the DRAM and, short of it, the CXL tier
+        assert b.credit_total_max_bytes == int((64 + 256) * G * 0.10)
+        assert b.credit_max_bytes == b.credit_total_max_bytes
         assert (b.credit_refill_low, b.credit_refill_high) == (4 * 32 * M, 16 * 32 * M)
-        assert b.commit_pending_max_bytes == int(64 * G * 0.05)
+        # what waits for its commit came from credit
+        assert b.commit_pending_max_bytes == b.credit_total_max_bytes
         assert b.transfer_reserve_bytes == {
             "dram": int(64 * G * 0.05),
             "cxl": int(256 * G * 0.05),
@@ -135,44 +136,37 @@ class TestExamples:
         "page, pages",
         [("1M", 512), ("3M", 170), ("32M", 16), ("64M", 16)],
     )
-    def test_credit_max_default_is_16_pages_or_512m(self, page, pages):
+    def test_credit_at_hand_is_16_pages_or_512m(self, page, pages):
         raw = edit(GPU_NODE, page_size=page)
         raw["tiers"][1]["region_size"] = "192M"  # a multiple of every page
         b = parse_node_config(raw).budgets
         size = parse_size(page, "page")
-        assert b.credit_max_bytes == pages * size
         assert b.credit_refill_low == int(pages * size * 0.25)
         assert b.credit_refill_high == pages * size
+        assert b.credit_max_bytes == b.credit_total_max_bytes // size * size
 
-    @pytest.mark.parametrize(
-        "step_objects, pages",
-        [(0, 512), (100, 512), (600, 600), (5000, 3276)],
-    )
-    def test_a_worker_gets_credit_for_one_step(self, step_objects, pages):
-        """Default 512 pages at 1 MiB pages; a 32 GiB tier's 3276-page total."""
-        raw = edit(GPU_NODE, page_size="1M", tiers=[{"store": "dram", "size": "32G"}])
-        config = parse_node_config(raw)
-        b = worker_budgets(config.budgets, config.budget_keys, M, step_objects)
-        assert b.credit_max_bytes == pages * M
-        assert b.credit_refill_low == int(pages * M * 0.25)
-        assert b.credit_refill_high == pages * M
-        assert b.credit_total_max_bytes == config.budgets.credit_total_max_bytes
+    def test_without_fallback_credit_comes_from_the_top_tier(self):
+        raw = with_tier(GPU_NODE, 1, credit_fallback=False)
+        c = parse_node_config(raw)
+        assert c.tiers[1].credit_fallback is False
+        assert c.budgets.credit_total_max_bytes == int(64 * G * 0.10)
+        traits = c.traits()
+        assert not traits[PoolKind.CXL].credit_fallback
 
-    def test_explicit_budgets_win_over_the_step(self):
+    def test_explicit_cap_bounds_the_credit_at_hand(self):
         raw = edit(
             GPU_NODE,
             page_size="1M",
             tiers=[{"store": "dram", "size": "32G"}],
             budgets={"credit_max_bytes": "64M"},
         )
-        config = parse_node_config(raw)
-        b = worker_budgets(config.budgets, config.budget_keys, M, 600)
-        assert b.credit_max_bytes == 64 * M
+        b = parse_node_config(raw).budgets
+        assert (b.credit_max_bytes, b.credit_refill_high) == (64 * M, 64 * M)
+        assert b.credit_refill_low == 16 * M
         raw["budgets"] = {"credit_refill_low": "8M", "credit_refill_high": "100M"}
-        config = parse_node_config(raw)
-        b = worker_budgets(config.budgets, config.budget_keys, M, 600)
-        assert b.credit_max_bytes == 600 * M
+        b = parse_node_config(raw).budgets
         assert (b.credit_refill_low, b.credit_refill_high) == (8 * M, 100 * M)
+        assert b.credit_max_bytes == b.credit_total_max_bytes // M * M
 
     def test_explicit_credit_max_wins_over_the_default(self):
         raw = edit(GPU_NODE, page_size="1M", budgets={"credit_max_bytes": "8M"})
@@ -304,10 +298,22 @@ class TestRules:
             "fetch_max_batch_bytes <=",
         )
 
-    def test_budgets_fit_the_top_tier(self):
+    def test_budgets_fit_the_tiers_credit_comes_from(self):
+        # dram + cxl hold 320 GiB, less the pending budget and both reserves
         rejects(
-            edit(GPU_NODE, budgets={"credit_total_max_bytes": "60G"}), "exceed tiers"
+            edit(GPU_NODE, budgets={"credit_total_max_bytes": "310G"}),
+            r"exceed the tiers credit comes from \(dram \+ cxl",
         )
+        no_fallback = with_tier(GPU_NODE, 1, credit_fallback=False)
+        rejects(
+            edit(no_fallback, budgets={"credit_total_max_bytes": "60G"}),
+            r"exceed the tiers credit comes from \(dram:",
+        )
+
+    def test_fallback_is_for_a_tier_below_the_top(self):
+        raw = copy.deepcopy(GPU_NODE)
+        raw["tiers"] = [{"store": "cxl", "size": "32G", "credit_fallback": True}]
+        rejects(raw, "only a tier below the top")
 
     def test_transfer_reserve_per_tier(self):
         c = parse_node_config(
@@ -345,7 +351,8 @@ class TestFileAndCli:
         assert out["page_size"] == 32 * M
         assert out["tiers"][1]["visibility"] == "coherent"
         assert out["budgets"]["transfer_reserve_bytes"]["dram"] == int(64 * G * 0.05)
-        assert out["budgets"]["credit_max_bytes"] == 512 * M
+        assert out["budgets"]["credit_refill_high"] == 512 * M
+        assert out["tiers"][1]["credit_fallback"] is True
 
     def test_check_prints_the_credit_default_of_small_pages(self, tmp_path, capsys):
         raw = edit(GPU_NODE, page_size="1M")
@@ -354,7 +361,7 @@ class TestFileAndCli:
         path.write_text(json.dumps(raw))
         assert main(["--config", str(path), "--check"]) == 0
         budgets = json.loads(capsys.readouterr().out)["budgets"]
-        assert budgets["credit_max_bytes"] == 512 * M
+        assert budgets["credit_max_bytes"] == budgets["credit_total_max_bytes"]
         assert budgets["credit_refill_low"] == 128 * M
         assert budgets["credit_refill_high"] == 512 * M
 
