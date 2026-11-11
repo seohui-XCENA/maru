@@ -420,7 +420,7 @@ class NodeRegistry:
             req.node_epoch,
             node.epoch_seq,
         )
-        return self._open_reply(node, session, previous=None)
+        return self._open_reply(node, session)
 
     def _resume_run(
         self, node: NodeRecord | None, req: NodeOpenRequest, now: float
@@ -462,7 +462,7 @@ class NodeRegistry:
             req.node_epoch,
             node.epoch_seq,
         )
-        return self._open_reply(node, session, previous=None)
+        return self._open_reply(node, session)
 
     def _open_new_epoch(
         self, node: NodeRecord | None, req: NodeOpenRequest, now: float
@@ -473,7 +473,6 @@ class NodeRegistry:
             raise OpenError(Status.REJECTED, f"epoch_seq of {req.node_id} exhausted")
         listed = {info.pool_id: info for info in req.pools}
         old = node.session
-        previous = node.node_epoch
         adopt, remove = [], []
         for pool in self.catalog.pools_of(req.node_id):
             if pool.state == PoolState.REMOVING:
@@ -485,6 +484,7 @@ class NodeRegistry:
         self.nodes[node.node_id] = node
         if old is not None and not old.ended:
             self._end_run(node, old)
+        released = self._release_earlier_workers(node, req.node_epoch)
         for pool in remove:
             self.catalog.remove_pool(pool)
         for pool in adopt:
@@ -501,14 +501,31 @@ class NodeRegistry:
                 self.catalog.register_pool(info, node.epoch_seq)
         session = self._new_session(node, req, now)
         logger.info(
-            "node %s opened node_epoch %s (epoch_seq %d): %d pools adopted, %d removed",
+            "node %s opened node_epoch %s (epoch_seq %d): %d pools adopted, %d "
+            "removed, pins of %d workers of earlier runs released",
             node.node_id,
             req.node_epoch,
             node.epoch_seq,
             len(adopt),
             len(remove),
+            released,
         )
-        return self._open_reply(node, session, previous=previous)
+        return self._open_reply(node, session)
+
+    def _release_earlier_workers(self, node: NodeRecord, node_epoch: str) -> int:
+        """Release every pin of the worker sessions attached to the node's
+        earlier runs: holds (CXL) and a new memfd (DRAM) keep the memory safe,
+        not those pins. Returns how many sessions held some."""
+        released = 0
+        for worker in self._node_workers(node.node_id):
+            if (
+                worker.role == SessionRole.WORKER
+                and worker.node_epoch != node_epoch
+                and self.pins.holds(worker.token)
+            ):
+                self._release_pins(worker.token, 0)
+                released += 1
+        return released
 
     @staticmethod
     def _adoptable(
@@ -551,20 +568,12 @@ class NodeRegistry:
         self._node_sessions[session.token] = session
         return session
 
-    def _open_reply(
-        self, node: NodeRecord, session: NodeSession, previous: str | None
-    ) -> NodeOpenResponse:
+    def _open_reply(self, node: NodeRecord, session: NodeSession) -> NodeOpenResponse:
         adopted = []
         for pool_id in node.adopted:
             pool = self.catalog.pool(pool_id)
             if pool is not None and pool.state == PoolState.ACTIVE:
                 adopted.append(pool.info)
-        old_workers = [
-            worker.ref()
-            for worker in self._node_workers(node.node_id)
-            if worker.role == SessionRole.WORKER
-            and worker.node_epoch != session.node_epoch
-        ]
         return NodeOpenResponse(
             status=Status.OK,
             server_epoch=self.server_epoch,
@@ -574,8 +583,6 @@ class NodeRegistry:
             session_ttl_s=self.session_ttl_s,
             recovering=False,
             adopted=adopted,
-            old_workers=old_workers,
-            previous_node_epoch=previous if previous != session.node_epoch else None,
         )
 
     def _end_run(
@@ -849,7 +856,10 @@ class NodeRegistry:
             deadline=now + self.session_ttl_s,
         )
         if previous is not None:
-            self.pins.move_holder(previous.token, session.token)
+            if previous.node_epoch == session.node_epoch:
+                self.pins.move_holder(previous.token, session.token)
+            else:  # released when the node opened a later run
+                self._release_pins(previous.token, 0)
             self._forget_worker(previous)
         self._workers[session.token] = session
         self._incarnations[(session.incarnation, session.role)] = session.token

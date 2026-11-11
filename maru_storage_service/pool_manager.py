@@ -70,9 +70,10 @@ class PoolManager:
         self.page_size = page_size
         self._lock = threading.RLock()
         self._tables: dict[str, PageTable] = {}
-        # Pools that give credit; an adopted pool (until released) or a
-        # disabled one does not
+        # Pools that give credit; a quarantined or a disabled one does not
         self._creditable: set[str] = set()
+        # Pools an earlier run may still write (see quarantine_pool)
+        self._quarantined: set[str] = set()
         self._epoch_seq: int | None = None
         self._counter = 0
         self._credit_stopped: str | None = None
@@ -136,10 +137,34 @@ class PoolManager:
             return True
 
     def enable_pool(self, pool_id: str) -> None:
-        """Credit from a pool from now on (an adopted pool once released)."""
+        """Credit from a pool from now on."""
         with self._lock:
             if pool_id in self._tables:
                 self._creditable.add(pool_id)
+
+    def quarantine_pool(self, pool_id: str) -> None:
+        """An earlier run may still write the pool: no credit from it, and a
+        page of it that would become FREE is QUARANTINED instead, until
+        end_pool_quarantine. Its READY pages are read and retired as usual."""
+        with self._lock:
+            if pool_id not in self._tables:
+                raise InvalidTransitionError(f"no pool {pool_id}")
+            self._quarantined.add(pool_id)
+            self._creditable.discard(pool_id)
+
+    def pool_quarantined(self, pool_id: str) -> bool:
+        with self._lock:
+            return pool_id in self._quarantined
+
+    def end_pool_quarantine(self, pool_id: str, creditable: bool) -> int:
+        """No earlier run writes the pool any more: its quarantined pages are
+        FREE (returns how many) and it gives credit if ``creditable``."""
+        with self._lock:
+            self._quarantined.discard(pool_id)
+            freed = self.release_quarantine(RECOVERY_TAG, pool_id)
+            if creditable:
+                self.enable_pool(pool_id)
+            return freed
 
     def pool_ids(self) -> list[str]:
         with self._lock:
@@ -731,7 +756,14 @@ class PoolManager:
         return table, table.get(ref, state)
 
     def _to_free(self, table: PageTable, page: Page, src: PageState) -> None:
-        """``src`` -> FREE, or QUARANTINED while hold_frees holds a page this old."""
+        """``src`` -> FREE, or QUARANTINED while its pool is quarantined or
+        hold_frees holds a page this old."""
+        if table.pool_id in self._quarantined:
+            if src == PageState.QUARANTINED:
+                page.tag = RECOVERY_TAG
+            else:
+                table.quarantine(page, src, RECOVERY_TAG)
+            return
         if (
             self._hold is not None
             and src != PageState.QUARANTINED

@@ -457,17 +457,13 @@ class TestOtherRequests:
         r = worker.request(NodeMessageType.NOTIFY, Notify(kind=NotifyKind.EPOCH))
         assert r.status == Status.REJECTED
 
-    def test_drain_unmap_and_detach(self, node, worker):
+    def test_drain_unmap_and_detach(self, worker):
         worker.attach()
         r = worker.request(
             NodeMessageType.DRAIN_ACK,
-            DrainAckRequest(kind=DrainKind.NODE, epoch=node.node_epoch),
+            DrainAckRequest(kind=DrainKind.SERVER, epoch="old"),
         )
-        assert r.status == Status.REJECTED  # the current epoch has not ended
-        r = worker.request(
-            NodeMessageType.DRAIN_ACK, DrainAckRequest(kind=DrainKind.NODE, epoch="old")
-        )
-        assert r.status == Status.OK
+        assert r.status == Status.OK  # no open drain: nothing to confirm
         r = worker.request(
             NodeMessageType.UNMAP_ACK, UnmapAckRequest(pool_id="p", pool_generation=1)
         )

@@ -21,7 +21,7 @@ from maru_common.node_protocol import (
     NodeMessageType,
     Notify,
 )
-from maru_common.protocol import MessageType, RecoverItem, WorkerOpenRequest
+from maru_common.protocol import MessageType, RecoverItem
 from maru_common.storage_types import (
     BlockRequest,
     CloseMode,
@@ -35,7 +35,6 @@ from maru_common.storage_types import (
     NotifyKind,
     PoolInfo,
     PoolKind,
-    SessionRole,
     Status,
     StorageUnavailableError,
     WorkerRef,
@@ -46,7 +45,6 @@ from maru_handler.client import CreditUnavailableError
 from maru_storage_service.local_server import LocalServerError
 from maru_storage_service.pool_manager import PageState
 from maru_storage_service.service import StorageService
-from maru_storage_service.worker_registry import OldState
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -505,98 +503,54 @@ class TestSessions:
         assert put(h, "b")
         assert len(fake.requests(MessageType.HANDSHAKE)) >= 1
 
-    def test_adopted_pool_waits_for_the_old_workers(self, fake, nodes, sockdir):
-        import subprocess
-        import sys
-
-        from maru_common.node_protocol import process_start_time
-
-        sleeper = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"]
+    def test_an_adopted_pool_no_run_holds_is_free_at_once(self, fake, nodes):
+        """Its listed pages come back READY; nothing holds it in an RM, so the
+        rest is free at once (it is no credit tier's)."""
+        first = nodes()
+        info = PoolInfo(
+            pool_id="ssd:gpu-test:/data",
+            kind=PoolKind.SSD,
+            node_id="gpu-test",
+            pool_generation=1,
+            capacity=4 * PAGE,
+            page_size=PAGE,
+            path="/data",
         )
-        try:
-            first = nodes()
-            rpc = MsRpcClient(fake.url, timeout_s=2)
-            opened = rpc.call(
-                MessageType.WORKER_OPEN,
-                WorkerOpenRequest(
-                    node_id="gpu-test",
-                    node_epoch=first.node_epoch,
-                    engine_id="old",
-                    dp_index=0,
-                    tp_rank=0,
-                    pid=sleeper.pid,
-                    pid_start=process_start_time(sleeper.pid),
-                    incarnation="old-worker",
-                    namespace=NS,
-                    role=SessionRole.WORKER,
-                    protocol="ms1",
+        listed = [
+            RecoverItem(
+                key=Key(NS, f"r{i}"),
+                location=Location(
+                    info.pool_id,
+                    f"a{i}",
+                    make_generation(1, i),
+                    i * PAGE,
+                    9,
+                    PoolKind.SSD,
                 ),
+                logical_bytes=9,
+                pinned=False,
             )
-            rpc.close()
-            assert opened.status.value == "OK"
-            info = PoolInfo(
-                pool_id="ssd:gpu-test:/data",
-                kind=PoolKind.SSD,
-                node_id="gpu-test",
-                pool_generation=1,
-                capacity=4 * PAGE,
-                page_size=PAGE,
-                path="/data",
-            )
-            listed = [
-                RecoverItem(
-                    key=Key(NS, f"r{i}"),
-                    location=Location(
-                        info.pool_id,
-                        f"a{i}",
-                        make_generation(1, i),
-                        i * PAGE,
-                        9,
-                        PoolKind.SSD,
-                    ),
-                    logical_bytes=9,
-                    pinned=False,
-                )
-                for i in (0, 2, 3)
-            ]
-            first.stop()
-            fake.set_adopted("gpu-test", [(info, listed)])
-            node = nodes()
-            assert node.adopted == [info.pool_id]
-            assert node.pools.bytes_in(PageState.READY, info.pool_id) == 3 * PAGE
-            assert node.pools.bytes_in(PageState.QUARANTINED, info.pool_id) == PAGE
-            assert (
-                node.manager.workers.old_workers()["old-worker"].state
-                == OldState.WAITING
-            )
-            # the adopted pool gives no credit; the new DRAM pool does at once
-            raw = RawWorker(node.config.socket)
-            raw.attach()
-            assert len(raw.credit(PAGE).credits) == 1
-            assert all(c.kind == PoolKind.DRAM for c in raw.credit(PAGE).credits)
-            raw.close()
-            sleeper.kill()
-            sleeper.wait()
-            wait_until(
-                lambda: node.pools.bytes_in(PageState.QUARANTINED, info.pool_id) == 0,
-                what="adopted quarantine freed",
-            )
-            assert node.manager.workers.old_workers()["old-worker"].how == "exited"
-            wait_until(
-                lambda: any(
-                    r.incarnation == "old-worker" for r, _ in fake.worker_exits
-                ),
-                what="WORKER_EXIT of the old worker",
-            )
-            node.pools.check()
-        finally:
-            sleeper.kill()
-            sleeper.wait()
+            for i in (0, 2, 3)
+        ]
+        first.stop()
+        fake.set_adopted("gpu-test", [(info, listed)])
+        node = nodes()
+        assert node.adopted == [info.pool_id]
+        assert node.pools.bytes_in(PageState.READY, info.pool_id) == 3 * PAGE
+        assert node.pools.bytes_in(PageState.FREE, info.pool_id) == PAGE
+        assert not node.pools.pool_quarantined(info.pool_id)
+        assert not node.pools.creditable(info.pool_id)
+        raw = RawWorker(node.config.socket)
+        raw.attach()
+        assert all(c.kind == PoolKind.DRAM for c in raw.credit(PAGE).credits)
+        raw.close()
+        node.pools.check()
 
 
-class TestRestartDrain:
-    def test_worker_that_attaches_again_is_drained(self, fake, nodes, handlers):
+class TestRestart:
+    def test_a_worker_attaches_to_the_new_run_at_once(self, fake, nodes, handlers):
+        """Nothing waits for its copy into the old run's DRAM; the old pool
+        is unmapped once that copy is released."""
         first = nodes()
         h = handlers(first)
         client = h._cpu
@@ -610,33 +564,14 @@ class TestRestartDrain:
         wait_until(
             lambda: client.node_epoch == second.node_epoch, what="attached again"
         )
-        old = second.manager.workers.old_workers()
-        assert old[client.identity.incarnation].state == OldState.DRAINING
-        time.sleep(0.2)
-        # no DRAIN_ACK while the old copy is not done
-        assert (
-            second.manager.workers.old_workers()[client.identity.incarnation].state
-            == OldState.DRAINING
-        )
-        h.free(held)
-        wait_until(
-            lambda: (
-                second.manager.workers.old_workers()[client.identity.incarnation].state
-                == OldState.CONFIRMED
-            ),
-            what="drained",
-        )
-        assert (
-            "drained"
-            in second.manager.workers.old_workers()[client.identity.incarnation].how
-        )
-        # the old pool is gone from lookups, and unmapped once unused
+        # the old pool is gone from lookups; the new one takes writes
         assert h.retrieve("old") is None
+        wait_credit(h)
+        assert put(h, "new")
+        h.free(held)
         wait_until(
             lambda: client.pools.pool_ids() == [second.dram.pool_id], what="unmapped"
         )
-        wait_credit(h)
-        assert put(h, "new")
         read = h.retrieve("new")
         assert bytes(read.view) == b"new"
         h.release_retrieved([read])

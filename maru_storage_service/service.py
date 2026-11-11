@@ -3,22 +3,20 @@
 """StorageService: builds and runs the parts of one node.
 
 Start order: claim the socket, DRAM pool, the node's CXL regions from the RM,
-NODE_OPEN, adopted ledgers, old worker drain, heartbeat, then accept on the
-UDS. A GPU node with [dram], [cxl] or [dram, cxl] is served; other configs
-are refused. The top tier gives credit; in [dram, cxl] DRAM makes room by
-demoting its pages to CXL (write-back), and CXL by dropping its own.
+NODE_OPEN, adopted ledgers, quarantine of the regions an earlier run still
+holds, heartbeat, then accept on the UDS. A GPU node with [dram], [cxl] or
+[dram, cxl] is served; other configs are refused. The top tier gives credit;
+in [dram, cxl] DRAM makes room by demoting its pages to CXL (write-back), and
+CXL by dropping its own.
 """
 
 import logging
 import mmap
-import os
-import socket
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 
-from maru_common.storage_types import CloseMode, PoolKind, RmDomain, WorkerRef
+from maru_common.storage_types import CloseMode, PoolKind, RmDomain, run_holder
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError
@@ -46,29 +44,6 @@ from .storage_manager import (
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _OldWorkers:
-    refs: list[WorkerRef]
-    unwatchable: frozenset[str]
-    gone: frozenset[str]
-    previous: str | None
-
-
-def _local_identity() -> tuple[str, str, int]:
-    """(hostname, boot id, pid namespace) of this process, as the RM records
-    a worker's."""
-    try:
-        with open("/proc/sys/kernel/random/boot_id") as f:
-            boot = f.read().strip()
-    except OSError:
-        boot = ""
-    try:
-        pid_ns = os.stat("/proc/self/ns/pid").st_ino
-    except OSError:
-        pid_ns = 0
-    return socket.gethostname(), boot, pid_ns
 
 
 # How long a leave waits for the workers to unmap the CXL regions
@@ -117,11 +92,13 @@ class StorageService:
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
     ):
         """``transfer_bytes_per_s``: the demotion copy budget.
-        ``map_region``: maps a CXL region for those copies (GET_ACCESS and the
+        ``map_region``: maps a CXL region for those copies (NODE_HOLD and the
         device by default)."""
         check_servable(config)
         self.config = config
         self.node_epoch = node_epoch or uuid.uuid4().hex
+        # This process's RM hold on the regions it maps for those copies
+        self.own_holder = run_holder("ss", self.node_epoch)
         self.rpc_timeout_s = rpc_timeout_s
         self.gpu_drain_grace_s = gpu_drain_grace_s
         self.evict_interval_s = evict_interval_s
@@ -148,7 +125,9 @@ class StorageService:
         self.server: ServerClient | None = None
         self.manager: StorageManager | None = None
         self.local: LocalServer | None = None
+        # Pools taken over from the run before: adopted or claimed from the RM
         self.adopted: list[str] = []
+        self._credit_kinds: set[PoolKind] = set()
         self._stopped = threading.Event()
 
     def start(self) -> None:
@@ -254,6 +233,9 @@ class StorageService:
             transfers=self.transfers,
         )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
+        self._credit_kinds = {
+            kind for kind, t in traits.items() if t.credit or t.credit_fallback
+        }
         rm_domains = []
         if self.cxl is not None and self.cxl.rm_domain is not None:
             devices = sorted({p.region.device_uuid for p in cxl_pools} - {""})
@@ -267,9 +249,9 @@ class StorageService:
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
-            # Its committed pages come back READY; no credit from it yet
-            # No credit until its old workers are confirmed (then released)
+            # Its committed pages come back READY, the rest stay quarantined
             self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
+            self.pools.quarantine_pool(info.pool_id)
             items = self.server.recover_list(info.pool_id)
             refs = self.pools.recovered(
                 info.pool_id, [(i.key, i.location) for i in items]
@@ -277,48 +259,36 @@ class StorageService:
             for ref in refs:
                 placement.on_ready(ref)
             self.adopted.append(info.pool_id)
-            logger.info(
-                "adopted pool %s: %d committed pages, the rest quarantined until "
-                "the old workers are confirmed",
-                info.pool_id,
-                len(refs),
-            )
+            logger.info("adopted pool %s: %d committed pages", info.pool_id, len(refs))
         for pool in cxl_pools:
             if pool.pool_id in adopted_ids:
                 continue
             if pool.claimed:
-                # The run before may still write it: held until its workers
-                # are confirmed, like an adopted pool
+                # The run before may have written it: quarantined as an
+                # adopted pool, with no committed page
                 self.pools.add_pool(
                     pool.info(), creditable=False, state=PageState.QUARANTINED
                 )
+                self.pools.quarantine_pool(pool.pool_id)
                 self.adopted.append(pool.pool_id)
             else:
-                cxl = traits[PoolKind.CXL]
                 self.pools.add_pool(
-                    pool.info(), creditable=cxl.credit or cxl.credit_fallback
+                    pool.info(), creditable=PoolKind.CXL in self._credit_kinds
                 )
         self.manager.start()
-        credit_kinds = {
-            kind for kind, t in traits.items() if t.credit or t.credit_fallback
-        }
-        old = self._old_workers(opened)
-        for holder in old.gone:  # dead since the reboot: nothing to wait for
-            assert self.cxl is not None
-            self.cxl.drop_holds(holder)
-        self.manager.workers.start_restart_drain(
-            old.refs,
-            self.adopted,
-            old.previous,
-            unwatchable=old.unwatchable,
-            gone=old.gone,
-            credit_after=frozenset(
-                pool_id
-                for pool_id in self.adopted
-                if (adopted := self.pools.pool_info(pool_id)) is not None
-                and adopted.kind in credit_kinds
-            ),
-        )
+        # Quarantined while an earlier run holds the region in the RM
+        earlier = self.cxl.earlier_holds() if self.cxl is not None else {}
+        for pool_id in self.adopted:
+            if pool_id in earlier:
+                logger.info(
+                    "pool %s stays quarantined while earlier runs hold it: %s",
+                    pool_id,
+                    sorted(earlier[pool_id]),
+                )
+            else:
+                self._end_quarantine(pool_id)
+        if self.cxl is not None:
+            self.cxl.watch_holds(self._end_quarantine)
         self.manager.start_heartbeat()
         self.local.manager = self.manager
         dram_pools = (
@@ -364,7 +334,9 @@ class StorageService:
             )
         if self.cxl is not None:
             cxl = self.cxl
-            mapper = self.map_region or (lambda pool: map_region(cxl.source, pool))
+            mapper = self.map_region or (
+                lambda pool: map_region(cxl.source, pool, self.own_holder)
+            )
             for pool in cxl.pools:
                 try:
                     engine.add_pool(pool.pool_id, mapper(pool))
@@ -376,45 +348,21 @@ class StorageService:
                     )
         engine.start()
 
-    def _old_workers(self, opened) -> _OldWorkers:
-        """The workers of the run before: those MaruServer names (with pids
-        this node sees), and the holders of the regions this run claimed
-        (MaruServer may have lost them; the RM keeps holds). A holder MaruServer
-        does not name is watched only if it ran on this host, boot and pid
-        namespace; another namespace's is confirmed by its DRAIN_ACK alone; one
-        from before this host's last boot is gone, and so are its holds."""
-        refs = list(opened.old_workers)
-        named = {r.incarnation for r in refs}
-        known = set(named)
-        host, boot, pid_ns = _local_identity()
-        unwatchable, gone = set(), set()
-        for h in self.cxl.old_holders() if self.cxl is not None else []:
-            if h.holder in named:
-                continue
-            if h.holder not in known:
-                refs.append(
-                    WorkerRef(
-                        engine_id="",
-                        dp_index=0,
-                        tp_rank=0,
-                        pid=h.pid,
-                        pid_start=h.pid_start,
-                        incarnation=h.holder,
-                    )
-                )
-                known.add(h.holder)
-            if h.host == host and h.boot_id and boot and h.boot_id != boot:
-                gone.add(h.holder)
-            elif (h.host, h.boot_id, h.pid_ns) != (host, boot, pid_ns):
-                unwatchable.add(h.holder)
-        previous = opened.previous_node_epoch
-        if previous is None:
-            previous = (
-                next((h.node_epoch for h in self.cxl.old_holders()), None)
-                if self.cxl is not None
-                else None
-            )
-        return _OldWorkers(refs, frozenset(unwatchable), frozenset(gone), previous)
+    def _end_quarantine(self, pool_id: str) -> None:
+        """No earlier run holds the pool: its quarantined pages are free, and
+        it gives credit if its tier does. Never after a stop began."""
+        assert self.pools is not None
+        with self._stop_lock:
+            if self._stopped.is_set():
+                return
+            info = self.pools.pool_info(pool_id)
+            creditable = info is not None and info.kind in self._credit_kinds
+            freed = self.pools.end_pool_quarantine(pool_id, creditable)
+        logger.info(
+            "pool %s: no earlier run holds it; %d quarantined pages are free",
+            pool_id,
+            freed,
+        )
 
     def _worker_settled(self, incarnation: str) -> None:
         """Its GPU drain grace is over: its region holds can go."""
@@ -451,7 +399,7 @@ class StorageService:
         if self.transfers is not None:
             self.transfers.stop()  # the copy under way ends; no new one starts
         if self.cxl is not None:
-            self.cxl.stop_renewing(timeout=1.0)
+            self.cxl.stop(timeout=1.0)
         if self.cxl is not None and mode == CloseMode.LEAVE:
             still = {p.pool_id for p in self.cxl.pools} - self._unmap_cxl()
             if still:
@@ -475,6 +423,8 @@ class StorageService:
             )
         if self.transfers is not None:
             self.transfers.close()  # unmapped before the regions may go back
+            if self.cxl is not None and self.map_region is None:
+                self.cxl.unhold(self.own_holder)
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)
@@ -490,9 +440,11 @@ class StorageService:
         """The CXL pools no worker can map any more, before they go back."""
         assert self.cxl is not None
         cxl = self.cxl
+        # A pool an earlier run still holds stays held after this
+        earlier = set(cxl.earlier_holds())
         if self.manager is None or self.local is None or not self.local.started:
-            # No worker of this run mapped them; the run before may have
-            return {p.pool_id for p in cxl.pools if not p.claimed}
+            # No worker of this run mapped them
+            return {p.pool_id for p in cxl.pools} - earlier
         # A new ATTACH maps none of them: its record exists before its reply;
         # and no credit comes from them any more
         self.local.pools = [(d, fd) for d, fd in self.local.pools if d.dax is None]
@@ -501,11 +453,10 @@ class StorageService:
         timeout = self.unmap_timeout_s
         if self.lost is not None:  # the RM may free them once the lease ends
             timeout = min(timeout, cxl.time_left() / 2)
-        return self.manager.unmap_pools(
-            [(p.pool_id, p.pool_generation) for p in cxl.pools],
-            max(0.0, timeout),
-            old_may_map=set(self.adopted),
+        done = self.manager.unmap_pools(
+            [(p.pool_id, p.pool_generation) for p in cxl.pools], max(0.0, timeout)
         )
+        return done - earlier
 
     def wait(self, timeout: float | None = None) -> bool:
         """Whether stopping has begun."""

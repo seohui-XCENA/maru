@@ -166,7 +166,6 @@ class WaitLevel(StrEnum):
 @unique
 class DrainKind(StrEnum):
     SERVER = "server"
-    NODE = "node"
 
 
 @unique
@@ -245,6 +244,12 @@ class DaxMapping:
     # The owner node's current run: a worker's hold must name it (RM fencing)
     node_id: str = ""
     node_epoch: str = ""
+
+
+def run_holder(name: str, node_epoch: str) -> str:
+    """The RM holder name of ``name`` (a worker incarnation, or the
+    StorageService) in one node run: each run's mappings are held apart."""
+    return f"{name}@{node_epoch}"
 
 
 @dataclass(frozen=True)

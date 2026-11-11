@@ -61,7 +61,7 @@ class TestNodeOpen:
         assert response.epoch_seq == 1
         assert response.session_ttl_s == 30.0 and response.heartbeat_s == 10.0
         assert not response.recovering
-        assert response.adopted == [] and response.old_workers == []
+        assert response.adopted == []
 
     @pytest.mark.parametrize(
         "change, needle",
@@ -148,16 +148,6 @@ class TestNodeOpen:
         node.restart()
         response = node.open()
         assert response.status == Status.REJECTED and "exhausted" in response.error
-
-    def test_previous_node_epoch_names_the_replaced_run(self, env):
-        clock, _, wire = env
-        node = FakeNode(wire, "n1")
-        assert node.open().previous_node_epoch is None
-        first = node.epoch
-        clock.advance(31)
-        assert node.open().previous_node_epoch is None  # a renewal
-        node.restart()
-        assert node.open().previous_node_epoch == first
 
     def test_closed_epoch_cannot_reopen(self, env):
         _, _, wire = env
@@ -279,25 +269,22 @@ class TestEpochReplacement:
         assert sorted(p.pool_id for p in response.adopted) == sorted(
             [node.cxl().pool_id, node.ssd().pool_id]
         )
-        assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
-        assert response.old_workers[0].worker_session == worker.token
         # the old session gets EPOCH, its pins and op records are gone
         node.token, new_token = old_token, node.token
         assert node.heartbeat().status == Status.EPOCH
         node.token = new_token
         assert service.pins.get(source_pin) is None
         assert old_epoch not in service.ledger
-        # the worker's pins stay; it reopens on the new run to look up
-        assert all(service.pins.get(p) for p in worker_pins)
+        # the worker's pins of the old run go; it reopens on the new run
+        drain(service)
+        assert not any(service.pins.get(p) for p in worker_pins)
         assert worker.lookup(keys["d"]).status == Status.EPOCH
         assert worker.open().status == Status.OK
         response = worker.lookup(keys["d"], keys["s"], keys["c"])
         assert results(response) == ["MISS", "FETCH", "HIT"]
         assert response.items[0].reason == MissReason.ABSENT
-        # the old DRAM location goes once its last pin does
+        # with no pin left, the old DRAM pool goes
         drain(service)
-        assert service.catalog.locations(keys["d"])
-        worker.unpin(worker_pins[0])
         assert not service.catalog.locations(keys["d"])
         assert service.catalog.pool(old_dram) is None
 
@@ -363,16 +350,14 @@ class TestEpochReplacement:
     def test_reboot_drops_cxl(self, env):
         _, service, wire = env
         node, worker, keys, locs = self._node(wire, service)
-        pin = worker.lookup(keys["c"]).items[0].pin_id
+        worker.lookup(keys["c"])  # its pin goes with the old run
         node.restart(boot="boot-2")
         response = node.open(pools=self._pools(node))
         assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
-        # hidden at once, removed once unpinned
+        # hidden at once, removed with no pin left
         worker.open()
         assert worker.lookup(keys["c"]).items[0].result == "MISS"
         drain(service)
-        assert service.catalog.locations(keys["c"])
-        worker.unpin(pin)
         assert not service.catalog.locations(keys["c"])
         # the region, listed again, starts empty in this run
         pool = service.catalog.pool(node.cxl().pool_id)
@@ -421,7 +406,7 @@ class TestEpochReplacement:
     def test_cxl_not_listed_is_removed(self, env):
         _, service, wire = env
         node, worker, keys, _ = self._node(wire, service)
-        pin = worker.lookup(keys["c"]).items[0].pin_id
+        worker.lookup(keys["c"])  # its pin goes with the old run
         node.restart()
         # the RM no longer holds the region for the node
         response = node.open(pools=[node.dram(), node.ssd()])
@@ -429,9 +414,6 @@ class TestEpochReplacement:
         worker.open()
         assert worker.lookup(keys["c"]).items[0].result == "MISS"
         drain(service)
-        pool = service.catalog.pool(node.cxl().pool_id)
-        assert pool.state == PoolState.REMOVING
-        worker.unpin(pin)
         assert not service.catalog.locations(keys["c"])
         assert service.catalog.pool(node.cxl().pool_id) is None
 
@@ -469,36 +451,55 @@ class TestEpochReplacement:
         node, worker, keys, _ = self._node(wire, service)
         pin = worker.lookup(keys["c"]).items[0].pin_id
         node.close(CloseMode.LEAVE)
+        drain(service)
+        assert service.pins.get(pin) is not None  # kept while the node is away
         node.restart()
         response = node.open(pools=self._pools(node))
         assert response.status == Status.OK and response.adopted == []
         pool = service.catalog.pool(node.cxl().pool_id)
         assert pool.state == PoolState.ACTIVE and not pool.entries
-        # the old location still goes only with its last pin
+        # the next run releases the old run's pins: the old location goes
         drain(service)
-        assert service.catalog.locations(keys["c"])
-        worker.unpin(pin)
+        assert service.pins.get(pin) is None
         assert not service.catalog.locations(keys["c"])
 
-    def test_old_workers_are_those_not_confirmed_gone(self, env):
+    def test_a_new_run_releases_the_pins_of_its_earlier_runs_workers(self, env):
+        """Holds (CXL) and a new memfd (DRAM) keep the memory safe; the pins
+        of the earlier runs' workers go, also those reopened in time."""
         clock, service, wire = env
-        node = FakeNode(wire, "n1")
-        node.open()
-        alive, expired, closed = (FakeWorker(wire, node, tp_rank=i) for i in range(3))
-        probe = FakeWorker(wire, node, role=SessionRole.PROBE)
-        for w in (alive, expired, closed, probe):
+        node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
+        node.open(pools=[node.dram(), node.cxl()])
+        other.open(pools=[other.dram(), other.cxl(region_id=8)])
+        c, d, o = key("c"), key("d"), key("o")
+        node.commit((c, node.loc(node.cxl(), 1)), (d, node.loc(node.dram(), 1)))
+        other.commit((o, other.loc(other.cxl(region_id=8), 1)))
+        reopens, stays, expired = (FakeWorker(wire, node, tp_rank=i) for i in range(3))
+        reader = FakeWorker(wire, other)
+        for w in (reopens, stays, expired, reader):
             w.open()
-        closed.close()
+        pins = {w: [i.pin_id for i in w.lookup(c, d).items] for w in (reopens, stays)}
+        expired_pin = expired.lookup(c).items[0].pin_id
+        other_pin = reader.lookup(o).items[0].pin_id
         clock.advance(20)
-        node.heartbeat()
-        alive.heartbeat()
-        clock.advance(15)  # "expired" expired; it may still hold credits
-        node.heartbeat()
+        for alive in (node, other, reopens, stays, reader):
+            alive.heartbeat()
+        clock.advance(15)  # "expired" expired: its pin stays (never by time)
+        drain(service)
+        assert service.pins.get(expired_pin) is not None
+        # a renewal of the same run keeps them
+        assert node.open(pools=[node.dram(), node.cxl()]).status == Status.OK
+        drain(service)
+        assert all(service.pins.get(p) for p in pins[stays] + [expired_pin])
         node.restart()
-        response = node.open()
-        assert sorted(w.incarnation for w in response.old_workers) == sorted(
-            [alive.incarnation, expired.incarnation]
-        )
+        response = node.open(pools=[node.dram(), node.cxl()])
+        assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
+        assert reopens.open().status == Status.OK  # before maintain runs
+        drain(service)
+        for pin in pins[reopens] + pins[stays] + [expired_pin]:
+            assert service.pins.get(pin) is None
+        assert service.pins.held_by(reopens.token) == []
+        assert service.pins.get(other_pin) is not None  # another node's
+        assert results(reopens.lookup(c)) == ["HIT"]
 
     def test_worker_must_reopen_to_map_the_new_dram(self, env):
         _, service, wire = env
@@ -608,13 +609,14 @@ class TestNodeClose:
         clock.advance(600)  # pins never go by time
         drain(service)
         assert service.pins.get(foreign) is not None
-        # the node's next run lists the worker and confirms its end
+        # the node's next run releases its pins; then it expires
         node.restart()
-        response = node.open()
-        assert [w.incarnation for w in response.old_workers] == [worker.incarnation]
-        assert results(node.worker_exit(response.old_workers[0])) == ["OK"]
-        assert service.stats()["orphan_sessions"] == 0
+        node.open()
+        drain(service)
         assert service.pins.get(foreign) is None
+        clock.advance(31)
+        drain(service)
+        assert service.stats()["orphan_sessions"] == 0
 
     def test_leave_still_keeps_cxl_pins_until_unpinned(self, env):
         clock, service, wire = env

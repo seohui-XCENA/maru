@@ -14,13 +14,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from maru_common.node_protocol import process_start_time
+from maru_common.node_protocol import process_identity
 from maru_common.storage_types import (
     DaxMapping,
     Location,
     PoolDescriptor,
     PoolInfo,
     PoolKind,
+    run_holder,
 )
 from maru_handler.storage.cpu import CpuPool
 from maru_shm.client import MaruShmClient
@@ -103,27 +104,19 @@ class RegionHolder:
 
     @classmethod
     def this_process(cls, holder: str) -> "RegionHolder":
-        try:
-            with open("/proc/sys/kernel/random/boot_id") as f:
-                boot = f.read().strip()
-        except OSError:
-            boot = ""
-        try:
-            pid_ns = os.stat("/proc/self/ns/pid").st_ino
-        except OSError:
-            pid_ns = 0
-        pid = os.getpid()
-        return cls(holder, boot, pid, process_start_time(pid), pid_ns)
+        return cls(holder, *process_identity())
 
 
 class RegionHolds:
-    """One RM hold per region for the process while any mapping of it lives:
-    a region is mapped only after its hold is durable, and the hold is
-    dropped only once every mapping of it is unregistered and unmapped."""
+    """One RM hold per region and node run for the process while any mapping
+    of it lives: a region is mapped only after its hold is durable, and the
+    hold is dropped only once every mapping of it in that run is unregistered
+    and unmapped. The holder name carries the run, so an old run's mapping
+    and a new run's are separate holds."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (RM id, region, holder) as the RM keys holds: an RM written as
+        # (RM id, region, holder name) as the RM keys holds: an RM written as
         # another address is the same RM, and two clients of one process hold
         # apart
         self._count: dict[tuple[str, int, str], int] = {}
@@ -131,7 +124,8 @@ class RegionHolds:
     def acquire(self, dax: DaxMapping, who: RegionHolder):
         """The region's device access, holding it; RuntimeError (stale run,
         bad token) if the RM refuses."""
-        key = (dax.rm_domain, dax.handle.region_id, who.holder)
+        name = run_holder(who.holder, dax.node_epoch)
+        key = (dax.rm_domain, dax.handle.region_id, name)
         client = _rm_client(dax.rm_address)
         with self._lock:
             if self._count.get(key):
@@ -142,7 +136,7 @@ class RegionHolds:
                 dax.node_id,
                 dax.node_epoch,
                 dax.handle,
-                who.holder,
+                name,
                 boot_id=who.boot_id,
                 pid=who.pid,
                 pid_start=who.pid_start,
@@ -152,7 +146,8 @@ class RegionHolds:
             return access
 
     def release(self, dax: DaxMapping, who: RegionHolder) -> None:
-        key = (dax.rm_domain, dax.handle.region_id, who.holder)
+        name = run_holder(who.holder, dax.node_epoch)
+        key = (dax.rm_domain, dax.handle.region_id, name)
         with self._lock:
             count = self._count.get(key, 0) - 1
             if count > 0:
@@ -160,7 +155,7 @@ class RegionHolds:
                 return
             self._count.pop(key, None)
             try:
-                _rm_client(dax.rm_address).unhold(dax.handle, who.holder, who.holder)
+                _rm_client(dax.rm_address).unhold(dax.handle, name, name)
             except Exception as e:  # the RM reaps it once this process ends
                 logger.warning(
                     "could not drop the hold on region %d: %s", dax.handle.region_id, e

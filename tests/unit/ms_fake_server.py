@@ -233,7 +233,6 @@ class FakeMaruServer:
         self.access: dict[str, dict[tuple, list]] = collections.defaultdict(dict)
         self.blocks: dict[str, list[BlockRequest]] = collections.defaultdict(list)
         self.ended_epochs: set[str] = set()
-        self.previous_epochs: dict[str, str | None] = {}
         self.adopted_by: dict[str, list[PoolInfo]] = {}
         self.adopt: dict[str, list[tuple[PoolInfo, list[RecoverItem]]]] = {}
         self.recover_items: dict[str, list[RecoverItem]] = {}
@@ -558,11 +557,8 @@ class FakeMaruServer:
             old.last_seen = now
             old.online = True
             self.node_sessions[old.session] = req.node_id
-            self.previous_epochs[req.node_id] = None  # none on a renewal
             return self._open_response(old, list(self._adopted_of(old)))
-        previous = None
         if old is not None:
-            previous = old.node_epoch
             self.ended_epochs.add(old.node_epoch)
             self.node_sessions.pop(old.session, None)
             if old.node_epoch != req.node_epoch:
@@ -599,7 +595,6 @@ class FakeMaruServer:
         )
         self.node_sessions[token] = req.node_id
         self.adopted_by[req.node_id] = [info for info, _ in adopted]
-        self.previous_epochs[req.node_id] = previous
         return self._open_response(
             self.nodes[req.node_id], self.adopted_by[req.node_id]
         )
@@ -611,15 +606,6 @@ class FakeMaruServer:
         return time.monotonic() < self.recovering_until
 
     def _open_response(self, node: NodeRec, adopted) -> NodeOpenResponse:
-        # Worker sessions of this node not closed (expired ones keep pins)
-        old_workers = [
-            w.ref()
-            for w in self.workers.values()
-            if w.node_id == node.node_id
-            and w.role == SessionRole.WORKER
-            and w.node_epoch != node.node_epoch
-            and self.by_incarnation.get(w.incarnation) == w.token
-        ]
         return NodeOpenResponse(
             status=Status.OK,
             server_epoch=self.server_epoch,
@@ -629,8 +615,6 @@ class FakeMaruServer:
             session_ttl_s=self.session_ttl_s,
             recovering=self.recovering(),
             adopted=adopted,
-            old_workers=old_workers,
-            previous_node_epoch=self.previous_epochs.get(node.node_id),
         )
 
     def _node_heartbeat(self, node: NodeRec, req):

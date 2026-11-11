@@ -486,6 +486,22 @@ def process_start_time(pid: int) -> int:
     return int(rest[19])
 
 
+def process_identity() -> tuple[str, int, int, int]:
+    """(boot id, pid, start time, pid namespace inode) of this process, as the
+    RM records a hold; "" or 0 where unknown."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = ""
+    try:
+        pid_ns = os.stat("/proc/self/ns/pid").st_ino
+    except OSError:
+        pid_ns = 0
+    pid = os.getpid()
+    return boot, pid, process_start_time(pid), pid_ns
+
+
 def same_pid_namespace(pid: int) -> bool:
     """Whether ``pid`` lives in this process's pid namespace."""
     return os.stat(f"/proc/{pid}/ns/pid").st_ino == os.stat("/proc/self/ns/pid").st_ino

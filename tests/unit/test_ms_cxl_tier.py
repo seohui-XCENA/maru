@@ -13,6 +13,7 @@ from maru_shm.types import (
     MaruHandle,
     NodeClaim,
     NodeHostConflictError,
+    NodeLeaseExpiredError,
     NodeRegion,
     RegionHolder,
     StaleNodeEpochError,
@@ -58,6 +59,7 @@ class FakeRm:
         # region_id -> holder -> its record; the RM keeps them across runs
         self.holds: dict[int, dict[str, RegionHolder]] = {}
         self.unholds: list[tuple[int, str]] = []
+        self.dax_path = "/dev/dax9.0"  # what NODE_HOLD answers
 
     def _check(self, node_id: str, node_epoch: str) -> None:
         if self.epochs.get(node_id) != node_epoch:
@@ -93,27 +95,45 @@ class FakeRm:
         ]
         return NodeClaim(rm_domain=DOMAIN, lease_s=self.lease_s, regions=regions)
 
-    def hold(self, region: NodeRegion, holder: str, epoch: str, pid: int = 0, **who):
-        """A worker of run ``epoch`` holds ``region`` (set up by a test)."""
-        import os
+    def hold(self, region: NodeRegion, holder: str, epoch: str):
+        """This process holds ``region`` as ``holder`` in run ``epoch`` (set
+        up by a test); a remote agent's hold has no epoch."""
         import socket
 
-        from maru_common.node_protocol import process_start_time
-        from maru_storage_service.service import _local_identity
+        from maru_common.node_protocol import process_identity
 
-        _, boot, pid_ns = _local_identity()
+        boot, pid, pid_start, pid_ns = process_identity()
         record = RegionHolder(
-            holder=holder,
-            node_epoch=epoch,
-            host=who.get("host", socket.gethostname()),
-            boot_id=who.get("boot_id", boot),
-            pid=pid or os.getpid(),
-            pid_start=who.get(
-                "pid_start", 0 if pid else process_start_time(os.getpid())
-            ),
-            pid_ns=who.get("pid_ns", pid_ns),
+            holder, epoch, socket.gethostname(), boot, pid, pid_start, pid_ns
         )
         self.holds.setdefault(region.handle.region_id, {})[holder] = record
+
+    def node_hold(self, node_id, node_epoch, handle, holder, **who):
+        from types import SimpleNamespace
+
+        self.calls.append("hold")
+        self._check(node_id, node_epoch)
+        region = next(
+            r
+            for r in self.regions.get(node_id, [])
+            if r.handle.region_id == handle.region_id
+        )
+        self.hold(region, holder, node_epoch)
+        return SimpleNamespace(dax_path=self.dax_path)
+
+    def node_holds(self, node_id, node_epoch):
+        self.calls.append("holds")
+        self._check(node_id, node_epoch)
+        return [
+            NodeRegion(
+                r.handle,
+                r.requested_size,
+                r.dax_path,
+                r.device_uuid,
+                holders=list(self.holds.get(r.handle.region_id, {}).values()),
+            )
+            for r in self.regions.get(node_id, [])
+        ]
 
     def unhold(self, handle, holder, instance):
         self.unholds.append((handle.region_id, holder))
@@ -279,7 +299,16 @@ def test_a_stale_epoch_lets_go_at_once():
     t = tier(rm)
     t.claim(threading.Event())
     rm.epochs["n"] = "e2"  # another run claimed the node
-    assert "no longer counts this run" in (t.renew_once() or "")
+    assert "another run claimed the node" in (t.renew_once() or "")
+
+
+def test_a_fenced_run_is_told_from_another_runs_claim():
+    rm = FakeRm()
+    t = tier(rm)
+    t.claim(threading.Event())
+    rm.renew_error = NodeLeaseExpiredError("lease ran out")
+    reason = t.renew_once() or ""
+    assert "lease ended" in reason and "another run" not in reason
 
 
 def test_the_renew_thread_reports_once():
@@ -290,8 +319,46 @@ def test_the_renew_thread_reports_once():
     t.start_renewing()
     rm.epochs["n"] = "e2"
     wait_until(lambda: lost, what="lost")
-    t.stop_renewing()
+    t.stop()
     assert len(lost) == 1 and t.lost == lost[0]
+
+
+def test_the_hold_watch_retries_until_the_rm_answers():
+    rm = FakeRm()
+    region = rm.region(2 * PAGE)
+    rm.regions["n"] = [region]
+    rm.hold(region, "w@e0", "e0")
+    t = tier(rm, epoch="e1")
+    t.claim(threading.Event())
+    real, fails = rm.node_holds, [2]
+
+    def flaky(*args):
+        if fails[0]:
+            fails[0] -= 1
+            raise ConnectionRefusedError("RM down")
+        return real(*args)
+
+    rm.node_holds = flaky
+    cleared = []
+    t.watch_holds(cleared.append, interval_s=0.01)
+    rm.unhold(region.handle, "w@e0", "w@e0")
+    wait_until(lambda: cleared, what="cleared")
+    assert cleared == [t.pools[0].pool_id] and t.earlier_holds() == {}
+    assert fails == [0]
+    t.stop()
+
+
+def test_a_region_the_node_cannot_map_is_not_left_held():
+    from maru_storage_service.drivers.cxl import map_region
+
+    rm = FakeRm()
+    t = tier(rm)
+    t.claim(threading.Event())
+    rm.dax_path = "/nonexistent/dax"
+    with pytest.raises(OSError):
+        map_region(rm, t.pools[0], "ss@e1")
+    assert rm.unholds == [(t.pools[0].region.handle.region_id, "ss@e1")]
+    assert "ss@e1" not in rm.holds[t.pools[0].region.handle.region_id]
 
 
 # =============================================================================
@@ -350,22 +417,6 @@ def test_the_regions_are_registered_as_fallback_credit(fake, sockdir, fallback):
     finally:
         node.stop()
     assert rm.released == []  # restart keeps the regions
-
-
-def test_claimed_regions_wait_for_the_old_workers(fake, sockdir):
-    rm = FakeRm()
-    rm.regions["gpu-test"] = [rm.region(2 * PAGE)]
-    node = cxl_node(fake, sockdir, rm)
-    try:
-        claimed = node.cxl.pools[0].pool_id
-        assert claimed in node.adopted
-        # No old worker to wait for: the quarantine is released at once
-        wait_until(
-            lambda: node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE,
-            what="quarantine released",
-        )
-    finally:
-        node.stop()
 
 
 def test_leave_gives_the_regions_back(fake, sockdir):
@@ -708,62 +759,9 @@ class GoneWatcher:
         pass
 
 
-def test_an_old_worker_seen_ending_releases_after_the_gpu_grace():
-    """Its GPU copies may still land: the adopted pool is freed, and gives
-    credit, only after the drain grace."""
-    import time
-
-    from maru_common.storage_types import PoolInfo, WorkerRef
-    from maru_storage_service.op_ledger import OpLedger
-    from maru_storage_service.worker_registry import WorkerRegistry
-
-    pm = _two_pool_manager(2, 2)
-    adopted = cxl_pool_id(DOMAIN, ord("a"))
-    other = PoolInfo(
-        pool_id=adopted + "-q",
-        kind=PoolKind.CXL,
-        node_id="n",
-        pool_generation=1,
-        capacity=2 * PAGE,
-        page_size=PAGE,
-    )
-    pm.add_pool(other, creditable=False, state=PageState.QUARANTINED)
-    registry = WorkerRegistry(
-        node_epoch="e2",
-        pools=pm,
-        ledger=OpLedger(16),
-        watcher=GoneWatcher(),
-        on_exit=lambda ref: None,
-        gpu_drain_grace_s=0.5,
-    )
-    ref = WorkerRef("eng", 0, 0, pid=1 << 22, pid_start=1, incarnation="old")
-    started = time.monotonic()
-    registry.start_restart_drain(
-        [ref], [other.pool_id], "e1", credit_after=frozenset({other.pool_id})
-    )
-    assert pm.bytes_in(PageState.QUARANTINED, other.pool_id) == 2 * PAGE
-    assert not pm.creditable(other.pool_id)
-    wait_until(
-        lambda: pm.bytes_in(PageState.FREE, other.pool_id) == 2 * PAGE,
-        what="released",
-    )
-    assert time.monotonic() - started >= 0.5
-    assert pm.creditable(other.pool_id)
-    registry.stop()
-
-
 # =============================================================================
 # Holds: who maps a region, across restarts (Codex P1 on CXL reuse)
 # =============================================================================
-
-
-def _dead_pid() -> int:
-    import subprocess
-    import sys
-
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
-    return proc.pid
 
 
 def test_leave_gives_back_every_region_and_holds_keep_mapped_ones(fake, sockdir):
@@ -825,93 +823,104 @@ def test_claimed_regions_without_holders_are_free_at_once(fake, sockdir):
     node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=30.0)
     try:
         claimed = node.cxl.pools[0].pool_id
+        assert claimed in node.adopted
+        assert node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE
+        assert not node.pools.pool_quarantined(claimed)
+        assert "holds" not in rm.calls  # nothing to watch
+    finally:
+        node.stop()
+
+
+def test_an_earlier_runs_hold_quarantines_the_region_until_it_goes(fake, sockdir):
+    """Holds of this run and a remote agent's do not count; an earlier run's
+    does, whatever its process, until NODE_HOLDS no longer lists it."""
+    rm = FakeRm()
+    held, free = rm.region(2 * PAGE), rm.region(2 * PAGE)
+    rm.regions["gpu-test"] = [held, free]
+    rm.hold(held, "old-worker@e0", "e0")
+    rm.hold(free, "agent", "")
+    node = cxl_node(fake, sockdir, rm, node_epoch="e1")
+    try:
+        held_id, free_id = (p.pool_id for p in node.cxl.pools)
+        assert node.cxl.earlier_holds() == {held_id: {"old-worker@e0"}}
+        assert node.pools.pool_quarantined(held_id)
+        assert node.pools.bytes_in(PageState.QUARANTINED, held_id) == 2 * PAGE
+        assert node.pools.bytes_in(PageState.FREE, free_id) == 2 * PAGE
+        rm.hold(held, "old-worker@e1", "e1")  # it maps the region again
+        wait_until(lambda: rm.calls.count("holds") >= 2, what="watched")
+        assert node.pools.pool_quarantined(held_id)
+        rm.unhold(held.handle, "old-worker@e0", "old-worker@e0")  # its old map
         wait_until(
-            lambda: node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE,
-            what="released",
+            lambda: node.pools.bytes_in(PageState.FREE, held_id) == 2 * PAGE,
+            what="quarantine ended",
+        )
+        assert not node.pools.pool_quarantined(held_id)
+        assert node.pools.creditable(held_id) == node.pools.creditable(free_id)
+        assert node.cxl.earlier_holds() == {}
+        node.pools.check()
+    finally:
+        node.stop()
+
+
+def test_a_quarantined_region_keeps_its_retired_pages(fake, sockdir):
+    """Its READY pages are read and retired as usual, but none is FREE until
+    the earlier run's holds are gone."""
+    from maru_common.protocol import RecoverItem
+    from maru_common.storage_types import Key, Location, make_generation
+    from maru_storage_service.drivers.cxl import CxlRegionPool
+
+    rm = FakeRm()
+    region = rm.region(2 * PAGE)
+    rm.regions["gpu-test"] = [region]
+    rm.hold(region, "old-worker@e0", "e0")
+    info = CxlRegionPool("gpu-test", DOMAIN, region, PAGE, Visibility.COHERENT).info()
+    pool_id = info.pool_id
+    item = RecoverItem(
+        key=Key("ns", "k"),
+        location=Location(pool_id, "a0", make_generation(1, 0), 0, 9, PoolKind.CXL),
+        logical_bytes=9,
+        pinned=False,
+    )
+    fake.set_adopted("gpu-test", [(info, [item])])
+    node = cxl_node(fake, sockdir, rm, node_epoch="e1")
+    try:
+        assert node.adopted == [pool_id]
+        ((ref, _, _),) = node.pools.ready_pages()
+        node.pools.retired(ref)
+        node.pools.reclaim(ref)
+        assert node.pools.bytes_in(PageState.QUARANTINED, pool_id) == 2 * PAGE
+        assert pool_id not in node.manager._evictable_pools(PoolKind.CXL)
+        rm.unhold(region.handle, "old-worker@e0", "old-worker@e0")
+        wait_until(
+            lambda: node.pools.bytes_in(PageState.FREE, pool_id) == 2 * PAGE,
+            what="quarantine ended",
         )
     finally:
         node.stop()
 
 
-def test_a_live_holder_the_node_cannot_watch_keeps_the_pages_quarantined(fake, sockdir):
-    """MaruServer names no old worker, but the RM's hold names one on
-    another host: no time lets its pages go, only its DRAIN_ACK."""
-    import time
-
-    rm = FakeRm()
-    region = rm.region(2 * PAGE)
-    rm.regions["gpu-test"] = [region]
-    rm.hold(region, "old-worker", "e0", host="elsewhere")
-    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=0.2)
-    try:
-        claimed = node.cxl.pools[0].pool_id
-        time.sleep(0.6)
-        assert node.pools.bytes_in(PageState.QUARANTINED, claimed) == 2 * PAGE
-        assert not node.pools.creditable(claimed)
-        assert rm.unholds == []
-    finally:
-        node.stop()
-
-
-def test_a_holder_seen_ending_frees_the_pages_and_its_hold_after_the_grace(
-    fake, sockdir
-):
-    import time
-
-    rm = FakeRm()
-    region = rm.region(2 * PAGE)
-    rm.regions["gpu-test"] = [region]
-    rm.hold(region, "old-worker", "e0", pid=_dead_pid())
-    started = time.monotonic()
-    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=0.5)
-    try:
-        claimed = node.cxl.pools[0].pool_id
-        wait_until(
-            lambda: node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE,
-            what="released",
-        )
-        assert time.monotonic() - started >= 0.5
-        wait_until(lambda: rm.unholds, what="hold dropped for it")
-        # dropped on every region of the node; dropping one it lacks is a no-op
-        assert (region.handle.region_id, "old-worker") in rm.unholds
-        assert "old-worker" not in rm.holds[region.handle.region_id]
-    finally:
-        node.stop()
-
-
-def test_a_drained_old_worker_frees_the_pages_and_keeps_its_hold(fake, sockdir):
-    """DRAIN_ACK ends its old work; it may go on mapping the region in this
-    run, so its RM hold stays."""
-    from maru_common.node_protocol import DrainAckRequest, NodeMessageType
-    from maru_common.storage_types import DrainKind, NotifyKind
+def test_a_settled_worker_drops_its_holds_of_every_run(fake, sockdir):
+    """Its process ended and its GPU drain grace is over: its hold of this
+    run and those of earlier runs still listed go."""
     from tests.unit.ms_node_helpers import RawWorker
 
     rm = FakeRm()
     region = rm.region(2 * PAGE)
     rm.regions["gpu-test"] = [region]
     worker = RawWorker(f"{sockdir}/node.sock")
-    rm.hold(region, worker.incarnation, "e0")  # this live process
-    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=30.0)
+    rm.hold(region, f"{worker.incarnation}@e0", "e0")
+    rm.hold(region, "other@e0", "e0")
+    node = cxl_node(fake, sockdir, rm, node_epoch="e1", gpu_drain_grace_s=0.1)
     try:
-        claimed = node.cxl.pools[0].pool_id
-        assert node.pools.bytes_in(PageState.QUARANTINED, claimed) == 2 * PAGE
         worker.attach()
-        notice = wait_until(
-            lambda: next(
-                (n for n in worker.notices if n.kind == NotifyKind.DRAIN), None
-            ),
-            what="node drain notice",
-        )
-        assert notice.drain_kind == DrainKind.NODE and notice.epoch == "e0"
-        worker.request(
-            NodeMessageType.DRAIN_ACK,
-            DrainAckRequest(kind=DrainKind.NODE, epoch="e0"),
-        )
+        rm.hold(region, f"{worker.incarnation}@e1", "e1")
+        node.manager.workers._worker_exited(worker.incarnation)
         wait_until(
-            lambda: node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE,
-            what="released",
+            lambda: (region.handle.region_id, f"{worker.incarnation}@e1") in rm.unholds,
+            what="holds dropped",
         )
-        assert rm.unholds == []
+        assert (region.handle.region_id, f"{worker.incarnation}@e0") in rm.unholds
+        assert "other@e0" in rm.holds[region.handle.region_id]
         worker.close()
     finally:
         node.stop()
@@ -924,7 +933,9 @@ def test_a_cxl_only_restart_gives_credit_from_claimed_regions_once_released(
 
     rm = FakeRm()
     rm.regions["gpu-test"] = [rm.region(8 * PAGE), rm.region(8 * PAGE)]
-    rm.hold(rm.regions["gpu-test"][0], "old-worker", "e0", pid=_dead_pid())
+    first = rm.regions["gpu-test"][0]
+    for region in rm.regions["gpu-test"]:
+        rm.hold(region, "old-worker@e0", "e0")
     node = start_node(
         cxl_only_config(fake, sockdir),
         region_source=rm,
@@ -936,10 +947,33 @@ def test_a_cxl_only_restart_gives_credit_from_claimed_regions_once_released(
         worker = RawWorker(f"{sockdir}/node.sock")
         worker.attach()
         assert worker.credit(PAGE).credits == []  # all quarantined still
+        rm.unhold(first.handle, "old-worker@e0", "old-worker@e0")
         wait_until(lambda: worker.credit(PAGE).credits, what="credit after release")
         worker.close()
     finally:
         node.stop()
+
+
+def test_the_node_holds_the_regions_it_maps_for_demotion(fake, sockdir):
+    """NODE_HOLD under this run before mapping; dropped after the unmap."""
+    import os
+
+    rm = FakeRm()
+    fd = os.memfd_create("fake-cxl")
+    os.ftruncate(fd, 4 << 30)  # sparse: regions sit at region_id GiB
+    rm.dax_path = f"/proc/self/fd/{fd}"
+    try:
+        node = cxl_node(fake, sockdir, rm, map_region=None)
+        name = node.own_holder
+        assert name == f"ss@{node.node_epoch}"
+        ids = [p.region.handle.region_id for p in node.cxl.pools]
+        assert all(name in rm.holds[r] for r in ids)
+        assert all(node.transfers.has_pool(p.pool_id) for p in node.cxl.pools)
+        node.stop()
+        assert all(name not in rm.holds[r] for r in ids)
+        assert rm.released == []  # restart keeps the regions
+    finally:
+        os.close(fd)
 
 
 # =============================================================================
@@ -1011,11 +1045,42 @@ def test_a_worker_holds_a_region_before_mapping_and_unholds_after(holding_rm):
     maps = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
     descriptor = _cxl_descriptor()
     maps.add_dax(descriptor, "e1")
-    assert holding_rm.calls == [("hold", 5, "w1", "e1")]
-    maps.add_dax(descriptor, "e2")  # the next run maps it again: no new hold
+    assert holding_rm.calls == [("hold", 5, "w1@e1", "e1")]
+    maps.add_dax(descriptor, "e1")  # the same run maps it again: no new hold
     assert holding_rm.calls[-1] == ("access", 5)
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1")
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+
+
+def test_each_run_holds_apart_and_the_old_runs_hold_goes_with_its_mapping(
+    holding_rm,
+):
+    """The next run maps the region again under its own hold; closing the old
+    run's mapping (its last view released) drops only the old run's hold."""
+    from maru_common.storage_types import Location
+    from maru_handler.client.pool_maps import PoolMaps, RegionHolder
+
+    maps = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
+    old = _cxl_descriptor(epoch="e1")
+    maps.add_dax(old, "e1")
+    view = maps.view(Location(old.pool.pool_id, "a", 1, 0, PAGE, PoolKind.CXL))
+    maps.add_dax(_cxl_descriptor(epoch="e2"), "e2")  # retires the old mapping
+    assert holding_rm.calls == [("hold", 5, "w1@e1", "e1"), ("hold", 5, "w1@e2", "e2")]
+    view.release()  # the old mapping closes
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
+    assert maps.remove(old.pool.pool_id)
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e2")
+
+
+def test_a_hold_name_fits_the_rm():
+    """1..128 printable bytes, no spaces, as the RM checks holder names."""
+    import uuid
+
+    from maru_common.storage_types import run_holder
+
+    for name in (run_holder(uuid.uuid4().hex, uuid.uuid4().hex), "ss@" + "e" * 32):
+        assert 0 < len(name) <= 128
+        assert all(0x21 <= ord(c) <= 0x7E for c in name)
 
 
 def test_a_refused_hold_maps_nothing(holding_rm):
@@ -1038,10 +1103,10 @@ def test_a_mapping_still_in_use_keeps_its_hold(holding_rm):
     maps.add_dax(descriptor, "e1")
     view = maps.view(Location(descriptor.pool.pool_id, "a", 1, 0, PAGE, PoolKind.CXL))
     assert not maps.remove(descriptor.pool.pool_id)  # a view is held
-    assert holding_rm.calls == [("hold", 5, "w1", "e1")]
+    assert holding_rm.calls == [("hold", 5, "w1@e1", "e1")]
     view.release()
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1")
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
 
 
 def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
@@ -1055,12 +1120,12 @@ def test_one_rm_under_two_addresses_is_one_hold(holding_rm):
     first = _cxl_descriptor(epoch="e1")
     maps.add_dax(first, "e1")
     second = dataclasses.replace(
-        first, dax=dataclasses.replace(first.dax, rm_address="other:1", node_epoch="e2")
+        first, dax=dataclasses.replace(first.dax, rm_address="other:1")
     )
-    maps.add_dax(second, "e2")  # retires the first mapping
+    maps.add_dax(second, "e1")  # retires the first mapping
     assert [c[0] for c in holding_rm.calls] == ["hold", "access"]
     assert maps.remove(first.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1")
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
 
 
 def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
@@ -1071,55 +1136,9 @@ def test_a_failed_second_mapping_does_not_keep_a_count(holding_rm):
     maps.add_dax(descriptor, "e1")
     holding_rm.get_access = lambda handle: (_ for _ in ()).throw(OSError("RM down"))
     with pytest.raises(OSError):
-        maps.add_dax(descriptor, "e2")
+        maps.add_dax(descriptor, "e1")
     assert maps.remove(descriptor.pool.pool_id)
-    assert holding_rm.calls[-1] == ("unhold", 5, "w1")
-
-
-def test_a_holder_from_before_this_hosts_reboot_is_gone_at_once(fake, sockdir):
-    rm = FakeRm()
-    region = rm.region(2 * PAGE)
-    rm.regions["gpu-test"] = [region]
-    rm.hold(region, "old-worker", "e0", boot_id="an-earlier-boot")
-    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=30.0)
-    try:
-        claimed = node.cxl.pools[0].pool_id
-        wait_until(
-            lambda: node.pools.bytes_in(PageState.QUARANTINED, claimed) == 0,
-            what="released",
-        )
-        assert (region.handle.region_id, "old-worker") in rm.unholds
-    finally:
-        node.stop()
-
-
-def test_a_holder_of_another_pid_namespace_drains_by_incarnation(fake, sockdir):
-    """Its pid is its own namespace's: it attaches again by incarnation, and
-    its DRAIN_ACK confirms it."""
-    from maru_common.node_protocol import DrainAckRequest, NodeMessageType
-    from maru_common.storage_types import DrainKind
-    from tests.unit.ms_node_helpers import RawWorker
-
-    rm = FakeRm()
-    region = rm.region(2 * PAGE)
-    rm.regions["gpu-test"] = [region]
-    worker = RawWorker(f"{sockdir}/node.sock")
-    rm.hold(region, worker.incarnation, "e0", pid=7, pid_start=1, pid_ns=1)
-    node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=30.0)
-    try:
-        claimed = node.cxl.pools[0].pool_id
-        response = worker.attach()
-        assert response.status.value == "OK", response.error
-        worker.request(
-            NodeMessageType.DRAIN_ACK, DrainAckRequest(kind=DrainKind.NODE, epoch="e0")
-        )
-        wait_until(
-            lambda: node.pools.bytes_in(PageState.QUARANTINED, claimed) == 0,
-            what="released",
-        )
-        worker.close()
-    finally:
-        node.stop()
+    assert holding_rm.calls[-1] == ("unhold", 5, "w1@e1")
 
 
 def test_a_forgotten_detached_worker_counts_as_settled():

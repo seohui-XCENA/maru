@@ -1,24 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""WorkerRegistry: the workers attached to this node and the old workers of
-the run before it.
+"""WorkerRegistry: the workers attached to this node.
 
 A record lives from ATTACH until the process exits, or until a DETACH that
 leaves nothing behind. An exit quarantines the worker's credited pages for the
-GPU drain grace and is reported through ``on_exit``. Once every old worker is
-confirmed (exited or drained), the quarantined pages of adopted pools are free.
-After a MaruServer restart, the workers attached then drain the ended server
-epoch (ServerDrain) before its pages are reused.
+GPU drain grace and is reported through ``on_exit``. After a MaruServer
+restart, the workers attached then drain the ended server epoch (ServerDrain)
+before its pages are reused.
 """
 
-import dataclasses
 import itertools
 import logging
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import TypeVar
 
 from maru_common.node_protocol import (
@@ -36,7 +32,7 @@ from maru_common.storage_types import (
 )
 
 from .op_ledger import OpLedger
-from .pool_manager import RECOVERY_TAG, PoolManager, holder_tag
+from .pool_manager import PoolManager, holder_tag
 from .ports import ProcessWatcher, WorkerEndpoint
 
 logger = logging.getLogger(__name__)
@@ -84,21 +80,6 @@ class WorkerRecord:
         )
 
 
-class OldState(Enum):
-    WAITING = auto()  # neither attached again nor seen ending
-    DRAINING = auto()  # attached again; NOTIFY drain sent, DRAIN_ACK awaited
-    CONFIRMED = auto()
-
-
-@dataclass
-class OldWorker:
-    ref: WorkerRef
-    state: OldState = OldState.WAITING
-    how: str = ""
-    # When its pages are safe to reuse (an exit waits the GPU drain grace)
-    settled_at: float = 0.0
-
-
 # How often the workers an open server drain waits for are logged
 DRAIN_LOG_S = 30.0
 
@@ -123,10 +104,6 @@ class ServerDrain:
 
 def _worker_key(incarnation: str) -> str:
     return f"worker:{incarnation}"
-
-
-def _old_key(incarnation: str) -> str:
-    return f"old:{incarnation}"
 
 
 def _post_server_drains(conn: WorkerEndpoint, epochs: list[str]) -> None:
@@ -155,35 +132,25 @@ class WorkerRegistry:
         on_settled: Callable[[str], None] = lambda incarnation: None,
     ):
         self.node_epoch = node_epoch
-        self.previous_node_epoch: str | None = None
         self.gpu_drain_grace_s = gpu_drain_grace_s
         self._pools = pools
         self._ledger = ledger
         self._watcher = watcher
         self._on_exit = on_exit
-        # A worker (of this run or the one before) whose exit is confirmed and
-        # whose GPU drain grace is over: nothing of it touches the pools any
-        # more, so its region holds can go
+        # A worker whose exit is confirmed and whose GPU drain grace is over:
+        # nothing of it touches the pools any more, so its region holds can go
         self._on_settled = on_settled
         # incarnation -> when its exit's GPU drain grace ends
         self._settles_at: dict[str, float] = {}
         self._lock = threading.RLock()
         self._workers: dict[str, WorkerRecord] = {}
         self._probes: dict[str, WorkerRecord] = {}
-        self._old: dict[str, OldWorker] = {}
-        self._adopted: list[str] = []
-        self._adopted_released = False
-        self._credit_after: set[str] = set()
-        # Old workers this node cannot watch (their pid is another
-        # namespace's): known by incarnation alone
-        self._unwatchable: frozenset[str] = frozenset()
 
         self._stopping = False
         self._timers: set[threading.Timer] = set()
         self._drains: list[ServerDrain] = []  # open, oldest first
         self._drain_ids = itertools.count(1)
         self._drain_logged = 0.0
-        self._old_logged = 0.0
         self.server_drains_done = 0
 
     def stop(self) -> None:
@@ -207,16 +174,6 @@ class WorkerRegistry:
             rec = self._workers.get(ident.incarnation)
             if rec is not None:
                 return self._rebind(rec, conn, ident)
-            old = self._old.get(ident.incarnation)
-            if (
-                old is not None
-                and ident.incarnation not in self._unwatchable
-                and (old.ref.pid, old.ref.pid_start) != (ident.pid, ident.pid_start)
-            ):
-                return None, (
-                    "MaruServer lists this incarnation for another process "
-                    f"(pid {old.ref.pid})"
-                )
         # pidfd_open and /proc reads happen outside the lock
         key = _worker_key(ident.incarnation)
         if not self._watcher.watch(key, ident.pid, ident.pid_start):
@@ -227,13 +184,6 @@ class WorkerRegistry:
                 return self._rebind(rec, conn, ident)
             rec = WorkerRecord(ident=ident, conn=conn)
             self._workers[ident.incarnation] = rec
-            old = self._old.get(ident.incarnation)
-            unwatch_old = False
-            if old is not None and old.state == OldState.WAITING:
-                old.state = OldState.DRAINING
-                unwatch_old = True
-        if unwatch_old:
-            self._watcher.unwatch(_old_key(ident.incarnation))
         if not self._watcher.watching(key):
             # It ended between watch() and the record: its exit found no record
             self._worker_exited(ident.incarnation)
@@ -286,23 +236,12 @@ class WorkerRegistry:
         return rec, ""
 
     def after_attach_reply(self, rec: WorkerRecord) -> None:
-        """Send NOTIFY drain to an old worker that attached again, and to a
-        worker an open server drain still waits for."""
+        """Send NOTIFY drain to a worker an open server drain still waits for."""
         with self._lock:
-            old = self._old.get(rec.incarnation)
-            draining = old is not None and old.state == OldState.DRAINING
             conn = rec.conn
             server = self._server_drain_epochs(rec.incarnation)
         if conn is None:
             return
-        if draining:
-            conn.post_notify(
-                Notify(
-                    kind=NotifyKind.DRAIN,
-                    drain_kind=DrainKind.NODE,
-                    epoch=self.previous_node_epoch,
-                )
-            )
         _post_server_drains(conn, server)
 
     def connection_lost(self, rec: WorkerRecord, conn: WorkerEndpoint) -> None:
@@ -333,16 +272,14 @@ class WorkerRegistry:
 
     def after_detach_reply(self, rec: WorkerRecord) -> None:
         """Forget a worker that detached holding nothing: its record, pidfd
-        and op records go. One with credit, an op running or an old run to
-        drain waits for its exit."""
+        and op records go. One with credit or an op running waits for its
+        exit."""
         incarnation = rec.incarnation
         with self._lock:
-            old = self._old.get(incarnation)
             if (
                 not rec.detached
                 or rec.exited
                 or self._workers.get(incarnation) is not rec
-                or (old is not None and old.state != OldState.CONFIRMED)
                 or self._ledger.running(incarnation)
                 or not self._pools.forget_holder(incarnation)
             ):
@@ -389,8 +326,6 @@ class WorkerRegistry:
         kind, _, incarnation = key.partition(":")
         if kind == "worker":
             self._worker_exited(incarnation)
-        elif kind == "old":
-            self._old_worker_exited(incarnation)
 
     def _worker_exited(self, incarnation: str) -> None:
         with self._lock:
@@ -418,10 +353,6 @@ class WorkerRegistry:
             server_tags = self._confirm_server_drain(incarnation, None)
         self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, server_tags)
         self._ledger.drop(incarnation)
-        with self._lock:
-            old = self._old.get(incarnation)
-        if old is not None:
-            self._confirm_old(old, "exited")
         self._finish_server_drains()
 
     def _grace_over(self, incarnation: str, tags: list[str]) -> None:
@@ -457,62 +388,9 @@ class WorkerRegistry:
             self._timers.add(timer)
         timer.start()
 
-    # --------------------------------------------------------- restart drain
-
-    def start_restart_drain(
-        self,
-        old_workers: list[WorkerRef],
-        adopted: list[str],
-        previous_node_epoch: str | None = None,
-        credit_after: frozenset[str] = frozenset(),
-        unwatchable: frozenset[str] = frozenset(),
-        gone: frozenset[str] = frozenset(),
-    ) -> None:
-        """Start confirming the old workers; before workers attach. They are
-        the workers MaruServer names and the holders of the regions this run
-        claimed (the RM keeps those across restarts). One whose process this
-        node cannot watch (``unwatchable``: another host, pid namespace or
-        boot) is confirmed only by its DRAIN_ACK. The adopted pools in
-        ``credit_after`` give credit once released. Old workers in ``gone``
-        ran before this host's last boot: nothing of theirs survives."""
-        with self._lock:
-            self.previous_node_epoch = previous_node_epoch
-            self._adopted = list(adopted)
-            self._credit_after = set(credit_after)
-            self._unwatchable = frozenset(unwatchable)
-            for ref in old_workers:
-                self._old.setdefault(ref.incarnation, OldWorker(ref))
-            for incarnation in gone:
-                old = self._old.get(incarnation)
-                if old is not None:
-                    old.state = OldState.CONFIRMED
-                    old.how = "ran before this host's last boot"
-            pending = [
-                o
-                for o in self._old.values()
-                if o.state == OldState.WAITING and o.ref.incarnation not in unwatchable
-            ]
-        for old in pending:
-            if not self._watcher.watch(
-                _old_key(old.ref.incarnation), old.ref.pid, old.ref.pid_start
-            ):
-                self._old_worker_exited(old.ref.incarnation)
-        self._maybe_release_adopted()
-
     def drain_ack(self, rec: WorkerRecord, req: DrainAckRequest) -> DrainAckResponse:
         if req.kind == DrainKind.SERVER:
             self._server_drain_ack(rec.incarnation, req.epoch)
-        elif req.kind == DrainKind.NODE:
-            if req.epoch == self.node_epoch:
-                return DrainAckResponse(
-                    status=Status.REJECTED, error="the current node epoch has not ended"
-                )
-            with self._lock:
-                old = self._old.get(rec.incarnation)
-                if old is not None and old.state != OldState.DRAINING:
-                    old = None
-            if old is not None:
-                self._confirm_old(old, f"drained node epoch {req.epoch}")
         return DrainAckResponse(status=Status.OK)
 
     # --------------------------------------------------- MaruServer restart
@@ -525,14 +403,7 @@ class WorkerRegistry:
             if self._stopping or any(d.old_epoch == old_epoch for d in self._drains):
                 return None
             index = next(self._drain_ids)
-            # attached workers, and old workers of the run before that have
-            # not attached again if a pool was kept (they may read it; the
-            # old run's DRAM is never reused)
             waiting = {r.incarnation for r in self._workers.values() if not r.exited}
-            if self._adopted:
-                waiting |= {
-                    i for i, o in self._old.items() if o.state == OldState.WAITING
-                }
             drain = ServerDrain(
                 index=index,
                 old_epoch=old_epoch,
@@ -576,11 +447,6 @@ class WorkerRegistry:
                 if not rec.exited and not rec.detached
             }
 
-    def old_pending(self) -> bool:
-        """Some worker of the run before is neither back nor seen ending."""
-        with self._lock:
-            return any(o.state == OldState.WAITING for o in self._old.values())
-
     def notify_all(self, notify: Notify) -> None:
         """Post ``notify`` to every attached worker and probe."""
         with self._lock:
@@ -606,27 +472,6 @@ class WorkerRegistry:
                 for incarnation in sorted(drain.waiting):
                     out.setdefault(incarnation, []).append(drain.old_epoch)
             return out
-
-    def log_old_workers(self) -> None:
-        """Name the old workers the adopted pools wait for, every DRAIN_LOG_S."""
-        now = time.monotonic()
-        with self._lock:
-            if self._adopted_released or now - self._old_logged < DRAIN_LOG_S:
-                return
-            waiting = sorted(
-                o.ref.incarnation
-                for o in self._old.values()
-                if o.state == OldState.WAITING
-            )
-            if not waiting:
-                return
-            self._old_logged = now
-        logger.warning(
-            "pools %s of the run before stay quarantined: waiting for DRAIN_ACK "
-            "or the exit of old workers %s",
-            sorted(self._adopted),
-            waiting,
-        )
 
     def log_server_drain(self) -> None:
         """Name the workers an open drain waits for, every DRAIN_LOG_S."""
@@ -698,64 +543,3 @@ class WorkerRegistry:
 
     def _release(self, tags: list[str]) -> int:
         return sum(self._pools.release_quarantine(tag) for tag in tags)
-
-    def old_workers(self) -> dict[str, OldWorker]:
-        with self._lock:
-            return {k: dataclasses.replace(v) for k, v in self._old.items()}
-
-    def is_adopted(self, pool_id: str) -> bool:
-        """A pool of the run before whose old workers are not all confirmed."""
-        with self._lock:
-            return pool_id in self._adopted and not self._adopted_released
-
-    def _old_worker_exited(self, incarnation: str) -> None:
-        with self._lock:
-            old = self._old.get(incarnation)
-            if old is None or old.state != OldState.WAITING:
-                return
-        self._on_exit(old.ref)
-        self._confirm_old(old, "exited")
-        self._after(self.gpu_drain_grace_s, self._on_settled, incarnation)
-        with self._lock:
-            tags = self._confirm_server_drain(incarnation, None)
-        self._release(tags)
-        self._finish_server_drains()
-
-    def _confirm_old(self, old: OldWorker, how: str) -> None:
-        """Confirmed by DRAIN_ACK (its copies ended) or by its exit (its GPU
-        copies still get the drain grace)."""
-        with self._lock:
-            if old.state == OldState.CONFIRMED:
-                return
-            old.state = OldState.CONFIRMED
-            old.how = how
-            old.settled_at = time.monotonic() + (
-                self.gpu_drain_grace_s if how == "exited" else 0.0
-            )
-        logger.info("old worker %s confirmed (%s)", old.ref.incarnation, how)
-        self._maybe_release_adopted()
-
-    def _maybe_release_adopted(self) -> None:
-        with self._lock:
-            if self._adopted_released:
-                return
-            if any(o.state != OldState.CONFIRMED for o in self._old.values()):
-                return
-            settle = max([0.0, *(o.settled_at for o in self._old.values())])
-            wait = settle - time.monotonic()
-            if wait > 0:
-                self._after(wait, self._maybe_release_adopted)
-                return
-            self._adopted_released = True
-            adopted = list(self._adopted)
-            credit_after = set(self._credit_after)
-        for pool_id in adopted:
-            freed = self._pools.release_quarantine(RECOVERY_TAG, pool_id)
-            if pool_id in credit_after:
-                self._pools.enable_pool(pool_id)
-            logger.info(
-                "every old worker is confirmed: %d quarantined pages of adopted "
-                "pool %s are free",
-                freed,
-                pool_id,
-            )

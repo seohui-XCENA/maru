@@ -452,6 +452,36 @@ class TestServiceTransitions:
         assert pm2.credit("w", PS) == []
         pm.check()
 
+    def test_a_quarantined_pool_frees_nothing_until_its_quarantine_ends(self):
+        """An earlier run may still write it: retired or dropped pages stay
+        QUARANTINED, and no credit comes from it, until it ends."""
+        pm = PoolManager(budgets(), PS)
+        info = dataclasses.replace(
+            dram(), pool_id="cxl:rm:5", kind=PoolKind.CXL, capacity=4 * PS
+        )
+        pm.add_pool(info, creditable=False, state=PageState.QUARANTINED)
+        pm.quarantine_pool(info.pool_id)
+        pm.set_epoch_seq(2)
+        locs = [
+            Location(info.pool_id, f"a{i}", make_generation(1, i), i * PS, 9, info.kind)
+            for i in (0, 1)
+        ]
+        first, second = pm.recovered(
+            info.pool_id, [(Key("ns", f"k{i}"), loc) for i, loc in enumerate(locs)]
+        )
+        assert pm.pool_quarantined(info.pool_id)
+        assert pm.credit("w", PS, PoolKind.CXL) == []
+        pm.retired(first)
+        pm.reclaim(first)
+        pm.drop_ready(second)
+        assert pm.bytes_in(PageState.QUARANTINED, info.pool_id) == 4 * PS
+        assert pm.bytes_in(PageState.FREE, info.pool_id) == 0
+        assert pm.end_pool_quarantine(info.pool_id, creditable=True) == 4
+        assert not pm.pool_quarantined(info.pool_id)
+        assert pm.creditable(info.pool_id)
+        assert len(pm.credit("w", PS, PoolKind.CXL)) == 1
+        pm.check()
+
     def _ready(self, pm, key="a"):
         (c,) = pm.credit("w", PS)
         ref, location, _ = pm.write_done("w", c, Key("ns", key), 10)

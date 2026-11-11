@@ -26,7 +26,8 @@ class PageState(StrEnum):
     QUARANTINED = "QUARANTINED"
 
 
-# Quarantine tag of the pages of an adopted pool until NODE_RECOVER_LIST
+# Quarantine tag of a taken-over pool's pages: those NODE_RECOVER_LIST does not
+# list, and those freed while an earlier run may still write the pool
 RECOVERY_TAG = "recovery"
 
 

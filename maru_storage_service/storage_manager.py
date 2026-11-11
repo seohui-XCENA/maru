@@ -14,7 +14,6 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -798,21 +797,15 @@ class StorageManager:
             self._cv.notify_all()
         return UnmapAckResponse(status=Status.OK)
 
-    def unmap_pools(
-        self,
-        pools: list[tuple[str, int]],
-        timeout_s: float,
-        old_may_map: AbstractSet[str] = frozenset(),
-    ) -> set[str]:
-        """Ask every worker that may map ``pools`` (pool_id, generation) to
-        unmap them; the pool_ids each one unmapped (UNMAP_ACK) or settled
-        (detached, or ended with its GPU drain grace over) within
+    def unmap_pools(self, pools: list[tuple[str, int]], timeout_s: float) -> set[str]:
+        """Ask every worker of this run that may map ``pools`` (pool_id,
+        generation) to unmap them; the pool_ids each one unmapped (UNMAP_ACK)
+        or settled (detached, or ended with its GPU drain grace over) within
         ``timeout_s``. A worker that reconnects is asked again; one whose
-        connection dropped counts only once it settles. Pools in
-        ``old_may_map`` also wait for every worker of the run before. A
-        timeout is no confirmation. The caller stops new ATTACHes from mapping
-        them first. Whatever this answers, the RM keeps a region out of reuse
-        while any worker holds it."""
+        connection dropped counts only once it settles. A timeout is no
+        confirmation. The caller stops new ATTACHes from mapping them first.
+        Whatever this answers, the RM keeps a region out of reuse while any
+        worker holds it."""
         asked: dict[str, WorkerEndpoint | None] = {}
         deadline = time.monotonic() + timeout_s
         with self._cv:
@@ -831,12 +824,10 @@ class StorageManager:
                                     pool_generation=generation,
                                 )
                             )
-                old = self.workers.old_pending()
                 done = {
                     pool_id
                     for pool_id, generation in pools
-                    if not (old and pool_id in old_may_map)
-                    and all(
+                    if all(
                         (inc, pool_id, generation) in self._unmapped
                         or self.workers.settled(inc)
                         for inc in asked
@@ -987,7 +978,6 @@ class StorageManager:
                     self._evict_once()
                 elif draining:
                     self.workers.log_server_drain()
-                self.workers.log_old_workers()
             except ServerStopped:
                 return
             except Exception:
@@ -1039,7 +1029,8 @@ class StorageManager:
 
     def _evictable_pools(self, kind: PoolKind) -> list[str]:
         """The tier's pools pressure is measured over and removed from: not
-        invalid, not adopted and (in the credit tier) creditable."""
+        invalid, not quarantined for an earlier run and (in the credit tier)
+        creditable."""
         traits = self.traits[kind]
         with self._lock:
             invalid = set(self._invalid_pools)
@@ -1050,7 +1041,7 @@ class StorageManager:
                 info is None
                 or info.kind != kind
                 or pool_id in invalid
-                or self.workers.is_adopted(pool_id)
+                or self.pools.pool_quarantined(pool_id)
                 or (
                     (traits.credit or traits.credit_fallback)
                     and not self.pools.creditable(pool_id)
@@ -1188,7 +1179,7 @@ class StorageManager:
                 and info.kind == kind
                 and pool_id not in invalid
                 and self.transfers.has_pool(pool_id)
-                and not self.workers.is_adopted(pool_id)
+                and not self.pools.pool_quarantined(pool_id)
             ):
                 free = self.pools.bytes_in(PageState.FREE, pool_id)
                 room[pool_id] = free // info.page_size

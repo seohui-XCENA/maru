@@ -180,8 +180,7 @@ class TestResume:
         _, service, wire = env
         node = resumed(wire, epoch_seq=9)
         assert node.last_open.epoch_seq == 9
-        assert node.last_open.adopted == [] and node.last_open.old_workers == []
-        assert node.last_open.previous_node_epoch is None
+        assert node.last_open.adopted == []
         # new pages of the run carry the same epoch_seq
         k = key("new")
         assert results(node.commit((k, node.loc(node.dram(), 1)))) == [ItemResult.ADDED]

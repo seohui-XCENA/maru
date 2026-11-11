@@ -1442,65 +1442,7 @@ def test_a_late_open_reply_never_takes_the_epoch_back():
         conn._rpc.close()
 
 
-class TestOldWorkersAndTheServerDrain:
-    def test_an_old_worker_not_back_is_waited_for(self, fake, nodes):
-        import subprocess
-        import sys
-
-        from maru_common.ms_rpc import MsRpcClient
-        from maru_common.node_protocol import process_start_time
-        from maru_common.protocol import WorkerOpenRequest
-        from maru_common.storage_types import PoolInfo, SessionRole
-
-        sleeper = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"]
-        )
-        try:
-            first = nodes()
-            rpc = MsRpcClient(fake.url, timeout_s=2)
-            ssd = PoolInfo(
-                pool_id="ssd:gpu-test:/data",
-                kind=PoolKind.SSD,
-                node_id="gpu-test",
-                pool_generation=1,
-                capacity=4 * PAGE,
-                page_size=PAGE,
-                path="/data",
-            )
-            opened = rpc.call(
-                MessageType.WORKER_OPEN,
-                WorkerOpenRequest(
-                    node_id="gpu-test",
-                    node_epoch=first.node_epoch,
-                    engine_id="old",
-                    dp_index=0,
-                    tp_rank=0,
-                    pid=sleeper.pid,
-                    pid_start=process_start_time(sleeper.pid),
-                    incarnation="old-worker",
-                    namespace=NS,
-                    role=SessionRole.WORKER,
-                    protocol="ms1",
-                ),
-            )
-            rpc.close()
-            assert opened.status == Status.OK
-            first.stop()
-            fake.set_adopted("gpu-test", [(ssd, [])])  # a pool it may read
-            node = nodes()  # the old worker has not attached again
-            assert node.adopted == [ssd.pool_id]
-            restart(fake, node)
-            pending = node.manager.workers.server_drain_pending()
-            assert "old-worker" in pending
-            sleeper.kill()
-            sleeper.wait()
-            wait_until(
-                lambda: not node.manager.workers.server_drain_open(), what="exit"
-            )
-        finally:
-            sleeper.kill()
-            sleeper.wait()
-
+class TestServerDrainAfterANewRun:
     def test_a_worker_refused_by_the_new_run_keeps_no_drain_open(
         self, fake, nodes, handlers
     ):

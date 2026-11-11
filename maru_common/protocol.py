@@ -691,10 +691,6 @@ class NodeOpenResponse:
     session_ttl_s: float = 0.0
     recovering: bool = False
     adopted: list[PoolInfo] = field(default_factory=list)
-    old_workers: list[WorkerRef] = field(default_factory=list)
-    # node_epoch of the run this open replaced (for NOTIFY drain); None for a
-    # first open or a renewal of the same run
-    previous_node_epoch: str | None = None
 
 
 @dataclass

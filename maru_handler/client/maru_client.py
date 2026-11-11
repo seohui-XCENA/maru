@@ -203,7 +203,6 @@ class MaruClient:
         self._ops: OpTracker | None = None
         self.attach_info: AttachResponse | None = None
         self.node_epoch: str | None = None
-        self._old_epochs: list[str] = []
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
         self._returns: list[Location] = []
@@ -564,7 +563,6 @@ class MaruClient:
             if not closed:
                 if not same_run:
                     if self.node_epoch is not None:
-                        self._old_epochs.append(self.node_epoch)
                         logger.warning(
                             "the StorageService restarted (node epoch %s -> %s); "
                             "old credit and unresolved writes are dropped",
@@ -1705,32 +1703,19 @@ class MaruClient:
         if kind is None:
             logger.warning("NOTIFY drain without drain_kind; ignored")
             return
-        if kind == DrainKind.NODE:
-            with self._lock:
-                ack_epoch = notify.epoch or (
-                    self._old_epochs[-1] if self._old_epochs else ""
-                )
-                # Every older run, not only the one named: a superset is safe
-                self._cv.wait_for(
-                    lambda: (
-                        self._closing.is_set()
-                        or all(h.node_epoch == self.node_epoch for h in self._handles)
+        ack_epoch = notify.epoch or ""
+        if era is None:
+            era = self._end_server_epoch(ack_epoch)
+        with self._lock:
+            self._cv.wait_for(
+                lambda: (
+                    self._closing.is_set()
+                    or not any(h.era < era for h in self._handles)
+                    and not any(
+                        r.server_epoch in self._ended_epochs for r in self._reads
                     )
                 )
-        else:
-            ack_epoch = notify.epoch or ""
-            if era is None:
-                era = self._end_server_epoch(ack_epoch)
-            with self._lock:
-                self._cv.wait_for(
-                    lambda: (
-                        self._closing.is_set()
-                        or not any(h.era < era for h in self._handles)
-                        and not any(
-                            r.server_epoch in self._ended_epochs for r in self._reads
-                        )
-                    )
-                )
+            )
         if self._closing.is_set():
             return
         with self._lock:

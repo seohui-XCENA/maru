@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Workers in their own processes: sharing, kill -9, restart drain, the CLI."""
+"""Workers in their own processes: sharing, kill -9, restart, the CLI."""
 
 import json
 import os
@@ -10,14 +10,11 @@ import sys
 
 import pytest
 
-from maru_common.ms_rpc import MsRpcClient
-from maru_common.node_protocol import process_start_time
-from maru_common.protocol import MessageType, WorkerOpenRequest
-from maru_common.storage_types import CloseMode, Key, SessionRole
+from maru_common.protocol import MessageType
+from maru_common.storage_types import CloseMode, Key
 from maru_storage_service.cli import EXIT_START
 from maru_storage_service.drivers import dram
 from maru_storage_service.pool_manager import PageState
-from maru_storage_service.worker_registry import OldState
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -181,104 +178,31 @@ def test_kill_9_of_a_reader_that_never_stored(fake, sockdir, agents):
         node.stop()
 
 
-def test_storage_service_restart_drain(fake, sockdir, agents):
+def test_storage_service_restart(fake, sockdir, agents):
+    """The new run serves at once: a worker attaches again by itself, and
+    nothing waits for its copies into the old run's DRAM."""
     config = node_config(fake.url, f"{sockdir}/node.sock")
     first = start_node(config)
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     second = None
     try:
         x = agents(config.socket, "stays")
-        y = agents(config.socket, "ends")
         x.connect()
-        y.connect()
         store(x, "x0")
         x.call("wait_credit", bytes=PAGE)
         x.call("alloc_hold", name="copy", size=64)  # a copy into old credit
-        # a worker of this node that never attaches again (alive)
-        rpc = MsRpcClient(fake.url, timeout_s=2)
-        assert (
-            rpc.call(
-                MessageType.WORKER_OPEN,
-                WorkerOpenRequest(
-                    node_id="gpu-test",
-                    node_epoch=first.node_epoch,
-                    engine_id="idle",
-                    dp_index=0,
-                    tp_rank=0,
-                    pid=sleeper.pid,
-                    pid_start=process_start_time(sleeper.pid),
-                    incarnation="idle-worker",
-                    namespace="ns",
-                    role=SessionRole.WORKER,
-                    protocol="ms1",
-                ),
-            ).status.value
-            == "OK"
-        )
-        rpc.close()
         first.stop(CloseMode.RESTART)
-        y.kill()  # ends while the StorageService is down
         second = start_node(config)
-        old = second.manager.workers.old_workers()
-        assert set(old) == {x.incarnation, y.incarnation, "idle-worker"}
         wait_until(
-            lambda: (
-                second.manager.workers.old_workers()[y.incarnation].state
-                == OldState.CONFIRMED
-            ),
-            what="the ended worker confirmed",
-        )
-        assert second.manager.workers.old_workers()[y.incarnation].how == "exited"
-        wait_until(
-            lambda: any(r.incarnation == y.incarnation for r, _ in fake.worker_exits),
-            what="WORKER_EXIT",
-        )
-        wait_until(
-            lambda: (
-                second.manager.workers.old_workers()[x.incarnation].state
-                == OldState.DRAINING
-            ),
+            lambda: x.call("state")["node_epoch"] == second.node_epoch,
             what="attached again",
-        )
-        assert x.call("state")["node_epoch"] == second.node_epoch
-        assert (
-            second.manager.workers.old_workers()[x.incarnation].state
-            == OldState.DRAINING
-        )
-        x.call("free_held", name="copy")
-        wait_until(
-            lambda: (
-                second.manager.workers.old_workers()[x.incarnation].state
-                == OldState.CONFIRMED
-            ),
-            what="drained",
-        )
-        # NOTIFY drain named the replaced node epoch, and the worker acked it
-        assert second.manager.workers.previous_node_epoch == first.node_epoch
-        assert (
-            first.node_epoch in second.manager.workers.old_workers()[x.incarnation].how
-        )
-        assert (
-            second.manager.workers.old_workers()["idle-worker"].state
-            == OldState.WAITING
         )
         # DRAM locations of the old run are gone; the new pool works
         assert x.call("retrieve", key="x0") is None
         store(x, "x1")
         assert x.call("retrieve", key="x1", hold=False) == value("x1")
-        sleeper.kill()
-        sleeper.wait()
-        wait_until(
-            lambda: (
-                second.manager.workers.old_workers()["idle-worker"].state
-                == OldState.CONFIRMED
-            ),
-            what="the idle worker confirmed by its exit",
-        )
+        x.call("free_held", name="copy")
         second.pools.check()
     finally:
-        sleeper.kill()
-        sleeper.wait()
         first.stop()
         if second is not None:
             second.stop()
