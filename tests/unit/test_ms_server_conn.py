@@ -78,6 +78,32 @@ def test_a_reopen_after_epoch_is_skipped_once_the_session_moved_on():
         conn._rpc.close()
 
 
+def test_a_reopen_waiting_for_another_open_does_not_open_again():
+    gate, entered, calls = threading.Event(), threading.Event(), []
+
+    def call(code, request):
+        calls.append(code)
+        entered.set()
+        assert gate.wait(10)
+        return opened("s2", "old")
+
+    conn = make_conn(call)
+    first = threading.Thread(target=conn.open)
+    second = threading.Thread(target=lambda: conn._reopen_after_epoch("old", "s1"))
+    try:
+        first.start()
+        assert entered.wait(5)
+        second.start()
+        time.sleep(0.1)  # it waits for the open lock
+        gate.set()
+        first.join(5)
+        second.join(5)
+        assert conn.session == "s2" and calls == [MessageType.WORKER_OPEN]
+    finally:
+        gate.set()
+        conn._rpc.close()
+
+
 def test_the_heartbeat_goes_on_when_a_callback_raises(monkeypatch, caplog):
     monkeypatch.setattr(server_conn, "DOWN_POLL_S", 0.01)
     opens, beats = [], []

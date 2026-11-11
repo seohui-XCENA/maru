@@ -420,12 +420,13 @@ class PoolMaps:
             pools = list(self._pools.values())
         return bool(pools) and all(m.mapping.cuda_registered for m in pools)
 
-    def remove(self, pool_id: str) -> bool:
+    def remove(self, pool_id: str, expected: MappedPool | None = None) -> bool:
         """Unregister and unmap on the closer thread (wait_closed tells when);
-        False (nothing touched) while views are held."""
+        False (nothing touched) while views are held. With ``expected``, only
+        that mapping: another one installed since is left."""
         with self._lock:
             mapped = self._pools.get(pool_id)
-            if mapped is None:
+            if mapped is None or (expected is not None and mapped is not expected):
                 return True
             with mapped.lock:
                 if mapped.views:

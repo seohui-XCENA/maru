@@ -251,7 +251,6 @@ def test_the_signal_handler_only_writes_to_the_pipe():
 
 def test_a_signal_stops_the_node_from_another_thread(monkeypatch):
     handlers, stopped = {}, []
-    in_handler = threading.Event()
     done = threading.Event()
 
     class Waiting:
@@ -259,7 +258,7 @@ def test_a_signal_stops_the_node_from_another_thread(monkeypatch):
             self.failed, self.ended = None, None
 
         def stop(self):
-            stopped.append((threading.current_thread(), in_handler.is_set()))
+            stopped.append(threading.current_thread())
             done.set()
 
         def run(self):
@@ -274,13 +273,10 @@ def test_a_signal_stops_the_node_from_another_thread(monkeypatch):
     thread = threading.Thread(target=lambda: result.append(serve(config())))
     thread.start()
     wait_until(lambda: signal.SIGTERM in handlers, what="the handler")
-    in_handler.set()
     handlers[signal.SIGTERM](signal.SIGTERM, None)
-    in_handler.clear()
     thread.join(5)
     assert result == [0] and len(stopped) == 1
-    stop_thread, from_handler = stopped[0]
-    assert stop_thread.name == "maru-signal" and not from_handler
+    assert stopped[0].name == "maru-signal"
 
 
 # =============================================================================

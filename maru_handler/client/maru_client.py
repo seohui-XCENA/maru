@@ -199,6 +199,8 @@ class MaruClient:
         self._ops: OpTracker | None = None
         self.attach_info: AttachResponse | None = None
         self.node_epoch: str | None = None
+        # The run whose pools an ATTACH is installing, not current yet
+        self._attaching_epoch: str | None = None
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
         self._returns: list[Location] = []
@@ -521,6 +523,9 @@ class MaruClient:
             same_run = response.node_epoch == self.node_epoch
             if not same_run:
                 self._credit_kind = None
+            with self._lock:
+                # Its pools are not old ones while they are installed
+                self._attaching_epoch = response.node_epoch
             for descriptor in response.pools:
                 mapped = self.pools.get(descriptor.pool.pool_id)
                 if same_run and mapped and mapped.node_epoch == response.node_epoch:
@@ -546,10 +551,13 @@ class MaruClient:
                 added.append(descriptor.pool.pool_id)
             close_fds(fds)  # those of pools still mapped
         except BaseException:
+            with self._lock:
+                self._attaching_epoch = None
             close_fds(fds)
             conn.close()
             raise
         with self._lock:
+            self._attaching_epoch = None
             # close() sets _closing under this lock: it sees what is installed
             closed = self._closing.is_set()
             if not closed:
@@ -793,8 +801,14 @@ class MaruClient:
             if self._demand:
                 self._demand_taken += credit.length
         try:
-            view = self.pools.view(credit, size)
+            view = self.pools.view(credit, size, node_epoch=node_epoch)
         except LocationError as e:
+            with self._lock:
+                ended = node_epoch != self.node_epoch
+            if ended or isinstance(e, StaleRunError):
+                # Of an ended run: not given back to the new one
+                self._count("store_skipped_stale_run")
+                raise CreditUnavailableError(f"credit of an ended run: {e}") from e
             # Given back: the node may give it to a worker that maps it
             logger.error("a credit outside the mapped pools: %s", e)
             self._return_credits([credit])
@@ -1627,18 +1641,19 @@ class MaruClient:
     def _unmap_unused_old_pools(self) -> None:
         """Unmap pools of ended runs once unused."""
         with self._lock:
-            current = self.node_epoch
+            current = (self.node_epoch, self._attaching_epoch)
             old = [
-                pool_id
+                m
                 for pool_id in self.pools.pool_ids()
                 if (m := self.pools.get(pool_id)) is not None
-                and m.node_epoch != current
+                and m.node_epoch not in current
             ]
             busy = {h.location.pool_id for h in self._handles} | {
                 r.location.pool_id for r in self._reads
             }
-        for pool_id in old:
-            if pool_id not in busy and self.pools.remove(pool_id):
+        for m in old:
+            pool_id = m.info.pool_id
+            if pool_id not in busy and self.pools.remove(pool_id, expected=m):
                 logger.info("unmapped %s of an ended StorageService run", pool_id)
 
     # ----------------------------------------------------------------- notify

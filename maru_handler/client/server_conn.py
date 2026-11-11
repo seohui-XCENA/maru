@@ -124,12 +124,15 @@ class ServerConn:
 
     # ---------------------------------------------------------------- session
 
-    def open(self) -> None:
+    def open(self, if_session: str | None = None) -> None:
         """WORKER_OPEN; StorageUnavailableError if unreachable or refused
         (NodeRunUnknownError while a new MaruServer does not know the node
         run yet). Opens run one at a time, so a late answer never takes the server
-        epoch back."""
+        epoch back. With ``if_session``, only if that is still the session
+        once it is this open's turn."""
         with self._open_lock:
+            if if_session is not None and self.session != if_session:
+                return
             self._open()
 
     def _open(self) -> None:
@@ -298,12 +301,13 @@ class ServerConn:
                     continue
                 self._set_down(False)
                 if response.status == Status.EPOCH:
-                    with self._lock:
-                        moved = self.session != session
+                    with self._open_lock:  # the check and the open are one step
+                        with self._lock:
+                            moved = self.session != session
+                            if not moved:
+                                self._reopen = True
                         if not moved:
-                            self._reopen = True
-                    if not moved:
-                        self.open()  # expired, or MaruServer restarted
+                            self.open()  # expired, or MaruServer restarted
             except (RpcUnknownError, StorageUnavailableError) as e:
                 if isinstance(e, NodeRunUnknownError):
                     now = time.monotonic()
@@ -396,10 +400,7 @@ class ServerConn:
         """Reopen after EPOCH to a background request of ``epoch`` on
         ``session``, unless the session moved on already; whether the session
         is at that server epoch still."""
-        with self._lock:
-            moved = self.session != session
-        if not moved:
-            self.open()
+        self.open(if_session=session)
         with self._lock:
             return self.server_epoch == epoch
 
