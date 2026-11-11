@@ -586,7 +586,7 @@ def test_group_objects_are_written_on_the_write_behind_thread():
     assert worker._handler.alloc.call_count == staged == 5
     worker._store_executor.run()
     assert len(server.objects) == 5
-    assert worker._pending_store_keys == set()
+    assert worker._store_completion.pending == set()
     assert server.routes == {_chunk_keys(tokens, TINY_BLOCK)[0]}
 
 

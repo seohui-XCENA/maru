@@ -517,6 +517,65 @@ class _CopyAhead:
         self.stream.synchronize()
 
 
+class _StoreCompletion:
+    """Keys a store has queued, the requests waiting for them, and finished
+    requests not reported yet. The caller holds ``_store_lock``."""
+
+    def __init__(self) -> None:
+        self.pending: set[str] = set()
+        # key -> requests whose blocks its copy reads
+        self.key_waiters: dict[str, set[str]] = {}
+        # request -> keys it waits for
+        self.request_keys: dict[str, set[str]] = {}
+        # Finished requests a key still holds
+        self.finished: set[str] = set()
+
+    def add_pending(self, keys: Iterable[str]) -> None:
+        self.pending.update(keys)
+
+    def is_pending(self, key: str) -> bool:
+        return key in self.pending
+
+    def discard_pending(self, key: str) -> None:
+        self.pending.discard(key)
+
+    def reserve_or_join(self, key: str, req_ids: set[str]) -> bool:
+        """Have ``req_ids`` wait for ``key``. True if no store of it is
+        pending yet: the caller issues one."""
+        self.key_waiters.setdefault(key, set()).update(req_ids)
+        for req_id in req_ids:
+            self.request_keys.setdefault(req_id, set()).add(key)
+        if key in self.pending:
+            return False
+        self.pending.add(key)
+        return True
+
+    def hold(self, keys: Iterable[str]) -> set[str]:
+        """Detach the waiters of ``keys`` without letting them finish."""
+        held: set[str] = set()
+        for key in keys:
+            held |= self.key_waiters.pop(key, set())
+        return held
+
+    def release(self, keys: Iterable[str]) -> None:
+        """Let the requests waiting for ``keys`` finish."""
+        for key in keys:
+            for req_id in self.key_waiters.pop(key, set()):
+                pending = self.request_keys.get(req_id)
+                if pending is None:
+                    continue
+                pending.discard(key)
+                if not pending:
+                    del self.request_keys[req_id]
+
+    def take_ready(self, finished_req_ids: set[str]) -> set[str]:
+        """Note ``finished_req_ids``; take the finished requests no key holds."""
+        self.finished.update(finished_req_ids)
+        done = {req_id for req_id in self.finished if req_id not in self.request_keys}
+        self.finished.difference_update(done)
+        return done
+
+
 def _remote_cxl_async(extra: dict[str, Any]) -> bool:
     """Whether loads or stores of the remote_cxl backend run off the engine thread."""
     return extra.get("maru_storage_backend") == "remote_cxl" and any(
@@ -3931,7 +3990,7 @@ class MaruWorkerConnector:
         self._pending_layer_objects: dict[
             str, tuple[Any, dict[int, tuple[str, Any]]]
         ] = {}
-        self._pending_store_keys: set[str] = set()
+        self._store_completion = _StoreCompletion()
         # What a copy whose completion is unknown may still touch (pages,
         # pinned reads, its inputs): never freed or released here, so the
         # space is reused only after the process ends
@@ -3939,9 +3998,6 @@ class MaruWorkerConnector:
         # Why the worker stopped: a load copy could not be confirmed finished
         self._load_stopped: str | None = None
         self._stop_lock = threading.Lock()
-        self._store_key_waiters: dict[str, set[str]] = {}
-        self._request_pending_store_keys: dict[str, set[str]] = {}
-        self._finished_store_requests: set[str] = set()
         self._store_staging: torch.Tensor | None = None
         # save_kv_layer runs inside the model forward. In write-behind mode it
         # records completed packed-store batches here; get_finished() launches
@@ -6532,13 +6588,7 @@ class MaruWorkerConnector:
             for req_id in finished_req_ids | recv_only:
                 self._loaded_request_keys.pop(req_id, None)
         with self._store_lock:
-            self._finished_store_requests.update(finished_req_ids)
-            done = {
-                req_id
-                for req_id in self._finished_store_requests
-                if req_id not in self._request_pending_store_keys
-            }
-            self._finished_store_requests.difference_update(done)
+            done = self._store_completion.take_ready(finished_req_ids)
         return done or None
 
     def handle_preemptions(self, metadata: MaruConnectorMetadata) -> None:
@@ -7605,7 +7655,7 @@ class MaruWorkerConnector:
         """Publish a chunk's layers, then its ``_DONE`` marker on its page."""
         done_key = f"{base_key}_DONE"
         with self._store_lock:
-            self._pending_store_keys.add(done_key)
+            self._store_completion.add_pending([done_key])
 
         def write_marker(_keys: list[str], results: list[bool]) -> None:
             if all(results):
@@ -7637,7 +7687,7 @@ class MaruWorkerConnector:
             return
         handler = self._handler
         with self._store_lock:
-            self._pending_store_keys.update(keys)
+            self._store_completion.add_pending(keys)
         try:
             if handler is None:
                 raise StorageUnavailableError("the worker handler is closed")
@@ -7919,7 +7969,7 @@ class MaruWorkerConnector:
             self._publish_on_node(keys, handles, on_done)
             return
         with self._store_lock:
-            self._pending_store_keys.update(keys)
+            self._store_completion.add_pending(keys)
         if self._store_executor is None:
             self._store_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="maru-write-behind"
@@ -7940,7 +7990,7 @@ class MaruWorkerConnector:
         leaves the pending set, so no key is seen as neither.
         """
         with self._store_lock:
-            if key in self._pending_store_keys:
+            if self._store_completion.is_pending(key):
                 return True
         return self._is_stored(key)
 
@@ -8491,14 +8541,7 @@ class MaruWorkerConnector:
             for base_key, (chunk_slots, req_ids, route) in key_entries.items():
                 if self._is_stored(base_key):
                     continue
-                waiters = self._store_key_waiters.setdefault(base_key, set())
-                waiters.update(req_ids)
-                for req_id in req_ids:
-                    self._request_pending_store_keys.setdefault(req_id, set()).add(
-                        base_key
-                    )
-                if base_key not in self._pending_store_keys:
-                    self._pending_store_keys.add(base_key)
+                if self._store_completion.reserve_or_join(base_key, req_ids):
                     to_schedule.append((base_key, chunk_slots, route))
 
         if not to_schedule:
@@ -8851,7 +8894,7 @@ class MaruWorkerConnector:
                     self._record_stored(base_key)
                 elif not reported:
                     logger.warning("Maru write-behind store failed: %s", base_key)
-                self._pending_store_keys.discard(base_key)
+                self._store_completion.discard_pending(base_key)
             if copy_confirmed:
                 self._release_store_waiters(keys)
             else:
@@ -8861,9 +8904,7 @@ class MaruWorkerConnector:
         """Keep the requests waiting for ``keys`` from finishing, so vLLM does
         not reuse their GPU blocks. A later store of a key releases only its
         own waiters. Caller holds ``_store_lock``."""
-        held: set[str] = set()
-        for base_key in keys:
-            held |= self._store_key_waiters.pop(base_key, set())
+        held = self._store_completion.hold(keys)
         if held:
             logger.error(
                 "Maru: %d requests keep their GPU blocks until the process exits",
@@ -8873,14 +8914,7 @@ class MaruWorkerConnector:
     def _release_store_waiters(self, keys: list[str]) -> None:
         """Let the requests waiting for ``keys`` finish; caller holds
         ``_store_lock``."""
-        for base_key in keys:
-            for req_id in self._store_key_waiters.pop(base_key, set()):
-                pending = self._request_pending_store_keys.get(req_id)
-                if pending is None:
-                    continue
-                pending.discard(base_key)
-                if not pending:
-                    del self._request_pending_store_keys[req_id]
+        self._store_completion.release(keys)
 
     def _note_store_skip(
         self, base_key: str, exc: Exception, what: str = "packed save"

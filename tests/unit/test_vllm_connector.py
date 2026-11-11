@@ -24,6 +24,7 @@ from maru_vllm.connector import (
     _get_knob,
     _parse_size,
     _step_chunks,
+    _StoreCompletion,
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
@@ -4064,10 +4065,10 @@ class TestWriteBehindStoreLifecycle:
 
     @staticmethod
     def _reserve(worker, key="k1", req_ids=("r1",)):
-        worker._pending_store_keys.add(key)
-        worker._store_key_waiters[key] = set(req_ids)
+        worker._store_completion.pending.add(key)
+        worker._store_completion.key_waiters[key] = set(req_ids)
         for req_id in req_ids:
-            worker._request_pending_store_keys.setdefault(req_id, set()).add(key)
+            worker._store_completion.request_keys.setdefault(req_id, set()).add(key)
 
     def test_finished_request_waits_until_all_keys_complete(self):
         worker = self._make_worker()
@@ -4092,7 +4093,7 @@ class TestWriteBehindStoreLifecycle:
 
         assert worker.get_finished_saving(set()) == {"r1"}
         assert "k1" not in worker._stored_keys
-        assert worker._pending_store_keys == set()
+        assert worker._store_completion.pending == set()
 
     def test_shared_key_releases_all_waiters(self):
         worker = self._make_worker()
@@ -4129,7 +4130,7 @@ class TestWriteBehindStoreLifecycle:
 
         worker._handler.free.assert_called_once_with(handle)
         assert worker._stored_keys == set()
-        assert worker._pending_store_keys == set()
+        assert worker._store_completion.pending == set()
 
     def test_unconfirmed_copy_keeps_handle_and_request_blocks(self):
         """The D2H may still read the request's GPU blocks and write the page:
@@ -4145,8 +4146,22 @@ class TestWriteBehindStoreLifecycle:
 
         worker._handler.free.assert_not_called()
         worker._handler.batch_store.assert_not_called()
-        assert worker._pending_store_keys == set()
+        assert worker._store_completion.pending == set()
         assert worker.get_finished_saving(set()) is None
+
+    def test_one_store_per_key_and_held_requests_never_finish(self):
+        stores = _StoreCompletion()
+        assert stores.reserve_or_join("k", {"r1"})
+        assert not stores.reserve_or_join("k", {"r2"})  # joins the queued store
+        assert stores.take_ready({"r1", "r2"}) == set()
+        # The copy could not be waited for: its requests keep their blocks
+        assert stores.hold(["k"]) == {"r1", "r2"}
+        stores.discard_pending("k")
+        # A later store of the key finishes only its own requests
+        assert stores.reserve_or_join("k", {"r3"})
+        stores.release(["k"])
+        assert stores.take_ready({"r3"}) == {"r3"}
+        assert stores.take_ready(set()) == set()
 
     def test_preemption_drains_store_stream_before_block_reuse(self):
         from maru_vllm.connector import MaruConnectorMetadata
@@ -4793,8 +4808,8 @@ class TestPackedStorage:
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
         assert set(store) == set(chunk_keys)
         assert kernel[0].multi_layer_kv_transfer.call_count == len(chunk_keys)
-        assert worker._pending_store_keys == set()
-        assert worker._request_pending_store_keys == {}
+        assert worker._store_completion.pending == set()
+        assert worker._store_completion.request_keys == {}
         worker.shutdown()
 
     def test_kv2ltd_slab_scatter_contract(self):

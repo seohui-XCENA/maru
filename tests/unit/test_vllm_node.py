@@ -785,9 +785,9 @@ def wait_on(worker, req_id: str, *keys: str) -> None:
     """``req_id`` waits for the write-behind stores of ``keys``."""
     with worker._store_lock:
         for key in keys:
-            worker._pending_store_keys.add(key)
-            worker._store_key_waiters.setdefault(key, set()).add(req_id)
-            worker._request_pending_store_keys.setdefault(req_id, set()).add(key)
+            worker._store_completion.pending.add(key)
+            worker._store_completion.key_waiters.setdefault(key, set()).add(req_id)
+            worker._store_completion.request_keys.setdefault(req_id, set()).add(key)
 
 
 def test_a_failed_write_wait_keeps_its_pages_and_blocks():
@@ -797,7 +797,7 @@ def test_a_failed_write_wait_keeps_its_pages_and_blocks():
     wait_on(worker, "r", "k")
     worker._finish_write_behind_store(FailedWait(), ["k"], [page()], [])
     worker._handler.free.assert_not_called()
-    assert "k" not in worker._pending_store_keys
+    assert "k" not in worker._store_completion.pending
     assert worker.get_finished_saving({"r"}) is None
 
 
@@ -838,7 +838,7 @@ def test_an_abandoned_batch_waits_for_its_copies(ended):
     worker._abandon_write_behind(
         Done() if ended else FailedWait(), ["k"], [handle], [], []
     )
-    assert "k" not in worker._pending_store_keys
+    assert "k" not in worker._store_completion.pending
     if ended:
         worker._handler.free.assert_called_once_with(handle)
         assert worker.get_finished_saving({"r"}) == {"r"}
@@ -1195,15 +1195,31 @@ def test_write_behind_releases_requests_once_their_blocks_are_read():
     worker._write_behind = True
     future = Future()  # MaruServer has not answered
     worker._handler.store_async.return_value = future
-    worker._store_key_waiters["k"] = {"r1"}
-    worker._request_pending_store_keys["r1"] = {"k"}
-    worker._pending_store_keys.add("k")
+    worker._store_completion.key_waiters["k"] = {"r1"}
+    worker._store_completion.request_keys["r1"] = {"k"}
+    worker._store_completion.pending.add("k")
     worker._handler.has_local.return_value = False
     worker._finish_write_behind_store(None, ["k"], ["handle"], [])
     assert worker.get_finished_saving({"r1"}) == {"r1"}
     assert worker._store_pending("k")  # not stored again meanwhile
     future.set_result([True])
     assert not worker._store_pending("k")
+
+
+def test_a_request_joining_after_the_copy_waits_for_the_commit():
+    """The copy's own waiters finish once their blocks are read; a request
+    that joins the key afterwards finishes with MaruServer's answer."""
+    worker = pinning_worker()
+    worker._write_behind = True
+    future = Future()
+    worker._handler.store_async.return_value = future
+    wait_on(worker, "r1", "k")
+    worker._finish_write_behind_store(None, ["k"], ["handle"], [])
+    with worker._store_lock:
+        assert not worker._store_completion.reserve_or_join("k", {"r2"})
+    assert worker.get_finished_saving({"r1", "r2"}) == {"r1"}
+    future.set_result([True])
+    assert worker.get_finished_saving(set()) == {"r2"}
 
 
 def test_shutdown_waits_a_bounded_time_for_maruserver(fake, node, workers, monkeypatch):
