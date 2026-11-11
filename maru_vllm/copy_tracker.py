@@ -66,7 +66,8 @@ class CopyTracker:
             if record.state != _OPEN:
                 return False
             record.state = _CONFIRMED
-            record.owner = record.proof = None
+        # Outside the lock: an owner's finalizer may register a copy
+        record.owner = record.proof = None
         return True
 
     def keep(self, record: CopyRecord, error: BaseException | None = None) -> bool:

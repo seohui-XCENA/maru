@@ -3,8 +3,10 @@
 copy kernel over the staging buffer (design note 3.11)."""
 
 import contextlib
+import gc
 import itertools
 import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -524,6 +526,78 @@ def test_a_cxl_load_that_cannot_be_waited_for_stops_the_worker(monkeypatch):
         worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
     assert not worker._failed_load_blocks
     assert _stopped(worker)
+
+
+def test_a_failed_copy_ahead_wait_keeps_every_queued_batch(monkeypatch):
+    """A side-stream copy could not be waited for: the earlier batch, still
+    queued, keeps its leases too."""
+    alive = []
+
+    class Lease:
+        def __init__(self, view):
+            self.view = view
+
+    class Unknown:
+        def synchronize(self):
+            raise RuntimeError("CUDA error")
+
+    def setup(worker, ops, stream):
+        read = worker._batch_retrieve_all
+
+        def retrieve(keys, **route):
+            leases = [Lease(info.view) for info in read(keys, **route)]
+            alive.extend(weakref.ref(lease) for lease in leases)
+            return leases
+
+        injects = []
+
+        def inject(*args, copied_ahead=None, **kwargs):
+            injects.append(1)
+            if len(injects) == 2:
+                copied_ahead.add(Unknown())  # staged, then failed unlinked
+                raise RuntimeError("stage failed")
+            return False
+
+        worker._batch_retrieve_all = retrieve
+        worker._loader_kernel_ctx = lambda *a: None  # injects copied ahead
+        worker._inject_slab_layers = inject
+
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=setup)
+    gc.collect()
+    assert len(alive) == 2 and all(ref() is not None for ref in alive)
+    assert "release 1" not in log
+    assert _stopped(worker)
+
+
+@pytest.mark.parametrize("during", ["read", "copy"])
+def test_a_leased_load_ends_at_its_next_batch_once_another_stops(monkeypatch, during):
+    """Another load stopped the worker: a batch read since goes back unqueued,
+    and the queued batch keeps its slot."""
+    log = []
+
+    def setup(worker, ops, stream):
+        def stop(*args, **kwargs):
+            worker._stop_on_unconfirmed_load("other", RuntimeError("CUDA error"))
+
+        if during == "copy":
+            ops.multi_layer_kv_transfer.side_effect = stop
+            return
+        read = worker._batch_retrieve_all
+
+        def retrieve(keys, **route):
+            infos = read(keys, **route)
+            if "read 1" in log:
+                stop()
+            return infos
+
+        worker._batch_retrieve_all = retrieve
+
+    worker, _ = _pipelined(monkeypatch, log, setup=setup)
+    assert ("read 1" in log) == (during == "read") and "read 2" not in log
+    assert log.count("release 1") == (during == "read")
+    (kept,) = worker._copies.kept
+    assert len(kept.owner[0]) == 1  # batch 0, still queued
 
 
 def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):

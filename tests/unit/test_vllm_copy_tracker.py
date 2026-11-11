@@ -50,6 +50,26 @@ def test_a_kept_owner_outlives_its_tracker():
     assert alive() is not None
 
 
+def test_an_owner_released_last_may_register_a_copy():
+    """Its finalizer runs outside the tracker's lock."""
+    tracker = CopyTracker()
+    registered = []
+
+    class Finalized:
+        def __del__(self):
+            registered.append(tracker.register(Owner()))
+
+    record = tracker.register(Finalized())
+    done = threading.Event()
+
+    def confirm():
+        tracker.confirm(record, True)
+        done.set()
+
+    threading.Thread(target=confirm, daemon=True).start()
+    assert done.wait(5) and len(registered) == 1
+
+
 def test_a_wait_and_a_keep_racing_settle_a_record_once():
     for _ in range(50):
         tracker = CopyTracker()

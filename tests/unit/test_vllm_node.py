@@ -2472,19 +2472,35 @@ def test_a_failed_chunk_keeps_its_page_until_the_batch_copies_end(monkeypatch, e
     worker.shutdown()
 
 
-def test_a_failed_credit_copy_keeps_its_page_slab_and_room():
-    """The first gather ended, so the request's blocks went back; the copy
-    from its device slab to the page did not."""
+@pytest.mark.parametrize("queued", [True, False])
+def test_a_failed_credit_copy_keeps_its_page_slab_and_room_once_queued(
+    monkeypatch, queued
+):
+    """The first gather ended, so the request's blocks went back. A copy from
+    the device slab to the page that failed may still write it; one that
+    never started gives both back."""
     worker = write_behind_worker()
     slab = torch.zeros(4)
     worker._deferred_bytes = 16
-    short = SimpleNamespace(buf=memoryview(bytearray(8)))  # the copy fails
-    worker._handler.alloc.return_value = short
+    if queued:
+        handle = SimpleNamespace(buf=memoryview(bytearray(16)))
+
+        def failed(*args, **kwargs):
+            raise RuntimeError("CUDA error")
+
+        monkeypatch.setattr(torch.Tensor, "copy_", failed)
+    else:
+        handle = SimpleNamespace(buf=memoryview(bytearray(8)))  # too short
+    worker._handler.alloc.return_value = handle
     worker._store_after_credit(worker._handler, [("k", slab, {})])
-    worker._handler.free.assert_not_called()
-    assert worker._deferred_bytes == 16
-    owner = worker._copies.kept[0].owner
-    assert owner[0] is short and owner[1] is slab
+    if queued:
+        worker._handler.free.assert_not_called()
+        assert worker._deferred_bytes == 16
+        owner = worker._copies.kept[0].owner
+        assert owner[0] is handle and owner[1] is slab
+    else:
+        worker._handler.free.assert_called_once_with(handle)
+        assert worker._deferred_bytes == 0 and not worker._copies.kept
 
 
 # =============================================================================

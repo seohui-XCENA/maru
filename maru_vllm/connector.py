@@ -6073,10 +6073,19 @@ class MaruWorkerConnector:
             if settle(True):
                 self._fail_deferred_load(rest)
 
+        def keep_pending() -> None:
+            """Keep the batches whose copies are not confirmed ended."""
+            if pending:
+                self._keep_unconfirmed(list(pending), req_ids=req_meta.req_id)
+                pending.clear()
+
         b = 0
         batches = 0
         try:
             while b < len(chunk_keys):
+                if self._load_stopped is not None:
+                    keep_pending()
+                    return
                 n = min(step, len(chunk_keys) - b)
                 if pending:
                     # The batches still copying hold their slots: wait for
@@ -6109,6 +6118,10 @@ class MaruWorkerConnector:
                         "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
                     )
                     fail(rest)
+                    return
+                if self._load_stopped is not None:
+                    handler.release_retrieved(infos)  # never queued
+                    keep_pending()
                     return
                 queued = False
                 try:
@@ -6153,10 +6166,12 @@ class MaruWorkerConnector:
                                     req_meta.req_id,
                                     e,
                                 )
-                            # _load_packed already kept what it could not wait for
-                            if isinstance(
-                                e, _UnconfirmedLoadError
-                            ) or not self._drain_load_stream(
+                            # _load_packed kept this batch; the earlier ones
+                            # are not confirmed either
+                            unconfirmed = isinstance(e, _UnconfirmedLoadError)
+                            if unconfirmed:
+                                keep_pending()
+                            if unconfirmed or not self._drain_load_stream(
                                 stream, req_meta.req_id, [infos, list(pending)]
                             ):
                                 # Keep the slots, as a copy may still read them
@@ -8660,6 +8675,8 @@ class MaruWorkerConnector:
                         logger.error(
                             "Maru write-behind prepare error: %s: %s", base_key, e
                         )
+                    # Its waiters may finish now: a queued gather of this chunk
+                    # only reads their blocks into staging that is discarded
                     if handle is not None and self._node_mode:
                         dropped.append(handle)  # freed once the batch's copies end
                     elif handle is not None:
@@ -8881,10 +8898,10 @@ class MaruWorkerConnector:
                     wait_s=0.0 if hurry else max(0.0, deadline - time.monotonic()),
                     **route,
                 )
+                page = torch.frombuffer(handle.buf[:nbytes], dtype=slab.dtype)
+                page = page.view(slab.shape)
                 record = self._copies.register((handle, slab, handler), base_key)
-                torch.frombuffer(handle.buf[:nbytes], dtype=slab.dtype).view(
-                    slab.shape
-                ).copy_(slab)
+                page.copy_(slab)
             except Exception as e:
                 if isinstance(e, CreditUnavailableError):
                     self._set_credit_drought(True)
