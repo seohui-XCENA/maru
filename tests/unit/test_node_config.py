@@ -117,7 +117,7 @@ class TestExamples:
     def test_budget_defaults(self):
         b = parse_node_config(GPU_NODE).budgets
         # credit comes from the DRAM and, short of it, the CXL tier
-        assert b.credit_total_max_bytes == int((64 + 256) * G * 0.10)
+        assert b.credit_total_max_bytes == int((64 + 256) * G * 0.25)
         assert b.credit_max_bytes == b.credit_total_max_bytes
         assert (b.credit_refill_low, b.credit_refill_high) == (4 * 32 * M, 16 * 32 * M)
         # what waits for its commit came from credit
@@ -149,7 +149,7 @@ class TestExamples:
         raw = with_tier(GPU_NODE, 1, credit_fallback=False)
         c = parse_node_config(raw)
         assert c.tiers[1].credit_fallback is False
-        assert c.budgets.credit_total_max_bytes == int(64 * G * 0.10)
+        assert c.budgets.credit_total_max_bytes == int(64 * G * 0.25)
         traits = c.traits()
         assert not traits[PoolKind.CXL].credit_fallback
 
@@ -382,13 +382,13 @@ class TestReviewEdges:
     def test_small_top_tier_starts_with_defaults(self):
         raw = edit(GPU_NODE, tiers=[{"store": "dram", "size": "4G"}])
         b = parse_node_config(raw).budgets
-        # 10% of 4 GiB is 409.6 MiB: 12 whole pages of 32 MiB per connection
-        assert b.credit_total_max_bytes == int(4 * G * 0.10)
-        assert b.credit_max_bytes == 12 * 32 * M
-        assert b.credit_refill_high == b.credit_max_bytes
+        # 25% of 4 GiB is 1 GiB: 32 pages of 32 MiB, 16 of them at hand
+        assert b.credit_total_max_bytes == G
+        assert b.credit_max_bytes == 32 * 32 * M
+        assert b.credit_refill_high == 16 * 32 * M
 
     def test_top_tier_too_small_for_one_page_names_the_defaults(self):
-        raw = edit(GPU_NODE, tiers=[{"store": "dram", "size": "256M"}])
+        raw = edit(GPU_NODE, tiers=[{"store": "dram", "size": "64M"}])
         rejects(raw, "defaults")
 
     def test_cpu_is_read_as_dram(self):

@@ -42,7 +42,10 @@ CREDIT_MAX_PAGES = 16
 # A worker's credit cap is at least this much: one vLLM step of an 8B model
 # stores about 512 MiB, which small pages must not split into credit waits
 CREDIT_MAX_MIN_BYTES = 512 << 20
-CREDIT_TOTAL_FRACTION = 0.10
+# Node credit: the credit tiers' share that may be out being written at once.
+# Above one step (2 GiB for an 8B model at 16384 tokens) on a 16 GiB DRAM;
+# a step asks only for what it stores, so the rest stays cache
+CREDIT_TOTAL_FRACTION = 0.25
 CREDIT_REFILL_LOW_FRACTION = 0.25
 TRANSFER_RESERVE_FRACTION = 0.05
 DEFAULT_FETCH_REQUEST_MAX = 1 << 30
