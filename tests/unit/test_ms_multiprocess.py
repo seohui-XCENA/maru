@@ -282,8 +282,8 @@ def test_cli_serves_and_closes_on_sigterm(fake, sockdir, agents):
 
 def test_cli_fails_clearly_without_huge_pages(fake, sockdir):
     huge = dram.default_huge_page_size() or 2 << 20
-    if dram._meminfo().get("HugePages_Free", 0) * huge >= 8 * huge:
-        pytest.skip("this host has free huge pages")
+    if dram._meminfo().get("HugePages_Total", 0) >= 8:
+        pytest.skip("this host reserves huge pages: a shortage is waited out")
     raw = _raw_config(fake, f"{sockdir}/h.sock", hugepage=True, size=8 * huge)
     raw["page_size"] = huge
     raw["budgets"] = {

@@ -141,18 +141,23 @@ class RegionHolds:
                 self._count[key] += 1
                 return access
             # A drop still queued is not needed any more (NODE_HOLD of the
-            # same holder again is harmless)
-            self.unholds.take_back(key)
-            access = client.node_hold(
-                dax.node_id,
-                dax.node_epoch,
-                dax.handle,
-                name,
-                boot_id=who.boot_id,
-                pid=who.pid,
-                pid_start=who.pid_start,
-                pid_ns=who.pid_ns,
-            )
+            # same holder again is harmless); queued again if the hold fails
+            taken = self.unholds.take_back(key)
+            try:
+                access = client.node_hold(
+                    dax.node_id,
+                    dax.node_epoch,
+                    dax.handle,
+                    name,
+                    boot_id=who.boot_id,
+                    pid=who.pid,
+                    pid_start=who.pid_start,
+                    pid_ns=who.pid_ns,
+                )
+            except BaseException:
+                if taken is not None:
+                    self.unholds.put(key, *taken)
+                raise
             self._count[key] = 1
             return access
 

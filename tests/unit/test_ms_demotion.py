@@ -15,7 +15,15 @@ import pytest
 from maru_common.config import MaruConfig
 from maru_common.node_protocol import Budgets
 from maru_common.protocol import CommitResponse, MessageType
-from maru_common.storage_types import Key, Location, PoolInfo, PoolKind, Status
+from maru_common.storage_types import (
+    ItemOutcome,
+    ItemResult,
+    Key,
+    Location,
+    PoolInfo,
+    PoolKind,
+    Status,
+)
 from maru_handler import MaruHandler
 from maru_handler.client import pool_maps
 from maru_handler.storage.cpu import CpuPool
@@ -917,3 +925,38 @@ def test_credit_of_a_pool_the_worker_did_not_map_goes_back(
         what="the CXL credit back",
     )
     assert node.pools.held_bytes(incarnation) <= PAGE
+
+
+def _stale(response):
+    response.items = [ItemOutcome(ItemResult.STALE)] * len(response.items)
+    return response
+
+
+def test_an_unknown_finalize_move_result_ends_the_run(fake, nodes, handlers):
+    node = nodes(low=0.0625)
+    h = handlers(node)
+    fake.rewrite_responses(MessageType.FINALIZE_MOVE, _stale)
+    put_until_the_run_ends(node, h)
+    assert node.wait_finished(10)
+    assert "FINALIZE_MOVE" in node.ended and node.new_run
+    assert node.manager.move_results["UNKNOWN"] >= 1
+
+
+def test_an_unknown_commit_result_of_a_demoted_copy_ends_the_run(fake, nodes, handlers):
+    node = nodes(low=0.0625)
+    h = handlers(node)
+    first: list = []
+
+    def stale_copies(response):
+        # Only the COMMIT of demoted copies: those carry a finalizer
+        request = fake.requests(MessageType.COMMIT)[-1]
+        if request.items[0].finalizer:
+            first.append(request)
+            return _stale(response)
+        return response
+
+    fake.rewrite_responses(MessageType.COMMIT, stale_copies, count=1000)
+    put_until_the_run_ends(node, h)
+    assert node.wait_finished(10) and first
+    assert "COMMIT of demoted page" in node.ended and node.new_run
+    assert not finalized(fake)

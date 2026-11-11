@@ -1453,3 +1453,116 @@ def test_an_earlier_runs_mapping_keeps_its_hold_while_it_serves_a_read(holding_r
     assert unheld(holding_rm) == ("hold", 5, "w1@e2", "e2")  # e1's stays
     client.release_retrieved([read])  # the old mapping closes
     assert unheld(holding_rm) == ("unhold", 5, "w1@e1")
+
+
+def test_a_drop_taken_back_goes_out_again_if_the_hold_fails(holding_rm):
+    from maru_handler.client import pool_maps
+    from maru_handler.client.pool_maps import PoolMaps, RegionHolder
+
+    gate = threading.Event()
+    unhold = holding_rm.unhold
+
+    def slow_unhold(handle, holder, instance):
+        assert gate.wait(5)
+        unhold(handle, holder, instance)
+
+    holding_rm.unhold = slow_unhold
+    maps = PoolMaps(pin_pools=False, holder=RegionHolder.this_process("w1"))
+    descriptor = _cxl_descriptor()
+    other = dataclasses.replace(
+        descriptor,
+        dax=dataclasses.replace(
+            descriptor.dax,
+            handle=dataclasses.replace(descriptor.dax.handle, region_id=6),
+        ),
+        pool=dataclasses.replace(descriptor.pool, pool_id=cxl_pool_id(DOMAIN, 6)),
+    )
+    maps.add_dax(other, "e1")
+    assert maps.remove(other.pool.pool_id)  # its drop holds up the queue
+    maps.add_dax(descriptor, "e1")
+    assert maps.remove(descriptor.pool.pool_id)  # queued behind it
+    holding_rm.refuse = OSError("RM down")
+    with pytest.raises(OSError):
+        maps.add_dax(descriptor, "e1")  # takes the drop back, then fails
+    gate.set()
+    assert pool_maps._HOLDS.unholds.flush(5)
+    dropped = [c for c in holding_rm.calls if c[0] == "unhold"]
+    assert ("unhold", 5, "w1@e1") in dropped  # sent after all
+
+
+class TestUnholds:
+    def test_each_drop_is_retried_on_its_own_schedule(self):
+        from maru_shm.unholds import Unholds
+
+        unholds = Unholds(retry_s=0.05, max_retry_s=0.2)
+        sent: list[str] = []
+        fails = {"a": 100, "b": 1}
+
+        def send(key):
+            def go():
+                sent.append(key)
+                if fails[key]:
+                    fails[key] -= 1
+                    raise ConnectionRefusedError("RM down")
+
+            return go
+
+        unholds.put("a", send("a"), "a")
+        unholds.put("b", send("b"), "b")
+        wait_until(lambda: sent.count("b") == 2, what="b retried once")
+        time.sleep(0.5)
+        assert sent.count("b") == 2  # confirmed: not sent again
+        assert 3 <= sent.count("a") <= 8  # backing off to 0.2 s, not every pass
+        assert unholds.pending() == 1
+
+    def test_a_refused_drop_is_not_sent_again(self, caplog):
+        import logging
+
+        from maru_shm.client import HoldRefusedError
+        from maru_shm.unholds import Unholds
+
+        unholds = Unholds(retry_s=0.01)
+        sent: list[int] = []
+
+        def refused():
+            sent.append(1)
+            raise HoldRefusedError("Unhold failed with status -22")
+
+        log = logging.getLogger("maru_shm.unholds")
+        log.addHandler(caplog.handler)
+        try:
+            unholds.put("k", refused, "the hold w@e1 on region 5")
+            assert unholds.flush(5)
+            time.sleep(0.1)
+        finally:
+            log.removeHandler(caplog.handler)
+        assert sent == [1] and unholds.pending() == 0
+        notes = {id(r) for r in caplog.records if "not sent again" in r.getMessage()}
+        assert len(notes) == 1
+
+    def test_a_drop_taken_back_is_warned_about_afresh(self, caplog):
+        import logging
+
+        from maru_shm.unholds import Unholds
+
+        unholds = Unholds(retry_s=0.01, max_retry_s=0.01)
+        fails = [2]
+
+        def flaky():
+            if fails[0]:
+                fails[0] -= 1
+                raise ConnectionRefusedError("RM down")
+
+        log = logging.getLogger("maru_shm.unholds")
+        log.addHandler(caplog.handler)
+        try:
+            unholds.put("k", flaky, "the drop")
+            wait_until(lambda: fails[0] == 1, what="one failure")
+            unholds.take_back("k")
+            fails[0] = 1
+            unholds.put("k", flaky, "the drop")
+            assert unholds.flush(5)
+        finally:
+            log.removeHandler(caplog.handler)
+        warnings = {id(r) for r in caplog.records if "could not drop" in r.getMessage()}
+        assert len(warnings) == 2  # once before the take-back, once after

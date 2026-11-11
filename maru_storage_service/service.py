@@ -18,13 +18,14 @@ claimed the node, the run leaves and no new run starts.
 import logging
 import mmap
 import threading
+import time
 import uuid
 from collections.abc import Callable
 
 from maru_common.storage_types import CloseMode, PoolKind, RmDomain, run_holder
 from maru_shm.client import MaruShmClient
 
-from .config import NodeConfig, NodeConfigError
+from .config import NodeConfig, NodeConfigError, TierConfig
 from .drivers.cxl import (
     DEFAULT_RENEW_S,
     OWN_HOLDER,
@@ -33,7 +34,7 @@ from .drivers.cxl import (
     RegionSource,
     map_region,
 )
-from .drivers.dram import DramDriver, DramPool
+from .drivers.dram import DramDriver, DramPool, DramPoolError
 from .local_pin import LocalPins
 from .local_server import LocalServer
 from .op_ledger import OP_WINDOW
@@ -54,8 +55,19 @@ logger = logging.getLogger(__name__)
 
 # How long a leave waits for the workers to unmap the CXL regions
 DEFAULT_UNMAP_TIMEOUT_S = 30.0
-# Pause between a run that ended and the next one
+# Pause between a run that ended and the next one, doubled up to the max for
+# runs that end soon after they start
 NEW_RUN_PAUSE_S = 1.0
+NEW_RUN_PAUSE_MAX_S = 60.0
+# A run at least this long resets the pause
+NEW_RUN_RESET_S = 300.0
+# How long a stopped node waits for a run's teardown
+STOP_WAIT_S = 30.0
+# A DRAM pool that does not fit is tried again, this often (doubled up to the
+# max), and logged this often
+DRAM_RETRY_S = 1.0
+DRAM_RETRY_MAX_S = 30.0
+DRAM_LOG_S = 30.0
 
 
 class NotServableError(RuntimeError):
@@ -124,6 +136,10 @@ class StorageService:
         # Why the run ended on its own, and whether a new run follows
         self.ended: str | None = None
         self.new_run = False
+        # An earlier run of this process may still have its pool mapped
+        self.later_run = False
+        # Why tearing the run down failed: nothing may run after it
+        self.teardown_failed: str | None = None
         self._interrupted = threading.Event()
         self._finished = threading.Event()
         # One stop at a time, and never while a start is half done
@@ -168,6 +184,8 @@ class StorageService:
         size, high, low = top.size, top.high_watermark, top.low_watermark
         if size is None or high is None or low is None:  # parsing sets them
             raise NodeConfigError(f"the {top.store} tier needs size and watermarks")
+        if self._interrupted.is_set():
+            raise ServerStopped()
         # Claim the socket first: a second start must fail before NODE_OPEN
         self.local = LocalServer(
             config.socket,
@@ -184,12 +202,7 @@ class StorageService:
         self.local.claim()
         dram_tier = config.tier("dram")
         if dram_tier is not None:
-            self.dram = DramDriver().create(
-                dram_tier,
-                node_id=config.node_id,
-                node_epoch=self.node_epoch,
-                page_size=config.page_size,
-            )
+            self.dram = self._create_dram(dram_tier)
         cxl_tier = config.tier("cxl")
         if cxl_tier is not None:
             # Before NODE_OPEN: only regions this run owns are announced
@@ -342,6 +355,35 @@ class StorageService:
                 len(adopted_ids & {p.pool_id for p in cxl_pools}),
             )
 
+    def _create_dram(self, tier: TierConfig) -> DramPool:
+        """The run's memfd. Memory that ran short may come free once workers
+        unmap an earlier run's pool: tried again with a backoff until it fits
+        or the run is stopped, as is any failure of a later run in this
+        process."""
+        pause, logged = DRAM_RETRY_S, None
+        while True:
+            try:
+                return DramDriver().create(
+                    tier,
+                    node_id=self.config.node_id,
+                    node_epoch=self.node_epoch,
+                    page_size=self.config.page_size,
+                )
+            except DramPoolError as e:
+                if not (e.short or self.later_run):
+                    raise
+                now = time.monotonic()
+                if logged is None or now - logged >= DRAM_LOG_S:
+                    logged = now
+                    logger.warning(
+                        "cannot allocate the dram pool yet; workers may still map "
+                        "the pool of an earlier run. Trying again: %s",
+                        e,
+                    )
+            if self._interrupted.wait(pause):
+                raise ServerStopped("stopped while waiting for the dram pool")
+            pause = min(pause * 2, DRAM_RETRY_MAX_S)
+
     def _map_for_transfers(self, engine: TransferEngine) -> None:
         """The node's own mappings of its pools, for demotion copies. A
         region it cannot map takes no demotions."""
@@ -419,7 +461,9 @@ class StorageService:
                 return
             self.ended, self.new_run = reason, new_run
         logger.warning("run %s ends (%s): %s", self.node_epoch, mode.value, reason)
-        threading.Thread(target=self.stop, args=(mode,), name="maru-run-end").start()
+        threading.Thread(
+            target=self.stop, args=(mode,), name="maru-run-end", daemon=True
+        ).start()
 
     def stop(self, mode: CloseMode = CloseMode.RESTART) -> None:
         """Stop serving, then NODE_CLOSE (restart: back soon; leave: gone)."""
@@ -428,9 +472,14 @@ class StorageService:
                 return
             self._stopped.set()
         self.interrupt()
-        with self._lifecycle:  # a start still running gives up first
-            self._teardown(mode)
-        self._finished.set()
+        try:
+            with self._lifecycle:  # a start still running gives up first
+                self._teardown(mode)
+        except Exception as e:
+            self.teardown_failed = f"{type(e).__name__}: {e}"
+            logger.exception("tearing run %s down failed", self.node_epoch)
+        finally:
+            self._finished.set()
 
     def _teardown(self, mode: CloseMode) -> None:
         if self.transfers is not None:
@@ -507,56 +556,106 @@ class StorageService:
 class Node:
     """Runs of the node's StorageService, one after another in this process:
     a run that ends on its own and asks for a new one is followed by a new
-    run with a new node_epoch. Workers re-attach to it as after a process
-    restart."""
+    run with a new node_epoch, after a pause that grows while runs end soon
+    after they start. Workers re-attach to it as after a process restart."""
 
     def __init__(
         self,
         config: NodeConfig,
         make_service: Callable[[NodeConfig], StorageService] = StorageService,
         pause_s: float = NEW_RUN_PAUSE_S,
+        max_pause_s: float = NEW_RUN_PAUSE_MAX_S,
     ):
         check_servable(config)
         self.config = config
         self._make_service = make_service
         self.pause_s = pause_s
+        self.max_pause_s = max_pause_s
         self._stop = threading.Event()
-        self._lock = threading.Lock()
         self.service: StorageService | None = None
         self.runs = 0
         # Why the last run ended on its own
         self.ended: str | None = None
+        # A run's teardown failed: no run follows, the process must exit
+        self.failed: str | None = None
 
     def stop(self) -> None:
-        """End the current run with restart and start no other; any thread."""
+        """End the current run with restart and start no other; any thread,
+        a signal handler too (no lock)."""
         self._stop.set()
-        with self._lock:
-            service = self.service
+        service = self.service
         if service is not None:
             service.interrupt()
 
     def run(self) -> bool:
-        """Serve until stop() (True) or until another run claimed the node
-        (False). A start that fails raises."""
+        """Serve until stop() (True), or until no run may follow (False):
+        another run claimed the node, or a teardown failed (``failed``). A
+        start that fails otherwise raises."""
+        pause = self.pause_s
         while True:
-            with self._lock:
-                if self._stop.is_set():
-                    return True
-                service = self.service = self._make_service(self.config)
-                self.runs += 1
+            if self._stop.is_set():
+                return True
+            service = self._make_service(self.config)
+            service.later_run = self.runs > 0
+            self.service = service
+            self.runs += 1
+            if self._stop.is_set():  # stop() may have missed it
+                service.interrupt()
+            started = time.monotonic()
             try:
                 service.start()
             except ServerStopped:
                 pass  # stopped, or the run ended during its start
+            except Exception as e:
+                if self._claimed_elsewhere(service, str(e)):
+                    return False
+                raise
             while not self._stop.wait(0.1) and not service.wait(0):
                 pass
             if service.ended is None:
-                service.stop(CloseMode.RESTART)
+                # Stopped: torn down on a thread, waited for up to STOP_WAIT_S
+                threading.Thread(
+                    target=service.stop,
+                    args=(CloseMode.RESTART,),
+                    name="maru-run-stop",
+                    daemon=True,
+                ).start()
+            if not self._finished(service):
                 return True
-            service.wait_finished()
-            self.ended = service.ended
-            if not service.new_run:
+            if service.teardown_failed is not None:
+                self.failed = service.teardown_failed
+                logger.error("no new run: the teardown failed (%s)", self.failed)
                 return False
-            logger.warning("starting a new run after: %s", service.ended)
-            if self._stop.wait(self.pause_s):
+            if service.ended is None:
                 return True
+            self.ended = service.ended
+            if not service.new_run or self._claimed_elsewhere(service, service.ended):
+                return False
+            if self._stop.is_set():
+                return True
+            if time.monotonic() - started >= NEW_RUN_RESET_S:
+                pause = self.pause_s
+            logger.warning(
+                "starting a new run in %.1f s after: %s", pause, service.ended
+            )
+            if self._stop.wait(pause):
+                return True
+            pause = min(pause * 2, self.max_pause_s)
+
+    def _finished(self, service: StorageService) -> bool:
+        """Wait for the run's teardown; once stopped, for STOP_WAIT_S more."""
+        deadline = None
+        while not service.wait_finished(0.1):
+            if self._stop.is_set():
+                deadline = deadline or time.monotonic() + STOP_WAIT_S
+                if time.monotonic() >= deadline:
+                    logger.error("the run's teardown did not end; stopping anyway")
+                    return False
+        return True
+
+    def _claimed_elsewhere(self, service: StorageService, reason: str) -> bool:
+        """Another run claimed the node in the RM: never claim it back."""
+        if service.cxl is None or not service.cxl.claimed_elsewhere:
+            return False
+        self.ended = f"another run claimed the node ({reason})"
+        return True

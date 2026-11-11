@@ -20,6 +20,8 @@ EXIT_NOT_SERVING = 3
 EXIT_START = 4
 # Another run claimed the node in the RM; never claimed back from here
 EXIT_LOST = 5
+# A run could not be torn down: no run may follow it in this process
+EXIT_FAILED = 6
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,11 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
         ) as e:
             print(f"maru-storage: cannot start: {e}", file=sys.stderr)
             return EXIT_START
+        if node.failed is not None:
+            print(
+                f"maru-storage: a run's teardown failed: {node.failed}", file=sys.stderr
+            )
+            return EXIT_FAILED
         print(f"maru-storage: stopped: {node.ended}", file=sys.stderr)
         return EXIT_LOST
     finally:

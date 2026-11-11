@@ -301,8 +301,10 @@ class CxlTier:
                     self.node_id, self.node_epoch, self.tier.region_size
                 )
             except StaleNodeEpochError as e:
+                if not isinstance(e, NodeLeaseExpiredError):
+                    self.claimed_elsewhere = True
                 raise CxlTierError(
-                    f"RM {self.tier.rm}: another run claimed the node: {e}"
+                    f"RM {self.tier.rm}: this run no longer owns the node: {e}"
                 ) from e
             except (OSError, RuntimeError) as e:
                 logger.warning(

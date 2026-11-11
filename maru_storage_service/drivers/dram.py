@@ -22,7 +22,12 @@ _MEMINFO = "/proc/meminfo"
 
 
 class DramPoolError(RuntimeError):
-    """The DRAM pool could not be created as configured."""
+    """The DRAM pool could not be created as configured. ``short``: memory
+    ran short, and may come free (an earlier run's pool still mapped)."""
+
+    def __init__(self, message: str, short: bool = False):
+        super().__init__(message)
+        self.short = short
 
 
 def dram_pool_id(node_id: str, node_epoch: str) -> str:
@@ -134,10 +139,13 @@ def create_dram_pool(
                     f"cannot get {capacity // huge} huge pages of {huge} bytes for "
                     f"the dram pool ({capacity} bytes): HugePages_Free is "
                     f"{info.get('HugePages_Free', 'unknown')}. Reserve huge pages "
-                    "(vm.nr_hugepages) or set hugepage to false"
+                    "(vm.nr_hugepages) or set hugepage to false",
+                    # Short only if the reserved huge pages could hold it
+                    short=info.get("HugePages_Total", 0) * huge >= capacity,
                 ) from e
             raise DramPoolError(
-                f"cannot allocate the dram pool ({capacity} bytes): {e}"
+                f"cannot allocate the dram pool ({capacity} bytes): {e}",
+                short=e.errno in (errno.ENOSPC, errno.ENOMEM),
             ) from e
         # No holder of the fd may resize it under the others' mappings
 
