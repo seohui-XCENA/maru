@@ -410,6 +410,7 @@ vllm serve <model> \
 - Each worker gets credit for what one vLLM step may store, which it computes from `max_num_batched_tokens`, `max_num_seqs`, `maru_kv_chunk_tokens` and the storage format and tells the node when it attaches; at least 16 pages or 512 MiB, whichever is more, and within the node's total credit (`budgets.credit_total_max_bytes`). A `budgets.credit_max_bytes` in the node config sets it for every worker instead. A store that finds no credit is skipped, except that with `maru_async_store` a chunk waits up to a second for some (at most 256 MiB of such chunks per worker, kept on the GPU); a layerwise chunk becomes readable with all its layers or not at all.
 - A worker refills its credit up to its cap once it falls below a quarter of it, so a worker alone on a node may keep up to `credit_total_max_bytes` (default 10% of the top tier) credited but unused, which the cache cannot use meanwhile; lower `credit_total_max_bytes` or `credit_max_bytes` to keep less. One step may also bring the stores waiting for MaruServer's commit to `commit_pending_max_bytes` (default 5% of the top tier): no worker gets new credit until a commit round lands.
 - A load whose KV is unavailable (MaruServer or the node down) or gone is computed again; the connector logs both counts apart when it shuts down.
+- Foreground PROBE and LOOKUP_AND_PIN calls wait up to `maru_lookup_timeout_ms` (default 100 ms). A timeout counts as `probe_unavailable` or `retrieve_unavailable`; further calls miss without an RPC until a heartbeat recovers. The resolver resends an unresolved lookup with the same op and releases any late pins. Heartbeats, session opens, unpins, node calls and background work keep the 2 s client timeout.
 - MaruServer and the StorageService may restart while vLLM runs. A MaruServer started again at the same address knows no KV: every key is computed again, and each node starts a new run in the same process (a new DRAM pool; its CXL regions are reused once no access of the earlier run is left). A restarted StorageService starts with an empty DRAM tier and keeps the CXL KV MaruServer still lists. Either way the workers attach to the new run without a vLLM restart; one it refuses (its page is now too small) logs an error and runs without Maru until vLLM restarts.
 - Only a single `dram` tier is served so far.
 
@@ -420,6 +421,8 @@ Settings in `kv_connector_extra_config`:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `maru_node` | str | unset | Socket of the node's StorageService; set, the connector takes the node path (see above) and the storage settings below are refused |
+| `maru_lookup_timeout_ms` | int | `100` | With `maru_node`: foreground PROBE and LOOKUP_AND_PIN timeout in milliseconds |
+| `maru_credit_wait_ms` | float | `0` | With `maru_node`: total credit wait per step in milliseconds; `0` never waits |
 | `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
 | `maru_pool_size` | str/int | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, etc.): its first allocation, and each further one when its memory is full; required with `remote_cxl`, where each allocation is one region |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |

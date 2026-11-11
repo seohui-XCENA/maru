@@ -51,6 +51,7 @@ class MaruConfig:
     chunk_size_bytes: int = 1024 * 1024  # 1MB default
     auto_connect: bool = True
     timeout_ms: int = 2000  # Socket timeout in milliseconds
+    lookup_timeout_ms: int = 100  # Foreground PROBE and LOOKUP_AND_PIN timeout
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
@@ -108,7 +109,7 @@ class MaruConfig:
     store_timeout_s: float = 10.0
     # maru_node: how long a step's stores wait in all for the credit the
     # step asked for when it started (0: never)
-    credit_wait_s: float = 0.02
+    credit_wait_s: float = 0.0
     # maru_node: how long the first connect waits for the node to listen
     node_connect_timeout_s: float = 30.0
     # maru_node: this worker's data-parallel index and tensor-parallel rank
@@ -144,6 +145,8 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
+        if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
+            raise ValueError("lookup_timeout_ms must be a positive integer")
         if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
             raise ValueError(
                 "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"

@@ -1452,7 +1452,8 @@ def _create_node_handler(
         step_objects=0
         if metadata_only
         else int(extra_config.get("_maru_step_objects", 0)),
-        credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 20)) / 1000,
+        credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 0)) / 1000,
+        lookup_timeout_ms=int(extra_config.get("maru_lookup_timeout_ms", 100)),
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)

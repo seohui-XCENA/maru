@@ -214,6 +214,24 @@ def test_remote_cxl_settings_and_missing_identity_are_refused():
     assert _validate_storage_config(node_extra()) is False  # not a session backend
 
 
+@pytest.mark.parametrize("metadata_only", [False, True])
+@pytest.mark.parametrize("custom", [False, True])
+def test_lookup_timeout_and_credit_wait_config(monkeypatch, metadata_only, custom):
+    import maru
+
+    handler_class = MagicMock()
+    monkeypatch.setattr(maru, "MaruHandler", handler_class)
+    extra = node_extra()
+    if custom:
+        extra.update(maru_lookup_timeout_ms=250, maru_credit_wait_ms=20)
+    handler = connector_module._create_node_handler(extra, metadata_only, False)
+    config = handler_class.call_args.args[0]
+    assert config.lookup_timeout_ms == (250 if custom else 100)
+    assert config.credit_wait_s == (0.02 if custom else 0)
+    assert config.timeout_ms == 2000
+    handler.connect.assert_called_once_with(wait=False)
+
+
 def node_vllm_config(tp_size: int = 1, total_heads: int = 8, **parallel):
     config = remote_vllm_config(
         tp_size,

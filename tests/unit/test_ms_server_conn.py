@@ -10,15 +10,17 @@ import time
 
 import pytest
 
-from maru_common.ms_rpc import OpOrigin
+from maru_common.ms_rpc import OpOrigin, RpcUnknownError
 from maru_common.protocol import (
     LookupAndPinResponse,
     MessageType,
     ProbeResponse,
+    UnpinResponse,
+    WorkerCloseResponse,
     WorkerHeartbeatResponse,
     WorkerOpenResponse,
 )
-from maru_common.storage_types import Key, SessionRole, Status
+from maru_common.storage_types import ItemOutcome, ItemResult, Key, SessionRole, Status
 from maru_handler.client import server_conn
 from maru_handler.client.server_conn import ServerConn, WorkerIdentity
 from tests.unit.ms_node_helpers import wait_until
@@ -37,7 +39,7 @@ def make_conn(call, *, heartbeat_s: float = 30.0) -> ServerConn:
         node_epoch="node",
         pid=os.getpid(),
         pid_start=1,
-        timeout_s=0.1,
+        timeout_s=2.0,
         role=SessionRole.WORKER,
     )
     conn.session, conn.server_epoch, conn.session_node_epoch = "s1", "old", "node"
@@ -164,7 +166,7 @@ def test_lookups_and_probes_miss_without_an_rpc_while_a_reopen_is_due(op):
 def test_an_epoch_to_a_foreground_op_never_waits_for_the_reopen(op):
     gate, entered, open_threads = threading.Event(), threading.Event(), []
 
-    def call(code, request):
+    def call(code, request, timeout_s=None):
         if code == MessageType.WORKER_OPEN:
             open_threads.append(threading.current_thread().name)
             entered.set()
@@ -193,3 +195,49 @@ def test_an_epoch_to_a_foreground_op_never_waits_for_the_reopen(op):
         gate.set()
         conn.close(goodbye=False)
     assert open_threads == ["maru-worker-heartbeat"]
+
+
+def test_only_foreground_calls_use_the_lookup_timeout():
+    calls = []
+
+    def call(code, request, timeout_s=None):
+        calls.append((code, conn._rpc.timeout_s if timeout_s is None else timeout_s))
+        if code == MessageType.WORKER_OPEN:
+            return opened("s1", "old")
+        if code == MessageType.PROBE:
+            return ProbeResponse(status=Status.OK, items=[ItemOutcome(ItemResult.MISS)])
+        if code == MessageType.LOOKUP_AND_PIN:
+            if timeout_s is not None:
+                raise RpcUnknownError("slow lookup")
+            return LookupAndPinResponse(
+                status=Status.OK, items=[ItemOutcome(ItemResult.HIT, pin_id="pin")]
+            )
+        if code == MessageType.WORKER_HEARTBEAT:
+            return WorkerHeartbeatResponse(status=Status.OK)
+        if code == MessageType.UNPIN:
+            return UnpinResponse(status=Status.OK, items=[ItemOutcome(ItemResult.OK)])
+        assert code == MessageType.WORKER_CLOSE
+        return WorkerCloseResponse(status=Status.OK)
+
+    conn = make_conn(call)
+    try:
+        conn.open()
+        assert conn.probe(KEYS) is not None
+        assert conn.lookup_and_pin(KEYS) is None
+        assert conn.down and conn.unresolved_lookups() == 1
+        assert conn.heartbeat_once()
+        conn._resolve_lookups()
+        assert conn.late_hits == 1 and conn.unresolved_lookups() == 0
+        assert conn._flush_unpins()
+        assert conn.close()
+    finally:
+        conn._rpc.close()
+    assert calls == [
+        (MessageType.WORKER_OPEN, 2.0),
+        (MessageType.PROBE, 0.1),
+        (MessageType.LOOKUP_AND_PIN, 0.1),
+        (MessageType.WORKER_HEARTBEAT, 2.0),
+        (MessageType.LOOKUP_AND_PIN, 2.0),
+        (MessageType.UNPIN, 2.0),
+        (MessageType.WORKER_CLOSE, 2.0),
+    ]

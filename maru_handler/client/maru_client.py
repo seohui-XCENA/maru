@@ -264,6 +264,7 @@ class MaruClient:
                 pid=response.pid,
                 pid_start=response.pid_start,
                 timeout_s=self.rpc_timeout_s,
+                lookup_timeout_s=self.config.lookup_timeout_ms / 1000,
                 role=self.role,
             )
             server.on_server_epoch.append(self._server_epoch_changed)
@@ -399,6 +400,7 @@ class MaruClient:
                         pid=info.pid,
                         pid_start=info.pid_start,
                         timeout_s=self.rpc_timeout_s,
+                        lookup_timeout_s=self.config.lookup_timeout_ms / 1000,
                         role=self.role,
                     )
                     server.on_server_epoch.append(self._server_epoch_changed)

@@ -17,6 +17,7 @@ class MaruConfig:
     chunk_size_bytes: int = 1_048_576  # 1MB
     auto_connect: bool = True
     timeout_ms: int = 2000
+    lookup_timeout_ms: int = 100
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
@@ -44,6 +45,8 @@ class MaruConfig:
 | `chunk_size_bytes` | `int` | `1_048_576` (1MB) | Page size for paged allocation (bytes) |
 | `auto_connect` | `bool` | `True` | Connect automatically on `MaruHandler.__init__` |
 | `timeout_ms` | `int` | `2000` | RPC socket timeout in milliseconds |
+| `lookup_timeout_ms` | `int` | `100` | With `maru_node`: foreground PROBE and LOOKUP_AND_PIN timeout in milliseconds; recovery, node and background calls keep `timeout_ms` |
+| `credit_wait_s` | `float` | `0.0` | With `maru_node`: how long a step's stores wait in total for requested credit; `0` never waits |
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
 | `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
@@ -152,6 +155,8 @@ vllm serve <model> --kv-transfer-config '{
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
+| `maru_lookup_timeout_ms` | `int` | `100` | With `maru_node`: foreground PROBE and LOOKUP_AND_PIN timeout; all other calls keep the 2000 ms client timeout |
+| `maru_credit_wait_ms` | `float` | `0` | With `maru_node`: total credit wait per step in milliseconds; `0` never waits |
 | `maru_pool_size` | `str \| int` | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, or integer bytes): its first allocation, and each further one when its memory is full. Required with `remote_cxl`, where each allocation is one region; `cpu` and `mixed` use `maru_cpu_pool_size` and `maru_cxl_pool_size` |
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |

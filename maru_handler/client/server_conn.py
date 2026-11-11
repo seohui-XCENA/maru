@@ -76,6 +76,7 @@ class ServerConn:
         pid: int,
         pid_start: int,
         timeout_s: float,
+        lookup_timeout_s: float = 0.1,
         role: SessionRole = SessionRole.WORKER,
     ):
         self.url = url
@@ -87,6 +88,7 @@ class ServerConn:
         self.pid = pid
         self.pid_start = pid_start
         self._rpc = MsRpcClient(url, timeout_s=timeout_s, name=f"maru-{role.value}-rpc")
+        self._lookup_timeout_s = lookup_timeout_s
         self._lock = threading.RLock()
         # One WORKER_OPEN at a time, from request to applied response; the
         # stale-node callback may reopen from inside one (same thread)
@@ -454,7 +456,9 @@ class ServerConn:
         for _ in range(2):
             try:
                 response: LookupAndPinResponse = self._rpc.call(
-                    MessageType.LOOKUP_AND_PIN, request
+                    MessageType.LOOKUP_AND_PIN,
+                    request,
+                    timeout_s=None if background else self._lookup_timeout_s,
                 )
             except RpcUnknownError as e:
                 logger.warning("LOOKUP_AND_PIN op %d: result unknown (%s)", seq, e)
@@ -570,6 +574,7 @@ class ServerConn:
             response: ProbeResponse = self._rpc.call(
                 MessageType.PROBE,
                 ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
+                timeout_s=self._lookup_timeout_s,
             )
         except RpcUnknownError as e:
             self._set_down(True, e)

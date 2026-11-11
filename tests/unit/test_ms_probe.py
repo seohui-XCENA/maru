@@ -314,6 +314,83 @@ class TestProbeHandler:
         assert any("fill 12% of the node's" in line for line in said)
 
 
+class TestLookupTimeout:
+    @pytest.mark.parametrize("probe", [False, True])
+    def test_a_150ms_reply_misses_at_100ms_and_recovers(self, fake, handlers, probe):
+        worker = handlers(timeout_ms=2000)
+        assert put(worker, "here")
+        handler = handlers(timeout_ms=2000, metadata_only=True) if probe else worker
+        conn = handler._cpu.server_conn
+        code = MessageType.PROBE if probe else MessageType.LOOKUP_AND_PIN
+        counter = "probe_unavailable" if probe else "retrieve_unavailable"
+        call = handler.batch_exists if probe else handler.batch_retrieve
+        miss = [False] if probe else [None]
+        fake.delay(code, 0.15)
+        fake.delay(MessageType.WORKER_HEARTBEAT, 0.15)
+        fake.delay(MessageType.UNPIN, 0.15)
+
+        started = time.monotonic()
+        assert call(["here"]) == miss
+        elapsed = time.monotonic() - started
+        assert 0.08 <= elapsed < 0.15
+        assert conn.down
+        assert handler.get_stats()["maru_node"]["counters"][counter] == 1
+        sent = len(fake.requests(code))
+        started = time.monotonic()
+        assert call(["here"]) == miss
+        assert time.monotonic() - started < 0.05
+        assert len(fake.requests(code)) == sent == 1
+        assert handler.get_stats()["maru_node"]["counters"][counter] == 2
+
+        wait_until(lambda: not conn.down, what="heartbeat recovery")
+        if probe:
+            assert conn.unresolved_lookups() == 0
+            assert fake.pin_count() == 0
+        else:
+            wait_until(lambda: conn.unresolved_lookups() == 0, what="lookup resolved")
+            wait_until(lambda: fake.pin_count() == 0, what="late pin released")
+            assert conn.late_hits == 1
+            first, resent = fake.requests(code)
+            assert first.op == resent.op
+            assert fake.executed[code] == fake.replayed[code] == 1
+        fake.delay(code, 0)
+        if probe:
+            assert call(["here"]) == [True]
+        else:
+            reads = call(["here"])
+            assert bytes(reads[0].view) == b"here"
+            handler.release_retrieved(reads)
+
+    @pytest.mark.parametrize("wait", [False, True])
+    @pytest.mark.parametrize("lookup_ms", [None, 250])
+    def test_config_reaches_both_connection_paths(self, node, wait, lookup_ms):
+        options = {} if lookup_ms is None else {"lookup_timeout_ms": lookup_ms}
+        config = MaruConfig(
+            maru_node=node.config.socket,
+            engine_id="eng",
+            cache_namespace=NS,
+            chunk_size_bytes=PAGE,
+            pin_pools=False,
+            auto_connect=False,
+            **options,
+        )
+        assert config.credit_wait_s == 0
+        handler = MaruHandler(config)
+        try:
+            handler.connect(wait=wait)
+            client = handler._cpu
+            assert client.wait_connected(5)
+            assert client.rpc_timeout_s == client.server_conn._rpc.timeout_s == 2
+            assert client.server_conn._lookup_timeout_s == (lookup_ms or 100) / 1000
+        finally:
+            handler.close()
+
+    @pytest.mark.parametrize("value", [0, -1, True, 0.5])
+    def test_invalid_lookup_timeout_is_rejected(self, value):
+        with pytest.raises(ValueError, match="lookup_timeout_ms"):
+            MaruConfig(lookup_timeout_ms=value)
+
+
 class TestRankIdentity:
     def test_ranks_share_the_engine_id_and_name_their_ranks(self, fake, node, handlers):
         ranks = [handlers(dp_index=1, tp_rank=rank) for rank in range(2)]
@@ -512,15 +589,19 @@ class TestStepCredit:
         wait_until(lambda: h._cpu.credits.unused_bytes == 30 * PAGE, timeout=2)
         assert h._cpu._credit_kind is None
 
-    @pytest.mark.parametrize("delay, stored", [(0.005, 30), (0.3, 16)])
+    @pytest.mark.parametrize(
+        "delay, credit_wait_s, stored",
+        [(0.005, 0.02, 30), (0.3, 0.02, 16), (0.3, None, 16)],
+    )
     def test_a_store_waits_a_little_for_its_steps_credit(
-        self, step_node, handlers_on, monkeypatch, delay, stored
+        self, step_node, handlers_on, monkeypatch, delay, credit_wait_s, stored
     ):
         """The step's CREDIT answers late: a store past the credit at hand
         waits for it, at most credit_wait_s in the whole step."""
         from maru_handler.client import CreditUnavailableError
 
-        h = handlers_on(step_node)
+        options = {} if credit_wait_s is None else {"credit_wait_s": credit_wait_s}
+        h = handlers_on(step_node, **options)
         wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
         real = step_node.manager.credit
 
