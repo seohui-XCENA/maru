@@ -591,3 +591,34 @@ def test_memory_quarantine_cap_answers_stage_with_quarantine(staged_env, cap):
     assert refused.staging is None
     assert (refused.reason, refused.limit) == (MissReason.BUSY, RoomLimit.QUARANTINE)
     assert state(env.memory, answer.staging) == PageState.QUARANTINED
+
+
+def test_a_stage_whose_connection_ends_misses_at_once(routed):
+    env = routed
+    calls = observe_unstages(env)
+    node = env.remote._nodes[0]
+    with hold_loads(env) as (entered, release):
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            start = time.monotonic()
+            fetch = pool.submit(env.reader.fetch, "staged", deadline_ms=5000)
+            wait_until(lambda: entered, what="STAGE loading")
+            node.conn.close()  # the stream ends with the STAGE unanswered
+            answer = fetch.result(3).items[0]
+        assert time.monotonic() - start < 2.5  # not the 5 s deadline
+        assert answer.result == ItemResult.MISS
+        assert calls and calls[0][1] == TransferEnd.NOT_POSTED
+        release.set()
+        # Reconnected to the same run: the replayed STAGE's page is freed
+        wait_until(
+            lambda: env.remote.ready(node.node_id) and node.conn is not None,
+            what="reconnected",
+        )
+        wait_until(
+            lambda: (
+                not env.memory.peer_ops._staged
+                and not env.memory.peer_ops._staging_bytes[env.remote.origin]
+            ),
+            what="staging page freed",
+        )
+    wait_until(lambda: settled(env.gpu, env.gate.server), what="MISS cleanup")
+    assert pins(env.gate.server, "staged", env.source) == 0

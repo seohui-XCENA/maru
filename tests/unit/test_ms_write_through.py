@@ -4,8 +4,11 @@ tier is copied to the tier below at once (no finalizer, the source stays),
 copies chain through tiers, the in-flight cap skips, and pressure later
 only finalizes the source onto its copy."""
 
+import collections
 import shutil
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -232,4 +235,43 @@ def test_a_skipped_page_is_demoted_back_later(fake, env):
     assert n.manager.through_results["SKIPPED"] >= 1
     assert n.manager.through_results["COMMIT:ADDED"] == 0
     assert n.manager.move_results["COMMIT:ADDED"] >= 3  # back demotion copied
+    n.pools.check()
+
+
+def test_pressure_never_writes_a_source_whose_copy_is_in_flight(fake, env, monkeypatch):
+    node, handler, ssd_dir = env
+    n = node([dram(through_max_inflight=PAGE), ssd(ssd_dir)])
+    # Room for one copy in flight: a demotion write slot stays free
+    n.manager._through_inflight["dram"] = PAGE - len(value_of("k0"))
+    tier = n.tier("ssd")
+    real = tier.submit_store
+    gate = threading.Event()
+    writes: collections.Counter = collections.Counter()
+
+    def slow(src, dst, *, refs, callback=None, **kwargs):
+        first = not writes
+        writes[refs[0]] += 1
+        if not first:
+            return real(src, dst, refs=refs, callback=callback, **kwargs)
+
+        def later(result):  # the first copy stays in flight until the gate
+            threading.Thread(target=lambda: (gate.wait(10), callback(result))).start()
+
+        return real(src, dst, refs=refs, callback=later, **kwargs)
+
+    monkeypatch.setattr(tier, "submit_store", slow)
+    h = handler(n)
+    keys = [f"k{i}" for i in range(10)]  # past the high watermark
+    for key in keys:
+        assert put(h, key)
+    wait_until(lambda: n.manager.move_results["RETIRED"] >= 3, what="pressure moved")
+    time.sleep(0.3)  # more eviction passes under pressure meanwhile
+    assert n.manager.through_results["SKIPPED"] >= 1
+    assert max(writes.values()) == 1
+    gate.set()
+    wait_until(lambda: not n.manager._through_active, what="copies settled")
+    assert max(writes.values()) == 1  # also the copied source: finalized
+    assert n.manager.move_results["COPY_FAILED"] == 0
+    for key in keys:
+        assert fake.locations(Key(NS, key))
     n.pools.check()

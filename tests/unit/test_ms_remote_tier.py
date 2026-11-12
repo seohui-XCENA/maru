@@ -663,3 +663,52 @@ def test_writes_per_memory_node_are_bounded(gpu, memory):
     assert gpu.tier.reserve([Key("ns", "deep")]) == [None]
     node.writes = 0
     assert gpu.tier.reserve([Key("ns", "deep")]) != [None]
+
+
+def test_drain_waits_for_an_end_callback_running_elsewhere(fake, memory):
+    g = Gpu(fake, [memory.url], timeout_s=0.1)
+    try:
+        g.wait_ready()
+        [credit] = g.tier.reserve([Key("ns", "busy")])
+        g.tier.transport.stall()
+        in_end, release, ended = threading.Event(), threading.Event(), []
+
+        def end(result):  # the poller runs it past timeout_s
+            in_end.set()
+            release.wait(10)
+            ended.append(result)
+
+        g.tier.submit_store(
+            Span(LOCAL, 0, PAGE),
+            credit,
+            refs=(PageRef(LOCAL, 0, 1), None),
+            callback=end,
+        )
+        assert in_end.wait(10)
+        drained = threading.Event()
+        threading.Thread(target=lambda: (g.tier.drain(), drained.set())).start()
+        assert not drained.wait(0.3)  # its callback has not returned yet
+        release.set()
+        assert drained.wait(10) and len(ended) == 1
+    finally:
+        g.tier.transport.stall(False)
+        g.tier.transport.finish_stalled()
+        g.close()
+
+
+def test_a_lost_connection_is_told_at_once_and_made_again(fake, memory, gpu):
+    lost = []
+    gpu.tier.on_lost(lost.append)
+    old_epoch = gpu.tier._nodes[0].node_epoch
+    memory.node.stop()  # its end of the stream closes
+    wait_until(lambda: lost == ["mem1"], timeout=2, what="told")
+    assert not gpu.tier.ready("mem1")
+    assert gpu.tier.reserve([Key("ns", "x")]) == [None]
+    memory.start()
+    wait_until(
+        lambda: gpu.tier.ready("mem1") and gpu.tier._nodes[0].node_epoch != old_epoch,
+        timeout=15,
+        what="connected to the new run",
+    )
+    [credit] = gpu.tier.reserve([Key("ns", "y")])
+    assert store(gpu, 0, credit, 3).ok

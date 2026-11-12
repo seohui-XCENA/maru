@@ -443,6 +443,9 @@ class _Remote(RemoteTier):
     def ready(self, node_id):
         return False
 
+    def on_lost(self, callback):
+        pass
+
     def owner(self, pool_id):
         return None
 

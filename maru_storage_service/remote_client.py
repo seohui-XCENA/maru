@@ -44,6 +44,7 @@ class RemoteConnection:
         self._lock = threading.Lock()
         self._pending: dict[int, tuple[int, Reply]] = {}
         self._closed = threading.Event()
+        self._on_close: list[Callable[[], None]] = []
         self._reader = threading.Thread(
             target=self._read_loop, name="maru-remote-client", daemon=True
         )
@@ -149,6 +150,15 @@ class RemoteConnection:
             raise result[0]
         return result[0]
 
+    def on_close(self, callback: Callable[[], None]) -> None:
+        """``callback`` once the stream ends, after the pending callbacks
+        (at once if it has ended)."""
+        with self._lock:
+            if not self.closed:
+                self._on_close.append(callback)
+                return
+        self._closed_hook(callback)
+
     def close(self) -> None:
         """Close the stream and fail all pending callbacks exactly once."""
         self._fail(ConnectionError("remote connection closed"))
@@ -162,12 +172,20 @@ class RemoteConnection:
         except Exception:
             logger.debug("remote callback failed", exc_info=True)
 
+    @staticmethod
+    def _closed_hook(hook: Callable[[], None]) -> None:
+        try:
+            hook()
+        except Exception:
+            logger.debug("remote close hook failed", exc_info=True)
+
     def _fail(self, error: ConnectionError) -> None:
         with self._lock:
             if self.closed:
                 return
             self._closed.set()
             pending, self._pending = self._pending, {}
+            closing, self._on_close = self._on_close, []
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -175,6 +193,8 @@ class RemoteConnection:
         self._sock.close()
         for _, callback in pending.values():
             self._reply(callback, error)
+        for hook in closing:
+            self._closed_hook(hook)
 
     def _read_loop(self) -> None:
         try:

@@ -182,7 +182,11 @@ class PeerOps:
                 )
             self._lost.discard(origin)
             # Its staging pages count in its credit cap too
-            cap = self.pools.budgets.credit_max_bytes - self._staging_bytes[origin]
+            cap = (
+                self.pools.budgets.credit_max_bytes
+                - self._staging_bytes[origin]
+                - self.pools.held_bytes(origin)
+            )
             want = min(request.pages * self.page_size, max(0, cap))
             credits = (
                 self.pools.credit(origin, want, self.manager.credit_tiers)

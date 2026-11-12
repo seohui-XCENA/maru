@@ -367,3 +367,40 @@ def test_a_refused_op_keeps_the_credits_ttl(node):
     assert ops.sweep() == 1
     assert state(node, credit) == PageState.QUARANTINED
     check(node)
+
+
+def test_staging_and_credits_together_stay_within_the_credit_cap(fake):
+    root = short_tmpdir()
+    service = memory_node(fake, root, Parts([]), ssd=True)
+    try:
+        key = Key("ns", "cap")
+        ops, seqs = service.peer_ops, Seqs()
+        cap = service.pools.budgets.credit_max_bytes
+        [credit] = reserve(ops, A, 1, seqs).credits
+        write_done(ops, A, [written(credit, key)], seqs)
+        free = service.pools.bytes_in(PageState.FREE, credit.pool_id)
+        service.manager.want_room("dram", free + PAGE)
+        ssd = service.tier("ssd").pool.pool_id
+        wait_until(
+            lambda: [loc.pool_id for loc in fake.locations(key)] == [ssd],
+            what="SSD source",
+        )
+        source = fake.locations(key)[0]
+        answer = call(
+            ops.stage,
+            A,
+            StageRequest(seqs.op(A), 1, key, source, 5000),
+            time.monotonic() + 5,
+        )
+        assert answer.staging is not None
+        # Staging, then credits up to the cap, then none
+        got = reserve(ops, A, 2, seqs).credits
+        assert len(got) == cap // PAGE - 1
+        assert reserve(ops, A, 1, seqs).credits == []
+        assert service.pools.held_bytes(A) + ops._staging_bytes[A] == cap
+        call(ops.unstage, A, UnstageRequest(seqs.op(A), 1, TransferEnd.DONE))
+        assert len(reserve(ops, A, 1, seqs).credits) == 1
+        check(service)
+    finally:
+        service.stop()
+        remove_tree(root)

@@ -435,7 +435,7 @@ class StorageService:
         if l2 and not self.memory:
             # Workers fetch local SSD and remote memory pages into the top tier
             assert self.transfers is not None
-            self.manager.fetches = FetchManager(
+            fetches = FetchManager(
                 self.manager,
                 sources=self.transfers.l2_pools(),
                 node_id=config.node_id,
@@ -444,6 +444,9 @@ class StorageService:
                 request_max_bytes=config.budgets.fetch_request_max_bytes,
                 inflight_max_bytes=config.budgets.fetch_max_inflight_bytes,
             )
+            self.manager.fetches = fetches
+            for remote in self._remote_tiers():
+                remote.on_lost(fetches.node_lost)
         leases = [t for t in tiers.values() if isinstance(t, Leased)]
         # The tier of each pool this run opens: adopted ones are among them
         announced = [(n, i) for n, t in tiers.items() for i in self._listed(t)]

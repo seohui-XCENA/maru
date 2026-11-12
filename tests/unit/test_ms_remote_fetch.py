@@ -336,3 +336,28 @@ def test_only_an_unreferenced_transfer_page_can_be_quarantined(env):
     assert pools.page(ref).state == PageState.FREE
     assert loader.budgets.fetch_request_max_bytes == 11 * PAGE
     pools.check()
+
+
+def test_a_read_from_a_lost_memory_node_misses_at_once(env, monkeypatch):
+    pair, names, make_loader = env
+    name = names[0]
+    loader = make_loader()
+    reads = Reads(pair, monkeypatch)
+    pair.remote.transport.stall()
+    start = time.monotonic()
+    reply = loader.send(loader.request(loader.items(name), deadline_ms=5000))
+    assert reads.entered.wait(2)
+    pair.memory.stop()  # its stream ends; the READ stays posted
+    answer = reply.result(2).items[0]
+    assert time.monotonic() - start < 2.5  # not the 5 s deadline
+    assert answer.result == ItemResult.MISS
+    assert answer.reason == MissReason.OFFLINE
+    assert pair.gpu.manager.fetches.results["node_lost"] == 1
+    assert pair.gpu.manager.fetches.flights() == 0  # no one joins it
+    # The posted READ still ends its own way (the peer went: ERR, kept)
+    dest = reads.tickets[0].dst
+    pair.remote.transport.stall(False)
+    pair.remote.transport.finish_stalled()
+    wait_until(lambda: pair.gpu.pools.io_refs(dest) == 0, what="the read ended")
+    assert pair.gpu.pools.page(dest).state == PageState.QUARANTINED
+    pair.gpu.pools.check()

@@ -103,6 +103,11 @@ class _Waiter:
     index: int
 
 
+def _waiting(waiter: _Waiter) -> bool:
+    """Its item has no outcome yet (its op may wait for other items)."""
+    return not waiter.op.answered and waiter.op.outcomes[waiter.index] is None
+
+
 @dataclass(eq=False)
 class _Flight:
     """One read of a key and the requests waiting for it."""
@@ -451,14 +456,32 @@ class FetchManager:
             return _miss(MissReason.ABSENT)
         return ref, tier.io_size(plan.bytes)
 
+    def node_lost(self, node_id: str) -> None:
+        """The connection to memory node ``node_id`` ended: the waiters of
+        reads from it miss now (OFFLINE) and no one joins those flights;
+        each still ends its own way (its page, pin and STAGE)."""
+        with self._lock:
+            lost = [
+                f
+                for f in self._flights.values()
+                if f.source_node == node_id and f.source_ref is None and not f.cached
+            ]
+            waiters: list[_Waiter] = []
+            for flight in lost:
+                del self._flights[flight.key]
+                waiters += [flight.leader, *flight.waiters]
+                flight.waiters = []
+            if lost:
+                self.results["node_lost"] += len(lost)
+        for waiter in waiters:
+            self._resolve(waiter, _miss(MissReason.OFFLINE))
+
     # ------------------------------------------------------------- outcomes
 
     def _live(self, flight: _Flight) -> bool:
         """A waiter of the flight is still unanswered."""
         with self._lock:
-            return not flight.leader.op.answered or any(
-                not w.op.answered for w in flight.waiters
-            )
+            return any(_waiting(w) for w in (flight.leader, *flight.waiters))
 
     def _resolve(self, waiter: _Waiter, outcome: ItemOutcome) -> None:
         op = waiter.op
@@ -631,7 +654,7 @@ class FetchManager:
         """The latest deadline of the flight's unanswered waiters (0: none)."""
         with self._lock:
             waiters = [flight.leader, *flight.waiters]
-            return max((w.op.deadline for w in waiters if not w.op.answered), default=0)
+            return max((w.op.deadline for w in waiters if _waiting(w)), default=0)
 
     def destinations(self) -> list[str]:
         """The top tier's pools copies go to: those that give credit (workers

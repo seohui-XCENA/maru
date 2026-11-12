@@ -16,7 +16,7 @@ import functools
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -249,6 +249,9 @@ class StorageManager:
         # NO_ROOM, COPY_FAILED, COMMIT:<result>)
         self._through: collections.deque[PageRef] = collections.deque()
         self._through_inflight: collections.Counter[str] = collections.Counter()
+        # Sources whose write-through copy is not settled yet (in flight, or
+        # ended with its result not applied): no demotion of them
+        self._through_active: set[PageRef] = set()
         self.through_results: collections.Counter[str] = collections.Counter()
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
@@ -904,6 +907,14 @@ class StorageManager:
         room wait for the tier below to evict (it ran first in this pass);
         while the tier (``pools``) is past its high watermark they are dropped
         instead: writes must not stall."""
+        with self._lock:
+            busy = {r for r in refs if r in self._through_active}
+        if busy:  # their copy below is on its way: finalized onto it later
+            self.placement.release(list(busy), backoff=False)
+            kept = [(r, i) for r, i in zip(refs, items, strict=True) if r not in busy]
+            refs, items = [r for r, _ in kept], [i for _, i in kept]
+            if not refs:
+                return
         if below in self.remote:
             self._demote_remote(name, pools, self.remote[below], refs, items)
             return
@@ -1081,6 +1092,13 @@ class StorageManager:
         if move.through is not None:
             self._through_inflight[move.through] -= move.source.length
 
+    def _through_settled(self, moves: Iterable[_Move | _RemoteMove]) -> None:
+        """Caller holds the lock: these copies' results are being applied
+        on the eviction thread, before its demotions run."""
+        for move in moves:
+            if move.through is not None:
+                self._through_active.discard(move.src)
+
     # ------------------------------------------------- demotion to memory nodes
 
     def _demote_remote(
@@ -1156,6 +1174,7 @@ class StorageManager:
             self._remote_writing += 1
             if move.through is not None:
                 self._through_inflight[move.through] += move.source.length
+                self._through_active.add(move.src)
         try:
             self.transfers.submit_io(
                 Copy(move.source, move.dest, move.source.length),
@@ -1168,6 +1187,7 @@ class StorageManager:
             with self._lock:
                 self._remote_writing -= 1
                 self._through_ended(move)
+                self._through_settled([move])
             self._count(move, "COPY_FAILED")
             self.pools.io_release([move.src])
             logger.debug("cannot write %s to a memory node: %s", move.src, e)
@@ -1202,6 +1222,7 @@ class StorageManager:
         with self._lock:
             done = list(self._remote_written)
             self._remote_written.clear()
+            self._through_settled(m for m, _ in done)
             settled = list(self._remote_settled)
             self._remote_settled.clear()
         if not (done or settled) or not self.remote:
@@ -1485,6 +1506,7 @@ class StorageManager:
                 self._writing += 1
                 if move.through is not None:
                     self._through_inflight[move.through] += move.source.length
+                    self._through_active.add(move.src)
             try:
                 self.transfers.submit_io(
                     Copy(move.source, move.dest_location, move.source.length),
@@ -1496,6 +1518,7 @@ class StorageManager:
                 with self._lock:
                     self._writing -= 1
                     self._through_ended(move)
+                    self._through_settled([move])
                 self.pools.io_release([move.src, move.dest])
                 logger.debug("cannot write %s below: %s", move.src, e)
                 self._io_result(move.dest.pool_id, e)
@@ -1516,6 +1539,7 @@ class StorageManager:
         with self._lock:
             done = list(self._written)
             self._written.clear()
+            self._through_settled(m for m, _ in done)
         if not done:
             return
         for move, ticket in done:

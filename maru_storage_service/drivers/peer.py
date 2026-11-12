@@ -208,6 +208,8 @@ class _MemoryNode:
         self.credits: dict[tuple[str, int, int], int] = {}
         # WRITEs running there
         self.writes = 0
+        # Set when its connection ends (or the tier stops): ping it now
+        self.wake = threading.Event()
 
 
 class NixlRemoteTier(RemoteTier):
@@ -249,12 +251,15 @@ class NixlRemoteTier(RemoteTier):
         self._transfers: list[RemoteTransfer] = []
         # Kept, released in ERR: bytes may still land until the run ends
         self._held: list[RemoteTransfer] = []
+        # Transfers whose first end was not reported yet (its callback done)
+        self._unreported: set[RemoteTransfer] = set()
         # Local pages kept, and posted transfers running (each holds a page)
         self._kept_bytes = 0
         self._running = 0
         # NIXL peers of earlier memory runs, removed once no handle holds them
         self._stale_peers: set[str] = set()
         self._next_stage = 1  # stage_id: unique in this run
+        self._lost_callbacks: list[Callable[[str], None]] = []
         self._drained = False
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -313,6 +318,8 @@ class NixlRemoteTier(RemoteTier):
         self._stop.set()
         with self._wake:
             self._wake.notify_all()
+        for node in self._nodes:
+            node.wake.set()
         for node in self._nodes:
             conn = node.conn
             if conn is not None and node.ready:
@@ -402,7 +409,9 @@ class NixlRemoteTier(RemoteTier):
                     logger.warning("memory node %s: not ready: %s", node.url, e)
                     self._stop.wait(RECONNECT_S)
                     continue
-            if self._stop.wait(PING_S):
+            node.wake.wait(PING_S)
+            node.wake.clear()
+            if self._stop.is_set():
                 return
             self._drop_stale_peers()
             try:
@@ -442,6 +451,7 @@ class NixlRemoteTier(RemoteTier):
             conn.close()
             raise ConnectionError(f"HELLO refused: {hello.refusal} {hello.error}")
         replay = self._take_run(node, conn, hello)
+        conn.on_close(functools.partial(self._conn_lost, node, conn))
         try:
             self._load(node)
         except BaseException:
@@ -480,6 +490,8 @@ class NixlRemoteTier(RemoteTier):
         if reached and not self._probe_read(node_id, peer, reached[0]):
             raise ConnectionError(f"the probe READ of {peer} did not end DONE")
         with self._lock:
+            if node.conn is None or node.conn.closed:
+                raise ConnectionError(f"{node.url}: connection lost")
             node.ready = True
 
     def _take_run(
@@ -555,6 +567,29 @@ class NixlRemoteTier(RemoteTier):
                 with self._lock:
                     self._stale_peers.discard(peer)
 
+    def on_lost(self, callback: Callable[[str], None]) -> None:
+        with self._lock:
+            self._lost_callbacks.append(callback)
+
+    def _conn_lost(self, node: _MemoryNode, conn: RemoteConnection) -> None:
+        """A memory node's stream ended (on its reader, or ours closing it):
+        no transfer goes there until it is made anew, and those waiting on
+        that node are told now."""
+        with self._lock:
+            if node.conn is conn:
+                node.ready = False
+            node_id = node.node_id
+            callbacks = list(self._lost_callbacks)
+        node.wake.set()
+        if self._stop.is_set() or not node_id:
+            return
+        logger.warning("memory node %s (%s): connection lost", node.url, node_id)
+        for callback in callbacks:
+            try:
+                callback(node_id)
+            except Exception:
+                logger.exception("a connection-lost callback failed")
+
     def _disconnect(self, node: _MemoryNode) -> None:
         with self._lock:
             node.ready = False
@@ -587,11 +622,12 @@ class NixlRemoteTier(RemoteTier):
         *,
         resolve: bool = True,
         abandoned: Callable[[], bool] = lambda: False,
+        lost: Callable[[], None] | None = None,
     ) -> None:
         """Send an op; its answer goes to ``callback``. One whose answer is
         lost is kept to be sent again (same seq) on the next connection,
-        unless its sender abandoned it. With ``resolve`` False the sender
-        resolves the seq itself."""
+        unless its sender abandoned it; ``lost`` is told at once. With
+        ``resolve`` False the sender resolves the seq itself."""
         seq = request.op.seq
         ops = node.ops
 
@@ -600,6 +636,8 @@ class NixlRemoteTier(RemoteTier):
                 with self._lock:
                     if node.ops is ops and not abandoned():  # same memory run
                         node.unanswered[seq] = (code, request, callback)
+                if lost is not None:
+                    lost()
                 return
             if ops is not None and resolve:
                 ops.resolved(seq)
@@ -863,6 +901,7 @@ class NixlRemoteTier(RemoteTier):
 
         def expired() -> None:
             if finish(None):
+                timer.cancel()
                 self.unstage(
                     Staged(node_id, epoch, stage_id, source), TransferEnd.NOT_POSTED
                 )
@@ -870,7 +909,8 @@ class NixlRemoteTier(RemoteTier):
         timer = threading.Timer(remaining_ms / 1000.0, expired)
         timer.daemon = True
         timer.start()
-        self._send(node, RemoteMessageType.STAGE, request, answered)
+        # Its answer lost with the connection: a miss now, as at the deadline
+        self._send(node, RemoteMessageType.STAGE, request, answered, lost=expired)
 
     def unstage(self, staged: Staged, end: TransferEnd) -> None:
         """How the READ of a staging page ended; nothing if its memory run
@@ -988,6 +1028,7 @@ class NixlRemoteTier(RemoteTier):
                 settled=settled,
             )
             self._transfers.append(transfer)
+            self._unreported.add(transfer)
             self._running += 1
             if op == "WRITE":
                 node.credits.pop(_credit_key(remote), None)
@@ -1076,8 +1117,7 @@ class NixlRemoteTier(RemoteTier):
                 if node.node_id == transfer.node_id and node.writes > 0:
                     node.writes -= 1
 
-    @staticmethod
-    def _report(transfer: RemoteTransfer, action: str) -> None:
+    def _report(self, transfer: RemoteTransfer, action: str) -> None:
         callback = transfer.settled if action == "settle" else transfer.callback
         if callback is not None:
             try:
@@ -1086,13 +1126,16 @@ class NixlRemoteTier(RemoteTier):
                 logger.exception("a remote transfer's callback failed")
         if action == "end":
             transfer.done.set()
+            with self._lock:
+                self._unreported.discard(transfer)
 
     def drain(self) -> None:
         """No new transfer; returns once every one posted had its first end
-        (DONE, ERR or timeout_s) and its callback ran."""
+        (DONE, ERR or timeout_s) and its callback ran, also one whose
+        callback another thread is running now."""
         with self._lock:
             self._drained = True
-            waiting = [t for t in self._transfers if t.phase == "running"]
+            waiting = list(self._unreported)
         for transfer in waiting:
             while not transfer.done.is_set():
                 action = self._advance(transfer)
