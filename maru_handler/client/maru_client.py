@@ -15,6 +15,7 @@ only.
 """
 
 import collections
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -100,6 +101,8 @@ CLOSE_TIMEOUT_S = 5.0
 BUSY_RESEND_S = 0.2
 ATTACH_WARN_S = 30.0
 MAX_UNRESOLVED_FETCHES = 32
+# A FETCH past its deadline is answered by its scope; this bounds a lost one
+FETCH_WAIT_SLACK_S = 1.0
 
 
 def _release_view(view: memoryview) -> None:
@@ -134,11 +137,13 @@ class PinnedRead(CpuReadLease):
     key: str = ""
     pin_id: str = ""
     server_epoch: str = ""
+    # Fetched from the node's SSD: holds a slot of the fetch window
+    fetched: bool = False
 
 
 @dataclass(eq=False)
 class _FetchScope:
-    """A parked request's interest; no foreground caller uses this yet."""
+    """One FETCH of a parked load: its deadline, cancel and pending op."""
 
     request_id: str
     deadline: float
@@ -227,6 +232,8 @@ class MaruClient:
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
         self._fetch_scopes: set[_FetchScope] = set()
+        # The request a loader thread retrieves for (fetch_scope)
+        self._fetch_local = threading.local()
         self._returns: list[Location] = []
         self._connected = False
         self._closing = threading.Event()
@@ -472,7 +479,7 @@ class MaruClient:
                 )
             ],
             protocol=MS_PROTOCOL,
-            capabilities=[],
+            capabilities=[FETCH_CAPABILITY] if self.config.fetch_loads else [],
             role=self.role,
             step_objects=self.config.step_objects if self._writes else 0,
         )
@@ -1360,6 +1367,106 @@ class MaruClient:
 
     # ---------------------------------------------------------- parked fetch
 
+    @contextlib.contextmanager
+    def fetch_scope(self, request_id: str):
+        """Retrieves on this thread (a loader's, for a parked load of
+        ``request_id``) may FETCH what only the node can read. The engine
+        thread never enters one, so its retrieves never wait for a FETCH."""
+        self._fetch_local.request_id = request_id
+        try:
+            yield
+        finally:
+            self._fetch_local.request_id = None
+
+    def _fetch_window(self) -> int | None:
+        """Pages this worker's fetches may hold at once (the node's per-op
+        cap), or None when this thread fetches nothing."""
+        info = self.attach_info
+        if (
+            getattr(self._fetch_local, "request_id", None) is None
+            or not self.config.fetch_loads
+            or info is None
+            or info.budgets is None
+            or not info.page_size
+            or FETCH_CAPABILITY not in info.capabilities
+        ):
+            return None
+        return max(1, info.budgets.fetch_request_max_bytes // info.page_size)
+
+    def _fetch_used(self) -> int:
+        """Caller holds _lock: pages of FETCHes not answered yet, and fetched
+        reads not released (a read kept for an unconfirmed copy never is)."""
+        pending = sum(
+            len(request.items)
+            for scope in self._fetch_scopes
+            for request, _ in scope.pending.values()
+        )
+        return pending + sum(1 for read in self._reads if read.fetched)
+
+    def retrieve_capacity(self) -> int | None:
+        """Keys the next batch_retrieve may ask for on a loader thread that
+        fetches: the window less what it holds. None elsewhere (unbounded)."""
+        window = self._fetch_window()
+        if window is None:
+            return None
+        with self._lock:
+            return max(0, window - self._fetch_used())
+
+    def _fetch_into(
+        self,
+        server: ServerConn,
+        keys: list[str],
+        outcomes: list[ItemOutcome],
+        out: list[PinnedRead | None],
+        epoch: str,
+        node_epoch: str | None,
+    ) -> None:
+        """FETCH the keys LOOKUP planned on this node's SSD and put their
+        pinned reads in ``out``. None of them past the window (before any
+        I/O), and a miss for each item the node cannot read in time."""
+        wanted = [
+            i
+            for i, o in enumerate(outcomes)
+            if o.result == ItemResult.FETCH and o.plan is not None
+        ]
+        info = self.attach_info
+        if not wanted or info is None:
+            return
+        window = self._fetch_window()
+        with self._lock:
+            free = 0 if window is None else window - self._fetch_used()
+        if len(wanted) > free:
+            self._count("fetch_over_window", len(wanted))
+            return
+        scope = self._new_fetch_scope(self._fetch_local.request_id)
+        items = [
+            FetchItem(Key(self.identity.namespace, keys[i]), outcomes[i].plan)
+            for i in wanted
+        ]
+        reply = self._fetch(scope, items, len(items) * info.page_size)
+        try:
+            # The scope's deadline answers it; this only bounds a lost answer
+            response = reply.result(
+                max(0.0, scope.deadline - time.monotonic()) + FETCH_WAIT_SLACK_S
+            )
+        except Exception as e:
+            logger.debug("FETCH of %d keys failed: %s", len(items), e)
+            self._count("fetch_failed", len(items))
+            return
+        if response.status != Status.OK:
+            self._count(f"fetch_{response.status.value.lower()}", len(items))
+            return
+        for i, outcome in zip(wanted, response.items, strict=True):
+            if outcome.result != ItemResult.HIT:
+                self._count_miss("fetch", outcome)
+                continue
+            read = self._take_outcome(server, keys[i], outcome, epoch, node_epoch)
+            if read is not None:
+                with self._lock:
+                    read.fetched = True
+                self._count("fetch_hit")
+            out[i] = read
+
     def _new_fetch_scope(
         self, request_id: str, *, deadline_ms: int = 250
     ) -> _FetchScope:
@@ -1544,9 +1651,15 @@ class MaruClient:
             return [None] * len(keys)
         outcomes, epoch, node_epoch = answered
         out: list[PinnedRead | None] = []
+        fetch = self._fetch_window() is not None
         try:
             for key, outcome in zip(keys, outcomes, strict=True):
+                if fetch and outcome.result == ItemResult.FETCH:
+                    out.append(None)  # FETCHed below
+                    continue
                 out.append(self._take_outcome(server, key, outcome, epoch, node_epoch))
+            if fetch:
+                self._fetch_into(server, keys, outcomes, out, epoch, node_epoch)
         except BaseException:
             self.release_retrieved(out)
             for outcome in outcomes[len(out) :]:
@@ -1683,15 +1796,31 @@ class MaruClient:
                 self._count("probe_unavailable", len(batch))
                 out.extend([False] * len(batch))
                 continue
-            # Only a HIT is readable: fetching from another node is not
-            # supported yet
+            # A HIT is readable; so is a key only this node's SSD holds, when
+            # parked loads fetch it
             for outcome in outcomes:
                 if outcome.result == ItemResult.HIT:
                     self._count("probe_hit")
+                    out.append(True)
+                elif self._fetchable(outcome):
+                    self._count("probe_fetch_candidate")
+                    out.append(True)
                 else:
                     self._count_miss("probe", outcome)
-            out.extend(o.result == ItemResult.HIT for o in outcomes)
+                    out.append(False)
         return out
+
+    def _fetchable(self, outcome: ItemOutcome) -> bool:
+        """A FETCH, with fetch agreed at ATTACH. PROBE names no source; the
+        worker's node fetches only from its own SSD, so a plan elsewhere
+        (none before S7) fails that load, which recomputes."""
+        info = self.attach_info
+        return (
+            self.config.fetch_loads
+            and outcome.result == ItemResult.FETCH
+            and info is not None
+            and FETCH_CAPABILITY in info.capabilities
+        )
 
     def _count_miss(self, prefix: str, outcome: ItemOutcome) -> None:
         """Count fetch failures separately from absent and offline keys."""

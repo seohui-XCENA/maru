@@ -119,6 +119,9 @@ class MaruConfig:
     load_only: bool = False
     # maru_node: objects this worker may store in one engine step (0: unknown)
     step_objects: int = 0
+    # maru_node: parked loads may fetch what only the node reads (its SSD):
+    # asks for fetch_v1, and a scheduler probe counts such keys as found
+    fetch_loads: bool = False
 
     @property
     def server_urls(self) -> list[str]:

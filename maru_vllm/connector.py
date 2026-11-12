@@ -19,6 +19,7 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import inspect
@@ -1454,6 +1455,8 @@ def _create_node_handler(
         else int(extra_config.get("_maru_step_objects", 0)),
         credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 0)) / 1000,
         lookup_timeout_ms=int(extra_config.get("maru_lookup_timeout_ms", 100)),
+        # Parked loads fetch what only the node reads (its SSD)
+        fetch_loads=bool(_get_knob(extra_config, "maru_async_load")),
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)
@@ -4765,8 +4768,23 @@ class MaruWorkerConnector:
         queued.record(torch.cuda.current_stream(device))
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
-        self._deferred_executor.submit(self._group_load_job, req_meta, device, queued)
+        self._deferred_executor.submit(
+            self._in_fetch_scope,
+            req_meta.req_id,
+            self._group_load_job,
+            req_meta,
+            device,
+            queued,
+        )
         return True
+
+    def _in_fetch_scope(self, req_id: str, job: Callable[..., None], *args) -> None:
+        """Run a loader job whose retrieves may FETCH for ``req_id`` (only
+        the loader thread fetches; the engine thread never waits for one)."""
+        handler = self._handler
+        scope = getattr(handler, "fetch_scope", None)
+        with scope(req_id) if scope is not None else contextlib.nullcontext():
+            job(*args)
 
     def _group_load_job(
         self,
@@ -5155,7 +5173,12 @@ class MaruWorkerConnector:
             if self._leased_load(req_meta):
                 self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
         self._deferred_executor.submit(
-            self._deferred_load_job, req_meta, layers, device
+            self._in_fetch_scope,
+            req_meta.req_id,
+            self._deferred_load_job,
+            req_meta,
+            layers,
+            device,
         )
         return True
 

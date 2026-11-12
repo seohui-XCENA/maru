@@ -18,6 +18,7 @@ Example:
         result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
+import contextlib
 import logging
 import threading
 import time
@@ -1594,6 +1595,12 @@ class MaruHandler:
         """
         capacity = getattr(self._cpu, "retrieve_capacity", None)
         return capacity() if capacity is not None else None
+
+    def fetch_scope(self, request_id: str):
+        """A context in which retrieves on this thread may FETCH what only
+        the node reads in (maru_node, a parked load); a no-op elsewhere."""
+        scope = getattr(self._cpu, "fetch_scope", None)
+        return scope(request_id) if scope is not None else contextlib.nullcontext()
 
     def storage_gpu_accessible(self) -> bool:
         """Whether retrieved and allocated buffers are page-locked for the GPU.
