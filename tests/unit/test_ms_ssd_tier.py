@@ -714,6 +714,72 @@ def test_the_same_boot_adopts_the_file_and_a_reboot_empties_it(
         third.stop()
 
 
+def _maru_server():
+    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    port = _free_port()
+    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    thread = threading.Thread(target=rpc.start, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    return server, rpc, thread, f"tcp://127.0.0.1:{port}"
+
+
+def test_a_run_on_another_server_in_between_is_never_adopted(
+    sockdir, ssd_dir, handlers
+):
+    """The node leaves SSD keys at S1, runs on S2 (which reuses the extents
+    from scratch), then comes back to S1 on the same boot: S1 must not adopt
+    the file, whose extents now hold S2's keys."""
+    s1, r1, t1, u1 = _maru_server()
+    s2, r2, t2, u2 = _maru_server()
+    try:
+        a = start_node(dram_ssd(u1, sockdir, ssd_dir), host_boot_id="boot-1")
+        try:
+            h = handlers(a)
+            for i in range(10):
+                assert put(h, f"a{i}")
+            wait_until(lambda: a.manager.move_results["RETIRED"] >= 3, what="moved")
+            h.close()
+        finally:
+            a.stop(CloseMode.RESTART)
+        saved = {k: loc for i in range(10) if (loc := ssd_locations(s1, k := f"a{i}"))}
+        assert saved
+        b = start_node(dram_ssd(u2, sockdir, ssd_dir), host_boot_id="boot-1")
+        try:
+            assert b.adopted == []
+            h = handlers(b)
+            for i in range(10):
+                assert put(h, f"zz{i}")
+            wait_until(lambda: b.manager.move_results["RETIRED"] >= 3, what="moved")
+            h.close()
+        finally:
+            b.stop(CloseMode.RESTART)
+        c = start_node(dram_ssd(u1, sockdir, ssd_dir), host_boot_id="boot-1")
+        try:
+            # S2's run overwrote extents S1 still lists: never adopted
+            assert any(
+                ssd_bytes(c.ssd, loc) != value_of(k) for k, (loc,) in saved.items()
+            )
+            assert c.adopted == []
+            assert c.ssd.pool_generation == a.ssd.pool_generation + 2
+            wait_until(
+                lambda: not any(ssd_locations(s1, k) for k in saved),
+                what="S1 dropped the old extents",
+            )
+            h = handlers(c)
+            for key in saved:
+                read = h.retrieve(key)
+                assert read is None or bytes(read.view) == value_of(key), key
+            h.close()
+        finally:
+            c.stop(CloseMode.RESTART)
+    finally:
+        for rpc, thread, server in ((r1, t1, s1), (r2, t2, s2)):
+            rpc.stop()
+            thread.join(5)
+            server.close()
+
+
 def test_another_node_never_reuses_the_file(real_server, sockdir, ssd_dir, handlers):
     """A stops with its keys on the SSD; B, configured with the same path,
     cannot open the file, so A adopts its own bytes again. Handing the file

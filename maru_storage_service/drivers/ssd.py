@@ -2,11 +2,16 @@
 # Copyright 2026 XCENA Inc.
 """One locked, preallocated O_DIRECT file per SSD pool.
 
-Only a new file is initialized. Its header names the node that owns it;
-another node cannot open it. Completed bytes survive a process restart;
-boot fencing and extent recovery belong to the caller, not this driver.
+A new file is built under a temporary name and linked into place, so an
+interrupted init never blocks a later start. Its header names the node that
+owns it (another node cannot open it) and counts the opens: each create()
+of an existing file writes the count + 1, sent as pool_generation, so
+MaruServer can tell whether another run opened the file in between.
+Completed bytes survive a process restart; boot fencing and extent recovery
+belong to the caller, not this driver.
 """
 
+import contextlib
 import errno
 import fcntl
 import math
@@ -37,8 +42,13 @@ _VERSION = 2
 # by another node, whose pages its Catalog locations would then read
 _OWNER_BYTES = 256
 _HEADER = struct.Struct(f"<8sI16sQQIIQQ{_OWNER_BYTES}s")
+_GENERATION_MAX = (1 << 63) - 1
 DEFAULT_IO_TIMEOUT_S = 0.250
+# Header I/O runs once per start, off every request path
+HEADER_IO_TIMEOUT_S = 10.0
 _MAX_REWINDS = 3
+# A new file is built here, then linked as pool.data
+_INIT_SUFFIX = ".init"
 
 
 class SsdPoolError(RuntimeError):
@@ -63,7 +73,8 @@ def _transfer(
     write: bool,
     deadline: float,
 ) -> None:
-    """Finish this extent, retaining the original buffer for aligned retries."""
+    """Finish this extent, retaining the original buffer for aligned retries.
+    An extent whose every byte moved is done, also past the deadline."""
     cursor = high_water = rewinds = stalls = 0
     step = math.lcm(alignment.memory, alignment.offset)
     syscall = os.pwritev if write else os.preadv
@@ -76,16 +87,16 @@ def _transfer(
             if e.errno == errno.EINTR:
                 continue
             raise
-        _check_deadline(deadline)
         if count <= 0 or count > len(view) - cursor:
             raise OSError(errno.EIO, "SSD I/O made no progress or reached EOF")
         end = cursor + count
+        if end == len(view):
+            return
+        _check_deadline(deadline)
         stalls = stalls + 1 if end <= high_water else 0
         high_water = max(high_water, end)
         if stalls >= 2:
             raise OSError(errno.EIO, "SSD I/O repeatedly made no progress")
-        if end == len(view):
-            return
         cursor = end // step * step
         if cursor != end:
             rewinds += 1
@@ -139,16 +150,29 @@ class SsdPool:
         return round_up(n, self.alignment.offset)
 
     def read(
-        self, page_offset: int, n: int, dst, *, deadline: float | None = None
+        self,
+        page_offset: int,
+        n: int,
+        dst,
+        *,
+        deadline: float | None = None,
+        fd: int | None = None,
     ) -> int:
-        """Read rounded bytes into dst; only its first n bytes are logical data."""
-        return self._io(page_offset, dst, n, write=False, deadline=deadline)
+        """Read rounded bytes into dst; only its first n bytes are logical
+        data. ``fd``: the caller's duplicate of the pool's fd, if any."""
+        return self._io(page_offset, dst, n, write=False, deadline=deadline, fd=fd)
 
     def write(
-        self, page_offset: int, src, n: int, *, deadline: float | None = None
+        self,
+        page_offset: int,
+        src,
+        n: int,
+        *,
+        deadline: float | None = None,
+        fd: int | None = None,
     ) -> int:
         """Write n bytes and zero padding from the executor's bounce buffer."""
-        return self._io(page_offset, src, n, write=True, deadline=deadline)
+        return self._io(page_offset, src, n, write=True, deadline=deadline, fd=fd)
 
     def _io(
         self,
@@ -158,6 +182,7 @@ class SsdPool:
         *,
         write: bool,
         deadline: float | None,
+        fd: int | None,
     ) -> int:
         size = self.io_size(n)
         if (
@@ -180,7 +205,8 @@ class SsdPool:
                     if self._closing or self.fd < 0:
                         raise SsdPoolError("SSD pool is closed")
                     self._active += 1
-                    fd = self.fd
+                    if fd is None:
+                        fd = self.fd
                 try:
                     _check_deadline(deadline)
                     if write:
@@ -211,9 +237,67 @@ class SsdPool:
                 self.fd = -1
 
 
+def _layout(fd: int, page_size: int) -> tuple[DioAlignment, int]:
+    """The file's direct I/O alignment and header size."""
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise SsdPoolError("the SSD pool must be a regular file")
+    alignment = direct_alignment(fd)
+    if page_size % alignment.offset:
+        raise SsdPoolError("SSD page_size is not a multiple of direct I/O alignment")
+    return alignment, round_up(max(4096, _HEADER.size), alignment.step)
+
+
+def _header_io(
+    fd: int, header: memoryview, alignment: DioAlignment, *, write: bool
+) -> None:
+    deadline = time.monotonic() + HEADER_IO_TIMEOUT_S
+    _transfer(fd, 0, header, alignment, write=write, deadline=deadline)
+
+
+def _create_file(
+    path: str, flags: int, owner: bytes, page_size: int, capacity: int
+) -> int:
+    """Build a new pool file under a temporary name, then link it as
+    ``path``: a crash leaves no half-built pool.data. Returns its locked fd."""
+    init = path + _INIT_SUFFIX
+    fd = os.open(init, flags | os.O_CREAT, 0o600)
+    try:
+        # Held by a start building it now; a stale one is rebuilt
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        alignment, header_size = _layout(fd, page_size)
+        os.ftruncate(fd, 0)
+        os.posix_fallocate(fd, 0, header_size + capacity)
+        with aligned_buffer(header_size, alignment.memory) as header:
+            _HEADER.pack_into(
+                header,
+                0,
+                _MAGIC,
+                _VERSION,
+                uuid.uuid4().bytes,
+                page_size,
+                capacity,
+                alignment.memory,
+                alignment.offset,
+                header_size,
+                1,
+                owner,
+            )
+            _header_io(fd, header, alignment, write=True)
+        # Never replaces a pool.data another start linked meanwhile
+        os.link(init, path)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(init)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _open_pool(
     path: str, node_id: str, size: int, page_size: int, *, create: bool
 ) -> SsdPool:
+    """``create``: build a missing file, and count this open in the header
+    of an existing one."""
     if page_size <= 0 or size < page_size:
         raise SsdPoolError(
             "the SSD tier needs a positive page size and at least one page"
@@ -232,61 +316,38 @@ def _open_pool(
         pass
     flags = os.O_RDWR | os.O_CLOEXEC | os.O_DIRECT | os.O_NOFOLLOW
     new = False
-    if create:
-        try:
-            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-            new = True
-        except FileExistsError:
-            fd = os.open(path, flags)
-    else:
-        fd = os.open(path, flags)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SsdPoolError("the SSD pool must be a regular file")
-        alignment = direct_alignment(fd)
-        if page_size % alignment.offset:
-            raise SsdPoolError(
-                "SSD page_size is not a multiple of direct I/O alignment"
-            )
-        header_size = round_up(max(4096, _HEADER.size), alignment.step)
-        total_size = header_size + capacity
-        if new:
-            os.posix_fallocate(fd, 0, total_size)
-        if os.fstat(fd).st_size != total_size:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if not create:
+            raise
+        fd = _create_file(path, flags, owner, page_size, capacity)
+        new = True
+    try:
+        if not new:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        alignment, header_size = _layout(fd, page_size)
+        if os.fstat(fd).st_size != header_size + capacity:
             raise SsdPoolError("SSD file size does not match the configured pool")
         with aligned_buffer(header_size, alignment.memory) as header:
-            deadline = time.monotonic() + DEFAULT_IO_TIMEOUT_S
-            identity = uuid.uuid4().bytes if new else None
-            if new:
-                _HEADER.pack_into(
-                    header,
-                    0,
+            _header_io(fd, header, alignment, write=False)
+            magic, version, identity, p, cap, mem, off, h, generation, stored = (
+                _HEADER.unpack_from(header)
+            )
+            if (
+                (magic, version, p, cap, mem, off, h)
+                != (
                     _MAGIC,
                     _VERSION,
-                    identity,
                     page_size,
                     capacity,
                     alignment.memory,
                     alignment.offset,
                     header_size,
-                    1,
-                    owner,
                 )
-            _transfer(fd, 0, header, alignment, write=new, deadline=deadline)
-            magic, version, identity, p, cap, mem, off, h, generation, stored = (
-                _HEADER.unpack_from(header)
-            )
-            if (magic, version, p, cap, mem, off, h, generation) != (
-                _MAGIC,
-                _VERSION,
-                page_size,
-                capacity,
-                alignment.memory,
-                alignment.offset,
-                header_size,
-                1,
-            ) or not any(identity):
+                or not 1 <= generation < _GENERATION_MAX
+                or not any(identity)
+            ):
                 raise SsdPoolError("SSD header does not match the configured pool")
             stored = stored.rstrip(b"\0")
             if stored != owner:
@@ -296,6 +357,25 @@ def _open_pool(
                     "each node its own path, or remove the file to hand it over "
                     "(a new file gets a new UUID)"
                 )
+            if create and not new:
+                # Counted before NODE_OPEN: a run on another MaruServer in
+                # between makes the count jump by more than one
+                generation += 1
+                _HEADER.pack_into(
+                    header,
+                    0,
+                    magic,
+                    version,
+                    identity,
+                    p,
+                    cap,
+                    mem,
+                    off,
+                    h,
+                    generation,
+                    owner,
+                )
+                _header_io(fd, header, alignment, write=True)
         return SsdPool(
             pool_id=ssd_pool_id(node_id, path),
             node_id=node_id,
@@ -314,7 +394,8 @@ def _open_pool(
 
 
 def create_ssd_pool(node_id: str, path: str, size: int, page_size: int) -> SsdPool:
-    """Create pool.data under path, or validate and reuse the existing file."""
+    """Create pool.data under path, or validate and reuse the existing file
+    (counting this open)."""
     try:
         if not os.path.isabs(path):
             raise SsdPoolError("the SSD tier path must be an absolute directory")
@@ -337,6 +418,8 @@ class SsdDriver:
         return create_ssd_pool(node_id, tier.path, tier.size, page_size)
 
     def open(self, info: PoolInfo) -> SsdPool:
+        """The pool exactly as ``info`` describes it; the open is not
+        counted."""
         if info.kind != PoolKind.SSD or not info.path:
             raise SsdPoolError("expected SSD PoolInfo with a data file path")
         try:

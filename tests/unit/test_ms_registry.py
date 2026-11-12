@@ -373,12 +373,21 @@ class TestEpochReplacement:
         drain(service)
         assert not service.catalog.locations(keys["c"])
 
-    def test_ssd_needs_to_be_listed_unchanged(self, env):
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"pool_generation": 1},  # the open was not counted
+            {"pool_generation": 3},  # another run opened it in between
+            {"device_id": "another-file"},
+        ],
+        ids=["same-generation", "skipped-generation", "device"],
+    )
+    def test_ssd_needs_to_be_listed_unchanged(self, env, change):
         _, service, wire = env
         node, _, keys, locs = self._node(wire, service)
         node.restart()
-        # the same path with a new pool_generation: its contents are gone
-        changed = node.ssd(generation=2)
+        # only the next pool_generation of the same file keeps its contents
+        changed = replace(node.ssd(), **change)
         response = node.open(pools=[node.dram(), changed, node.cxl()])
         assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
         assert service.catalog.locations(keys["s"]) == [] or all(

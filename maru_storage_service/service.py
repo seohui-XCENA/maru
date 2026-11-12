@@ -364,9 +364,9 @@ class StorageService:
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
             # Its committed pages come back READY, the rest stay quarantined.
-            # MaruServer adopts the SSD pool only on the same boot; the
-            # file lock shows its earlier I/O ended, so its quarantine ends
-            # below once listed
+            # MaruServer adopts the SSD pool only on the same boot and when
+            # no other run opened the file since; the file lock shows its
+            # earlier I/O ended, so its quarantine ends below once listed
             self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
             self.pools.quarantine_pool(info.pool_id)
             items = self.server.recover_list(info.pool_id)
@@ -393,8 +393,8 @@ class StorageService:
                     pool.info(), creditable=PoolKind.CXL in self._credit_kinds
                 )
         if self.ssd is not None and self.ssd.pool_id not in adopted_ids:
-            # Not adopted (first run, another boot, a new MaruServer): the
-            # file is reused from scratch
+            # Not adopted (first run, another boot, another MaruServer or a
+            # run on one in between): the file is reused from scratch
             self.pools.add_pool(self.ssd.info(), creditable=False)
         self.manager.start()
         # Quarantined while an earlier run holds the region in the RM

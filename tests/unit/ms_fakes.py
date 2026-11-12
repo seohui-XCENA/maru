@@ -190,6 +190,8 @@ class FakeNode(_OpSender):
         self.epoch_seq = 0
         self.counter = 0
         self.last_open = None
+        # Opens of the SSD file, counted by each process as the driver does
+        self.ssd_opens = 1
 
     # -------------------------------------------------------------- pools
 
@@ -208,13 +210,16 @@ class FakeNode(_OpSender):
         )
 
     def ssd(
-        self, path: str = "/mnt/nvme0/maru", generation: int = 1, pages=POOL_PAGES
+        self,
+        path: str = "/mnt/nvme0/maru",
+        generation: int | None = None,
+        pages=POOL_PAGES,
     ) -> PoolInfo:
         return PoolInfo(
             pool_id=f"ssd:{self.node_id}:{path}",
             kind=PoolKind.SSD,
             node_id=self.node_id,
-            pool_generation=generation,
+            pool_generation=self.ssd_opens if generation is None else generation,
             capacity=pages * PAGE,
             page_size=PAGE,
             path=path,
@@ -283,6 +288,7 @@ class FakeNode(_OpSender):
         self.origin = self.epoch
         self.seq = self.ack = 0
         self.token = ""
+        self.ssd_opens += 1
         if boot is not None:
             self.boot = boot
 

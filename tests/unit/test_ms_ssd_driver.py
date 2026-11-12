@@ -141,30 +141,42 @@ def test_same_boot_reopen_keeps_identity_and_bytes(pool, directory, monkeypatch)
         pool.write(3 * PAGE, view, PAGE)
     info = pool.info()
     pool.close()
+    header = pool.header_size
     before = Path(info.path).read_bytes()
     inode = os.stat(info.path).st_ino
+    pwritev = os.pwritev
 
     def forbidden(*args):
-        pytest.fail("reopening must not allocate, truncate or rewrite")
+        pytest.fail("reopening must not allocate or truncate")
+
+    def header_only(fd, buffers, offset):
+        assert offset == 0 and len(buffers[0]) == header, "only the header"
+        return pwritev(fd, buffers, offset)
 
     monkeypatch.setattr(os, "posix_fallocate", forbidden)
     monkeypatch.setattr(os, "ftruncate", forbidden)
-    monkeypatch.setattr(os, "pwritev", forbidden)
+    monkeypatch.setattr(os, "pwritev", header_only)
     tier = TierConfig(store="ssd", path=str(directory), size=4 * PAGE)
-    reopened = SsdDriver().create(
-        tier, node_id="node", node_epoch="new", page_size=PAGE
-    )
-    assert reopened.info() == info
-    reopened.close()
-    reopened = SsdDriver().open(info)
+    # each create counts an open: the same identity, the next generation
+    for generation in (2, 3):
+        reopened = SsdDriver().create(
+            tier, node_id="node", node_epoch="new", page_size=PAGE
+        )
+        assert reopened.info() == replace(info, pool_generation=generation)
+        reopened.close()
+    counted = replace(info, pool_generation=3)
+    reopened = SsdDriver().open(counted)  # not counted
     try:
+        assert reopened.info() == counted
         with aligned_buffer(PAGE, reopened.alignment.memory) as view:
             reopened.read(3 * PAGE, PAGE, view)
             assert bytes(view) == b"r" * PAGE
     finally:
         reopened.close()
     assert os.stat(info.path).st_ino == inode
-    assert Path(info.path).read_bytes() == before
+    after = Path(info.path).read_bytes()
+    assert after[header:] == before[header:]
+    assert driver._HEADER.unpack_from(after)[8] == 3
 
 
 def test_preallocation_is_new_file_only(directory, monkeypatch):
@@ -183,6 +195,47 @@ def test_preallocation_is_new_file_only(directory, monkeypatch):
     pool = create_ssd_pool("node", str(directory), 4 * PAGE + 7, PAGE)
     pool.close()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("stale", ["empty", "short", "garbage"])
+def test_an_interrupted_init_does_not_block_the_next_start(directory, stale):
+    """A start killed while building the file leaves only pool.data.init."""
+    init = directory / ("pool.data" + driver._INIT_SUFFIX)
+    data = {"empty": b"", "short": b"x" * 100, "garbage": os.urandom(8 * PAGE)}
+    init.write_bytes(data[stale])
+    pool = create_ssd_pool("node", str(directory), 4 * PAGE, PAGE)
+    try:
+        assert pool.pool_generation == 1
+        assert sorted(p.name for p in directory.iterdir()) == ["pool.data"]
+        assert os.fstat(pool.fd).st_size == pool.header_size + 4 * PAGE
+    finally:
+        pool.close()
+
+
+def test_a_file_being_built_by_another_start_is_not_taken(directory):
+    init = directory / ("pool.data" + driver._INIT_SUFFIX)
+    fd = os.open(init, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(SsdPoolError) as error:
+            create_ssd_pool("node", str(directory), 4 * PAGE, PAGE)
+        assert isinstance(error.value.__cause__, BlockingIOError)
+        assert not (directory / "pool.data").exists()
+    finally:
+        os.close(fd)
+
+
+def test_a_file_linked_meanwhile_is_never_replaced(directory, monkeypatch):
+    link = os.link
+
+    def raced(src, dst):
+        Path(dst).write_bytes(b"another start's file")  # linked first
+        return link(src, dst)
+
+    monkeypatch.setattr(os, "link", raced)
+    with pytest.raises(SsdPoolError, match="exists"):
+        create_ssd_pool("node", str(directory), 4 * PAGE, PAGE)
+    assert (directory / "pool.data").read_bytes() == b"another start's file"
 
 
 @pytest.mark.parametrize("alias", [False, True])
@@ -218,8 +271,15 @@ def test_header_mismatch_is_preserved(pool, directory, field):
     pool.close()
     data = bytearray(path.read_bytes())
     values = list(driver._HEADER.unpack_from(data))
+    # field 8 counts the opens: any count from 1 is valid, 0 is not
     values[field] = (
-        b"badmagic" if field == 0 else bytes(16) if field == 2 else values[field] + 1
+        b"badmagic"
+        if field == 0
+        else bytes(16)
+        if field == 2
+        else 0
+        if field == 8
+        else values[field] + 1
     )
     driver._HEADER.pack_into(data, 0, *values)
     path.write_bytes(data)
@@ -450,7 +510,7 @@ def test_nonfinite_deadline_is_refused(pool, deadline):
             pool.write(0, view, PAGE, deadline=deadline)
 
 
-@pytest.mark.parametrize("fault", ["expired", "eintr", "late"])
+@pytest.mark.parametrize("fault", ["expired", "eintr", "short", "late"])
 def test_deadline_prevents_success_and_unbounded_eintr(pool, monkeypatch, fault):
     now = [11.0 if fault == "expired" else 1.0]
     calls = []
@@ -461,13 +521,19 @@ def test_deadline_prevents_success_and_unbounded_eintr(pool, monkeypatch, fault)
         now[0] = 11.0
         if fault == "eintr":
             raise InterruptedError(errno.EINTR, "injected")
+        if fault == "short":
+            with buffers[0][: pool.alignment.step] as partial:
+                return syscall(fd, [partial], offset)
         return syscall(fd, buffers, offset)
 
     monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(os, "pwritev", injected)
     with aligned_buffer(PAGE, pool.alignment.memory) as view:
-        with pytest.raises(TimeoutError):
-            pool.write(0, view, PAGE, deadline=10.0)
+        if fault == "late":  # every byte moved: done, though late
+            assert pool.write(0, view, PAGE, deadline=10.0) == PAGE
+        else:
+            with pytest.raises(TimeoutError):
+                pool.write(0, view, PAGE, deadline=10.0)
     assert len(calls) == (0 if fault == "expired" else 1)
 
 
@@ -503,8 +569,10 @@ def test_close_keeps_lock_and_fd_until_blocking_io_ends(pool, directory, monkeyp
         closer.start()
         assert not closed.wait(0.05)
         assert os.fstat(fd).st_size == pool.header_size + pool.capacity
-        with pytest.raises(SsdPoolError):
-            create_ssd_pool("other", str(directory), pool.capacity, PAGE)
+        # the owner itself is refused while the lock is held
+        with pytest.raises(SsdPoolError) as error:
+            create_ssd_pool("node", str(directory), pool.capacity, PAGE)
+        assert isinstance(error.value.__cause__, BlockingIOError)
     finally:
         release.set()
         reader.join(2)
@@ -587,8 +655,9 @@ def test_bad_config_and_nonregular_file_are_refused(directory):
         SsdDriver().create(
             TierConfig("ssd"), node_id="node", node_epoch="e", page_size=PAGE
         )
+    # a refused config leaves no pool.data behind
     path = directory / "pool.data"
-    path.unlink()
+    assert not path.exists()
     path.mkdir()
     with pytest.raises(SsdPoolError, match="regular file"):
         create_ssd_pool("node", str(directory), PAGE, PAGE)
