@@ -402,30 +402,77 @@ def test_a_copy_is_published_only_once_its_write_returned(
     node.pools.check()
 
 
-@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT, errno.EIO])
-def test_a_failed_write_publishes_nothing_and_keeps_the_source(
-    fake, nodes, handlers, monkeypatch, code
-):
-    node = nodes()
+def torn_writes(node, code: int, count: float = float("inf")) -> list[int]:
+    """The next ``count`` writes land half their bytes, then fail with
+    ``code``; returns the page offsets they tore."""
+    write = node.ssd.write
+    torn: list[int] = []
 
-    def fail(*args, **kwargs):
+    def tear(page_offset, src, n, *, deadline):
+        if len(torn) >= count:
+            return write(page_offset, src, n, deadline=deadline)
+        torn.append(page_offset)
+        write(page_offset, src, max(1, n // 2), deadline=deadline)
         raise OSError(code, os.strerror(code))
 
-    monkeypatch.setattr(node.ssd, "write", fail)
+    node.ssd.write = tear
+    return torn
+
+
+def served_right(fake, node, h, names) -> None:
+    """Every key reads its own bytes, from DRAM or the SSD, or misses."""
+    for name in names:
+        for location in fake.locations(Key(NS, name)):
+            if location.kind == PoolKind.SSD:
+                assert ssd_bytes(node.ssd, location) == value_of(name), name
+        read = h.retrieve(name)
+        if read is not None:
+            assert bytes(read.view) == value_of(name), name
+            h.release_retrieved([read])
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT, errno.EIO])
+def test_a_failed_write_publishes_nothing_and_its_source_waits(
+    fake, nodes, handlers, code
+):
+    node = nodes()
+    torn = torn_writes(node, code, count=1)
     h = handlers(node)
-    for i in range(10):
-        assert put(h, f"k{i}")
-    wait_until(lambda: node.manager.move_results["COPY_FAILED"] >= 2, what="failures")
+    names = [f"k{i}" for i in range(10)]
+    for name in names:
+        assert put(h, name)
+    wait_until(lambda: torn, what="a torn write")
+    # its source stays and moves on a later try; the torn bytes never count
+    wait_until(lambda: node.manager.move_results["RETIRED"] >= 3, what="moved")
+    assert node.manager.move_results["COPY_FAILED"] == 1
+    assert not node.manager.move_results["DROPPED"]
+    assert all(kinds(fake, n) for n in names)
+    served_right(fake, node, h, names)
+    node.pools.check()
+
+
+def test_a_persistent_write_failure_lets_stores_go_on(
+    fake, nodes, handlers, monkeypatch
+):
+    """Writes that keep failing pause the SSD: DRAM drops past its high
+    watermark (RETIRE), so stores keep coming. Nothing torn is published;
+    once the pause is over, pages move to the SSD again."""
+    monkeypatch.setattr("maru_storage_service.storage_manager.IO_PAUSE_S", 0.5)
+    node = nodes()
+    torn = torn_writes(node, errno.EIO)
+    h = handlers(node)
+    names = [f"k{i}" for i in range(40)]  # DRAM holds 16 pages
+    for name in names:
+        assert put(h, name)
+    assert len(torn) >= 3 and node.manager.move_results["DROPPED"] > 0
     assert not ssd_commits(fake) and not finalized(fake)
-    assert all(kinds(fake, f"k{i}") == {PoolKind.DRAM} for i in range(10))
-    ssd = node.ssd.pool_id
-    wait_until(
-        lambda: node.pools.bytes_in(PageState.FREE, ssd) == node.ssd.capacity,
-        what="the reserved pages back",
-    )
-    read = h.retrieve("k0")
-    assert read is not None and bytes(read.view) == value_of("k0")
-    h.release_retrieved([read])
+    served_right(fake, node, h, names)
+    node.pools.check()
+    del node.ssd.write  # the disk is back
+    for name in [f"n{i}" for i in range(10)]:
+        assert put(h, name)
+    wait_until(lambda: finalized(fake), what="moves to the SSD again")
+    served_right(fake, node, h, names + [f"n{i}" for i in range(10)])
     node.pools.check()
 
 

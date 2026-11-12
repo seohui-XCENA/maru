@@ -83,6 +83,11 @@ EXIT_RETRY_MAX_S = 30.0
 # executor's queue
 IO_BATCH_BYTES = 1 << 30
 IO_DEPTH = 2
+# This many failed writes in a row to a pool below take it out of demotion
+# for IO_PAUSE_S: the tier above then drops past its high watermark, as when
+# the tier below is full. One failure only keeps the source for a retry
+IO_FAILURES_MAX = 3
+IO_PAUSE_S = 10.0
 
 
 @dataclass(eq=False)
@@ -191,6 +196,10 @@ class StorageManager:
         self._invalid_pools: set[str] = set()
         # FREE bytes a fetch wants now, by tier (see want_room)
         self._demand: dict[PoolKind, int] = {}
+        # Pools below whose writes keep failing: failures in a row, and until
+        # when the pool takes no demotion
+        self._io_failures: collections.Counter[str] = collections.Counter()
+        self._io_paused: dict[str, float] = {}
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
 
@@ -889,8 +898,10 @@ class StorageManager:
         room: one region filled past its high watermark would drop pages
         while the others have room."""
         assert self.transfers is not None
+        now = time.monotonic()
         with self._lock:
             invalid = set(self._invalid_pools)
+            paused = {p for p, until in self._io_paused.items() if until > now}
         room: dict[str, int] = {}
         for pool_id in self.pools.pool_ids():
             info = self.pools.pool_info(pool_id)
@@ -898,6 +909,7 @@ class StorageManager:
                 info is not None
                 and info.kind == kind
                 and pool_id not in invalid
+                and pool_id not in paused
                 and self.transfers.has_pool(pool_id)
                 and not self.pools.pool_quarantined(pool_id)
             ):
@@ -965,8 +977,8 @@ class StorageManager:
             j, ticket = running.popleft()
             ticket.done.wait()
             results[j] = ticket.ok
-            if ticket.error is not None:
-                logger.warning("writing %s below failed: %s", ticket.src, ticket.error)
+            if ticket.ok or ticket.error is not None:
+                self._io_result(ticket.dst.pool_id, ticket.error)
 
         for i, (move, copy) in enumerate(zip(moves, copies, strict=True)):
             while len(running) >= IO_DEPTH:
@@ -989,6 +1001,30 @@ class StorageManager:
         while running:
             wait_one()
         return results
+
+    def _io_result(self, pool_id: str, error: Exception | None) -> None:
+        """Count a write to ``pool_id``; IO_FAILURES_MAX failures in a row
+        pause the pool for IO_PAUSE_S."""
+        with self._lock:
+            if error is None:
+                self._io_failures.pop(pool_id, None)
+                return
+            self._io_failures[pool_id] += 1
+            failures = self._io_failures[pool_id]
+            if failures >= IO_FAILURES_MAX:
+                del self._io_failures[pool_id]
+                self._io_paused[pool_id] = time.monotonic() + IO_PAUSE_S
+        if failures >= IO_FAILURES_MAX:
+            logger.error(
+                "writes to %s failed %d times in a row (%s): no demotion goes "
+                "there for %.0f s; the tier above drops past its high watermark",
+                pool_id,
+                failures,
+                error,
+                IO_PAUSE_S,
+            )
+        else:
+            logger.warning("writing a page to %s failed: %s", pool_id, error)
 
     def _commit_moves(self, moves: list[_Move]) -> list[_Move]:
         """COMMIT the copies with a finalizer; returns those to FINALIZE_MOVE.
