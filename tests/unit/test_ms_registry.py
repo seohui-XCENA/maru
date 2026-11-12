@@ -1185,9 +1185,9 @@ class TestMaintenanceThread:
         assert all(not service.catalog.locations(key(f"k{i}")) for i in range(35))
 
     def test_a_large_dropped_node_is_cleaned_in_bounded_steps(self):
-        import gc
-        import statistics
+        import weakref
         from collections import OrderedDict
+        from fractions import Fraction
 
         from maru_common.protocol import WorkerOpenRequest
         from maru_common.storage_types import MS_PROTOCOL, KeyLocation
@@ -1209,6 +1209,7 @@ class TestMaintenanceThread:
         node.open(pools=[node.dram(), node.cxl()])
         n = 25_000
         target = (key("k"), node.loc(node.dram(), 1))
+        records = weakref.WeakSet()  # op records not freed yet
         with service.lock:
             for i in range(n):
                 token = registry.worker_open(
@@ -1234,6 +1235,7 @@ class TestMaintenanceThread:
                     origin, OpRef(f"w{i}", 1, b"d", 0), "big"
                 )
                 service.ledger.finish(origin, record, None, 1)
+                records.add(record)
                 if i == 0:  # it still reads mapped CXL: an orphan
                     orphan = token
                     cxl = node.loc(node.cxl(), 1)
@@ -1255,17 +1257,36 @@ class TestMaintenanceThread:
                 )
                 big.blocks[f"b{b}"] = _Block(f"b{b}", items, "delete")
                 big.blocked.update((i.key, i.location) for i in items)
+        del record  # the ledger holds the records alone
+        # held here, so one dropped whole instead of freed in steps stays full
+        listing = big.listings["1"].entries
+        access = registry._access["big"]
+        blocks_left, blocked_left = big.blocks, big.blocked
+
+        def left():
+            """(count, freed per unit of work) of what the node leaves."""
+            return (
+                (len(registry._workers), 1),
+                (len(service.pins), 1),
+                (len(records), 1),
+                (len(listing), nr.LISTING_FREES_PER_UNIT),
+                (len(access), nr.ACCESS_FREES_PER_UNIT),
+                (len(blocked_left), nr.BLOCKED_FREES_PER_UNIT),
+                (len(blocks_left), nr.BLOCK_FREES_PER_UNIT),
+            )
+
         clock.advance(631)  # past node_give_up_s
-        works, times = [], []
-        gc.disable()  # time our work, not a collection
-        try:
-            while not works or works[-1] >= budget:
-                # CPU time of this thread: preemption does not count
-                t0 = time.thread_time()
-                works.append(service.maintain())
-                times.append(time.thread_time() - t0)
-        finally:
-            gc.enable()
+        works = []
+        while not works or works[-1] >= budget:
+            before = left()
+            works.append(service.maintain())
+            after = left()
+            # what a step frees, in units, is within the work it reports
+            freed = sum(
+                Fraction(b - a, per)
+                for (b, per), (a, _) in zip(before, after, strict=True)
+            )
+            assert freed <= works[-1], (len(works), works[-1], before, after)
         assert max(works) <= budget
 
         # one unit per node given up, due session check, worker session
@@ -1291,12 +1312,7 @@ class TestMaintenanceThread:
         )
         assert registry.worker_sessions() == [] and cxl.pool_id == node.cxl().pool_id
         assert len(service.pins) == 0 and ("worker", "w0") not in service.ledger
-        # no step holds the lock much longer than a typical one
-        assert len(works) > 400
-        assert max(times) < 10 * statistics.median(times), (
-            max(times),
-            statistics.median(times),
-        )
+        assert not any(count for count, _ in left())
 
     def test_large_forced_sweep_keeps_lookup_p99_low(self):
         service = make_service(clock=time.monotonic, maintenance_interval_s=0.01)
