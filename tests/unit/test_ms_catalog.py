@@ -724,6 +724,73 @@ class TestFetch:
         assert wire.call(MessageType.FETCH_COMPLETE, request) == first
 
 
+class TestWorkerBinding:
+    """SOURCE_PIN and FETCH_COMPLETE for a named worker: only its own open
+    session on this node's run, with its namespace, gets a pin."""
+
+    _setup = TestFetch._setup
+
+    def test_source_pin_refuses_another_workers_session(self, env):
+        from maru_common.protocol import MessageType, SourcePinRequest
+        from maru_common.storage_types import KeyLocation
+
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        other = FakeWorker(wire, a, tp_rank=1)
+        other.open()
+
+        def pin(session: str, incarnation: str, keyed=k):
+            return a.send(
+                MessageType.SOURCE_PIN,
+                a.build(
+                    SourcePinRequest,
+                    **a.envelope(),
+                    items=[KeyLocation(keyed, source)],
+                    worker_session=session,
+                    worker_incarnation=incarnation,
+                ),
+            )
+
+        refused = pin(other.token, worker.incarnation)
+        assert refused.status == Status.REJECTED and len(service.pins) == 0
+        assert pin("nope", worker.incarnation).status == Status.REJECTED
+        foreign = replace(k, namespace="other")
+        assert pin(worker.token, worker.incarnation, foreign).status == Status.REJECTED
+        assert results(pin(worker.token, worker.incarnation)) == ["HIT"]
+
+    def test_fetch_complete_pins_only_the_named_workers_session(self, env):
+        from maru_common.protocol import (
+            FetchCompleteItem,
+            FetchCompleteRequest,
+            MessageType,
+        )
+
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        other = FakeWorker(wire, a, tp_rank=1)
+        other.open()
+        copy = a.loc(a.dram(), 1)
+
+        def complete(session: str, incarnation: str):
+            pin = a.source_pin((k, source)).items[0].pin_id
+            return a.send(
+                MessageType.FETCH_COMPLETE,
+                a.build(
+                    FetchCompleteRequest,
+                    **a.envelope(),
+                    worker_session=session,
+                    items=[FetchCompleteItem(k, pin, copy, copy.length)],
+                    worker_incarnation=incarnation,
+                ),
+            )
+
+        assert results(complete(other.token, worker.incarnation)) == ["REJECTED"]
+        assert len(service.pins) == 0  # the source pin went too
+        hit = complete(worker.token, worker.incarnation).items[0]
+        assert hit.result == "HIT"
+        assert service.pins.get(hit.pin_id).holder == worker.token
+
+
 class TestHoldCopy:
     """FETCH_COMPLETE with hold_copy: the node's pin on the copy comes with
     the worker's, so a shared fetch's copy outlives its first worker."""

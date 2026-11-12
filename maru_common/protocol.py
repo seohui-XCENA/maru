@@ -878,12 +878,19 @@ class UnpinResponse:
 
 @dataclass
 class SourcePinRequest:
-    """SOURCE_PIN (0x53) - A StorageService pins a fetch source."""
+    """SOURCE_PIN (0x53) - A StorageService pins a fetch source.
+
+    With ``worker_incarnation`` the fetch is for that worker: unless
+    ``worker_session`` is its open session on this node's run, with the
+    items' namespace, the request is REJECTED and pins nothing.
+    """
 
     session: str
     server_epoch: str
     op: OpRef
     items: list[KeyLocation]
+    worker_session: str = ""
+    worker_incarnation: str = ""
 
 
 @dataclass
@@ -959,6 +966,9 @@ class FetchCompleteRequest:
     op: OpRef
     worker_session: str
     items: list[FetchCompleteItem]
+    # The worker the node attached; another worker's session, or one of
+    # another node run or namespace, gets no pin (REJECTED)
+    worker_incarnation: str = ""
 
 
 @dataclass

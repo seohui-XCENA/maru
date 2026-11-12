@@ -70,10 +70,18 @@ class MetadataPort(Protocol):
 
     def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse: ...
 
-    def source_pin(self, items: list[KeyLocation]) -> SourcePinResponse: ...
+    def source_pin(
+        self,
+        items: list[KeyLocation],
+        worker_session: str = "",
+        worker_incarnation: str = "",
+    ) -> SourcePinResponse: ...
 
     def fetch_complete(
-        self, worker_session: str, items: list[FetchCompleteItem]
+        self,
+        worker_session: str,
+        items: list[FetchCompleteItem],
+        worker_incarnation: str = "",
     ) -> FetchCompleteResponse: ...
 
     def unpin(self, pin_ids: list[str]) -> UnpinResponse: ...

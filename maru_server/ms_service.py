@@ -567,6 +567,15 @@ class MsService:
             rejected = self._too_many(req.items, SourcePinResponse, "items")
             if rejected:
                 return rejected
+            if req.worker_incarnation:
+                worker = self.registry.known_worker(req.worker_session)
+                error = self._not_bound(session, worker, req.worker_incarnation)
+                if error is None and any(
+                    i.key.namespace != worker.namespace for i in req.items
+                ):
+                    error = "a key is not in the worker's namespace"
+                if error is not None:
+                    return SourcePinResponse(status=Status.REJECTED, error=error)
 
             def run(batch: _Batch) -> SourcePinResponse:
                 now = self._clock()
@@ -713,6 +722,11 @@ class MsService:
                 foreign = worker is not None and (
                     worker.role != SessionRole.WORKER
                     or worker.node_id != session.node_id
+                    or (
+                        bool(req.worker_incarnation)
+                        and self._not_bound(session, worker, req.worker_incarnation)
+                        is not None
+                    )
                 )
                 # a closed, unknown, orphaned or replaced-run session: the
                 # copy stays as cache, with no pin that only time would free
@@ -730,7 +744,11 @@ class MsService:
                 ]
                 batch.applying = True
                 for item, error in zip(req.items, errors, strict=True):
-                    if foreign:
+                    if foreign or (
+                        worker is not None
+                        and req.worker_incarnation
+                        and item.key.namespace != worker.namespace
+                    ):
                         self._release_source(session, item.source_pin_id)
                         batch.outcomes.append(ItemOutcome(ItemResult.REJECTED))
                         continue
@@ -761,6 +779,23 @@ class MsService:
                 len(req.items),
                 run,
             )
+
+    @staticmethod
+    def _not_bound(
+        session: NodeSession, worker: WorkerSession | None, incarnation: str
+    ) -> str | None:
+        """Why ``worker`` is not the open session of the worker
+        ``incarnation`` on the node run of ``session``, or None."""
+        if worker is None:
+            return "the worker session is unknown or closed"
+        if (
+            worker.role != SessionRole.WORKER
+            or worker.node_id != session.node_id
+            or worker.node_epoch != session.node_epoch
+            or worker.incarnation != incarnation
+        ):
+            return "the worker session is not that worker's on this node run"
+        return None
 
     def _release_source(self, session: NodeSession, pin_id: str) -> None:
         pin = self.pins.get(pin_id)

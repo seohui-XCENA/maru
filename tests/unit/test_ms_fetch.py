@@ -41,7 +41,9 @@ from maru_handler.client import pool_maps
 from maru_server.catalog import PoolState
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
+from maru_storage_service.fetch_manager import CANCEL_MARKS, FLIGHT_WAITERS
 from maru_storage_service.pool_manager import PageState
+from maru_storage_service.ports import ReplyError
 from tests.unit.ms_fakes import FakeWorker, Wire
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -704,3 +706,183 @@ def test_dram_over_cxl_over_ssd_fetches_into_dram(
         loader.close()
     finally:
         node.stop()
+
+
+# =============================================================================
+# Review fixes: whose session, early cancels, waiters, deadlines, late plans
+# =============================================================================
+
+
+def node_pins(server, node) -> int:
+    """Pins the node session holds (source and copy pins)."""
+    service = server.ms_service
+    with service.lock:
+        return len(service.pins.held_by(node.server.session))
+
+
+def test_a_worker_cannot_fetch_with_another_workers_session(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    reads = Reads(node, monkeypatch)
+    forged = a.raw.stamp(
+        FetchRequest(PLACEHOLDER_OP, b.token, a.items(keys[0]), 1 << 30, 5000)
+    )
+    answer = a.send(forged).result(10)
+    assert answer.items[0].result == ItemResult.REJECTED
+    assert reads.calls == 0  # refused before any read
+    with server.ms_service.lock:
+        assert server.ms_service.pins.held_by(b.token) == []
+    # nor by joining another worker's read with a forged session
+    reads.hold()
+    first = a.send(a.request(a.items(keys[1])))
+    assert reads.entered.wait(5)
+    joined = b.raw.stamp(
+        FetchRequest(PLACEHOLDER_OP, a.token, b.items(keys[1]), 1 << 30, 5000)
+    )
+    second = b.send(joined)
+    wait_until(lambda: node.manager.fetches.results["joined"] == 1, "joined")
+    reads.release()
+    hit = first.result(10).items[0]
+    assert hit.result == ItemResult.HIT
+    assert second.result(10).items[0].result == ItemResult.REJECTED
+    wait_until(lambda: pins(server, keys[1], hit.location) == 1, "only a's pin")
+    a.unpin(hit.pin_id)
+    wait_until(lambda: node_pins(server, node) == 0, "no node pin left")
+    a.close()
+    b.close()
+
+
+def test_an_unknown_unpin_result_is_retried_then_ends_the_run(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    loader = Loader(node, server)
+    unpin = node.manager.metadata.unpin
+    calls = []
+
+    def flaky(ids):
+        calls.append(list(ids))
+        if len(calls) == 1:
+            raise ReplyError("UNPIN: 0 results")
+        return unpin(ids)
+
+    monkeypatch.setattr(node.manager.metadata, "unpin", flaky)
+    hit = loader.fetch(keys[0]).items[0]
+    assert hit.result == ItemResult.HIT
+    # the node pin is sent again, not dropped
+    wait_until(lambda: pins(server, keys[0], hit.location) == 1, "node pin gone")
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert node.manager.ended is None
+    loader.unpin(hit.pin_id)
+
+    def broken(ids):
+        raise ReplyError("UNPIN: 0 results")
+
+    monkeypatch.setattr(node.manager.metadata, "unpin", broken)
+    loader.fetch(keys[1])
+    wait_until(lambda: node.manager.ended is not None, "the run ends")
+    assert "UNPIN" in node.manager.ended
+    loader.close()
+
+
+def test_early_cancels_are_kept_until_acked(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    loader = Loader(node, server)
+    reads = Reads(node, monkeypatch)
+    items = loader.items(keys[0])
+    cancelled = [loader.request(items) for _ in range(CANCEL_MARKS)]
+    for request in cancelled:
+        assert loader.cancel(request).status == Status.OK
+    # one more cancel, and a FETCH not cancelled, wait for acks
+    assert loader.cancel(loader.request(items)).status == Status.BUSY
+    assert loader.send(loader.request(items)).result(10).status == Status.BUSY
+    # a cancelled FETCH that comes late never reads
+    assert loader.send(cancelled[0]).result(10).items[0] == miss()
+    assert reads.calls == 0
+    for request in cancelled:
+        loader.raw.origin.resolved(request.op.seq)
+    hit = loader.fetch(keys[0]).items[0]  # its ack drops the marks
+    assert hit.result == ItemResult.HIT and reads.calls == 1
+    loader.unpin(hit.pin_id)
+    loader.close()
+
+
+def test_a_flight_takes_a_bounded_number_of_waiters(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    reads = Reads(node, monkeypatch).hold()
+    first = a.send(a.request(a.items(keys[0])))
+    assert reads.entered.wait(5)
+    items = b.items(keys[0])
+    fetches = node.manager.fetches
+    # cancelled waiters leave the flight
+    for i in range(FLIGHT_WAITERS + 6):
+        request = b.request(items)
+        reply = b.send(request)
+        wait_until(lambda i=i: fetches.results["joined"] == i + 1, "joined")
+        assert b.cancel(request).status == Status.OK
+        assert reply.result(10).items[0] == miss()
+    with fetches._lock:
+        (flight,) = fetches._flights.values()
+        assert flight.waiters == []
+    waiting = [b.send(b.request(items)) for _ in range(FLIGHT_WAITERS)]
+    over = b.send(b.request(items)).result(10).items[0]
+    assert over == miss(MissReason.BUSY)
+    reads.release()
+    hits = [f.result(10).items[0] for f in [first, *waiting]]
+    assert all(h.result == ItemResult.HIT for h in hits) and reads.calls == 1
+    a.unpin(hits[0].pin_id)
+    b.unpin(*[h.pin_id for h in hits[1:]])
+    wait_until(lambda: pins(server, keys[0], hits[0].location) == 0, "pins gone")
+    wait_until(lambda: node_pins(server, node) == 0, "no node pin left")
+    a.close()
+    b.close()
+
+
+def test_each_waiter_waits_for_room_until_its_own_deadline(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    fetches = node.manager.fetches
+    reserve = fetches._reserve
+    short = threading.Event()
+    monkeypatch.setattr(fetches, "_reserve", lambda count: short.set() or [])
+    first = a.send(a.request(a.items(keys[0]), deadline_ms=150))
+    assert short.wait(5)
+    second = b.send(b.request(b.items(keys[0]), deadline_ms=5000))
+    wait_until(lambda: fetches.results["joined"] == 1, "joined")
+    assert first.result(5).items[0] == miss(MissReason.TIMEOUT)
+    time.sleep(0.2)  # the flight goes on for b
+    assert not second.done()
+    monkeypatch.setattr(fetches, "_reserve", reserve)  # room now
+    hit = second.result(5).items[0]
+    assert hit.result == ItemResult.HIT
+    b.unpin(hit.pin_id)
+    wait_until(lambda: settled(node), "quota back")
+    a.close()
+    b.close()
+
+
+def test_a_late_plan_uses_the_copy_published_before(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    reads = Reads(node, monkeypatch)
+    late = b.request(b.items(keys[0]))  # planned on the SSD, sent later
+    first = a.fetch(keys[0]).items[0]
+    assert first.result == ItemResult.HIT
+    wait_until(lambda: settled(node), "the first flight ended")
+    second = b.send(late).result(10).items[0]
+    assert second.result == ItemResult.HIT and second.location == first.location
+    assert reads.calls == 1
+    assert node.manager.fetches.results["published_used"] == 1
+    wait_until(lambda: node_pins(server, node) == 0, "the copy's node pin gone")
+    assert pins(server, keys[0], first.location) == 2
+    a.unpin(first.pin_id)
+    b.unpin(second.pin_id)
+    assert pins(server, keys[0], first.location) == 0
+    node.pools.check()
+    a.close()
+    b.close()

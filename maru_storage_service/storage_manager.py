@@ -1449,6 +1449,8 @@ class StorageManager:
     # ----------------------------------------------------------- worker exit
 
     def _queue_exit(self, ref: WorkerRef) -> None:
+        if self.fetches is not None:
+            self.fetches.forget(ref.incarnation)
         with self._cv:
             self._exits.append(ref)
             self._cv.notify_all()

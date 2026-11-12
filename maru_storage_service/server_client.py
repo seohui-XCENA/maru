@@ -410,23 +410,47 @@ class ServerClient:
         )
         return response
 
-    def source_pin(self, items: list[KeyLocation]) -> SourcePinResponse:
-        """Pin exact sources until the result is known."""
+    def source_pin(
+        self,
+        items: list[KeyLocation],
+        worker_session: str = "",
+        worker_incarnation: str = "",
+    ) -> SourcePinResponse:
+        """Pin exact sources until the result is known; for that worker, if
+        named (refused unless the session is its own)."""
         session, epoch = self._ids()
         return self._call_op(
             MessageType.SOURCE_PIN,
-            SourcePinRequest(session, epoch, PLACEHOLDER_OP, items),
+            SourcePinRequest(
+                session,
+                epoch,
+                PLACEHOLDER_OP,
+                items,
+                worker_session=worker_session,
+                worker_incarnation=worker_incarnation,
+            ),
             len(items),
         )
 
     def fetch_complete(
-        self, worker_session: str, items: list[FetchCompleteItem]
+        self,
+        worker_session: str,
+        items: list[FetchCompleteItem],
+        worker_incarnation: str = "",
     ) -> FetchCompleteResponse:
-        """Publish copies and take worker and optional node pins atomically."""
+        """Publish copies and take worker and optional node pins atomically;
+        a worker pin only for the session of ``worker_incarnation``, if set."""
         session, epoch = self._ids()
         return self._call_op(
             MessageType.FETCH_COMPLETE,
-            FetchCompleteRequest(session, epoch, PLACEHOLDER_OP, worker_session, items),
+            FetchCompleteRequest(
+                session,
+                epoch,
+                PLACEHOLDER_OP,
+                worker_session,
+                items,
+                worker_incarnation=worker_incarnation,
+            ),
             len(items),
         )
 

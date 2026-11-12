@@ -60,8 +60,16 @@ FETCH_IO_DEPTH = 8
 FETCH_DEADLINE_MAX_MS = 60_000
 # How often a FETCH short of room looks again, while eviction makes it
 ROOM_POLL_S = 0.005
-# Cancels kept per worker for FETCHes not seen yet
+# Cancels kept per worker for FETCHes not seen yet, until acked; past
+# this, the worker's new FETCHes and early cancels are answered BUSY
 CANCEL_MARKS = 64
+# Waiters joined to one flight; more get MISS busy
+FLIGHT_WAITERS = 64
+# Copies published lately, by key: a late plan uses one instead of a read
+PUBLISHED_KEYS = 4096
+# UNPINs tried this often before their result counts as unknown
+UNPIN_TRIES = 3
+UNPIN_RETRY_S = 0.1
 
 
 def _miss(reason: MissReason | None = None) -> ItemOutcome:
@@ -108,6 +116,8 @@ class _Flight:
     copy: Location | None = None
     node_pin: str | None = None
     closed: bool = False
+    # A copy published before: no read, unless it is gone by its SOURCE_PIN
+    cached: bool = False
 
 
 class FetchManager:
@@ -141,6 +151,9 @@ class FetchManager:
         self._flights: dict[Key, _Flight] = {}
         self._ops: dict[tuple[str, int], _Op] = {}
         self._cancelled: dict[str, dict[int, None]] = {}
+        self._published: collections.OrderedDict[Key, Location] = (
+            collections.OrderedDict()
+        )
         self._inflight = 0
         self._stop = threading.Event()
         self._tasks = concurrent.futures.ThreadPoolExecutor(
@@ -193,6 +206,13 @@ class FetchManager:
         if digest is None:
             reply(FetchResponse(status=Status.REJECTED, error=reason))
             return
+        with self._lock:
+            marks = self._marks(rec.incarnation, req.op.ack)
+            full = len(marks) >= CANCEL_MARKS and req.op.seq not in marks
+        if full:
+            # Not recorded: sent again once its cancels are acked
+            reply(FetchResponse(status=Status.BUSY, error="too many early cancels"))
+            return
         ledger = self.manager.ledger
         verdict, entry = ledger.begin(rec.incarnation, req.op, digest)
         if verdict == Verdict.STALE:
@@ -218,7 +238,6 @@ class FetchManager:
                 displaced(FetchResponse(status=Status.BUSY, error="too many resends"))
             return
         ledger.attach(entry, reply, key)
-        rec.worker_session = req.worker_session
         count = len(req.items)
         op = _Op(
             origin=rec.incarnation,
@@ -231,32 +250,37 @@ class FetchManager:
         )
         # Checked against this node's pages before the lock
         sources = [self._source(rec, item.key, item.plan) for item in req.items]
+        copies = [
+            None if isinstance(source, ItemOutcome) else self._copy(item.key)
+            for item, source in zip(req.items, sources, strict=True)
+        ]
         led: list[_Flight] = []
         with self._lock:
-            marks = self._cancelled.get(op.origin)
-            if marks:
-                for seq in [s for s in marks if s <= req.op.ack]:
-                    del marks[seq]
+            marks = self._marks(op.origin, req.op.ack)
             if self._stop.is_set():
                 op.outcomes = [_miss(MissReason.BUSY)] * count
-            elif marks is not None and op.seq in marks:
+            elif op.seq in marks:
                 del marks[op.seq]
                 op.outcomes = [_miss()] * count  # cancelled before it came
             else:
-                for i, (item, source) in enumerate(
-                    zip(req.items, sources, strict=True)
+                for i, (item, source, copy) in enumerate(
+                    zip(req.items, sources, copies, strict=True)
                 ):
                     if isinstance(source, ItemOutcome):
                         op.outcomes[i] = source
                         continue
                     flight = self._flights.get(item.key)
                     if flight is not None and not flight.closed:
+                        if len(flight.waiters) >= FLIGHT_WAITERS:
+                            op.outcomes[i] = _miss(MissReason.BUSY)
+                            continue
                         flight.waiters.append(_Waiter(op, i))
                         op.flights[i] = flight
                         self.results["joined"] += 1
                         continue
                     ref, bounce = source
-                    cost = self.page_size + bounce
+                    # A copy published before costs no read and no quota
+                    cost = 0 if copy is not None else self.page_size + bounce
                     if self._inflight + cost > self.inflight_max_bytes:
                         op.outcomes[i] = _miss(MissReason.BUSY)
                         continue
@@ -267,6 +291,8 @@ class FetchManager:
                         bounce=bounce,
                         leader=_Waiter(op, i),
                         charged=cost,
+                        copy=copy,
+                        cached=copy is not None,
                     )
                     self._inflight += cost
                     self._flights[item.key] = flight
@@ -302,13 +328,28 @@ class FetchManager:
         with self._lock:
             op = self._ops.get((target.origin, target.seq))
             if op is None:
-                marks = self._cancelled.setdefault(target.origin, {})
+                marks = self._marks(target.origin, target.ack)
+                if target.seq not in marks and len(marks) >= CANCEL_MARKS:
+                    return FetchCancelResponse(
+                        status=Status.BUSY, error="too many early cancels"
+                    )
                 marks[target.seq] = None
-                while len(marks) > CANCEL_MARKS:
-                    del marks[next(iter(marks))]
         if op is not None:
             self._answer(op, None)
         return FetchCancelResponse(status=Status.OK)
+
+    def _marks(self, origin: str, ack: int) -> dict[int, None]:
+        """Caller holds the lock: the early cancels of ``origin``, less those
+        at or below ``ack`` (their FETCH is resolved)."""
+        marks = self._cancelled.setdefault(origin, {})
+        for seq in [s for s in marks if s <= ack]:
+            del marks[seq]
+        return marks
+
+    def forget(self, incarnation: str) -> None:
+        """The worker ended: its early cancels go."""
+        with self._lock:
+            self._cancelled.pop(incarnation, None)
 
     def _check(self, req: FetchRequest) -> str | None:
         """Why the request is malformed or too large, or None."""
@@ -392,6 +433,10 @@ class FetchManager:
                         pins.append(outcome.pin_id)
                     outcome = _miss(fill)
                 items.append(outcome)
+            # Its waiters leave the flights (a leader stays, answered)
+            for flight in set(op.flights):
+                if flight is not None:
+                    flight.waiters = [w for w in flight.waiters if w.op is not op]
             for outcome in items:
                 reason = f":{outcome.reason.value}" if outcome.reason else ""
                 self.results[f"{outcome.result.value}{reason}"] += 1
@@ -429,8 +474,15 @@ class FetchManager:
     def _lead(self, op: _Op, flights: list[_Flight]) -> None:
         """Run the flights ``op`` started, then serve their other waiters."""
         try:
-            todo = self._take_pages(flights, op.deadline)
-            todo = self._pin_sources(todo)
+            cached = [f for f in flights if f.cached]
+            todo = [f for f in flights if not f.cached]
+            if cached:
+                held, gone = self._hold_copies(op, cached)
+                for flight in held:
+                    self._fan_out(flight)
+                todo += gone
+            todo = self._take_pages(todo)
+            todo = self._pin_sources(op, todo)
             todo = self._read(todo)
             for flight in self._publish(op, todo):
                 self._fan_out(flight)
@@ -440,16 +492,18 @@ class FetchManager:
                 if not flight.closed:
                     self._fail(flight, _miss(MissReason.BUSY))
 
-    def _take_pages(self, flights: list[_Flight], deadline: float) -> list[_Flight]:
+    def _take_pages(self, flights: list[_Flight]) -> list[_Flight]:
         """A destination page for each flight, from the top tier's mapped
-        pools. Short of room, eviction is asked to make it (want_room) until
-        the deadline."""
+        pools. Short of room, eviction is asked to make it (want_room) while
+        a waiter of the flight is within its deadline; each waiter is
+        answered at its own."""
         out: list[_Flight] = []
         need = list(flights)
         while need:
-            for flight in [f for f in need if not self._live(f)]:
+            now = time.monotonic()
+            for flight in [f for f in need if self._deadline(f) <= now]:
                 need.remove(flight)
-                self._fail(flight, _miss())
+                self._fail(flight, _miss(MissReason.BUSY))
             refs = self._reserve(len(need))
             for flight, ref in zip(need, refs, strict=False):
                 flight.dest = ref
@@ -457,13 +511,19 @@ class FetchManager:
             need = need[len(refs) :]
             if not need:
                 break
-            if time.monotonic() >= deadline or self._stop.is_set():
+            if self._stop.is_set():
                 for flight in need:
                     self._fail(flight, _miss(MissReason.BUSY))
                 break
             self.manager.want_room(self.kind, len(need) * self.page_size)
             self._stop.wait(ROOM_POLL_S)
         return out
+
+    def _deadline(self, flight: _Flight) -> float:
+        """The latest deadline of the flight's unanswered waiters (0: none)."""
+        with self._lock:
+            waiters = [flight.leader, *flight.waiters]
+            return max((w.op.deadline for w in waiters if not w.op.answered), default=0)
 
     def _reserve(self, count: int) -> list[PageRef]:
         """FREE -> TRANSFER pages of the top tier, roomiest pool first: the
@@ -485,8 +545,8 @@ class FetchManager:
             out += self.pools.reserve_transfer(pool_id, count - len(out))
         return out
 
-    def _pin_sources(self, flights: list[_Flight]) -> list[_Flight]:
-        """SOURCE_PIN the exact sources, one request."""
+    def _pin_sources(self, op: _Op, flights: list[_Flight]) -> list[_Flight]:
+        """SOURCE_PIN the exact sources for ``op``'s worker, one request."""
         live = []
         for flight in flights:
             if self._live(flight):
@@ -494,34 +554,95 @@ class FetchManager:
             else:
                 self._drop_page(flight)
                 self._fail(flight, _miss())
-        if not live:
-            return []
-        try:
-            response = self.metadata.source_pin(
-                [KeyLocation(key=f.key, location=f.source) for f in live]
-            )
-        except Exception as e:
-            # No read started: the pages go back; the run ends unless stopping
-            self._unknown("SOURCE_PIN", e)
-            for flight in live:
-                self._drop_page(flight)
-                self._fail(flight, _miss(MissReason.BUSY))
-            return []
-        if response.status != Status.OK:
-            logger.error("SOURCE_PIN refused: %s %s", response.status, response.error)
-            for flight in live:
-                self._drop_page(flight)
-                self._fail(flight, _miss(MissReason.BUSY))
-            return []
+        pins = self._source_pin(op, live, [f.source for f in live])
         out = []
-        for flight, outcome in zip(live, response.items, strict=True):
-            if outcome.result == ItemResult.HIT and outcome.pin_id:
-                flight.source_pin = outcome.pin_id
+        for flight, pin in zip(live, pins, strict=True):
+            if isinstance(pin, str):
+                flight.source_pin = pin
                 out.append(flight)
             else:
                 self._drop_page(flight)
-                self._fail(flight, _miss(outcome.reason or MissReason.ABSENT))
+                self._fail_for(op, flight, pin)
         return out
+
+    def _source_pin(
+        self, op: _Op, flights: list[_Flight], locations: list[Location]
+    ) -> list[str | ItemOutcome]:
+        """A node pin on each exact location, or the outcome of its flight.
+        MaruServer checks that ``op``'s session is its worker's own (the one
+        that attached here) before anything is read: REJECTED otherwise."""
+        if not flights:
+            return []
+        try:
+            response = self.metadata.source_pin(
+                [
+                    KeyLocation(key=f.key, location=loc)
+                    for f, loc in zip(flights, locations, strict=True)
+                ],
+                worker_session=op.session,
+                worker_incarnation=op.origin,
+            )
+        except Exception as e:
+            # Nothing read: the run ends unless stopping
+            self._unknown("SOURCE_PIN", e)
+            return [_miss(MissReason.BUSY)] * len(flights)
+        if response.status == Status.REJECTED:
+            logger.warning("FETCH of %s refused: %s", op.origin, response.error)
+            return [ItemOutcome(ItemResult.REJECTED)] * len(flights)
+        if response.status != Status.OK:
+            logger.error("SOURCE_PIN refused: %s %s", response.status, response.error)
+            return [_miss(MissReason.BUSY)] * len(flights)
+        return [
+            o.pin_id
+            if o.result == ItemResult.HIT and o.pin_id
+            else _miss(o.reason or MissReason.ABSENT)
+            for o in response.items
+        ]
+
+    def _fail_for(self, op: _Op, flight: _Flight, outcome: ItemOutcome) -> None:
+        """End the flight with ``outcome`` for ``op``; a refusal of op's
+        worker is only a miss for the other waiters."""
+        if outcome.result != ItemResult.REJECTED:
+            self._fail(flight, outcome)
+            return
+        with self._lock:
+            waiters = [flight.leader, *flight.waiters]
+            flight.waiters = []
+            self._close(flight)
+        for waiter in waiters:
+            self._resolve(waiter, outcome if waiter.op is op else _miss())
+
+    def _hold_copies(
+        self, op: _Op, flights: list[_Flight]
+    ) -> tuple[list[_Flight], list[_Flight]]:
+        """A node pin (SOURCE_PIN) on each copy published before, to serve
+        the waiters from (leader too); those whose copy went meanwhile read
+        the SSD as a new flight, if the quota has room."""
+        pins = self._source_pin(op, flights, [f.copy for f in flights])
+        held, gone = [], []
+        for flight, pin in zip(flights, pins, strict=True):
+            if isinstance(pin, str):
+                flight.node_pin = pin
+                with self._lock:
+                    flight.waiters.insert(0, flight.leader)
+                self.results["published_used"] += 1
+                held.append(flight)
+                continue
+            if pin.result == ItemResult.REJECTED or pin.reason == MissReason.BUSY:
+                self._fail_for(op, flight, pin)
+                continue
+            cost = self.page_size + flight.bounce
+            with self._lock:
+                fits = self._inflight + cost <= self.inflight_max_bytes
+                if fits:
+                    flight.cached, flight.copy = False, None
+                    flight.charged = cost
+                    self._inflight += cost
+            if fits:
+                gone.append(flight)
+            else:
+                self._fail(flight, _miss(MissReason.BUSY))
+        return held, gone
 
     def _read(self, flights: list[_Flight]) -> list[_Flight]:
         """Read each source into its page, FETCH_IO_DEPTH at a time; the
@@ -619,7 +740,9 @@ class FetchManager:
             for f, copy in zip(flights, copies, strict=True)
         ]
         try:
-            response = self.metadata.fetch_complete(session, items)
+            response = self.metadata.fetch_complete(
+                session, items, worker_incarnation=op.origin if session else ""
+            )
         except Exception as e:
             # Unknown whether published: the pages stay PENDING, with the run
             self._unknown("FETCH_COMPLETE", e)
@@ -662,6 +785,11 @@ class FetchManager:
                 )
                 self._fail(flight, _miss(MissReason.ABSENT))
                 continue
+            with self._lock:
+                self._published[flight.key] = location
+                self._published.move_to_end(flight.key)
+                while len(self._published) > PUBLISHED_KEYS:
+                    self._published.popitem(last=False)
             if outcome.result == ItemResult.HIT and outcome.pin_id:
                 hit = ItemOutcome(
                     ItemResult.HIT, location=location, pin_id=outcome.pin_id
@@ -671,6 +799,19 @@ class FetchManager:
                 self._resolve(flight.leader, _miss())
             out.append(flight)
         return out
+
+    def _copy(self, key: Key) -> Location | None:
+        """A copy of ``key`` published here before and still usable."""
+        with self._lock:
+            location = self._published.get(key)
+        if location is None:
+            return None
+        if self._usable(key, location):
+            return location
+        with self._lock:
+            if self._published.get(key) == location:
+                del self._published[key]
+        return None
 
     def _usable(self, key: Key, location: Location) -> bool:
         """A READY page of the key in a pool workers map (never handed over
@@ -697,26 +838,35 @@ class FetchManager:
                 if not batch:
                     self._close(flight)
                     break
-            sessions: dict[str, list[_Waiter]] = {}
+            workers: dict[tuple[str, str], list[_Waiter]] = {}
             for waiter in batch:
-                sessions.setdefault(waiter.op.session, []).append(waiter)
-            for session, waiters in sessions.items():
+                op = waiter.op
+                workers.setdefault((op.session, op.origin), []).append(waiter)
+            for (session, origin), waiters in workers.items():
                 for i in range(0, len(waiters), MAX_BATCH):
                     self._pin_copy(
-                        flight.key, copy, session, waiters[i : i + MAX_BATCH]
+                        flight.key, copy, session, origin, waiters[i : i + MAX_BATCH]
                     )
         if flight.node_pin:
             self._unpin_later([flight.node_pin])
 
     def _pin_copy(
-        self, key: Key, copy: Location, session: str, waiters: list[_Waiter]
+        self,
+        key: Key,
+        copy: Location,
+        session: str,
+        origin: str,
+        waiters: list[_Waiter],
     ) -> None:
-        """FETCH_COMPLETE of the exact copy: one pin per waiter."""
+        """FETCH_COMPLETE of the exact copy: one pin per waiter, only for the
+        worker ``origin``'s own session."""
         items = [
             FetchCompleteItem(key, "", copy, copy.length) for _ in range(len(waiters))
         ]
         try:
-            response = self.metadata.fetch_complete(session, items)
+            response = self.metadata.fetch_complete(
+                session, items, worker_incarnation=origin
+            )
         except Exception as e:
             self._unknown("FETCH_COMPLETE", e)
             outcomes = [_miss(MissReason.BUSY)] * len(waiters)
@@ -725,6 +875,9 @@ class FetchManager:
                 outcomes = [
                     ItemOutcome(ItemResult.HIT, location=copy, pin_id=o.pin_id)
                     if o.result == ItemResult.HIT and o.pin_id
+                    # another worker's session, run or namespace
+                    else ItemOutcome(ItemResult.REJECTED)
+                    if o.result == ItemResult.REJECTED
                     else _miss()
                     for o in response.items
                 ]
@@ -762,6 +915,21 @@ class FetchManager:
             self._unpins.extend(pin_ids)
             self._unpin_cv.notify()
 
+    def _unpin(self, batch: list[str]):
+        """UNPIN until a result is known (an UNPIN is idempotent); None once
+        the run is over or ended because the result stays unknown."""
+        for attempt in range(UNPIN_TRIES):
+            try:
+                return self.metadata.unpin(batch)
+            except (EpochChanged, ServerStopped):
+                return None  # the run is over: its pins go with it
+            except Exception as e:
+                logger.warning("UNPIN of %d fetch pins: %s", len(batch), e)
+                if attempt + 1 == UNPIN_TRIES or self._stop.wait(UNPIN_RETRY_S):
+                    self._unknown("UNPIN", e)
+                    return None
+        return None
+
     def _release_loop(self) -> None:
         """UNPIN, a batch at a time, off the fetch path."""
         while True:
@@ -774,13 +942,9 @@ class FetchManager:
                     self._unpins.popleft()
                     for _ in range(min(MAX_BATCH, len(self._unpins)))
                 ]
-            try:
-                response = self.metadata.unpin(batch)
-            except (EpochChanged, ServerStopped):
+            response = self._unpin(batch)
+            if response is None:
                 return
-            except Exception:
-                logger.exception("UNPIN of %d fetch pins failed", len(batch))
-                continue
             refused = [
                 p
                 for p, o in zip(batch, response.items, strict=False)
