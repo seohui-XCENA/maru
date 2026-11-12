@@ -42,7 +42,7 @@ from maru_handler.client import (
 )
 from maru_handler.client.storage_conn import StorageConn, close_fds
 from maru_storage_service.config import parse_node_config
-from tests.unit.ms_fake_server import Entry, FakeMaruServer, NodeRec
+from tests.unit.ms_fake_server import Entry, FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
     RawWorker,
@@ -427,25 +427,19 @@ class TestOutcomeCounters:
         handler = handlers()
         assert put(handler, "here")
         with fake._lock:
-            fake.nodes["other"] = NodeRec(
-                node_id="other",
-                node_epoch="o",
-                session="s-other",
-                epoch_seq=1,
-                pools={},
-                last_seen=0.0,
-            )
-            loc = Location("dram:other:o", "x", 1, 0, 8, PoolKind.DRAM)
-            entry = Entry(Key(NS, "remote"), loc, 8, "other")
+            # Only the node's own SSD copy is a FETCH source
+            (node_id,) = fake.nodes
+            loc = Location(f"ssd:{node_id}:/x", "x", 1, 0, 8, PoolKind.SSD)
+            entry = Entry(Key(NS, "on_ssd"), loc, 8, node_id)
             fake.catalog[entry.key] = [entry]
-            fake.by_loc[("dram:other:o", "x", 1)] = entry
+            fake.by_loc[(loc.pool_id, "x", 1)] = entry
 
         def offline(response):
             response.items[-1] = ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
             return response
 
         fake.rewrite_responses(MessageType.LOOKUP_AND_PIN, offline)
-        reads = handler.batch_retrieve(["here", "gone", "remote", "late"])
+        reads = handler.batch_retrieve(["here", "gone", "on_ssd", "late"])
         assert reads[0] is not None and reads[1:] == [None, None, None]
         handler.release_retrieved(reads)
         stats = handler.get_stats()["maru_node"]["counters"]
