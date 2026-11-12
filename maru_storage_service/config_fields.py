@@ -184,6 +184,8 @@ class TierSpec:
     check_servable: Callable[[TierConfig], None] = _always_servable
     # The tier the StorageService runs; None: parsed, not served
     make: Callable[[TierConfig, TierEnv], Tier] | None = None
+    # It makes a Leased tier: claimed once every other tier is open
+    leased: bool = False
 
     @property
     def served(self) -> bool:

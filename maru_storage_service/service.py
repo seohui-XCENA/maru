@@ -2,9 +2,10 @@
 # Copyright 2026 XCENA Inc.
 """StorageService: builds and runs the parts of one node for one run.
 
-Start order: claim the socket, DRAM pool, SSD file, the node's CXL regions
-from the RM, NODE_OPEN, adopted ledgers, quarantine of the regions an earlier
-run still holds, heartbeat, then accept on the UDS. A GPU node with [dram],
+Start order: claim the socket, open the tiers in config order (DRAM pool,
+SSD file), then claim the leased ones (the node's CXL regions from the RM),
+NODE_OPEN, adopted ledgers, quarantine of the regions an earlier run still
+holds, heartbeat, then accept on the UDS. A GPU node with [dram],
 [cxl], [dram, cxl], [dram, ssd], [cxl, ssd] or [dram, cxl, ssd] is served;
 other configs are refused. The top tier gives credit; each tier makes room by
 demoting its pages to the tier below (write-back), the last one by dropping
@@ -32,7 +33,9 @@ from typing import TypeVar
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
+    POOL_KINDS,
     CloseMode,
+    PoolDescriptor,
     run_holder,
 )
 
@@ -62,7 +65,7 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
-from .tiers import Level, Tier, TierEnv
+from .tiers import L1Tier, L2Tier, Leased, Level, Tier, TierEnv
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
@@ -124,7 +127,7 @@ def check_servable(config: NodeConfig) -> None:
 def worker_budgets(
     config: NodeConfig, top_bytes: int, bounce: int, workers: int = 1
 ) -> Budgets:
-    """The budgets a worker gets at ATTACH. With an SSD tier its
+    """The budgets a worker gets at ATTACH. With an L2 tier (SSD) its
     fetch_request_max_bytes is its fetch window: the pages it may hold
     fetched at once. Within the per-op cap, its share among ``workers``
     (the fetch_v1 workers attached, itself included) of the flights the
@@ -132,7 +135,7 @@ def worker_budgets(
     ``top_bytes`` really mapped for the top tier less its credit, commit
     pending and transfer reserve; one page at least."""
     budgets = config.budgets
-    if config.tier("ssd") is None:
+    if all(t.is_memory for t in config.tiers):
         return budgets
     ps = config.page_size
     workers = max(1, workers)
@@ -190,9 +193,8 @@ class StorageService:
         self.transfer_bytes_per_s = transfer_bytes_per_s
         self.map_region = map_region
         self.transfers: TransferEngine | None = None
-        self._dram_tier: DramTier | None = None
-        self.cxl: CxlTier | None = None
-        self._ssd_tier: SsdTier | None = None
+        # The run's tiers by store name, in the order they started
+        self._tiers: dict[str, Tier] = {}
         # Why the run ended on its own, and whether a new run follows
         self.ended: str | None = None
         self.new_run = False
@@ -213,6 +215,24 @@ class StorageService:
         self.adopted: list[str] = []
         self._credit_tiers: set[str] = set()
         self._stopped = threading.Event()
+
+    def _named(self, name: str, cls: type[T]) -> T | None:
+        """The run's tier ``name``, if it is a ``cls``."""
+        tier = self._tiers.get(name)
+        return tier if isinstance(tier, cls) else None
+
+    @property
+    def _dram_tier(self) -> DramTier | None:
+        return self._named("dram", DramTier)
+
+    @property
+    def _ssd_tier(self) -> SsdTier | None:
+        return self._named("ssd", SsdTier)
+
+    @property
+    def cxl(self) -> CxlTier | None:
+        """The cxl tier, once made."""
+        return self._named("cxl", CxlTier)
 
     @property
     def dram(self) -> DramPool | None:
@@ -239,12 +259,18 @@ class StorageService:
             map_region=self.map_region,
         )
 
-    def _make(self, tier: TierConfig, cls: type[T]) -> T:
-        """The tier object of ``tier``, made by its store's TierSpec."""
-        make = TIERS[tier.store].make
-        assert make is not None  # check_servable lets served stores only
-        made = make(tier, self._env())
-        assert isinstance(made, cls)
+    def _make(self, tier: TierConfig) -> Tier:
+        """The tier object of ``tier``, made by its store's TierSpec; the run
+        keeps it."""
+        spec = TIERS[tier.store]
+        assert spec.make is not None  # check_servable lets served stores only
+        made = spec.make(tier, self._env())
+        if spec.leased != isinstance(made, Leased):
+            raise TypeError(
+                f"store {tier.store}: its spec says leased={spec.leased}, "
+                f"but it made a {type(made).__name__}"
+            )
+        self._tiers[tier.store] = made
         return made
 
     def start(self) -> None:
@@ -292,39 +318,45 @@ class StorageService:
             socket_group=config.socket_group,
             capabilities=(
                 frozenset({FETCH_CAPABILITY})
-                if config.tier("ssd") is not None
+                if any(not t.is_memory for t in config.tiers)
                 else frozenset()
             ),
         )
         self.local.claim()
-        dram_tier = config.tier("dram")
-        if dram_tier is not None:
-            self._create_dram(dram_tier)
-        ssd_tier = config.tier("ssd")
-        if ssd_tier is not None:
-            # Before NODE_OPEN. Its lock is free only once every earlier run's
-            # I/O on it has ended: an earlier run of this process drained
-            # and closed it, an earlier process exited
-            self._ssd_tier = self._make(ssd_tier, SsdTier)
-            self._ssd_tier.open()
-        cxl_tier = config.tier("cxl")
-        if cxl_tier is not None:
-            # Before NODE_OPEN: only regions this run owns are announced
-            self.cxl = self._make(cxl_tier, CxlTier)
-            self.cxl.claim()
-            if self._interrupted.is_set():
-                raise ServerStopped()
-            self.cxl.start_renewing()
-            self._check_stopped()
+        # Before NODE_OPEN, in config order. An SSD file's lock is free only
+        # once every earlier run's I/O on it has ended: an earlier run of
+        # this process drained and closed it, an earlier process exited
+        for t in config.tiers:
+            if not TIERS[t.store].leased:
+                self._open(self._make(t))
+        # Then the leased ones: only regions this run owns are announced
+        for t in config.tiers:
+            if TIERS[t.store].leased:
+                leased = self._make(t)
+                assert isinstance(leased, Leased)
+                leased.open()
+                leased.claim()
+                if self._interrupted.is_set():
+                    raise ServerStopped()
+                leased.start_renewing()
+                self._check_stopped()
+        # In the order they started: the order pools are announced and logged
+        tiers = self._tiers
         traits = config.traits()
         if any(t.demotes_to is not None for t in traits.values()):
             self.transfers = TransferEngine(self.transfer_bytes_per_s)
             self._map_for_transfers(self.transfers)
         self.pools = PoolManager(config.budgets, config.page_size)
-        if self.dram is not None:
-            self.pools.add_pool(
-                self.dram.info(), creditable=traits["dram"].credit, tier="dram"
-            )
+        self._credit_tiers = {
+            name for name, t in traits.items() if t.credit or t.credit_fallback
+        }
+        # A pool that ends with its run (DRAM) is never adopted
+        for t in config.tiers:
+            for info in tiers[t.store].pool_infos():
+                if POOL_KINDS[info.kind].run_scoped:
+                    self.pools.add_pool(
+                        info, creditable=t.store in self._credit_tiers, tier=t.store
+                    )
         self.server = ServerClient(
             config.server,
             config.node_id,
@@ -335,11 +367,9 @@ class StorageService:
         if self._interrupted.is_set():  # before interrupt() could stop it
             raise ServerStopped()
         placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
-        for tier in config.tiers[1:]:
-            if tier.high_watermark is not None and tier.low_watermark is not None:
-                placement.set_watermarks(
-                    tier.store, tier.high_watermark, tier.low_watermark
-                )
+        for t in config.tiers[1:]:
+            if t.high_watermark is not None and t.low_watermark is not None:
+                placement.set_watermarks(t.store, t.high_watermark, t.low_watermark)
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,
@@ -357,8 +387,9 @@ class StorageService:
                 reason, CloseMode.RESTART, new_run=True
             ),
         )
-        if self.ssd is not None:
-            # Workers fetch SSD pages into the top tier
+        l2 = [t for t in tiers.values() if isinstance(t, L2Tier)]
+        if l2:
+            # Workers fetch L2 pages into the top tier
             self.manager.fetches = FetchManager(
                 self.manager,
                 sources=self.transfers.l2_pools() if self.transfers is not None else {},
@@ -368,22 +399,13 @@ class StorageService:
                 request_max_bytes=config.budgets.fetch_request_max_bytes,
                 inflight_max_bytes=config.budgets.fetch_max_inflight_bytes,
             )
-        cxl_pools = self.cxl.pools if self.cxl is not None else []
-        self._credit_tiers = {
-            name for name, t in traits.items() if t.credit or t.credit_fallback
-        }
+        leases = [t for t in tiers.values() if isinstance(t, Leased)]
         # The tier of each pool this run opens: adopted ones are among them
-        pool_tiers = {p.pool_id: "cxl" for p in cxl_pools}
-        if self.dram is not None:
-            pool_tiers[self.dram.pool_id] = "dram"
-        if self.ssd is not None:
-            pool_tiers[self.ssd.pool_id] = "ssd"
-        rm_domains = self.cxl.rm_domains() if self.cxl is not None else []
+        announced = [(n, i) for n, t in tiers.items() for i in t.pool_infos()]
+        pool_tiers = {info.pool_id: name for name, info in announced}
+        rm_domains = [d for t in leases for d in t.rm_domains()]
         opened = self.server.open(
-            ([self.dram.info()] if self.dram is not None else [])
-            + ([self.ssd.info()] if self.ssd is not None else [])
-            + [p.info() for p in cxl_pools],
-            rm_domains=rm_domains,
+            [info for _, info in announced], rm_domains=rm_domains
         )
         self._check_stopped()
         self.pools.set_epoch_seq(opened.epoch_seq)
@@ -408,31 +430,34 @@ class StorageService:
                 placement.on_ready(ref)
             self.adopted.append(info.pool_id)
             logger.info("adopted pool %s: %d committed pages", info.pool_id, len(refs))
-        for pool in cxl_pools:
-            if pool.pool_id in adopted_ids:
-                continue
-            if self.cxl is not None and self.cxl.taken_over(pool.pool_id):
-                # The run before may have written it: quarantined as an
-                # adopted pool, with no committed page
-                self.pools.add_pool(
-                    pool.info(),
-                    creditable=False,
-                    state=PageState.QUARANTINED,
-                    tier="cxl",
-                )
-                self.pools.quarantine_pool(pool.pool_id)
-                self.adopted.append(pool.pool_id)
-            else:
-                self.pools.add_pool(
-                    pool.info(), creditable="cxl" in self._credit_tiers, tier="cxl"
-                )
-        if self.ssd is not None and self.ssd.pool_id not in adopted_ids:
-            # Not adopted (first run, another boot, another MaruServer or a
-            # run on one in between): the file is reused from scratch
-            self.pools.add_pool(self.ssd.info(), creditable=False, tier="ssd")
+        # The rest in config order. An SSD file not adopted (first run,
+        # another boot, another MaruServer or a run on one in between) is
+        # reused from scratch
+        for t in config.tiers:
+            tier = tiers[t.store]
+            for info in tier.pool_infos():
+                if info.pool_id in adopted_ids or POOL_KINDS[info.kind].run_scoped:
+                    continue
+                if isinstance(tier, Leased) and tier.taken_over(info.pool_id):
+                    # The run before may have written it: quarantined as an
+                    # adopted pool, with no committed page
+                    self.pools.add_pool(
+                        info,
+                        creditable=False,
+                        state=PageState.QUARANTINED,
+                        tier=t.store,
+                    )
+                    self.pools.quarantine_pool(info.pool_id)
+                    self.adopted.append(info.pool_id)
+                else:
+                    self.pools.add_pool(
+                        info, creditable=t.store in self._credit_tiers, tier=t.store
+                    )
         self.manager.start()
         # Quarantined while an earlier run holds the region in the RM
-        earlier = self.cxl.earlier_holds() if self.cxl is not None else {}
+        earlier: dict[str, set[str]] = {}
+        for lease in leases:
+            earlier.update(lease.earlier_holds())
         for pool_id in self.adopted:
             if pool_id in earlier:
                 logger.info(
@@ -442,17 +467,22 @@ class StorageService:
                 )
             else:
                 self._end_quarantine(pool_id)
-        if self.cxl is not None:
-            self.cxl.watch_holds(self._end_quarantine)
+        for lease in leases:
+            lease.watch_holds(self._end_quarantine)
         self.manager.start_heartbeat()
         self.local.manager = self.manager
-        dram_pools = (
-            [] if self.dram is None else [(self.dram.descriptor(memfd=0), self.dram.fd)]
-        )
-        self.local.pools = dram_pools + [
-            (pool.descriptor(), None) for pool in cxl_pools
-        ]
-        if self.ssd is not None:
+        # Workers map the L1 pools; memfd indexes the fds sent with ATTACH
+        attach: list[tuple[PoolDescriptor, int | None]] = []
+        for tier in tiers.values():
+            if isinstance(tier, L1Tier):
+                for pool in tier.pools:
+                    fd = pool.worker_fd()
+                    memfd = (
+                        None if fd is None else sum(f is not None for _, f in attach)
+                    )
+                    attach.append((pool.descriptor(memfd=memfd), fd))
+        self.local.pools = attach
+        if l2:
             # The window fits the pools fetches can use at ATTACH (the RM may
             # give less, a mapping may fail, a pool may be quarantined)
             pools, fetches = self.pools, self.manager.fetches
@@ -461,7 +491,7 @@ class StorageService:
                 infos = [pools.pool_info(i) for i in fetches.destinations()]
                 return sum(i.capacity for i in infos if i is not None)
 
-            bounce = self.ssd.io_size(config.page_size)
+            bounce = max(t.io_size(config.page_size) for t in l2)
             self.local.budgets = worker_budgets(config, top_bytes(), bounce)
             self.local.fetch_budgets = lambda workers: worker_budgets(
                 config, top_bytes(), bounce, workers
@@ -473,24 +503,27 @@ class StorageService:
             config.node_id,
             config.page_size >> 10,
         )
-        if self._dram_tier is not None:
-            logger.info("dram tier: %s", self._dram_tier.describe(adopted_ids))
-        if self._ssd_tier is not None:
-            logger.info("ssd tier: %s", self._ssd_tier.describe(adopted_ids))
-        if self.cxl is not None and self.cxl.pools:
-            logger.info("cxl tier: %s", self.cxl.describe(adopted_ids))
+        for name, tier in tiers.items():
+            if tier.pool_infos():
+                logger.info("%s tier: %s", name, tier.describe(adopted_ids))
 
     def _create_dram(self, tier: TierConfig) -> DramPool:
-        """The run's memfd (its DramTier opened). Memory that ran short may
-        come free once workers unmap an earlier run's pool: tried again with
-        a backoff until it fits or the run is stopped, as is any failure of a
-        later run in this process."""
-        dram = self._dram_tier = self._make(tier, DramTier)
+        """The run's memfd: its DramTier made and opened."""
+        dram = self._make(tier)
+        assert isinstance(dram, DramTier)
+        self._open(dram)
+        return dram.pools[0]
+
+    def _open(self, tier: Tier) -> None:
+        """Open ``tier``. A DRAM pool that ran short of memory may fit once
+        workers unmap an earlier run's pool: tried again with a backoff until
+        it fits or the run is stopped, as is any DRAM failure of a later run
+        in this process."""
         pause, logged = DRAM_RETRY_S, None
         while True:
             try:
-                dram.open()
-                return dram.pools[0]
+                tier.open()
+                return
             except DramPoolError as e:
                 if not (e.short or self.later_run):
                     raise
@@ -507,18 +540,19 @@ class StorageService:
             pause = min(pause * 2, DRAM_RETRY_MAX_S)
 
     def _map_for_transfers(self, engine: TransferEngine) -> None:
-        """The node's own mappings of its pools, for demotion copies. A
-        region it cannot map takes no demotions."""
-        dram = self._dram_tier
-        if dram is not None and dram.pool is not None:
-            engine.add_pool(dram.pool.pool_id, dram.map_for_transfers(dram.pool))
-        if self.cxl is not None:
-            for pool in self.cxl.pools:
-                mapping = self.cxl.map_for_transfers(pool)
-                if mapping is not None:
-                    engine.add_pool(pool.pool_id, mapping)
-        if self._ssd_tier is not None and self._ssd_tier.pool is not None:
-            engine.add_l2(self._ssd_tier)
+        """The node's own mappings of its L1 pools, for demotion copies, then
+        the L2 tiers, in the order the tiers started. A pool it cannot map
+        takes no demotions."""
+        tiers = self._tiers.values()
+        for tier in tiers:
+            if isinstance(tier, L1Tier):
+                for pool in tier.pools:
+                    mapping = tier.map_for_transfers(pool)
+                    if mapping is not None:
+                        engine.add_pool(pool.pool_id, mapping)
+        for tier in tiers:
+            if isinstance(tier, L2Tier):
+                engine.add_l2(tier)
         engine.start()
 
     def _end_quarantine(self, pool_id: str) -> None:

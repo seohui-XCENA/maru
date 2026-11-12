@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """An L2 tier written against tiers.L2Tier alone moves pages through the
-TransferEngine: bytes, result flags, and drain before unmap."""
+TransferEngine: bytes, result flags, and drain before unmap. A store
+registered with a make() is started by the StorageService as it is."""
 
 import collections
+import logging
 import mmap
 import threading
 import time
@@ -11,10 +13,17 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from maru_common.storage_types import Location, PoolInfo, PoolKind
+from maru_common.storage_types import FETCH_CAPABILITY, Location, PoolInfo, PoolKind
+from maru_storage_service import service as service_module
+from maru_storage_service.config import parse_node_config
+from maru_storage_service.config_fields import TierSpec
+from maru_storage_service.drivers.registry import TIERS
 from maru_storage_service.page_table import PageRef
 from maru_storage_service.tiers import IOResult, L2Tier, Level
 from maru_storage_service.transfer_engine import Copy, TransferEngine
+from tests.unit.ms_fake_server import FakeMaruServer
+from tests.unit.ms_node_helpers import PAGE as NODE_PAGE
+from tests.unit.ms_node_helpers import remove_tree, short_tmpdir, start_node
 
 PAGE = mmap.PAGESIZE
 WAIT = 5
@@ -248,3 +257,110 @@ def test_tiers_need_not_be_hashable():
     assert engine.close() == set()
     assert "drained" in tier.events
     assert memory.closed
+
+
+class StoreL2(FakeL2):
+    """FakeL2 as a store's tier: one pool of the node's pages."""
+
+    def __init__(self, tier, env):
+        super().__init__(env.node_epoch)
+        self.info = PoolInfo(
+            f"ssd:{env.node_id}:/fake",
+            PoolKind.SSD,
+            env.node_id,
+            1,
+            tier.size,
+            env.page_size,
+        )
+        self.opened = False
+
+    def open(self) -> None:
+        self.opened = True
+
+    def pool_infos(self) -> list[PoolInfo]:
+        return [self.info]
+
+
+def test_a_registered_store_is_started_by_the_service(monkeypatch, caplog):
+    made: list[StoreL2] = []
+
+    def make(tier, env):
+        made.append(StoreL2(tier, env))
+        return made[-1]
+
+    keys = frozenset({"store", "size", "demotion", "high_watermark", "low_watermark"})
+    spec = TierSpec("fake", Level.L2, True, PoolKind.SSD, keys, make=make)
+    monkeypatch.setitem(TIERS, "fake", spec)
+    monkeypatch.setattr(service_module, "SERVED_TIERS", service_module._served_tiers())
+    server, sockdir = FakeMaruServer(heartbeat_s=0.1), short_tmpdir()
+    caplog.set_level(logging.INFO, logger="maru_storage_service.service")
+    try:
+        config = parse_node_config(
+            {
+                "node_id": "gpu-test",
+                "socket": f"{sockdir}/node.sock",
+                "server": server.url,
+                "page_size": NODE_PAGE,
+                "tiers": [
+                    {"store": "dram", "size": 16 * NODE_PAGE, "hugepage": False},
+                    {"store": "fake", "size": 32 * NODE_PAGE},
+                ],
+                "budgets": {
+                    "credit_max_bytes": 4 * NODE_PAGE,
+                    "credit_total_max_bytes": 8 * NODE_PAGE,
+                    "credit_refill_low": NODE_PAGE,
+                    "credit_refill_high": 4 * NODE_PAGE,
+                    "commit_pending_max_bytes": 4 * NODE_PAGE,
+                    "transfer_reserve_bytes": NODE_PAGE,
+                },
+            }
+        )
+        service = start_node(config)
+        try:
+            [tier] = made
+            pool_id, dram_id = tier.info.pool_id, service.dram.pool_id
+            assert tier.opened
+            assert pool_id in server.nodes["gpu-test"].pools  # announced
+            assert service.pools.tier_of(pool_id) == "fake"
+            assert not service.pools.creditable(pool_id)
+            assert service.transfers.l2_pools() == {pool_id: tier}
+            assert list(tier.memory) == [dram_id]
+            assert service.manager.fetches is not None
+            assert service.local.capabilities == {FETCH_CAPABILITY}
+            assert "fake tier: fake" in caplog.text
+        finally:
+            service.stop()
+        assert service.teardown_failed is None
+        assert tier.events.index("drained") < tier.events.index(f"detach {dram_id}")
+    finally:
+        remove_tree(sockdir)
+        server.close()
+
+
+def test_a_spec_that_misstates_leased_fails_the_start(monkeypatch):
+    def make(tier, env):
+        return StoreL2(tier, env)
+
+    keys = frozenset({"store", "size", "demotion", "high_watermark", "low_watermark"})
+    spec = TierSpec("fake", Level.L2, True, PoolKind.SSD, keys, make=make, leased=True)
+    monkeypatch.setitem(TIERS, "fake", spec)
+    monkeypatch.setattr(service_module, "SERVED_TIERS", service_module._served_tiers())
+    server, sockdir = FakeMaruServer(heartbeat_s=0.1), short_tmpdir()
+    try:
+        config = parse_node_config(
+            {
+                "node_id": "gpu-test",
+                "socket": f"{sockdir}/node.sock",
+                "server": server.url,
+                "page_size": NODE_PAGE,
+                "tiers": [
+                    {"store": "dram", "size": 16 * NODE_PAGE, "hugepage": False},
+                    {"store": "fake", "size": 32 * NODE_PAGE},
+                ],
+            }
+        )
+        with pytest.raises(TypeError, match="leased=True, but it made a StoreL2"):
+            start_node(config)
+    finally:
+        remove_tree(sockdir)
+        server.close()

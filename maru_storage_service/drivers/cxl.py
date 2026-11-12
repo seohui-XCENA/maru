@@ -720,4 +720,5 @@ SPEC = TierSpec(
     parse=_parse,
     check_servable=_check_servable,
     make=_make,
+    leased=True,
 )
