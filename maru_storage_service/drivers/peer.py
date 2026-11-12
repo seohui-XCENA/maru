@@ -650,13 +650,18 @@ class NixlRemoteTier(RemoteTier):
         resolve: bool = True,
         abandoned: Callable[[], bool] = lambda: False,
         lost: Callable[[], None] | None = None,
+        run: OpOrigin | None = None,
     ) -> None:
         """Send an op; its answer goes to ``callback``. One whose answer is
         lost is kept to be sent again (same seq) on the next connection,
         unless its sender abandoned it; ``lost`` is told at once. With
-        ``resolve`` False the sender resolves the seq itself."""
+        ``resolve`` False the sender resolves the seq itself. With ``run``,
+        nothing is sent once that memory run has ended."""
         seq = request.op.seq
-        ops = node.ops
+        with self._lock:  # a memory run and its connection, together
+            ops, conn = node.ops, node.conn
+        if run is not None and ops is not run:
+            return
 
         def answered(response: Any) -> None:
             if isinstance(response, ConnectionError):
@@ -678,13 +683,13 @@ class NixlRemoteTier(RemoteTier):
                         callback,
                         resolve=resolve,
                         abandoned=abandoned,
+                        run=ops,
                     )
                 return
             if ops is not None and resolve:
                 ops.resolved(seq)
             callback(response)
 
-        conn = node.conn
         if conn is None or conn.closed:
             answered(ConnectionError("not connected"))
             return

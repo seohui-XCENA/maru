@@ -116,7 +116,8 @@ class HelloRequest:
     """HELLO (0x01) - The first request of a connection, after the key proof.
 
     ``capabilities``: those MaruServer accepted for the sender's run.
-    ``conn_gen`` counts the run's connections to this memory node from 1.
+    ``conn_gen`` numbers the connection; it grows over the sender's run
+    (all memory nodes). The memory node does not use it.
     ``ack``: as OpRef.ack, for the run's ops so far.
     """
 

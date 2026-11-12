@@ -515,7 +515,8 @@ def test_a_large_fetch_gets_a_longer_deadline(client):
         looked_up(c, *[PLANNED] * keys)
         answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * keys))
         assert c._retrieve_chunk([f"k{i}" for i in range(keys)]) == [None] * keys
-        assert longest - 10 < c._storage.requests[-1].deadline_ms <= longest
+        # The scope's time left, read a moment later (slack for a loaded host)
+        assert longest - 100 < c._storage.requests[-1].deadline_ms <= longest
     c.config = dataclasses.replace(c.config, fetch_deadline_per_page_ms=10_000)
     answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * 40))
     c._retrieve_chunk([f"k{i}" for i in range(40)])

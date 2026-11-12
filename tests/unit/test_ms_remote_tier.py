@@ -753,3 +753,18 @@ def test_connection_numbers_are_unique_and_kept_from_ready(fake, memory, gpu):
         assert len({a.conn_gen, b.conn_gen}) == 2 and a.conn_gen > b.conn_gen
     finally:
         other.close()
+
+
+def test_a_resend_for_an_ended_memory_run_is_dropped(gpu, monkeypatch):
+    from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin
+    from maru_common.remote_protocol import CancelRequest
+    from maru_common.remote_protocol import RemoteMessageType as Code
+
+    node = gpu.tier._nodes[0]
+    sent, answers = [], []
+    monkeypatch.setattr(node.conn, "submit", lambda *args: sent.append(args))
+    request = gpu.tier._stamp(node, CancelRequest(PLACEHOLDER_OP, locations=[]))
+    gpu.tier._send(node, Code.CANCEL, request, answers.append, run=OpOrigin("old"))
+    assert sent == [] and answers == []
+    gpu.tier._send(node, Code.CANCEL, request, answers.append, run=node.ops)
+    assert len(sent) == 1
