@@ -190,7 +190,10 @@ class _MemoryNode:
         self.node_id = ""
         self.node_epoch = ""
         self.conn: RemoteConnection | None = None
+        # Its latest connection's number (unique in this tier), and the
+        # number of the one it was made ready on
         self.conn_gen = 0
+        self.ready_gen = 0
         self.peer = ""  # NIXL agent of its run
         self.pools: dict[str, RemotePool] = {}
         self.capabilities: list[str] = []
@@ -259,6 +262,7 @@ class NixlRemoteTier(RemoteTier):
         # NIXL peers of earlier memory runs, removed once no handle holds them
         self._stale_peers: set[str] = set()
         self._next_stage = 1  # stage_id: unique in this run
+        self._conn_seq = 0  # connection numbers, over all memory nodes
         self._lost_callbacks: list[Callable[[str, int], None]] = []
         self._drained = False
         self._stop = threading.Event()
@@ -386,7 +390,7 @@ class NixlRemoteTier(RemoteTier):
         with self._lock:
             for node in self._nodes:
                 if node.ready and node.node_id == node_id:
-                    return node.conn_gen
+                    return node.ready_gen
         return 0
 
     def owner(self, pool_id: str) -> str | None:
@@ -434,7 +438,8 @@ class NixlRemoteTier(RemoteTier):
     def _hello(self, node: _MemoryNode) -> HelloRequest:
         assert self.transport is not None
         with self._lock:
-            node.conn_gen += 1
+            self._conn_seq += 1
+            node.conn_gen = self._conn_seq
             return HelloRequest(
                 version=REMOTE_WIRE_VERSION,
                 node_id=self.env.node_id,
@@ -464,7 +469,9 @@ class NixlRemoteTier(RemoteTier):
         replay = self._take_run(node, conn, hello)
         with self._lock:
             gen = node.conn_gen
-        conn.on_close(functools.partial(self._conn_lost, node, conn, gen))
+        conn.on_close(
+            functools.partial(self._conn_lost, node, conn, gen, hello.node_id)
+        )
         if self._stop.is_set():  # stop() may have passed this connection
             self._goodbye(node, conn)
             self._disconnect(node)
@@ -509,7 +516,7 @@ class NixlRemoteTier(RemoteTier):
         with self._lock:
             if node.conn is None or node.conn.closed:
                 raise ConnectionError(f"{node.url}: connection lost")
-            node.ready = True
+            node.ready, node.ready_gen = True, node.conn_gen
 
     def _take_run(
         self, node: _MemoryNode, conn: RemoteConnection, hello: HelloResponse
@@ -588,15 +595,16 @@ class NixlRemoteTier(RemoteTier):
         with self._lock:
             self._lost_callbacks.append(callback)
 
-    def _conn_lost(self, node: _MemoryNode, conn: RemoteConnection, gen: int) -> None:
-        """Connection ``gen`` to a memory node ended (on its reader, or ours
-        closing it): no transfer goes there until one is made anew, and
-        what began on it or before is told now."""
+    def _conn_lost(
+        self, node: _MemoryNode, conn: RemoteConnection, gen: int, node_id: str
+    ) -> None:
+        """Connection ``gen`` to memory node ``node_id`` ended (on its
+        reader, or ours closing it): no transfer goes there until one is
+        made anew, and what began on it or before is told now."""
         with self._lock:
             was_ready = node.conn is conn and node.ready
             if node.conn is conn:
                 node.ready = False
-            node_id = node.node_id
             callbacks = list(self._lost_callbacks)
         node.wake.set()
         if self._stop.is_set() or not node_id:
@@ -652,11 +660,25 @@ class NixlRemoteTier(RemoteTier):
 
         def answered(response: Any) -> None:
             if isinstance(response, ConnectionError):
+                again = False
                 with self._lock:
                     if node.ops is ops and not abandoned():  # same memory run
-                        node.unanswered[seq] = (code, request, callback)
+                        current = node.conn
+                        # A newer connection took the replays already
+                        again = current is not None and current is not conn
+                        if not again:
+                            node.unanswered[seq] = (code, request, callback)
                 if lost is not None:
                     lost()
+                if again:
+                    self._send(
+                        node,
+                        code,
+                        request,
+                        callback,
+                        resolve=resolve,
+                        abandoned=abandoned,
+                    )
                 return
             if ops is not None and resolve:
                 ops.resolved(seq)

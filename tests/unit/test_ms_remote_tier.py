@@ -712,3 +712,44 @@ def test_a_lost_connection_is_told_at_once_and_made_again(fake, memory, gpu):
     )
     [credit] = gpu.tier.reserve([Key("ns", "y")])
     assert store(gpu, 0, credit, 3).ok
+
+
+def test_a_lost_answer_seen_after_a_reconnect_is_sent_again(
+    fake, memory, gpu, monkeypatch
+):
+    [credit] = gpu.tier.reserve([Key("ns", "late")])
+    node = gpu.tier._nodes[0]
+    old = node.conn
+    held = []
+    # The CANCEL's error comes only after a newer connection took the replays
+    monkeypatch.setattr(
+        old, "submit", lambda code, request, callback: held.append(callback)
+    )
+    gpu.tier.cancel([credit])
+    assert len(held) == 1
+    old.close()
+    wait_until(
+        lambda: gpu.tier.ready("mem1") and node.conn is not old, what="reconnected"
+    )
+    assert memory.state(credit) is not None  # still held there
+    held[0](ConnectionError("lost"))
+    wait_until(lambda: memory.state(credit) is None, what="CANCEL sent again (FREE)")
+
+
+def test_connection_numbers_are_unique_and_kept_from_ready(fake, memory, gpu):
+    node = gpu.tier._nodes[0]
+    ready_on = gpu.tier.connection("mem1")
+    assert ready_on == node.conn_gen > 0
+    gpu.tier._hello(node)  # a reconnect has begun; the node is still ready
+    assert node.conn_gen > ready_on
+    assert gpu.tier.connection("mem1") == ready_on
+    other = make_tier([memory.url, "127.0.0.1:1"])
+    other.open()
+    try:
+        a, b = other._nodes
+        other._hello(a)
+        other._hello(b)
+        other._hello(a)
+        assert len({a.conn_gen, b.conn_gen}) == 2 and a.conn_gen > b.conn_gen
+    finally:
+        other.close()
