@@ -682,6 +682,8 @@ class NodeOpenResponse:
     heartbeat_s: float = 0.0
     session_ttl_s: float = 0.0
     adopted: list[PoolInfo] = field(default_factory=list)
+    # Those of the request MaruServer accepted; none from an older server
+    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -98,8 +98,8 @@ class TransferEngine:
     def submit_io(
         self,
         copy: Copy,
-        src: PageRef,
-        dst: PageRef,
+        src: PageRef | None,
+        dst: PageRef | None,
         *,
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,

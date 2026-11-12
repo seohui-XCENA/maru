@@ -511,7 +511,7 @@ class SsdTier(L2Tier):
         src: Span,
         dst: Location,
         *,
-        refs: tuple[PageRef, PageRef],
+        refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
     ) -> IOTicket:
@@ -522,7 +522,7 @@ class SsdTier(L2Tier):
         src: Location,
         dst: Span,
         *,
-        refs: tuple[PageRef, PageRef],
+        refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
     ) -> IOTicket:
@@ -536,7 +536,7 @@ class SsdTier(L2Tier):
         span: Span,
         page: Location,
         write: bool,
-        refs: tuple[PageRef, PageRef],
+        refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None,
         deadline: float | None,
     ) -> IOTicket:

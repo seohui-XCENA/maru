@@ -47,6 +47,11 @@ class StorageUnavailableError(ConnectionError):
 MS_PROTOCOL = "ms1"
 # ATTACH capability: the worker can run FETCH, the node serves it
 FETCH_CAPABILITY = "fetch_v1"
+# NODE_OPEN capabilities: the node reads and writes memory nodes' pools over
+# RDMA; it is a memory node; it stages its SSD pages for peers' READs
+REMOTE_CAPABILITY = "remote_v1"
+MEMORY_CAPABILITY = "memory_v1"
+STAGE_CAPABILITY = "stage_v1"
 # Items in one multi-storage request
 MAX_BATCH = MAX_STORAGE_BATCH
 # generation = epoch_seq << 40 | counter: a new run always gives higher

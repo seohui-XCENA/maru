@@ -14,7 +14,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, RmDomain
+from maru_common.remote_protocol import TransferEnd, Written
+from maru_common.storage_types import (
+    ItemOutcome,
+    Key,
+    Location,
+    PoolDescriptor,
+    PoolInfo,
+    RmDomain,
+)
 
 from .page_table import PageRef
 
@@ -38,16 +46,17 @@ class Span:
 
 class IOResult(Protocol):
     """One L2 transfer. ``ok`` only once every byte moved (``late`` if past
-    its deadline); ``done`` is set after its callback and cleanup ended."""
+    its deadline); ``done`` is set after its callback and cleanup ended.
+    ``src``/``dst`` are its pages, None for another node's."""
 
     @property
     def run(self) -> str: ...
 
     @property
-    def src(self) -> PageRef: ...
+    def src(self) -> PageRef | None: ...
 
     @property
-    def dst(self) -> PageRef: ...
+    def dst(self) -> PageRef | None: ...
 
     @property
     def ok(self) -> bool: ...
@@ -60,6 +69,13 @@ class IOResult(Protocol):
 
     @property
     def error(self) -> Exception | None: ...
+
+    @property
+    def kept(self) -> bool:
+        """It did not end DONE and the tier took its local pages over: they
+        stay in use (a destination quarantined, a source held) until a late
+        DONE or the run's end, and the caller neither frees nor reuses them."""
+        ...
 
     @property
     def done(self) -> threading.Event: ...
@@ -204,8 +220,9 @@ class L2Tier(Tier):
     full queue, ValueError for a bad range, RuntimeError once drained);
     other failures come in the result. The callback runs on the tier's I/O
     thread, or on the caller's in drain or a queued cancel, never under the
-    tier's own locks, and only once the medium no longer touches the memory.
-    The caller holds the pages' I/O references until it runs."""
+    tier's own locks, and only once the medium no longer touches the memory
+    or the tier took the pages over (``kept``). The caller holds the pages'
+    I/O references until it runs; ``refs`` has None for another node's page."""
 
     level = Level.L2
 
@@ -227,7 +244,7 @@ class L2Tier(Tier):
         src: Span,
         dst: Location,
         *,
-        refs: tuple[PageRef, PageRef],
+        refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
     ) -> IOResult:
@@ -239,7 +256,7 @@ class L2Tier(Tier):
         src: Location,
         dst: Span,
         *,
-        refs: tuple[PageRef, PageRef],
+        refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
     ) -> IOResult:
@@ -249,3 +266,76 @@ class L2Tier(Tier):
     def drain(self) -> None:
         """No new submit; queued ones are cancelled; returns after every
         callback ran."""
+
+
+@dataclass(frozen=True)
+class Staged:
+    """A memory node's staging page holding one of its SSD pages for this
+    node to READ."""
+
+    node_id: str  # the memory node
+    node_epoch: str  # its run that gave the page
+    stage_id: int
+    location: Location
+
+
+class RemoteTier(L2Tier):
+    """Memory nodes' pages over RDMA. A memory node reserves, commits and
+    frees its own pages; this node only moves bytes."""
+
+    name = "remote"
+
+    def pool_infos(self) -> list[PoolInfo]:
+        return []  # no pool of this node
+
+    def io_size(self, nbytes: int) -> int:
+        return 0  # page to page, no bounce
+
+    @abstractmethod
+    def ready(self, node_id: str) -> bool:
+        """Connected to the memory node and probed."""
+
+    @abstractmethod
+    def owner(self, pool_id: str) -> str | None:
+        """The memory node of a pool, or None."""
+
+    @abstractmethod
+    def reserve(self, keys: list[Key]) -> list[Location | None]:
+        """A credited page per key, from the memory nodes with the most
+        room; None where none was given."""
+
+    @abstractmethod
+    def write_done(self, items: list[Written]) -> list[ItemOutcome]:
+        """ADDED, DUPLICATE (the committed location) or REJECTED per item;
+        raises when the answer is unknown."""
+
+    @abstractmethod
+    def cancel(self, locations: list[Location]) -> None:
+        """Credited pages never posted to go back."""
+
+    @abstractmethod
+    def stage(self, key: Key, source: Location, deadline: float) -> Staged | None:
+        """The owner loads its SSD page ``source`` into a staging page by
+        ``deadline`` (monotonic); None on a miss."""
+
+    @abstractmethod
+    def unstage(self, staged: Staged, end: TransferEnd) -> None:
+        """How the READ of the staging page ended (or that it never began)."""
+
+    @abstractmethod
+    def drop(self, key: Key, location: Location) -> None:
+        """The owner retires ``key`` at exactly ``location``."""
+
+
+@runtime_checkable
+class Exporter(Protocol):
+    """Registers L1 mappings with the node's NIC so peers reach them by RDMA."""
+
+    def attach(self, pool_id: str, memory: mmap.mmap) -> None:
+        """Register the whole mapping; raises if the NIC refuses it."""
+        ...
+
+    def detach(self, pool_id: str) -> None:
+        """Deregister, before ``memory`` is unmapped; if this raises, it
+        stays mapped."""
+        ...

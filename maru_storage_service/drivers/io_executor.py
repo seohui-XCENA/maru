@@ -89,8 +89,8 @@ class IOTicket:
     """
 
     run: str
-    src: PageRef
-    dst: PageRef
+    src: PageRef | None
+    dst: PageRef | None
     nbytes: int
     write: bool
     _owner: "IOExecutor" = field(repr=False)
@@ -124,6 +124,11 @@ class IOTicket:
     @property
     def error(self) -> Exception | None:
         return self._state.error
+
+    @property
+    def kept(self) -> bool:
+        """Never: a file I/O has ended by its callback."""
+        return False
 
 
 class IOExecutor:
@@ -163,8 +168,8 @@ class IOExecutor:
 
     def submit(
         self,
-        src: PageRef,
-        dst: PageRef,
+        src: PageRef | None,
+        dst: PageRef | None,
         *,
         fd: int,
         nbytes: int,
