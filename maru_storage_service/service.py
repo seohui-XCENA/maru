@@ -424,15 +424,18 @@ class StorageService:
             (pool.descriptor(), None) for pool in cxl_pools
         ]
         if self.ssd is not None:
-            # The window fits the top tier's real pools (the RM may give less)
-            infos = [self.pools.pool_info(i) for i in self.pools.pool_ids()]
-            top_bytes = sum(
-                i.capacity for i in infos if i is not None and i.kind == top.store
-            )
+            # The window fits the pools fetches can use at ATTACH (the RM may
+            # give less, a mapping may fail, a pool may be quarantined)
+            pools, fetches = self.pools, self.manager.fetches
+
+            def top_bytes() -> int:
+                infos = [pools.pool_info(i) for i in fetches.destinations()]
+                return sum(i.capacity for i in infos if i is not None)
+
             bounce = self.ssd.io_size(config.page_size)
-            self.local.budgets = worker_budgets(config, top_bytes, bounce)
+            self.local.budgets = worker_budgets(config, top_bytes(), bounce)
             self.local.fetch_budgets = lambda workers: worker_budgets(
-                config, top_bytes, bounce, workers
+                config, top_bytes(), bounce, workers
             )
         self.local.start()
         logger.info(

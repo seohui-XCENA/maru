@@ -162,8 +162,9 @@ class FetchManager:
             collections.OrderedDict()
         )
         self._inflight = 0
-        # FETCHes short of room, in the order they came: the first takes pages
-        self._room: collections.deque[object] = collections.deque()
+        # FETCHes leading flights, in the order they came, until their
+        # flights have pages: the first takes pages
+        self._room: collections.deque[_Op] = collections.deque()
         self._stop = threading.Event()
         self._tasks = concurrent.futures.ThreadPoolExecutor(
             threads, thread_name_prefix="maru-fetch"
@@ -310,6 +311,19 @@ class FetchManager:
                     op.flights[i] = flight
                     led.append(flight)
             self._ops[(op.origin, op.seq)] = op
+            submitted = False
+            if led:
+                # Its turn for room is taken as it comes, and its task is
+                # queued in the same order, so the first turn always runs
+                self._room.append(op)
+                try:
+                    self._tasks.submit(self._lead, led)
+                    submitted = True
+                except RuntimeError:  # stopping
+                    self._room.remove(op)
+        if led and not submitted:
+            for flight in led:
+                self._fail(flight, _miss(MissReason.BUSY))
         if all(o is not None for o in op.outcomes):
             self._answer(op)
             return
@@ -321,12 +335,8 @@ class FetchManager:
         timer.daemon = True
         op.timer = timer
         timer.start()
-        if led:
-            try:
-                self._tasks.submit(self._lead, led)
-            except RuntimeError:  # stopping
-                for flight in led:
-                    self._fail(flight, _miss(MissReason.BUSY))
+        if op.answered:  # answered before its timer was set
+            timer.cancel()
 
     def cancel(self, rec: WorkerRecord, req: FetchCancelRequest) -> FetchCancelResponse:
         """No longer needed: an open FETCH is answered at once; one not seen
@@ -512,6 +522,8 @@ class FetchManager:
                     self._fail(flight, _miss(MissReason.BUSY))
             if not self._stop.is_set():
                 self.manager.end_run(f"a fetch failed: {e!r}")
+        finally:
+            self._leave(flights[0].leader.op)
 
     def _run(self, flights: list[_Flight]) -> None:
         """Each flight goes to its SOURCE_PIN and read as soon as it has a
@@ -523,42 +535,38 @@ class FetchManager:
         ready: collections.deque[_Flight] = collections.deque()
         running: list[_Flight] = []
         wake = threading.Event()
-        turn = object()
-        with self._lock:
-            self._room.append(turn)
-        try:
-            while need or ready or running:
-                wake.clear()
-                need = self._expire(need)
-                got = []
-                if need and self._first(turn):
-                    refs = self._reserve(len(need))
-                    for flight, ref in zip(need, refs, strict=False):
-                        flight.dest = ref
-                        got.append(flight)
-                    need = need[len(refs) :]
-                    if need:
-                        self.manager.want_room(self.kind, len(need) * self.page_size)
-                if not need:
-                    self._leave(turn)
-                if got:
-                    ready.extend(self._pin_sources(got))
-                while ready and len(running) < FETCH_IO_DEPTH:
-                    flight = ready.popleft()
-                    if self._start_read(flight, wake):
-                        running.append(flight)
-                with self._lock:
-                    ended = [f for f in running if f.read_over]
-                if ended:
-                    running = [f for f in running if f not in ended]
-                    read = [f for f in ended if self._read_result(f)]
-                    for flight in self._publish(read):
-                        self._fan_out(flight)
-                    continue
-                if need or running:
-                    wake.wait(ROOM_POLL_S if need else 1.0)
-        finally:
-            self._leave(turn)
+        # The FETCH that leads them took its turn as it came (_lead leaves it)
+        turn = flights[0].leader.op if flights else None
+        while need or ready or running:
+            wake.clear()
+            need = self._expire(need)
+            got = []
+            if need and self._first(turn):
+                refs = self._reserve(len(need))
+                for flight, ref in zip(need, refs, strict=False):
+                    flight.dest = ref
+                    got.append(flight)
+                need = need[len(refs) :]
+                if need:
+                    self.manager.want_room(self.kind, len(need) * self.page_size)
+            if not need:
+                self._leave(turn)
+            if got:
+                ready.extend(self._pin_sources(got))
+            while ready and len(running) < FETCH_IO_DEPTH:
+                flight = ready.popleft()
+                if self._start_read(flight, wake):
+                    running.append(flight)
+            with self._lock:
+                ended = [f for f in running if f.read_over]
+            if ended:
+                running = [f for f in running if f not in ended]
+                read = [f for f in ended if self._read_result(f)]
+                for flight in self._publish(read):
+                    self._fan_out(flight)
+                continue
+            if need or running:
+                wake.wait(ROOM_POLL_S if need else 1.0)
 
     def _expire(self, need: list[_Flight]) -> list[_Flight]:
         """Those still waiting for room: not past every waiter's deadline,
@@ -587,10 +595,10 @@ class FetchManager:
             waiters = [flight.leader, *flight.waiters]
             return max((w.op.deadline for w in waiters if not w.op.answered), default=0)
 
-    def _reserve(self, count: int) -> list[PageRef]:
-        """FREE -> TRANSFER pages of the top tier, roomiest pool first: the
-        ones that give credit (workers map them, none quarantined)."""
-        pools = []
+    def destinations(self) -> list[str]:
+        """The top tier's pools copies go to: those that give credit (workers
+        map them, none quarantined) and that this node mapped for transfer."""
+        out = []
         for pool_id in self.pools.pool_ids():
             info = self.pools.pool_info(pool_id)
             if (
@@ -599,7 +607,15 @@ class FetchManager:
                 and self.pools.creditable(pool_id)
                 and self.transfers.has_pool(pool_id)
             ):
-                pools.append((self.pools.bytes_in(PageState.FREE, pool_id), pool_id))
+                out.append(pool_id)
+        return out
+
+    def _reserve(self, count: int) -> list[PageRef]:
+        """FREE -> TRANSFER pages of the destinations, roomiest pool first."""
+        pools = [
+            (self.pools.bytes_in(PageState.FREE, pool_id), pool_id)
+            for pool_id in self.destinations()
+        ]
         out: list[PageRef] = []
         for _, pool_id in sorted(pools, reverse=True):
             if len(out) >= count:

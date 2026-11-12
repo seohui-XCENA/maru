@@ -28,7 +28,7 @@ from maru_common.node_protocol import (
     NodeMessageType,
     process_start_time,
 )
-from maru_common.protocol import UnpinResponse
+from maru_common.protocol import CommitItem, UnpinResponse
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
     ItemOutcome,
@@ -44,6 +44,7 @@ from maru_handler.client import pool_maps
 from maru_server.catalog import PoolState
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
+from maru_storage_service.drivers.ssd_alignment import aligned_buffer
 from maru_storage_service.fetch_manager import CANCEL_MARKS, FLIGHT_WAITERS
 from maru_storage_service.pool_manager import PageState
 from maru_storage_service.ports import ReplyError
@@ -1070,24 +1071,54 @@ def test_a_full_window_fits_the_inflight_cap(env):
     loader.close()
 
 
-def test_the_window_fits_the_regions_the_rm_gave(
-    real_server, sockdir, ssd_dir, regions
+def seed_ssd(node, names: list[str]) -> None:
+    """Commit each name's page straight to the node's SSD."""
+    refs = node.pools.reserve_transfer(node.ssd.pool_id, len(names))
+    assert len(refs) == len(names)
+    for name, ref in zip(names, refs, strict=True):
+        with aligned_buffer(PAGE, node.ssd.alignment.memory) as buffer:
+            buffer[:] = value_of(name, PAGE)
+            node.ssd.write(node.pools.transfer_location(ref).offset, buffer, PAGE)
+        node.pools.transfer_done(ref, Key(NS, name), PAGE)
+        location = node.pools.page(ref).location
+        commit = node.server.commit([CommitItem(Key(NS, name), location, PAGE)])
+        assert commit.items[0].result == ItemResult.ADDED
+        node.pools.commit_added(ref)
+        node.manager.placement.on_ready(ref)
+
+
+@pytest.mark.parametrize("short", ["rm", "mapping"])
+def test_the_window_fits_the_regions_fetches_reach(
+    real_server, sockdir, ssd_dir, regions, short
 ):
+    """Of the regions the tier asks for, the RM gives one, or the node
+    cannot map one for transfer: the window fits the one copies can go to."""
     server, url = real_server
     config = cxl_ssd(url, sockdir, ssd_dir)
     rm = FakeRm()
-    rm.capacity = 8 * PAGE  # one region of the two the tier asks for
+    map_region = regions.node_map
+    if short == "rm":
+        rm.capacity = 8 * PAGE
+    else:
+
+        def map_region(pool):
+            mapping = regions.node_map(pool)  # workers still map it
+            if len(regions.fds) == 1:
+                mapping.close()
+                raise OSError("injected")
+            return mapping
+
     node = start_node(
         config,
         host_boot_id="boot-1",
         region_source=rm,
         cxl_renew_s=0.05,
-        map_region=regions.node_map,
+        map_region=map_region,
     )
+    loader = None
     try:
-        assert sum(p.info().capacity for p in node.cxl.pools) == 8 * PAGE
-        worker = RawWorker(node.config.socket)
-        reply = worker.attach(capabilities=[FETCH_CAPABILITY])
+        (reached,) = [p for p in node.cxl.pools if node.transfers.has_pool(p.pool_id)]
+        assert reached.info().capacity == 8 * PAGE
         budgets = config.budgets
         room = (
             8 * PAGE
@@ -1096,9 +1127,23 @@ def test_the_window_fits_the_regions_the_rm_gave(
             - PAGE
         )
         assert PAGE <= room < budgets.fetch_request_max_bytes
-        assert reply.budgets.fetch_request_max_bytes == room
-        worker.close()
+        loader = Loader(node, server)
+        assert loader.budgets.fetch_request_max_bytes == room
+        if short == "mapping":  # a full window goes through
+            names = [f"s{i}" for i in range(room // PAGE)]
+            seed_ssd(node, names)
+            answer = loader.fetch(*names)
+            assert [o.result for o in answer.items] == [ItemResult.HIT] * len(names)
+            for name, outcome in zip(names, answer.items, strict=True):
+                assert outcome.location.pool_id == reached.pool_id
+                assert region_bytes(node, regions, outcome.location) == value_of(
+                    name, PAGE
+                )
+            loader.unpin(*[o.pin_id for o in answer.items])
+            wait_until(lambda: settled(node, server), "quota back")
     finally:
+        if loader is not None:
+            loader.close()
         node.stop()
 
 
@@ -1219,6 +1264,64 @@ def test_two_loaders_share_the_room_and_both_go_on(env, monkeypatch):
     node.pools.check()
     a.close()
     b.close()
+
+
+def test_room_goes_by_arrival_not_by_which_task_runs_first(env, monkeypatch):
+    """b comes after a and joins a flight of a's. b's task runs first, but
+    it waits for a's turn: it holds no page a needs while it waits for a's
+    flight."""
+    server, make = env
+    node, _ = make(keys=40)
+    names = on_ssd(server, [f"k{i}" for i in range(40)])
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    assert a.budgets.fetch_request_max_bytes == 11 * PAGE
+    assert b.budgets.fetch_request_max_bytes == 5 * PAGE
+    writer = RawWorker(node.config.socket)
+    writer.attach()
+    assert len(writer.credit(2 * PAGE).credits) == 2  # 14 pages for a's 11, b's 4
+    fetches = node.manager.fetches
+    run, first = fetches._run, fetches._first
+    paused, go, refused = threading.Event(), threading.Event(), threading.Event()
+    a_names = names[:11]
+    b_names = [*names[11:15], a_names[-1]]
+
+    def a_runs_late(flights):
+        if any(f.leader.op.origin == a.raw.incarnation for f in flights):
+            paused.set()
+            assert go.wait(10)
+        return run(flights)
+
+    def first_or_refused(turn):
+        ok = first(turn)
+        if not ok:
+            refused.set()
+        return ok
+
+    monkeypatch.setattr(fetches, "_run", a_runs_late)
+    monkeypatch.setattr(fetches, "_first", first_or_refused)
+
+    def unpin_on_answer(loader, future):
+        loader.unpin(*[o.pin_id for o in future.result().items if o.pin_id])
+
+    try:
+        replies = []
+        for loader, batch in ((a, a_names), (b, b_names)):
+            reply = loader.send(loader.request(loader.items(*batch), deadline_ms=3000))
+            reply.add_done_callback(lambda f, w=loader: unpin_on_answer(w, f))
+            replies.append(reply)
+            assert paused.wait(10)
+        wait_until(refused.is_set, "b waits for a's turn")
+        assert fetches.results["joined"] == 1 and no_transfer_pages(node)
+        go.set()
+        for reply, batch in zip(replies, (a_names, b_names), strict=True):
+            outcomes = [(o.result, o.reason) for o in reply.result(10).items]
+            assert outcomes == [(ItemResult.HIT, None)] * len(batch)
+        wait_until(lambda: settled(node, server), "quota back")
+        node.pools.check()
+    finally:
+        go.set()
+        for worker in (a, b, writer):
+            worker.close()
 
 
 def test_a_resend_may_carry_less_of_its_deadline(env, monkeypatch):
