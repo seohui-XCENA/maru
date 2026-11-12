@@ -27,9 +27,11 @@ from maru_common.storage_types import (
     PoolDescriptor,
     PoolInfo,
     PoolKind,
+    RmDomain,
     Visibility,
     run_holder,
 )
+from maru_shm.client import MaruShmClient
 from maru_shm.ipc import GetAccessResp
 from maru_shm.types import (
     MaruHandle,
@@ -52,12 +54,14 @@ from ..config_fields import (
     _str,
     parse_size,
 )
-from ..tiers import Level
+from ..tiers import L1Pool, L1Tier, Leased, Level, TierEnv
 from . import PoolAccess
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RENEW_S = 10.0
+# How long stop() waits for each of its threads
+STOP_JOIN_S = 1.0
 # How often NODE_HOLDS is asked while a region waits for an earlier run, and
 # how often the holds it waits for are logged
 HOLDS_POLL_S = 1.0
@@ -216,14 +220,18 @@ def map_region(source: RegionSource, pool: CxlRegionPool, holder: str) -> mmap.m
         raise
 
 
-class CxlTier:
+class CxlTier(L1Tier, Leased):
     """The node's regions in one RM: claimed at start, renewed while the run
     lasts, given back on leave. ``on_lost`` is called once, from the renew
-    thread, when the run must let go of them."""
+    thread, when the run must let go of them. ``source`` None: a client of
+    the RM at ``tier.rm``, closed by close(). The node maps a region for its
+    own copies held by ``own_holder``, or with ``mapper``."""
+
+    name = "cxl"
 
     def __init__(
         self,
-        source: RegionSource,
+        source: RegionSource | None,
         tier: TierConfig,
         *,
         node_id: str,
@@ -232,9 +240,15 @@ class CxlTier:
         on_lost: Callable[[str], None],
         renew_s: float = DEFAULT_RENEW_S,
         clock: Callable[[], float] = time.monotonic,
+        interrupted: threading.Event | None = None,
+        own_holder: str | None = None,
+        mapper: Callable[[CxlRegionPool], mmap.mmap] | None = None,
     ):
         if tier.size is None or tier.region_size is None:
             raise CxlTierError("the cxl tier needs size and region_size")
+        self._client: MaruShmClient | None = None
+        if source is None:
+            source = self._client = MaruShmClient(address=tier.rm)
         self.source = source
         self.tier = tier
         self.node_id = node_id
@@ -243,6 +257,9 @@ class CxlTier:
         self.renew_s = renew_s
         self._on_lost = on_lost
         self._clock = clock
+        self._interrupted = interrupted or threading.Event()
+        self.own_holder = own_holder or run_holder(OWN_HOLDER, node_epoch)
+        self._mapper = mapper
         self.rm_domain: str | None = None
         self.lease_s = 0.0
         self.pools: list[CxlRegionPool] = []
@@ -259,10 +276,15 @@ class CxlTier:
         self._lock = threading.Lock()
         self._earlier: dict[str, set[str]] = {}
 
-    def claim(self, stopped: threading.Event, retry_s: float = 1.0) -> None:
+    def claim(
+        self, stopped: threading.Event | None = None, retry_s: float = 1.0
+    ) -> None:
         """Take the node's regions back, then allocate up to the tier size.
         Retries until the RM answers: no pool is announced that this run has
-        not claimed. Returns early, with no pools, once ``stopped`` is set."""
+        not claimed. Returns early, with no pools, once ``stopped`` (by
+        default ``interrupted``) is set."""
+        if stopped is None:
+            stopped = self._interrupted
         claim = None
         while claim is None and not stopped.is_set():
             sent = self._clock()  # the RM's lease restarts no earlier than this
@@ -395,7 +417,7 @@ class CxlTier:
             logger.warning("cxl tier: lease renewal failed (%s); retrying", e)
             return None
 
-    def stop(self, timeout: float | None = None) -> None:
+    def stop(self, timeout: float | None = STOP_JOIN_S) -> None:
         """Stop renewing the lease and watching holds. A request under way may
         outlast ``timeout``; it changes nothing."""
         self._stop.set()
@@ -578,6 +600,65 @@ class CxlTier:
                 e,
             )
 
+    # ------------------------------------------------------- the tier hooks
+
+    def taken_over(self, pool_id: str) -> bool:
+        return any(p.claimed for p in self.pools if p.pool_id == pool_id)
+
+    def rm_domains(self) -> list[RmDomain]:
+        if self.rm_domain is None:
+            return []
+        devices = sorted({p.region.device_uuid for p in self.pools} - {""})
+        return [RmDomain(self.rm_domain, tuple(devices))]
+
+    def worker_settled(self, incarnation: str) -> None:
+        self.drop_holds(incarnation)
+
+    def map_for_transfers(self, pool: L1Pool) -> mmap.mmap | None:
+        assert isinstance(pool, CxlRegionPool)
+        try:
+            if self._mapper is not None:
+                return self._mapper(pool)
+            return map_region(self.source, pool, self.own_holder)
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.error(
+                "cxl tier: cannot map %s for demotion, so it takes none: %s",
+                pool.pool_id,
+                e,
+            )
+            return None
+
+    def after_transfers_closed(self) -> None:
+        """Drop the hold of the node's own mappings (none with ``mapper``)."""
+        if self._mapper is None:
+            self.unhold(self.own_holder)
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+
+    def describe(self, adopted: set[str]) -> str:
+        ids = {p.pool_id for p in self.pools}
+        return (
+            f"{len(self.pools)} regions ({sum(p.capacity for p in self.pools) >> 20}"
+            f" MiB) from RM {self.rm_domain}, {len(adopted & ids)} adopted"
+        )
+
+
+def _make(tier: TierConfig, env: TierEnv) -> CxlTier:
+    return CxlTier(
+        env.region_source,
+        tier,
+        node_id=env.node_id,
+        node_epoch=env.node_epoch,
+        page_size=env.page_size,
+        on_lost=env.on_lost,
+        renew_s=env.renew_s,
+        interrupted=env.interrupted,
+        own_holder=env.own_holder,
+        mapper=env.map_region,
+    )
+
 
 def _parse(raw: dict, ctx: TierContext) -> dict:
     what, size, page_size = ctx.what, ctx.size, ctx.page_size
@@ -638,4 +719,5 @@ SPEC = TierSpec(
     size_optional=True,
     parse=_parse,
     check_servable=_check_servable,
+    make=_make,
 )

@@ -46,7 +46,6 @@ SPEC = TierSpec(
     local=False,
     kind=None,
     keys=frozenset({"store", "url", "rdma_device", "timeout_s"}),
-    served=False,
     common=False,
     last_only=True,
     gpu_only=True,

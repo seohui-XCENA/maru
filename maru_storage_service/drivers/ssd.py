@@ -35,7 +35,7 @@ from ..config_fields import (
     _str,
 )
 from ..page_table import PageRef
-from ..tiers import IOResult, L2Tier, Level, Span
+from ..tiers import IOResult, L2Tier, Level, Span, TierEnv
 from . import PoolAccess
 from .io_executor import (
     DEFAULT_IO_QUEUE_SIZE,
@@ -455,34 +455,47 @@ class SsdDriver:
 class SsdTier(L2Tier):
     """One SSD pool and the I/O executor that moves its pages: reads first,
     writes paced to ``bytes_per_s``, through aligned bounce buffers. The
-    owner closes the pool after drain()."""
+    owner closes the pool after drain(). Without ``pool``, open() opens it
+    with ``create``."""
 
     name = "ssd"
 
     def __init__(
         self,
-        pool: SsdPool,
+        pool: SsdPool | None,
         *,
         run: str,
         bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         max_queue: int = DEFAULT_IO_QUEUE_SIZE,
+        create: Callable[[], SsdPool] | None = None,
     ):
+        if bytes_per_s <= 0:
+            raise ValueError(f"bytes_per_s must be positive, got {bytes_per_s}")
         self.pool = pool
+        self._create = create
         self.io = IOExecutor(run, max_queue=max_queue, bytes_per_s=bytes_per_s)
         self._lock = threading.Lock()
         self._memory: dict[str, mmap.mmap] = {}
 
+    def open(self) -> None:
+        if self.pool is None and self._create is not None:
+            self.pool = self._create()
+
     def pool_infos(self) -> list[PoolInfo]:
-        return [self.pool.info()]
+        return [] if self.pool is None else [self.pool.info()]
 
     def describe(self, adopted: set[str]) -> str:
-        state = "adopted" if self.pool.pool_id in adopted else "empty"
-        return f"{self.pool.path} ({self.pool.capacity >> 20} MiB), {state}"
+        pool = self.pool
+        assert pool is not None
+        state = "adopted" if pool.pool_id in adopted else "empty"
+        return f"{pool.path} ({pool.capacity >> 20} MiB), {state}"
 
     def close(self) -> None:
-        self.pool.close()
+        if self.pool is not None:
+            self.pool.close()
 
     def io_size(self, nbytes: int) -> int:
+        assert self.pool is not None
         return self.pool.io_size(nbytes)
 
     def attach(self, pool_id: str, memory: mmap.mmap) -> None:
@@ -531,6 +544,7 @@ class SsdTier(L2Tier):
         default the I/O gets IO_TIMEOUT_S plus its bytes at
         IO_MIN_BYTES_PER_S from its start."""
         pool, n, offset, page_offset = self.pool, span.nbytes, span.offset, page.offset
+        assert pool is not None
         with self._lock:
             mapping = self._memory.get(span.pool_id)
         if (
@@ -573,6 +587,20 @@ class SsdTier(L2Tier):
         )
 
 
+def _make(tier: TierConfig, env: TierEnv) -> SsdTier:
+    def create() -> SsdPool:
+        return SsdDriver().create(
+            tier,
+            node_id=env.node_id,
+            node_epoch=env.node_epoch,
+            page_size=env.page_size,
+        )
+
+    return SsdTier(
+        None, run=env.node_epoch, bytes_per_s=env.transfer_bytes_per_s, create=create
+    )
+
+
 def _parse(raw: dict, ctx: TierContext) -> dict:
     path = _str(raw, "path", ctx.what)
     if not os.path.isabs(path):
@@ -592,4 +620,5 @@ SPEC = TierSpec(
         {"store", "size", "demotion", "high_watermark", "low_watermark", "path"}
     ),
     parse=_parse,
+    make=_make,
 )

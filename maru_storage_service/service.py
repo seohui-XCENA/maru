@@ -27,15 +27,14 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from typing import TypeVar
 
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
     CloseMode,
-    RmDomain,
     run_holder,
 )
-from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError, TierConfig
 from .config_fields import NotServableError as NotServableError
@@ -45,11 +44,10 @@ from .drivers.cxl import (
     CxlRegionPool,
     CxlTier,
     RegionSource,
-    map_region,
 )
-from .drivers.dram import DramDriver, DramPool, DramPoolError
+from .drivers.dram import DramPool, DramPoolError, DramTier
 from .drivers.registry import TIERS
-from .drivers.ssd import SsdDriver, SsdPool, SsdTier
+from .drivers.ssd import SsdPool, SsdTier
 from .fetch_manager import FetchManager
 from .local_pin import LocalPins
 from .local_server import LocalServer
@@ -64,7 +62,7 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
-from .tiers import Level
+from .tiers import Level, Tier, TierEnv
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
@@ -85,6 +83,8 @@ STOP_WAIT_S = 30.0
 DRAM_RETRY_S = 1.0
 DRAM_RETRY_MAX_S = 30.0
 DRAM_LOG_S = 30.0
+
+T = TypeVar("T", bound=Tier)
 
 
 def _served_tiers() -> tuple[list[str], ...]:
@@ -190,9 +190,9 @@ class StorageService:
         self.transfer_bytes_per_s = transfer_bytes_per_s
         self.map_region = map_region
         self.transfers: TransferEngine | None = None
-        self.dram: DramPool | None = None
+        self._dram_tier: DramTier | None = None
         self.cxl: CxlTier | None = None
-        self.ssd: SsdPool | None = None
+        self._ssd_tier: SsdTier | None = None
         # Why the run ended on its own, and whether a new run follows
         self.ended: str | None = None
         self.new_run = False
@@ -205,7 +205,6 @@ class StorageService:
         # One stop at a time, and never while a start is half done
         self._stop_lock = threading.Lock()
         self._lifecycle = threading.Lock()
-        self._rm_client: MaruShmClient | None = None
         self.pools: PoolManager | None = None
         self.server: ServerClient | None = None
         self.manager: StorageManager | None = None
@@ -214,6 +213,39 @@ class StorageService:
         self.adopted: list[str] = []
         self._credit_tiers: set[str] = set()
         self._stopped = threading.Event()
+
+    @property
+    def dram(self) -> DramPool | None:
+        """The run's DRAM pool, once created."""
+        return self._dram_tier.pool if self._dram_tier is not None else None
+
+    @property
+    def ssd(self) -> SsdPool | None:
+        """The SSD pool, once open."""
+        return self._ssd_tier.pool if self._ssd_tier is not None else None
+
+    def _env(self) -> TierEnv:
+        return TierEnv(
+            node_id=self.config.node_id,
+            node_epoch=self.node_epoch,
+            page_size=self.config.page_size,
+            own_holder=self.own_holder,
+            transfer_bytes_per_s=self.transfer_bytes_per_s,
+            interrupted=self._interrupted,
+            later_run=self.later_run,
+            on_lost=self._lose_regions,
+            renew_s=self.cxl_renew_s,
+            region_source=self.region_source,
+            map_region=self.map_region,
+        )
+
+    def _make(self, tier: TierConfig, cls: type[T]) -> T:
+        """The tier object of ``tier``, made by its store's TierSpec."""
+        make = TIERS[tier.store].make
+        assert make is not None  # check_servable lets served stores only
+        made = make(tier, self._env())
+        assert isinstance(made, cls)
+        return made
 
     def start(self) -> None:
         """Bring the node up; on failure everything started is undone.
@@ -267,34 +299,19 @@ class StorageService:
         self.local.claim()
         dram_tier = config.tier("dram")
         if dram_tier is not None:
-            self.dram = self._create_dram(dram_tier)
+            self._create_dram(dram_tier)
         ssd_tier = config.tier("ssd")
         if ssd_tier is not None:
             # Before NODE_OPEN. Its lock is free only once every earlier run's
             # I/O on it has ended: an earlier run of this process drained
             # and closed it, an earlier process exited
-            self.ssd = SsdDriver().create(
-                ssd_tier,
-                node_id=config.node_id,
-                node_epoch=self.node_epoch,
-                page_size=config.page_size,
-            )
+            self._ssd_tier = self._make(ssd_tier, SsdTier)
+            self._ssd_tier.open()
         cxl_tier = config.tier("cxl")
         if cxl_tier is not None:
             # Before NODE_OPEN: only regions this run owns are announced
-            source = self.region_source
-            if source is None:
-                source = self._rm_client = MaruShmClient(address=cxl_tier.rm)
-            self.cxl = CxlTier(
-                source,
-                cxl_tier,
-                node_id=config.node_id,
-                node_epoch=self.node_epoch,
-                page_size=config.page_size,
-                on_lost=self._lose_regions,
-                renew_s=self.cxl_renew_s,
-            )
-            self.cxl.claim(self._interrupted)
+            self.cxl = self._make(cxl_tier, CxlTier)
+            self.cxl.claim()
             if self._interrupted.is_set():
                 raise ServerStopped()
             self.cxl.start_renewing()
@@ -361,10 +378,7 @@ class StorageService:
             pool_tiers[self.dram.pool_id] = "dram"
         if self.ssd is not None:
             pool_tiers[self.ssd.pool_id] = "ssd"
-        rm_domains = []
-        if self.cxl is not None and self.cxl.rm_domain is not None:
-            devices = sorted({p.region.device_uuid for p in cxl_pools} - {""})
-            rm_domains = [RmDomain(self.cxl.rm_domain, tuple(devices))]
+        rm_domains = self.cxl.rm_domains() if self.cxl is not None else []
         opened = self.server.open(
             ([self.dram.info()] if self.dram is not None else [])
             + ([self.ssd.info()] if self.ssd is not None else [])
@@ -397,7 +411,7 @@ class StorageService:
         for pool in cxl_pools:
             if pool.pool_id in adopted_ids:
                 continue
-            if pool.claimed:
+            if self.cxl is not None and self.cxl.taken_over(pool.pool_id):
                 # The run before may have written it: quarantined as an
                 # adopted pool, with no committed page
                 self.pools.add_pool(
@@ -459,42 +473,24 @@ class StorageService:
             config.node_id,
             config.page_size >> 10,
         )
-        if self.dram is not None:
-            logger.info(
-                "dram tier: pool %s (%d MiB)",
-                self.dram.pool_id,
-                self.dram.capacity >> 20,
-            )
-        if self.ssd is not None:
-            logger.info(
-                "ssd tier: %s (%d MiB), %s",
-                self.ssd.path,
-                self.ssd.capacity >> 20,
-                "adopted" if self.ssd.pool_id in adopted_ids else "empty",
-            )
-        if cxl_pools:
-            logger.info(
-                "cxl tier: %d regions (%d MiB) from RM %s, %d adopted",
-                len(cxl_pools),
-                sum(p.capacity for p in cxl_pools) >> 20,
-                self.cxl.rm_domain if self.cxl else None,
-                len(adopted_ids & {p.pool_id for p in cxl_pools}),
-            )
+        if self._dram_tier is not None:
+            logger.info("dram tier: %s", self._dram_tier.describe(adopted_ids))
+        if self._ssd_tier is not None:
+            logger.info("ssd tier: %s", self._ssd_tier.describe(adopted_ids))
+        if self.cxl is not None and self.cxl.pools:
+            logger.info("cxl tier: %s", self.cxl.describe(adopted_ids))
 
     def _create_dram(self, tier: TierConfig) -> DramPool:
-        """The run's memfd. Memory that ran short may come free once workers
-        unmap an earlier run's pool: tried again with a backoff until it fits
-        or the run is stopped, as is any failure of a later run in this
-        process."""
+        """The run's memfd (its DramTier opened). Memory that ran short may
+        come free once workers unmap an earlier run's pool: tried again with
+        a backoff until it fits or the run is stopped, as is any failure of a
+        later run in this process."""
+        dram = self._dram_tier = self._make(tier, DramTier)
         pause, logged = DRAM_RETRY_S, None
         while True:
             try:
-                return DramDriver().create(
-                    tier,
-                    node_id=self.config.node_id,
-                    node_epoch=self.node_epoch,
-                    page_size=self.config.page_size,
-                )
+                dram.open()
+                return dram.pools[0]
             except DramPoolError as e:
                 if not (e.short or self.later_run):
                     raise
@@ -513,38 +509,16 @@ class StorageService:
     def _map_for_transfers(self, engine: TransferEngine) -> None:
         """The node's own mappings of its pools, for demotion copies. A
         region it cannot map takes no demotions."""
-        if self.dram is not None:
-            engine.add_pool(
-                self.dram.pool_id,
-                mmap.mmap(
-                    self.dram.fd,
-                    self.dram.capacity,
-                    flags=mmap.MAP_SHARED,
-                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                ),
-            )
+        dram = self._dram_tier
+        if dram is not None and dram.pool is not None:
+            engine.add_pool(dram.pool.pool_id, dram.map_for_transfers(dram.pool))
         if self.cxl is not None:
-            cxl = self.cxl
-            mapper = self.map_region or (
-                lambda pool: map_region(cxl.source, pool, self.own_holder)
-            )
-            for pool in cxl.pools:
-                try:
-                    engine.add_pool(pool.pool_id, mapper(pool))
-                except (OSError, RuntimeError, ValueError) as e:
-                    logger.error(
-                        "cxl tier: cannot map %s for demotion, so it takes none: %s",
-                        pool.pool_id,
-                        e,
-                    )
-        if self.ssd is not None:
-            engine.add_l2(
-                SsdTier(
-                    self.ssd,
-                    run=self.node_epoch,
-                    bytes_per_s=self.transfer_bytes_per_s,
-                )
-            )
+            for pool in self.cxl.pools:
+                mapping = self.cxl.map_for_transfers(pool)
+                if mapping is not None:
+                    engine.add_pool(pool.pool_id, mapping)
+        if self._ssd_tier is not None and self._ssd_tier.pool is not None:
+            engine.add_l2(self._ssd_tier)
         engine.start()
 
     def _end_quarantine(self, pool_id: str) -> None:
@@ -569,7 +543,7 @@ class StorageService:
     def _worker_settled(self, incarnation: str) -> None:
         """Its GPU drain grace is over: its region holds can go."""
         if self.cxl is not None:
-            self.cxl.drop_holds(incarnation)
+            self.cxl.worker_settled(incarnation)
 
     def interrupt(self) -> None:
         """Stop a start still waiting for the RM or MaruServer."""
@@ -617,7 +591,7 @@ class StorageService:
         if self.transfers is not None:
             self.transfers.stop()  # the copy under way ends; no new one starts
         if self.cxl is not None:
-            self.cxl.stop(timeout=1.0)
+            self.cxl.stop()
         if self.cxl is not None and mode == CloseMode.LEAVE:
             still = {p.pool_id for p in self.cxl.pools} - self._unmap_cxl()
             if still:
@@ -646,22 +620,22 @@ class StorageService:
                 logger.error(
                     "pools %s stay mapped: their hold and regions stay", sorted(kept)
                 )
-            elif self.cxl is not None and self.map_region is None:
-                self.cxl.unhold(self.own_holder)
+            elif self.cxl is not None:
+                self.cxl.after_transfers_closed()
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)
             self.server.close()
         if self.cxl is not None and mode == CloseMode.LEAVE and not kept:
             self.cxl.release()
-        if self._rm_client is not None:
-            self._rm_client.close()
-        if self.dram is not None:
-            self.dram.close()
-        if self.ssd is not None:
+        if self.cxl is not None:
+            self.cxl.close()  # its RM client
+        if self._dram_tier is not None:
+            self._dram_tier.close()
+        if self._ssd_tier is not None:
             # Every I/O was drained above (transfers.stop); closing ends the
             # lock, so the next run may open the file
-            self.ssd.close()
+            self._ssd_tier.close()
 
     def _unmap_cxl(self) -> set[str]:
         """The CXL pools no worker can map any more, before they go back."""

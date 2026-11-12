@@ -14,7 +14,7 @@ from typing import Any
 
 from maru_common.storage_types import PoolKind, Visibility
 
-from .tiers import Level, Tier
+from .tiers import Level, Tier, TierEnv
 
 
 class NodeConfigError(ValueError):
@@ -173,7 +173,6 @@ class TierSpec:
     local: bool  # its pools are this node's (in the PoolManager)
     kind: PoolKind | None  # the wire kind of its pools; None if not local
     keys: frozenset[str]  # the keys its config object may carry
-    served: bool = True  # the StorageService runs it
     common: bool = True  # size, demotion and watermarks are read for it
     size_optional: bool = False
     last_only: bool = False  # it must be the last tier
@@ -183,4 +182,9 @@ class TierSpec:
     parse: Callable[[dict, TierContext], dict[str, Any]] = _no_fields
     # Raises NotServableError for a tier it cannot run yet
     check_servable: Callable[[TierConfig], None] = _always_servable
-    make: Callable[..., Tier] | None = None
+    # The tier the StorageService runs; None: parsed, not served
+    make: Callable[[TierConfig, TierEnv], Tier] | None = None
+
+    @property
+    def served(self) -> bool:
+        return self.make is not None

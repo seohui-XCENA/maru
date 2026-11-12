@@ -9,6 +9,7 @@ never opened again.
 
 import errno
 import fcntl
+import mmap
 import os
 import re
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from maru_common.storage_types import PoolDescriptor, PoolInfo, PoolKind
 
 from ..config_fields import TierConfig, TierContext, TierSpec, _bool
-from ..tiers import Level
+from ..tiers import L1Pool, L1Tier, Level, TierEnv
 from . import PoolAccess
 
 _MEMINFO = "/proc/meminfo"
@@ -184,6 +185,61 @@ class DramDriver:
         raise DramPoolError(f"{info.pool_id}: a DRAM pool ends with its run")
 
 
+class DramTier(L1Tier):
+    """The run's memfd pool, created by open(); DramPoolError (``short``:
+    memory may come free) if it cannot be."""
+
+    name = "dram"
+
+    def __init__(
+        self, tier: TierConfig, *, node_id: str, node_epoch: str, page_size: int
+    ):
+        self.tier = tier
+        self.node_id = node_id
+        self.node_epoch = node_epoch
+        self.page_size = page_size
+        self.pools: list[DramPool] = []
+
+    @property
+    def pool(self) -> DramPool | None:
+        return self.pools[0] if self.pools else None
+
+    def open(self) -> None:
+        self.pools = [
+            DramDriver().create(
+                self.tier,
+                node_id=self.node_id,
+                node_epoch=self.node_epoch,
+                page_size=self.page_size,
+            )
+        ]
+
+    def map_for_transfers(self, pool: L1Pool) -> mmap.mmap:
+        fd = pool.worker_fd()  # the memfd
+        assert fd is not None
+        return mmap.mmap(
+            fd,
+            pool.capacity,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+
+    def close(self) -> None:
+        for pool in self.pools:
+            pool.close()
+
+    def describe(self, adopted: set[str]) -> str:
+        pool = self.pool
+        assert pool is not None
+        return f"pool {pool.pool_id} ({pool.capacity >> 20} MiB)"
+
+
+def _make(tier: TierConfig, env: TierEnv) -> DramTier:
+    return DramTier(
+        tier, node_id=env.node_id, node_epoch=env.node_epoch, page_size=env.page_size
+    )
+
+
 def _parse(raw: dict, ctx: TierContext) -> dict:
     return {"hugepage": _bool(raw, "hugepage", ctx.what, True)}
 
@@ -197,4 +253,5 @@ SPEC = TierSpec(
         {"store", "size", "demotion", "high_watermark", "low_watermark", "hugepage"}
     ),
     parse=_parse,
+    make=_make,
 )
