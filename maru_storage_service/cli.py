@@ -40,7 +40,23 @@ def config_to_dict(config: NodeConfig) -> dict[str, Any]:
             return [plain(v) for v in value]
         return value
 
-    out: dict[str, Any] = plain(dataclasses.asdict(config))
+    out: dict[str, Any] = plain(
+        dataclasses.asdict(dataclasses.replace(config, tiers=()))
+    )
+    # A store's options print as its other keys do
+    out["tiers"] = [
+        plain(
+            {
+                **{
+                    f.name: getattr(t, f.name)
+                    for f in dataclasses.fields(t)
+                    if f.name != "options"
+                },
+                **t.options,
+            }
+        )
+        for t in config.tiers
+    ]
     out.pop("source", None)
     return out
 

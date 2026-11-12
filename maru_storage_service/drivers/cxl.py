@@ -42,7 +42,17 @@ from maru_shm.types import (
 )
 from maru_shm.unholds import Unholds
 
-from ..config import TierConfig
+from ..config_fields import (
+    NodeConfigError,
+    NotServableError,
+    TierConfig,
+    TierContext,
+    TierSpec,
+    _bool,
+    _str,
+    parse_size,
+)
+from ..tiers import Level
 from . import PoolAccess
 
 logger = logging.getLogger(__name__)
@@ -54,6 +64,8 @@ HOLDS_POLL_S = 1.0
 HOLDS_LOG_S = 30.0
 # Holder name of the StorageService's own holds (run_holder)
 OWN_HOLDER = "ss"
+DEFAULT_RM = "127.0.0.1:9850"
+DEFAULT_REGION_SIZE = 1 << 30
 
 # Holds the node failed to drop, sent again until the RM confirms them; for
 # the process, so they outlive the run that queued them
@@ -565,3 +577,65 @@ class CxlTier:
                 "them when the lease ends",
                 e,
             )
+
+
+def _parse(raw: dict, ctx: TierContext) -> dict:
+    what, size, page_size = ctx.what, ctx.size, ctx.page_size
+    tier: dict = {}
+    region = parse_size(
+        raw.get("region_size", DEFAULT_REGION_SIZE), f"{what}.region_size"
+    )
+    if region < page_size or region % page_size:
+        raise NodeConfigError(
+            f"{what}.region_size: {region} must be a multiple of page_size {page_size}"
+        )
+    if size is not None and size < region:
+        raise NodeConfigError(
+            f"{what}.size: {size} is smaller than region_size {region}"
+        )
+    tier["region_size"] = region
+    tier["rm"] = _str(raw, "rm", what, DEFAULT_RM)
+    if ctx.index == 0 and "credit_fallback" in raw:
+        raise NodeConfigError(
+            f"{what}.credit_fallback: only a tier below the top gives fallback credit"
+        )
+    tier["credit_fallback"] = ctx.index > 0 and _bool(
+        raw, "credit_fallback", what, True
+    )
+    visibility = raw.get("visibility", Visibility.COHERENT.value)
+    try:
+        tier["visibility"] = Visibility(visibility)
+    except ValueError:
+        raise NodeConfigError(
+            f"{what}.visibility: one of {[v.value for v in Visibility]}, got {visibility!r}"
+        ) from None
+    return tier
+
+
+def _check_servable(tier: TierConfig) -> None:
+    if tier.size is None:
+        raise NotServableError("the cxl tier needs a size")
+
+
+SPEC = TierSpec(
+    store="cxl",
+    level=Level.L1,
+    local=True,
+    kind=PoolKind.CXL,
+    keys=frozenset(
+        {
+            "store",
+            "size",
+            "demotion",
+            "high_watermark",
+            "low_watermark",
+            "region_size",
+            "rm",
+            "visibility",
+            "credit_fallback",
+        }
+    ),
+    size_optional=True,
+    parse=_parse,
+    check_servable=_check_servable,
+)

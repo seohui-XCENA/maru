@@ -145,7 +145,9 @@ class StorageManager:
         self.node_epoch = node_epoch
         # By tier name, in config order
         self.traits = traits or {
-            "dram": TierTraits("dram", Level.L1, credit=True, evicts=True)
+            "dram": TierTraits(
+                "dram", Level.L1, PoolKind.DRAM, credit=True, evicts=True
+            )
         }
         # Credit comes from the top tier, then from the fallback tiers in order
         self.credit_tiers = [n for n, t in self.traits.items() if t.credit] + [
@@ -332,8 +334,8 @@ class StorageManager:
     @property
     def credit_kinds(self) -> list[PoolKind]:
         """The kinds of the credit tiers' pools, in credit order (the wire
-        names tiers by kind)."""
-        kinds = (self.pools.tier_kind(t) for t in self.credit_tiers)
+        names tiers by kind), whether or not a tier has pools now."""
+        kinds = (self.traits[t].kind for t in self.credit_tiers)
         return [k for k in kinds if k is not None]
 
     def credit(self, rec: WorkerRecord, decoded: DecodedRequest) -> CreditResponse:
@@ -372,9 +374,7 @@ class StorageManager:
                 req.want_bytes,
                 self.credit_tiers
                 if req.kind is None
-                else [
-                    t for t in self.credit_tiers if self.pools.tier_kind(t) == req.kind
-                ],
+                else [t for t in self.credit_tiers if self.traits[t].kind == req.kind],
             )
             asks = [
                 (conn, nbytes)

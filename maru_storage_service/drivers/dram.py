@@ -15,7 +15,8 @@ from dataclasses import dataclass
 
 from maru_common.storage_types import PoolDescriptor, PoolInfo, PoolKind
 
-from ..config import TierConfig
+from ..config_fields import TierConfig, TierContext, TierSpec, _bool
+from ..tiers import Level
 from . import PoolAccess
 
 _MEMINFO = "/proc/meminfo"
@@ -181,3 +182,19 @@ class DramDriver:
 
     def open(self, info: PoolInfo) -> DramPool:
         raise DramPoolError(f"{info.pool_id}: a DRAM pool ends with its run")
+
+
+def _parse(raw: dict, ctx: TierContext) -> dict:
+    return {"hugepage": _bool(raw, "hugepage", ctx.what, True)}
+
+
+SPEC = TierSpec(
+    store="dram",
+    level=Level.L1,
+    local=True,
+    kind=PoolKind.DRAM,
+    keys=frozenset(
+        {"store", "size", "demotion", "high_watermark", "low_watermark", "hugepage"}
+    ),
+    parse=_parse,
+)

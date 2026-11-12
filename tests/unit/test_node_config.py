@@ -3,19 +3,25 @@
 """StorageService node config: example configs, defaults and every rule."""
 
 import copy
+import dataclasses
 import json
 
 import pytest
 
 from maru_common.storage_types import PoolKind, Visibility
-from maru_storage_service.cli import EXIT_CONFIG, EXIT_NOT_SERVING, main
+from maru_storage_service.cli import EXIT_CONFIG, EXIT_NOT_SERVING, config_to_dict, main
 from maru_storage_service.config import (
     DEFAULT_RM,
     NodeConfigError,
+    TierConfig,
     load_node_config,
     parse_node_config,
     parse_size,
 )
+from maru_storage_service.config_fields import TierSpec
+from maru_storage_service.drivers.registry import TIERS
+from maru_storage_service.service import SERVED_TIERS, NotServableError, check_servable
+from maru_storage_service.tiers import Level
 
 M = 1 << 20
 G = 1 << 30
@@ -487,3 +493,122 @@ class TestReviewEdges:
     def test_key_file_home_is_expanded(self):
         c = parse_node_config(MEMORY_NODE)
         assert not c.remote_server.key_file.startswith("~")
+
+
+class TestRegistry:
+    def test_stores_and_their_wire_kinds(self):
+        assert [(s.store, s.level, s.local, s.kind) for s in TIERS.values()] == [
+            ("dram", Level.L1, True, PoolKind.DRAM),
+            ("cxl", Level.L1, True, PoolKind.CXL),
+            ("ssd", Level.L2, True, PoolKind.SSD),
+            ("remote", Level.L2, False, None),
+        ]
+
+    def test_served_tiers_are_the_six_combinations_in_order(self):
+        assert SERVED_TIERS == (
+            ["dram"],
+            ["cxl"],
+            ["dram", "cxl"],
+            ["dram", "ssd"],
+            ["cxl", "ssd"],
+            ["dram", "cxl", "ssd"],
+        )
+
+    def test_servable_checks_keep_their_order(self):
+        raw = copy.deepcopy(GPU_NODE)
+        raw["tiers"][0]["demotion"] = "through"
+        del raw["tiers"][1]["size"]
+        raw["budgets"] = {"transfer_reserve_bytes": {"cxl": "1G"}}
+        config = parse_node_config(raw)
+        dram, cxl, ssd = config.tiers
+        # combination, then the cxl size, then write-through
+        for tiers, match in (
+            ((cxl, dram), "serving the tiers"),
+            ((dram, cxl, ssd), "the cxl tier needs a size"),
+            ((dram, dataclasses.replace(cxl, size=T), ssd), "write-through"),
+        ):
+            with pytest.raises(NotServableError, match=match):
+                check_servable(dataclasses.replace(config, tiers=tiers))
+        with pytest.raises(NotServableError, match="memory node"):
+            check_servable(
+                dataclasses.replace(config, role="memory", tiers=(cxl, dram))
+            )
+
+    def test_traits_carry_the_wire_kind(self):
+        traits = parse_node_config(GPU_NODE).traits()
+        assert {n: t.kind for n, t in traits.items()} == {
+            "dram": PoolKind.DRAM,
+            "cxl": PoolKind.CXL,
+            "ssd": PoolKind.SSD,
+        }
+
+    def test_options_are_read_only(self):
+        tier = TierConfig(store="dram", options={"a": 1})
+        with pytest.raises(TypeError):
+            tier.options["a"] = 2  # type: ignore[index]
+        assert TierConfig(store="dram").options == {}
+
+
+def _fake_spec(**changes):
+    def parse(raw, ctx):
+        return {"options": {"depth": raw.get("depth", 1), "size_seen": ctx.size}}
+
+    spec = TierSpec(
+        store="fake",
+        level=Level.L2,
+        local=True,
+        kind=PoolKind.SSD,
+        keys=frozenset({"store", "size", "demotion", "depth"}),
+        parse=parse,
+    )
+    return dataclasses.replace(spec, **changes)
+
+
+class TestAStoreFromTheRegistry:
+    def test_a_registered_store_is_parsed_by_its_spec(self, monkeypatch):
+        monkeypatch.setitem(TIERS, "fake", _fake_spec())
+        raw = edit(
+            GPU_NODE,
+            tiers=[
+                {"store": "dram", "size": "64G"},
+                {"store": "fake", "size": "1T", "depth": 3},
+            ],
+        )
+        config = parse_node_config(raw)
+        fake = config.tiers[1]
+        assert dict(fake.options) == {"depth": 3, "size_seen": T}
+        assert not fake.is_memory
+        assert config.traits()["fake"].kind == PoolKind.SSD
+        assert config_to_dict(config)["tiers"][1]["depth"] == 3
+        rejects(with_tier(raw, 1, path="/x"), r"tiers\[1\] \(fake\): unknown keys")
+
+    def test_two_local_tiers_of_one_kind_are_refused(self, monkeypatch):
+        monkeypatch.setitem(TIERS, "fake", _fake_spec())
+        raw = copy.deepcopy(GPU_NODE)
+        raw["tiers"][2]["demotion"] = "back"
+        raw["tiers"].append({"store": "fake", "size": "1T"})
+        rejects(raw, r"two local tiers have pools of one kind: \['ssd'\]")
+
+    def test_a_tier_that_is_not_local_shares_a_kind(self, monkeypatch):
+        monkeypatch.setitem(TIERS, "fake", _fake_spec(local=False))
+        raw = copy.deepcopy(GPU_NODE)
+        raw["tiers"][2]["demotion"] = "back"
+        raw["tiers"].append({"store": "fake", "size": "1T"})
+        assert "fake" not in parse_node_config(raw).traits()
+
+
+class TestTierConfigCopies:
+    def test_a_config_pickles_and_copies_with_its_options(self):
+        import pickle
+
+        tier = TierConfig(store="dram", size=1 << 20, options={"x": 1})
+        for clone in (pickle.loads(pickle.dumps(tier)), copy.deepcopy(tier)):
+            assert clone == tier and dict(clone.options) == {"x": 1}
+            with pytest.raises(TypeError):
+                clone.options["x"] = 2  # type: ignore[index]
+        assert dataclasses.asdict(tier)["options"] == {"x": 1}
+
+    @pytest.mark.parametrize("store", [[], ["dram"], {}, {"a": 1}])
+    def test_a_store_that_is_not_a_string_is_a_config_error(self, store):
+        with pytest.raises(NodeConfigError, match=r"tiers\[0\]\.store: one of"):
+            parse_node_config({**GPU_NODE, "tiers": [{"store": store, "size": "64M"}]})

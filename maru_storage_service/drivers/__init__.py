@@ -11,7 +11,7 @@ from typing import Protocol, runtime_checkable
 
 from maru_common.storage_types import PoolDescriptor, PoolInfo
 
-from ..config import TierConfig
+from ..config_fields import TierConfig
 
 
 class PoolAccess(StrEnum):

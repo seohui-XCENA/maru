@@ -7,7 +7,6 @@ Unknown keys are errors so a typo never falls back to a default.
 
 import grp
 import json
-import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -15,31 +14,31 @@ from pathlib import Path
 from typing import Any
 
 from maru_common.node_protocol import DEFAULT_NODE_SOCKET, Budgets, TransferDefaults
-from maru_common.storage_types import Visibility
+from maru_common.storage_types import PoolKind
 
+from .config_fields import NodeConfigError as NodeConfigError
+from .config_fields import TierConfig as TierConfig
+from .config_fields import TierContext
+from .config_fields import _bool as _bool
+from .config_fields import _number as _number
+from .config_fields import _require_keys as _require_keys
+from .config_fields import _str as _str
+from .config_fields import parse_size as parse_size
+from .drivers.cxl import DEFAULT_REGION_SIZE as DEFAULT_REGION_SIZE
+from .drivers.cxl import DEFAULT_RM as DEFAULT_RM
+from .drivers.peer import DEFAULT_RDMA_TIMEOUT_S as DEFAULT_RDMA_TIMEOUT_S
+from .drivers.registry import TIERS
 from .tiers import Level
 
-
-class NodeConfigError(ValueError):
-    """The node config breaks a rule; the message names the field."""
-
-
-STORES = ("dram", "cxl", "ssd", "remote")
 # Old names read as the current store (the session backends called DRAM "cpu")
 STORE_ALIASES = {"cpu": "dram"}
 # node_id goes into pool ids such as dram:{node_id}:{node_epoch}
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-MEMORY_STORES = ("dram", "cxl")
-# Tiers of this node's own pools: the ones demotion moves pages between
-LOCAL_STORES = ("dram", "cxl", "ssd")
 DEMOTIONS = ("back", "through")
 ROLES = ("gpu", "memory")
 
-DEFAULT_RM = "127.0.0.1:9850"
-DEFAULT_REGION_SIZE = 1 << 30
 DEFAULT_HIGH_WATERMARK = 0.9
 DEFAULT_LOW_WATERMARK = 0.8
-DEFAULT_RDMA_TIMEOUT_S = 30.0  # the same as maru_rdma_timeout_s today
 
 # Budget defaults (all provisional until measured)
 CREDIT_MAX_PAGES = 16
@@ -67,30 +66,6 @@ _TOP_KEYS = {
     "budgets",
     "remote_server",
 }
-# Keys a tier may carry, by store
-_TIER_KEYS = {
-    "dram": {
-        "store",
-        "size",
-        "demotion",
-        "high_watermark",
-        "low_watermark",
-        "hugepage",
-    },
-    "cxl": {
-        "store",
-        "size",
-        "demotion",
-        "high_watermark",
-        "low_watermark",
-        "region_size",
-        "rm",
-        "visibility",
-        "credit_fallback",
-    },
-    "ssd": {"store", "size", "demotion", "high_watermark", "low_watermark", "path"},
-    "remote": {"store", "url", "rdma_device", "timeout_s"},
-}
 _BUDGET_KEYS = {
     "credit_max_bytes",
     "credit_total_max_bytes",
@@ -103,47 +78,6 @@ _BUDGET_KEYS = {
 }
 _REMOTE_SERVER_KEYS = {"listen", "key_file"}
 
-_SIZE_RE = re.compile(r"^\s*(\d+)\s*([KMGT]?)(?:i?B)?\s*$", re.IGNORECASE)
-_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
-
-
-def parse_size(value: Any, what: str) -> int:
-    """Bytes from an int or a string like "32M" or "1GiB" (binary units)."""
-    if isinstance(value, bool):
-        raise NodeConfigError(f"{what}: expected a size, got {value!r}")
-    if isinstance(value, int):
-        if value < 0:
-            raise NodeConfigError(f"{what}: must not be negative, got {value}")
-        return value
-    if isinstance(value, str):
-        m = _SIZE_RE.match(value)
-        if m:
-            return int(m.group(1)) * _UNITS[m.group(2).upper()]
-    raise NodeConfigError(f'{what}: not a size: {value!r} (e.g. 4096, "32M", "1G")')
-
-
-@dataclass(frozen=True)
-class TierConfig:
-    store: str
-    size: int | None = None
-    demotion: str | None = None
-    high_watermark: float | None = None
-    low_watermark: float | None = None
-    hugepage: bool | None = None
-    region_size: int | None = None
-    rm: str | None = None
-    visibility: Visibility | None = None
-    path: str | None = None
-    url: tuple[str, ...] = ()
-    rdma_device: str | None = None
-    timeout_s: float | None = None
-    # A tier below the top that workers map gives the credit the top lacks
-    credit_fallback: bool = False
-
-    @property
-    def is_memory(self) -> bool:
-        return self.store in MEMORY_STORES
-
 
 @dataclass(frozen=True)
 class TierTraits:
@@ -152,6 +86,7 @@ class TierTraits:
 
     name: str  # the store name
     level: Level
+    kind: PoolKind | None  # the wire kind of its pools
     credit: bool  # workers get credit from it (the top tier)
     evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
     demotes_to: str | None = None  # write-back target tier (demotion "back")
@@ -201,19 +136,19 @@ class NodeConfig:
         out: dict[str, TierTraits] = {}
         receives = True  # the top tier gets the writes
         for i, t in enumerate(self.tiers):
-            if t.store not in LOCAL_STORES:
+            spec = TIERS[t.store]
+            if not spec.local:
                 receives = False
                 continue
             below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
             demotes = (
-                t.demotion == "back"
-                and below is not None
-                and below.store in LOCAL_STORES
+                t.demotion == "back" and below is not None and TIERS[below.store].local
             )
             fallback = i > 0 and t.credit_fallback
             out[t.store] = TierTraits(
                 name=t.store,
-                level=Level.L1 if t.is_memory else Level.L2,
+                level=spec.level,
+                kind=spec.kind,
                 credit=i == 0,
                 evicts=receives or fallback,
                 demotes_to=below.store if demotes and below else None,
@@ -225,48 +160,8 @@ class NodeConfig:
     def transfer_defaults(self) -> TransferDefaults:
         """Workers park loads when a tier can only be fetched from; a store
         ends in a tier workers map, so it needs no write-behind."""
-        fetched = any(t.store not in MEMORY_STORES for t in self.tiers)
+        fetched = any(not t.is_memory for t in self.tiers)
         return TransferDefaults(async_load=fetched, async_store=False)
-
-
-def _require_keys(obj: Any, allowed: set[str], what: str) -> dict:
-    if not isinstance(obj, dict):
-        raise NodeConfigError(f"{what}: expected an object, got {type(obj).__name__}")
-    unknown = sorted(set(obj) - allowed)
-    if unknown:
-        raise NodeConfigError(
-            f"{what}: unknown keys {unknown} (allowed: {sorted(allowed)})"
-        )
-    return obj
-
-
-def _str(obj: dict, key: str, what: str, default: str | None = None) -> str:
-    value = obj.get(key, default)
-    if value is None:
-        raise NodeConfigError(f"{what}.{key}: required")
-    if not isinstance(value, str) or not value.strip():
-        raise NodeConfigError(
-            f"{what}.{key}: expected a non-empty string, got {value!r}"
-        )
-    return value
-
-
-def _bool(obj: dict, key: str, what: str, default: bool) -> bool:
-    value = obj.get(key, default)
-    if not isinstance(value, bool):
-        raise NodeConfigError(f"{what}.{key}: expected true or false, got {value!r}")
-    return value
-
-
-def _number(obj: dict, key: str, what: str, default: float) -> float:
-    value = obj.get(key, default)
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or not math.isfinite(value)
-    ):
-        raise NodeConfigError(f"{what}.{key}: expected a finite number, got {value!r}")
-    return float(value)
 
 
 def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
@@ -276,114 +171,51 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
     store = raw.get("store")
     if isinstance(store, str):
         store = STORE_ALIASES.get(store, store)
-    if store not in STORES:
-        raise NodeConfigError(f"{what}.store: one of {list(STORES)}, got {store!r}")
+    if not isinstance(store, str) or store not in TIERS:
+        raise NodeConfigError(f"{what}.store: one of {list(TIERS)}, got {store!r}")
+    spec = TIERS[store]
     what = f"{what} ({store})"
-    _require_keys(raw, _TIER_KEYS[store], what)
+    _require_keys(raw, spec.keys, what)
 
-    if store == "remote":
-        urls = raw.get("url")
-        if isinstance(urls, str):
-            urls = [u.strip() for u in urls.split(",")]
-        if (
-            not isinstance(urls, list)
-            or not urls
-            or not all(isinstance(u, str) and u for u in urls)
-        ):
-            raise NodeConfigError(f"{what}.url: required, one address or several")
-        timeout = _number(raw, "timeout_s", what, DEFAULT_RDMA_TIMEOUT_S)
-        if timeout <= 0:
+    tier: dict[str, Any] = {"store": store}
+    size = None
+    if spec.common:
+        size = raw.get("size")
+        if size is None:
+            if not spec.size_optional:
+                raise NodeConfigError(f"{what}.size: required")
+        else:
+            size = parse_size(size, f"{what}.size")
+            if size < page_size:
+                raise NodeConfigError(
+                    f"{what}.size: {size} is smaller than page_size {page_size}"
+                )
+
+        if last:
+            if "demotion" in raw:
+                raise NodeConfigError(
+                    f"{what}.demotion: the last tier has nothing below it"
+                )
+            demotion = None
+        else:
+            demotion = raw.get("demotion", "back")
+            if demotion not in DEMOTIONS:
+                raise NodeConfigError(
+                    f"{what}.demotion: one of {list(DEMOTIONS)}, got {demotion!r}"
+                )
+
+        high = _number(raw, "high_watermark", what, DEFAULT_HIGH_WATERMARK)
+        low = _number(raw, "low_watermark", what, DEFAULT_LOW_WATERMARK)
+        if not 0 < low < high <= 1:
             raise NodeConfigError(
-                f"{what}.timeout_s: expected a positive number, got {timeout!r}"
+                f"{what}: need 0 < low_watermark < high_watermark <= 1, got {low} and {high}"
             )
-        device = raw.get("rdma_device")
-        if device is not None and not isinstance(device, str):
-            raise NodeConfigError(
-                f"{what}.rdma_device: expected a string, got {device!r}"
-            )
-        return TierConfig(
-            store=store,
-            url=tuple(urls),
-            rdma_device=device or None,
-            timeout_s=float(timeout),
+        tier.update(
+            size=size, demotion=demotion, high_watermark=high, low_watermark=low
         )
 
-    size = raw.get("size")
-    if size is None:
-        if store != "cxl":
-            raise NodeConfigError(f"{what}.size: required")
-    else:
-        size = parse_size(size, f"{what}.size")
-        if size < page_size:
-            raise NodeConfigError(
-                f"{what}.size: {size} is smaller than page_size {page_size}"
-            )
-
-    if last:
-        if "demotion" in raw:
-            raise NodeConfigError(
-                f"{what}.demotion: the last tier has nothing below it"
-            )
-        demotion = None
-    else:
-        demotion = raw.get("demotion", "back")
-        if demotion not in DEMOTIONS:
-            raise NodeConfigError(
-                f"{what}.demotion: one of {list(DEMOTIONS)}, got {demotion!r}"
-            )
-
-    high = _number(raw, "high_watermark", what, DEFAULT_HIGH_WATERMARK)
-    low = _number(raw, "low_watermark", what, DEFAULT_LOW_WATERMARK)
-    if not 0 < low < high <= 1:
-        raise NodeConfigError(
-            f"{what}: need 0 < low_watermark < high_watermark <= 1, got {low} and {high}"
-        )
-
-    tier: dict[str, Any] = {
-        "store": store,
-        "size": size,
-        "demotion": demotion,
-        "high_watermark": high,
-        "low_watermark": low,
-    }
-    if store == "dram":
-        tier["hugepage"] = _bool(raw, "hugepage", what, True)
-    elif store == "cxl":
-        region = parse_size(
-            raw.get("region_size", DEFAULT_REGION_SIZE), f"{what}.region_size"
-        )
-        if region < page_size or region % page_size:
-            raise NodeConfigError(
-                f"{what}.region_size: {region} must be a multiple of page_size {page_size}"
-            )
-        if size is not None and size < region:
-            raise NodeConfigError(
-                f"{what}.size: {size} is smaller than region_size {region}"
-            )
-        tier["region_size"] = region
-        tier["rm"] = _str(raw, "rm", what, DEFAULT_RM)
-        if index == 0 and "credit_fallback" in raw:
-            raise NodeConfigError(
-                f"{what}.credit_fallback: only a tier below the top gives fallback credit"
-            )
-        tier["credit_fallback"] = index > 0 and _bool(
-            raw, "credit_fallback", what, True
-        )
-        visibility = raw.get("visibility", Visibility.COHERENT.value)
-        try:
-            tier["visibility"] = Visibility(visibility)
-        except ValueError:
-            raise NodeConfigError(
-                f"{what}.visibility: one of {[v.value for v in Visibility]}, got {visibility!r}"
-            ) from None
-    elif store == "ssd":
-        path = _str(raw, "path", what)
-        if not os.path.isabs(path):
-            raise NodeConfigError(
-                f"{what}.path: must be an absolute path, got {path!r}"
-            )
-        # The path is part of the pool id, so /mnt/x and /mnt/x/ must be one pool
-        tier["path"] = os.path.normpath(path)
+    ctx = TierContext(what=what, index=index, page_size=page_size, last=last, size=size)
+    tier.update(spec.parse(raw, ctx))
     return TierConfig(**tier)
 
 
@@ -564,17 +396,26 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
     duplicated = sorted({s for s in stores if stores.count(s) > 1})
     if duplicated:
         raise NodeConfigError(f"config.tiers: a store appears twice: {duplicated}")
-    if not tiers[0].is_memory:
+    # The wire names a node's tier by the kind of its pools
+    kinds = [TIERS[s].kind for s in stores if TIERS[s].local]
+    shared = sorted({str(k) for k in kinds if k is not None and kinds.count(k) > 1})
+    if shared:
         raise NodeConfigError(
-            f"config.tiers[0]: the first tier must be dram or cxl (workers copy to it from the GPU), got {tiers[0].store}"
+            f"config.tiers: two local tiers have pools of one kind: {shared}"
         )
-    if "remote" in stores:
-        if role == "memory":
+    if not tiers[0].is_memory:
+        memory = " or ".join(s.store for s in TIERS.values() if s.level is Level.L1)
+        raise NodeConfigError(
+            f"config.tiers[0]: the first tier must be {memory} (workers copy to it from the GPU), got {tiers[0].store}"
+        )
+    for t in tiers:
+        spec = TIERS[t.store]
+        if spec.gpu_only and role == "memory":
             raise NodeConfigError(
-                "config.tiers: a memory node cannot have a remote tier"
+                f"config.tiers: a memory node cannot have a {t.store} tier"
             )
-        if stores[-1] != "remote":
-            raise NodeConfigError("config.tiers: remote must be the last tier")
+        if spec.last_only and t is not tiers[-1]:
+            raise NodeConfigError(f"config.tiers: {t.store} must be the last tier")
 
     remote_server = None
     if raw.get("remote_server") is not None:

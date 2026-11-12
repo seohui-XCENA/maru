@@ -23,7 +23,6 @@ from maru_common.storage_types import (
     Key,
     Location,
     PoolInfo,
-    PoolKind,
     PoolUsage,
     generation_epoch_seq,
     make_generation,
@@ -136,14 +135,6 @@ class PoolManager:
         """The pool's tier; None for a pool this node does not have."""
         with self._lock:
             return self._tier.get(pool_id)
-
-    def tier_kind(self, tier: str) -> PoolKind | None:
-        """The kind of the tier's pools; None while it has none."""
-        with self._lock:
-            return next(
-                (t.info.kind for p, t in self._tables.items() if self._tier[p] == tier),
-                None,
-            )
 
     def creditable(self, pool_id: str) -> bool:
         with self._lock:

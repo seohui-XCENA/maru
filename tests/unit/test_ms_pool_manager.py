@@ -86,7 +86,6 @@ class TestTiers:
             "fast",
             None,
         ]
-        assert pm.tier_kind("fast") == PoolKind.DRAM and pm.tier_kind("cxl") is None
         # credit and the transfer reserve go by tier, not by kind
         got = pm.credit("w", 4 * PS, "fast")
         assert [c.pool_id for c in got] == ["dram:n:f"] * 2

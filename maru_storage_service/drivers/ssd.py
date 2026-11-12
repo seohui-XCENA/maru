@@ -27,9 +27,15 @@ from dataclasses import dataclass, field
 
 from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, PoolKind
 
-from ..config import TierConfig
+from ..config_fields import (
+    NodeConfigError,
+    TierConfig,
+    TierContext,
+    TierSpec,
+    _str,
+)
 from ..page_table import PageRef
-from ..tiers import IOResult, L2Tier, Span
+from ..tiers import IOResult, L2Tier, Level, Span
 from . import PoolAccess
 from .io_executor import (
     DEFAULT_IO_QUEUE_SIZE,
@@ -565,3 +571,25 @@ class SsdTier(L2Tier):
             alignment=pool.alignment.memory,
             resources=(pool, mapping),
         )
+
+
+def _parse(raw: dict, ctx: TierContext) -> dict:
+    path = _str(raw, "path", ctx.what)
+    if not os.path.isabs(path):
+        raise NodeConfigError(
+            f"{ctx.what}.path: must be an absolute path, got {path!r}"
+        )
+    # The path is part of the pool id, so /mnt/x and /mnt/x/ must be one pool
+    return {"path": os.path.normpath(path)}
+
+
+SPEC = TierSpec(
+    store="ssd",
+    level=Level.L2,
+    local=True,
+    kind=PoolKind.SSD,
+    keys=frozenset(
+        {"store", "size", "demotion", "high_watermark", "low_watermark", "path"}
+    ),
+    parse=_parse,
+)

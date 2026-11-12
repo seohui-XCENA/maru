@@ -20,6 +20,7 @@ claimed the node, the run leaves and no new run starts.
 """
 
 import dataclasses
+import itertools
 import logging
 import mmap
 import threading
@@ -37,6 +38,7 @@ from maru_common.storage_types import (
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError, TierConfig
+from .config_fields import NotServableError as NotServableError
 from .drivers.cxl import (
     DEFAULT_RENEW_S,
     OWN_HOLDER,
@@ -46,6 +48,7 @@ from .drivers.cxl import (
     map_region,
 )
 from .drivers.dram import DramDriver, DramPool, DramPoolError
+from .drivers.registry import TIERS
 from .drivers.ssd import SsdDriver, SsdPool, SsdTier
 from .fetch_manager import FetchManager
 from .local_pin import LocalPins
@@ -61,6 +64,7 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
+from .tiers import Level
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
@@ -83,18 +87,19 @@ DRAM_RETRY_MAX_S = 30.0
 DRAM_LOG_S = 30.0
 
 
-class NotServableError(RuntimeError):
-    """The config asks for something not supported yet."""
+def _served_tiers() -> tuple[list[str], ...]:
+    """One or more served L1 stores in registry order, then at most one
+    served L2 store; those without an L2 first."""
+    l1 = [s.store for s in TIERS.values() if s.served and s.level is Level.L1]
+    l2 = [s.store for s in TIERS.values() if s.served and s.level is Level.L2]
+    tops = [
+        list(c) for n in range(1, len(l1) + 1) for c in itertools.combinations(l1, n)
+    ]
+    belows: list[list[str]] = [[], *([s] for s in l2)]
+    return tuple(top + below for below in belows for top in tops)
 
 
-SERVED_TIERS = (
-    ["dram"],
-    ["cxl"],
-    ["dram", "cxl"],
-    ["dram", "ssd"],
-    ["cxl", "ssd"],
-    ["dram", "cxl", "ssd"],
-)
+SERVED_TIERS = _served_tiers()
 
 
 def check_servable(config: NodeConfig) -> None:
@@ -108,9 +113,8 @@ def check_servable(config: NodeConfig) -> None:
             f"serving the tiers {stores} is not implemented yet: only {served} "
             "are served"
         )
-    cxl = config.tier("cxl")
-    if cxl is not None and cxl.size is None:
-        raise NotServableError("the cxl tier needs a size")
+    for t in config.tiers:
+        TIERS[t.store].check_servable(t)
     if any(t.demotion == "through" for t in config.tiers):
         raise NotServableError(
             "write-through demotion is not implemented yet: use demotion back"

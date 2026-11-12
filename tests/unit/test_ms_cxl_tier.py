@@ -745,6 +745,50 @@ def test_credit_dram_lacks_comes_from_cxl(fake, sockdir, fallback):
         node.stop()
 
 
+@pytest.mark.parametrize("with_dram", [False, True])
+def test_a_cxl_tier_the_rm_gave_no_region_answers_cxl_credit_with_none(
+    fake, sockdir, with_dram
+):
+    from maru_common.ms_rpc import PLACEHOLDER_OP
+    from maru_common.node_protocol import CreditRequest
+    from tests.unit.ms_node_helpers import RawWorker
+
+    rm = FakeRm()
+    rm.capacity = 0
+    if with_dram:
+        config = node_config(fake.url, f"{sockdir}/node.sock", cxl_pages=4)
+        expected = [PoolKind.DRAM, PoolKind.CXL]
+    else:
+        config = cxl_only_config(fake, sockdir)
+        expected = [PoolKind.CXL]
+    node = start_node(
+        config, region_source=rm, cxl_renew_s=0.02, map_region=anon_region
+    )
+    try:
+        assert node.cxl.pools == []
+        # The tier's kind, not its pools, makes it a credit tier on the wire
+        assert node.manager.credit_kinds == expected
+        worker = RawWorker(f"{sockdir}/node.sock")
+        worker.attach()
+        request = worker.stamp(
+            CreditRequest(
+                op=PLACEHOLDER_OP,
+                worker_session="session",
+                want_bytes=PAGE,
+                kind=PoolKind.CXL,
+            )
+        )
+        response = worker.credit(PAGE, stamped=request)
+        assert (response.status.value, response.error, response.credits) == (
+            "OK",
+            None,
+            [],
+        )
+        worker.close()
+    finally:
+        node.stop()
+
+
 def test_leave_gives_no_more_cxl_credit(fake, sockdir):
     from maru_common.storage_types import CloseMode
 
