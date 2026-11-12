@@ -378,8 +378,21 @@ class Catalog:
             return f"generation {location.generation} is not of epoch_seq {epoch_seq}"
         return None
 
+    def check_commit(
+        self, node_id: str, epoch_seq: int, item: CommitItem
+    ) -> str | None:
+        # A location already in (an adopted page keeps its run's generation)
+        # only gets a finalizer
+        if self.entry_exact(item.key, item.location) is not None and self.own_pool(
+            node_id, item.location.pool_id
+        ):
+            return None
+        return self.check_new_location(
+            node_id, epoch_seq, item.location, item.logical_bytes
+        )
+
     def commit(self, item: CommitItem, holder: str) -> ItemOutcome:
-        """Apply one item that passed check_new_location."""
+        """Apply one item that passed check_commit."""
         loc = item.location
         pool = self._pools[loc.pool_id]
         existing = self._current(item.key, loc.pool_id)

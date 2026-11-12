@@ -623,12 +623,7 @@ class MsService:
 
             def run(batch: _Batch) -> CommitResponse:
                 errors = [
-                    self.catalog.check_new_location(
-                        session.node_id,
-                        session.epoch_seq,
-                        item.location,
-                        item.logical_bytes,
-                    )
+                    self.catalog.check_commit(session.node_id, session.epoch_seq, item)
                     for item in req.items
                 ]
                 batch.applying = True

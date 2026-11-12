@@ -255,6 +255,28 @@ class TestCommit:
         assert again.items[0].finalizer_id != first.items[0].finalizer_id
         assert service.pins.count(k, loc) == 2
 
+    def test_an_adopted_location_gets_a_finalizer_in_the_new_run(self, env):
+        _, service, wire = env
+        a = open_node(wire, "a", ssd=True)
+        k = key("k")
+        old = a.loc(a.ssd(), 1)
+        assert results(a.commit((k, old))) == ["ADDED"]
+        a.restart()
+        response = a.open(pools=[a.dram(), a.ssd()])
+        assert [p.pool_id for p in response.adopted] == [a.ssd().pool_id]
+        # the page keeps the old run's generation: the COMMIT only protects it
+        response = a.commit((k, old), finalizer=True)
+        assert results(response) == ["ADDED"] and response.items[0].finalizer_id
+        src = a.loc(a.dram(), 1)
+        assert results(a.commit((k, src))) == ["ADDED"]
+        moved = a.finalize_move((k, src, old, response.items[0].finalizer_id))
+        assert results(moved) == ["RETIRED"]
+        assert [e.location for e in service.catalog.locations(k)] == [old]
+        # a new location still needs this run's generation
+        assert results(a.commit((key("x"), old))) == ["REJECTED"]
+        other = replace(old, allocation_id="a2", offset=2 * PAGE)
+        assert results(a.commit((key("y"), other))) == ["REJECTED"]
+
     def test_overlapping_bytes_are_rejected(self, env):
         _, _, wire = env
         a = open_node(wire, "a")

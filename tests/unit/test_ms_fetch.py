@@ -31,6 +31,7 @@ from maru_common.node_protocol import (
 from maru_common.protocol import CommitItem, UnpinResponse
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
+    CloseMode,
     ItemOutcome,
     ItemResult,
     Key,
@@ -646,6 +647,55 @@ def test_a_load_larger_than_dram_goes_through_in_windows(env, monkeypatch):
     wait_until(lambda: settled(node, server), "quota back")
     node.pools.check()
     loader.close()
+
+
+def test_after_a_restart_fetched_copies_drop_onto_the_adopted_ssd_pages(
+    real_server, sockdir, ssd_dir, handlers, monkeypatch
+):
+    """The adopted SSD pages keep the old run's generations: dropping a
+    fetched copy onto one must still work, or DRAM fills and fetches stop."""
+    server, url = real_server
+    first = make_node(url, sockdir, ssd_dir)
+    all_names = [f"k{i}" for i in range(40)]
+    try:
+        h = handlers(first)
+        for name in all_names:
+            assert put(h, name)
+        wait_until(lambda: len(on_ssd(server, all_names)) >= 24, "on the SSD")
+        h.close()
+    finally:
+        first.stop(CloseMode.RESTART)
+    node = make_node(url, sockdir, ssd_dir)
+    try:
+        assert node.adopted == [node.ssd.pool_id]
+        names = on_ssd(server, all_names)
+        assert len(names) * PAGE > node.dram.capacity
+        writes = []
+        write = node.ssd.write
+        monkeypatch.setattr(
+            node.ssd, "write", lambda *a, **k: writes.append(1) or write(*a, **k)
+        )
+        loader = Loader(node, server)
+        for i in range(0, len(names), 4):
+            window = names[i : i + 4]
+            answer = loader.fetch(*window)
+            assert [o.result for o in answer.items] == [ItemResult.HIT] * len(window), (
+                i,
+                [o.reason for o in answer.items],
+                dict(node.manager.move_results),
+            )
+            for name, outcome in zip(window, answer.items, strict=True):
+                assert loader.read(outcome.location) == value_of(name)
+            loader.unpin(*[o.pin_id for o in answer.items])
+        moves = node.manager.move_results
+        assert not moves["COMMIT:REJECTED"] and not moves["COMMIT:DUPLICATE"]
+        assert moves["RETIRED"] >= len(names) - node.dram.capacity // PAGE
+        assert not writes  # no rewrite of a page the SSD has
+        wait_until(lambda: settled(node, server), "quota back")
+        node.pools.check()
+        loader.close()
+    finally:
+        node.stop()
 
 
 # =============================================================================
