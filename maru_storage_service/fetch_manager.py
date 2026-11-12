@@ -137,6 +137,8 @@ class _Flight:
     read_settled: bool = False
     staged: Staged | None = None
     stage_tier: RemoteTier | None = None
+    # The connection to source_node it began on (remote sources)
+    conn: int = 0
 
 
 class FetchManager:
@@ -175,6 +177,8 @@ class FetchManager:
             collections.OrderedDict()
         )
         self._inflight = 0
+        # Per memory node, the last connection that ended
+        self._lost: dict[str, int] = {}
         # FETCHes leading flights, in the order they came, until their
         # flights have pages: the first takes pages and pins copies
         self._room: collections.deque[_Op] = collections.deque()
@@ -301,7 +305,10 @@ class FetchManager:
                         op.flights[i] = flight
                         self.results["joined"] += 1
                         continue
-                    ref, bounce = source
+                    ref, bounce, conn = source
+                    if conn and conn <= self._lost.get(item.plan.source_node, 0):
+                        op.outcomes[i] = _miss(MissReason.OFFLINE)  # it ended
+                        continue
                     if copy is None:  # published since it was looked up
                         copy = self._published.get(item.key)
                     # A copy published before costs no read and no quota
@@ -319,6 +326,7 @@ class FetchManager:
                         charged=cost,
                         copy=copy,
                         cached=copy is not None,
+                        conn=conn,
                     )
                     self._inflight += cost
                     self._flights[item.key] = flight
@@ -415,7 +423,8 @@ class FetchManager:
         return None
 
     def _source(self, rec: WorkerRecord, key: Key, plan) -> ItemOutcome | tuple:
-        """(the local source ref or None, bounce bytes), or the outcome."""
+        """(the local source ref or None, bounce bytes, the connection to a
+        memory node source), or the outcome."""
         source = plan.source
         if key.namespace != rec.ident.namespace:
             return ItemOutcome(ItemResult.REJECTED)
@@ -434,7 +443,10 @@ class FetchManager:
                     or source.length != plan.bytes
                 ):
                     return _miss(MissReason.OFFLINE)
-                return None, remote.io_size(plan.bytes)
+                conn = remote.connection(plan.source_node)
+                if not conn:
+                    return _miss(MissReason.OFFLINE)
+                return None, remote.io_size(plan.bytes), conn
         info = self.pools.pool_info(source.pool_id)
         if (
             key.namespace != rec.ident.namespace
@@ -454,17 +466,24 @@ class FetchManager:
             or source.length != plan.bytes
         ):
             return _miss(MissReason.ABSENT)
-        return ref, tier.io_size(plan.bytes)
+        return ref, tier.io_size(plan.bytes), 0
 
-    def node_lost(self, node_id: str) -> None:
-        """The connection to memory node ``node_id`` ended: the waiters of
-        reads from it miss now (OFFLINE) and no one joins those flights;
-        each still ends its own way (its page, pin and STAGE)."""
+    def node_lost(self, node_id: str, conn: int) -> None:
+        """Connection ``conn`` to memory node ``node_id`` ended: the waiters
+        of reads from it that began on that connection or before and have
+        not ended miss now (OFFLINE), and no one joins those flights; each
+        still ends its own way (its page, pin and STAGE)."""
         with self._lock:
+            self._lost[node_id] = max(conn, self._lost.get(node_id, 0))
             lost = [
                 f
                 for f in self._flights.values()
-                if f.source_node == node_id and f.source_ref is None and not f.cached
+                if f.source_node == node_id
+                and f.source_ref is None
+                and 0 < f.conn <= conn
+                and not f.cached
+                and not f.read_over
+                and f.copy is None
             ]
             waiters: list[_Waiter] = []
             for flight in lost:
@@ -898,7 +917,9 @@ class FetchManager:
         with self._lock:
             if end == TransferEnd.UNKNOWN and flight.read_settled:
                 end = TransferEnd.DONE
-            tier.unstage(flight.staged, end)
+        # Not under the lock: a send that fails ends the connection, whose
+        # callbacks come here
+        tier.unstage(flight.staged, end)
 
     def _read_ended(
         self,

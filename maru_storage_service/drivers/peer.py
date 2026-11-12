@@ -259,7 +259,7 @@ class NixlRemoteTier(RemoteTier):
         # NIXL peers of earlier memory runs, removed once no handle holds them
         self._stale_peers: set[str] = set()
         self._next_stage = 1  # stage_id: unique in this run
-        self._lost_callbacks: list[Callable[[str], None]] = []
+        self._lost_callbacks: list[Callable[[str, int], None]] = []
         self._drained = False
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -323,12 +323,16 @@ class NixlRemoteTier(RemoteTier):
         for node in self._nodes:
             conn = node.conn
             if conn is not None and node.ready:
-                try:
-                    conn.call(RemoteMessageType.GOODBYE, GoodbyeRequest(), 1.0)
-                except Exception:
-                    logger.debug("GOODBYE to %s failed", node.url, exc_info=True)
+                self._goodbye(node, conn)
             if conn is not None:
                 conn.close()
+
+    @staticmethod
+    def _goodbye(node: _MemoryNode, conn: RemoteConnection) -> None:
+        try:
+            conn.call(RemoteMessageType.GOODBYE, GoodbyeRequest(), 1.0)
+        except Exception:
+            logger.debug("GOODBYE to %s failed", node.url, exc_info=True)
 
     def close(self) -> None:
         """The NIXL agent ends, unless a transfer may still use its memory."""
@@ -377,6 +381,13 @@ class NixlRemoteTier(RemoteTier):
             if self._full() or self._drained:
                 return False
             return any(n.ready and n.node_id == node_id for n in self._nodes)
+
+    def connection(self, node_id: str) -> int:
+        with self._lock:
+            for node in self._nodes:
+                if node.ready and node.node_id == node_id:
+                    return node.conn_gen
+        return 0
 
     def owner(self, pool_id: str) -> str | None:
         with self._lock:
@@ -451,7 +462,13 @@ class NixlRemoteTier(RemoteTier):
             conn.close()
             raise ConnectionError(f"HELLO refused: {hello.refusal} {hello.error}")
         replay = self._take_run(node, conn, hello)
-        conn.on_close(functools.partial(self._conn_lost, node, conn))
+        with self._lock:
+            gen = node.conn_gen
+        conn.on_close(functools.partial(self._conn_lost, node, conn, gen))
+        if self._stop.is_set():  # stop() may have passed this connection
+            self._goodbye(node, conn)
+            self._disconnect(node)
+            raise ConnectionError("stopping")
         try:
             self._load(node)
         except BaseException:
@@ -567,15 +584,16 @@ class NixlRemoteTier(RemoteTier):
                 with self._lock:
                     self._stale_peers.discard(peer)
 
-    def on_lost(self, callback: Callable[[str], None]) -> None:
+    def on_lost(self, callback: Callable[[str, int], None]) -> None:
         with self._lock:
             self._lost_callbacks.append(callback)
 
-    def _conn_lost(self, node: _MemoryNode, conn: RemoteConnection) -> None:
-        """A memory node's stream ended (on its reader, or ours closing it):
-        no transfer goes there until it is made anew, and those waiting on
-        that node are told now."""
+    def _conn_lost(self, node: _MemoryNode, conn: RemoteConnection, gen: int) -> None:
+        """Connection ``gen`` to a memory node ended (on its reader, or ours
+        closing it): no transfer goes there until one is made anew, and
+        what began on it or before is told now."""
         with self._lock:
+            was_ready = node.conn is conn and node.ready
             if node.conn is conn:
                 node.ready = False
             node_id = node.node_id
@@ -583,10 +601,11 @@ class NixlRemoteTier(RemoteTier):
         node.wake.set()
         if self._stop.is_set() or not node_id:
             return
-        logger.warning("memory node %s (%s): connection lost", node.url, node_id)
+        if was_ready:
+            logger.warning("memory node %s (%s): connection lost", node.url, node_id)
         for callback in callbacks:
             try:
-                callback(node_id)
+                callback(node_id, gen)
             except Exception:
                 logger.exception("a connection-lost callback failed")
 

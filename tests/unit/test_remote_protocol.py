@@ -443,6 +443,9 @@ class _Remote(RemoteTier):
     def ready(self, node_id):
         return False
 
+    def connection(self, node_id):
+        return 0
+
     def on_lost(self, callback):
         pass
 

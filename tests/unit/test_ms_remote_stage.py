@@ -622,3 +622,42 @@ def test_a_stage_whose_connection_ends_misses_at_once(routed):
         )
     wait_until(lambda: settled(env.gpu, env.gate.server), what="MISS cleanup")
     assert pins(env.gate.server, "staged", env.source) == 0
+
+
+def test_an_unstage_whose_send_fails_neither_blocks_fetches_nor_leaks(routed):
+    from maru_common.protocol import MessageHeader
+    from maru_storage_service import remote_client
+
+    env = routed
+    real = remote_client.send_frame
+    failed = []
+
+    def send(sock, frame):  # the first UNSTAGE meets a reset stream
+        if MessageHeader.unpack(frame).msg_type == R.UNSTAGE and not failed:
+            failed.append(frame)
+            raise BrokenPipeError(32, "Broken pipe")
+        return real(sock, frame)
+
+    env.gate.monkeypatch.setattr(remote_client, "send_frame", send)
+    node = env.remote._nodes[0]
+    answer = env.reader.fetch("staged").items[0]
+    assert answer.result == ItemResult.HIT
+    env.reader.unpin(answer.pin_id)
+    wait_until(lambda: failed, what="the UNSTAGE send failed")
+    fetches = env.gpu.manager.fetches
+    wait_until(lambda: not fetches._lock.locked(), timeout=2, what="no thread stuck")
+    # Reconnected to the same run: the UNSTAGE is sent again, the page freed
+    wait_until(
+        lambda: env.remote.ready(node.node_id) and not node.conn.closed,
+        what="reconnected",
+    )
+    wait_until(
+        lambda: (
+            not env.memory.peer_ops._staged
+            and not env.memory.peer_ops._staging_bytes[env.remote.origin]
+        ),
+        what="staging page freed",
+    )
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        assert pool.submit(fetches.flights).result(2) == 0  # its lock is free
+    wait_until(lambda: settled(env.gpu, env.gate.server), what="pins released")

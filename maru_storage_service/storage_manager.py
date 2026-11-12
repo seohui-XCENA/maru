@@ -910,7 +910,7 @@ class StorageManager:
         with self._lock:
             busy = {r for r in refs if r in self._through_active}
         if busy:  # their copy below is on its way: finalized onto it later
-            self.placement.release(list(busy), backoff=False)
+            self.placement.release(list(busy))
             kept = [(r, i) for r, i in zip(refs, items, strict=True) if r not in busy]
             refs, items = [r for r, _ in kept], [i for _, i in kept]
             if not refs:

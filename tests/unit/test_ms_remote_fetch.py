@@ -361,3 +361,54 @@ def test_a_read_from_a_lost_memory_node_misses_at_once(env, monkeypatch):
     wait_until(lambda: pair.gpu.pools.io_refs(dest) == 0, what="the read ended")
     assert pair.gpu.pools.page(dest).state == PageState.QUARANTINED
     pair.gpu.pools.check()
+
+
+def test_only_reads_begun_on_the_lost_connection_miss(env, monkeypatch):
+    pair, names, make_loader = env
+    name = names[0]
+    loader = make_loader()
+    reads = Reads(pair, monkeypatch)
+    fetches = pair.gpu.manager.fetches
+    conn = pair.remote.connection("mem1")
+    assert conn > 0
+    pair.remote.transport.stall()
+    reply = loader.send(loader.request(loader.items(name), deadline_ms=5000))
+    assert reads.entered.wait(2)
+    fetches.node_lost("mem1", conn - 1)  # an earlier connection's late notice
+    with pytest.raises(TimeoutError):
+        reply.result(0.3)
+    fetches.node_lost("mem1", conn)
+    assert reply.result(2).items[0].reason == MissReason.OFFLINE
+    # A FETCH planned on the ended connection misses at once
+    again = loader.send(loader.request(loader.items(names[1]), deadline_ms=5000))
+    assert again.result(2).items[0].reason == MissReason.OFFLINE
+    pair.remote.transport.stall(False)
+    assert pair.remote.transport.finish_stalled() == 1
+    wait_until(lambda: settled(pair.gpu, pair.server), what="the read published")
+    pair.gpu.pools.check()
+
+
+def test_a_read_that_ended_is_not_missed_on_a_lost_connection(env, monkeypatch):
+    pair, names, make_loader = env
+    name = names[0]
+    loader = make_loader()
+    fetches = pair.gpu.manager.fetches
+    conn = pair.remote.connection("mem1")
+    publishing, release = threading.Event(), threading.Event()
+    complete = pair.gpu.server.fetch_complete
+
+    def held(session, items, **kwargs):  # the read is done; it is publishing
+        publishing.set()
+        assert release.wait(10)
+        return complete(session, items, **kwargs)
+
+    monkeypatch.setattr(pair.gpu.server, "fetch_complete", held)
+    reply = loader.send(loader.request(loader.items(name), deadline_ms=5000))
+    assert publishing.wait(5)
+    fetches.node_lost("mem1", conn)
+    release.set()
+    answer = reply.result(5).items[0]
+    assert answer.result == ItemResult.HIT
+    loader.unpin(answer.pin_id)
+    wait_until(lambda: settled(pair.gpu, pair.server), what="published")
+    pair.gpu.pools.check()

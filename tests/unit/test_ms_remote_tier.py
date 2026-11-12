@@ -698,7 +698,7 @@ def test_drain_waits_for_an_end_callback_running_elsewhere(fake, memory):
 
 def test_a_lost_connection_is_told_at_once_and_made_again(fake, memory, gpu):
     lost = []
-    gpu.tier.on_lost(lost.append)
+    gpu.tier.on_lost(lambda node_id, conn: lost.append(node_id))
     old_epoch = gpu.tier._nodes[0].node_epoch
     memory.node.stop()  # its end of the stream closes
     wait_until(lambda: lost == ["mem1"], timeout=2, what="told")

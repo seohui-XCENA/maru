@@ -315,9 +315,15 @@ class RemoteTier(L2Tier):
         """Connected to the memory node and probed."""
 
     @abstractmethod
-    def on_lost(self, callback: Callable[[str], None]) -> None:
-        """``callback(node_id)`` when the connection to a memory node ends:
-        its transfers in flight may take until their timeout to end."""
+    def connection(self, node_id: str) -> int:
+        """The number of the connection a ready memory node is served on
+        (they only grow), or 0."""
+
+    @abstractmethod
+    def on_lost(self, callback: Callable[[str, int], None]) -> None:
+        """``callback(node_id, connection)`` when that connection to a memory
+        node ends: what began on it or before may take until its timeout to
+        end."""
 
     @abstractmethod
     def owner(self, pool_id: str) -> str | None:

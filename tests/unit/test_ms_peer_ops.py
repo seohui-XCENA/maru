@@ -404,3 +404,50 @@ def test_staging_and_credits_together_stay_within_the_credit_cap(fake):
     finally:
         service.stop()
         remove_tree(root)
+
+
+def test_a_cap_that_is_not_whole_pages_is_kept_in_whole_pages():
+    from types import SimpleNamespace
+
+    from maru_common.ms_rpc import PLACEHOLDER_OP
+    from maru_common.storage_types import PoolInfo, PoolKind
+    from maru_storage_service.config import parse_node_config
+    from maru_storage_service.peer_ops import PeerOps
+    from maru_storage_service.pool_manager import PoolManager
+
+    page = 4096
+    config = parse_node_config(
+        {
+            "node_id": "mem",
+            "server": "tcp://127.0.0.1:1",
+            "page_size": page,
+            "tiers": [{"store": "dram", "size": 16 * page, "hugepage": False}],
+            "budgets": {
+                "credit_max_bytes": 5 * page // 2,
+                "credit_total_max_bytes": 8 * page,
+                "credit_refill_low": page,
+                "credit_refill_high": 2 * page,
+                "commit_pending_max_bytes": 3 * page,
+                "transfer_reserve_bytes": page,
+            },
+        }
+    )
+    pools = PoolManager(config.budgets, page)
+    pools.add_pool(PoolInfo("dram:mem:e", PoolKind.DRAM, "mem", 1, 16 * page, page))
+    pools.set_epoch_seq(1)
+    manager = SimpleNamespace(
+        pools=pools, credit_tiers=["dram"], want_room=lambda *args: None
+    )
+    ops = PeerOps(
+        manager,
+        reserve_ttl_s=60,
+        peer_quarantine_max=8 * page,
+        quarantine_max=16 * page,
+    )
+    # A staging page charged to the peer: 1.5 pages of the cap are left
+    assert len(pools.reserve_transfer("dram:mem:e", 1)) == 1
+    ops._staging_bytes[A] = page
+    assert len(ops._reserve(A, ReserveRequest(PLACEHOLDER_OP, 2))) == 1
+    assert (
+        pools.held_bytes(A) + ops._staging_bytes[A] <= config.budgets.credit_max_bytes
+    )

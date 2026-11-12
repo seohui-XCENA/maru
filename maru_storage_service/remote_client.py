@@ -127,7 +127,13 @@ class RemoteConnection:
                     failure = ConnectionError(str(exc))
         if failure is not None:
             if registered:
-                self._fail(failure)
+                # The reader sees the stream end and answers every pending
+                # callback there, not on this caller's thread (it may hold
+                # locks those callbacks take)
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             else:
                 self._reply(callback, failure)
         return seq
@@ -151,8 +157,8 @@ class RemoteConnection:
         return result[0]
 
     def on_close(self, callback: Callable[[], None]) -> None:
-        """``callback`` once the stream ends, after the pending callbacks
-        (at once if it has ended)."""
+        """``callback`` once the stream ends, before the pending callbacks
+        get their error (at once if it has ended)."""
         with self._lock:
             if not self.closed:
                 self._on_close.append(callback)
@@ -191,10 +197,10 @@ class RemoteConnection:
         except OSError:
             pass
         self._sock.close()
-        for _, callback in pending.values():
-            self._reply(callback, error)
         for hook in closing:
             self._closed_hook(hook)
+        for _, callback in pending.values():
+            self._reply(callback, error)
 
     def _read_loop(self) -> None:
         try:

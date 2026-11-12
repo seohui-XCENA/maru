@@ -187,7 +187,8 @@ class PeerOps:
                 - self._staging_bytes[origin]
                 - self.pools.held_bytes(origin)
             )
-            want = min(request.pages * self.page_size, max(0, cap))
+            # Whole pages: credit() rounds a part page up
+            want = min(request.pages, max(0, cap) // self.page_size) * self.page_size
             credits = (
                 self.pools.credit(origin, want, self.manager.credit_tiers)
                 if want >= self.page_size

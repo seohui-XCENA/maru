@@ -257,3 +257,37 @@ def test_close_racing_a_failed_send_calls_callback_once(make_server, monkeypatch
         thread.join(WAIT)
         assert not thread.is_alive()
     assert len(answer.values) == 1
+
+
+def test_a_failed_send_is_answered_on_the_reader_after_the_close_hooks(
+    make_server, monkeypatch
+):
+    h = make_server()
+    conn, _ = h.open()
+    seen = []
+    conn.on_close(lambda: seen.append(("hook", threading.current_thread())))
+
+    def fail(*args):
+        raise OSError("injected send failure")
+
+    monkeypatch.setattr(remote_client, "send_frame", fail)
+    answer = Answer()
+
+    def callback(response):
+        seen.append(("callback", threading.current_thread()))
+        answer(response)
+
+    conn.submit(Code.PING, PingRequest(), callback)
+    assert isinstance(answer.get(), ConnectionError)
+    # Not on the submitting thread, which may hold locks the callbacks take
+    assert [what for what, _ in seen] == ["hook", "callback"]
+    assert all(thread is conn._reader for _, thread in seen)
+
+
+def test_on_close_after_the_end_runs_at_once(make_server):
+    h = make_server()
+    conn, _ = h.open()
+    conn.close()
+    ran = []
+    conn.on_close(lambda: ran.append(threading.current_thread()))
+    assert ran == [threading.current_thread()]
