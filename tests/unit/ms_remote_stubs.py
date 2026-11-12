@@ -6,6 +6,7 @@ a network."""
 import errno
 import mmap
 
+from maru_common.remote_protocol import RemotePool
 from maru_storage_service.remote_server import RemoteServer
 
 
@@ -47,7 +48,7 @@ class StubRemoteServer(RemoteServer):
         self.listening = True
         self.log.append("remote start")
 
-    def ready(self) -> None:
+    def ready(self, server_epoch: str, pools: list[RemotePool]) -> None:
         assert self.listening
         self.serving = True
         self.log.append("remote ready")

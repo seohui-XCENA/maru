@@ -488,7 +488,7 @@ class TestInterfaces:
         server = StubRemoteServer(log=log)
         assert isinstance(server, RemoteServer)
         server.start()
-        server.ready()
+        server.ready("s1", [])
         server.stop()
         server.stop()
         assert log == ["remote start", "remote ready", "remote stop"]
