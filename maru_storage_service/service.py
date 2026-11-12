@@ -47,7 +47,7 @@ from .drivers.cxl import (
     map_region,
 )
 from .drivers.dram import DramDriver, DramPool, DramPoolError
-from .drivers.ssd import SsdDriver, SsdPool
+from .drivers.ssd import SsdDriver, SsdPool, SsdTier
 from .fetch_manager import FetchManager
 from .local_pin import LocalPins
 from .local_server import LocalServer
@@ -298,9 +298,7 @@ class StorageService:
             self._check_stopped()
         traits = config.traits()
         if any(t.demotes_to is not None for t in traits.values()):
-            self.transfers = TransferEngine(
-                self.transfer_bytes_per_s, run=self.node_epoch
-            )
+            self.transfers = TransferEngine(self.transfer_bytes_per_s)
             self._map_for_transfers(self.transfers)
         self.pools = PoolManager(config.budgets, config.page_size)
         if self.dram is not None:
@@ -523,7 +521,13 @@ class StorageService:
                         e,
                     )
         if self.ssd is not None:
-            engine.add_file_pool(self.ssd.pool_id, self.ssd)
+            engine.add_l2(
+                SsdTier(
+                    self.ssd,
+                    run=self.node_epoch,
+                    bytes_per_s=self.transfer_bytes_per_s,
+                )
+            )
         engine.start()
 
     def _end_quarantine(self, pool_id: str) -> None:
@@ -620,15 +624,20 @@ class StorageService:
                 stats["demotions"] or "none",
                 {k: v >> 20 for k, v in stats["credit_short_bytes"].items()} or "never",
             )
+        kept: set[str] = set()
         if self.transfers is not None:
-            self.transfers.close()  # unmapped before the regions may go back
-            if self.cxl is not None and self.map_region is None:
+            kept = self.transfers.close()  # unmapped before the regions may go back
+            if kept:
+                logger.error(
+                    "pools %s stay mapped: their hold and regions stay", sorted(kept)
+                )
+            elif self.cxl is not None and self.map_region is None:
                 self.cxl.unhold(self.own_holder)
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)
             self.server.close()
-        if self.cxl is not None and mode == CloseMode.LEAVE:
+        if self.cxl is not None and mode == CloseMode.LEAVE and not kept:
             self.cxl.release()
         if self._rm_client is not None:
             self._rm_client.close()

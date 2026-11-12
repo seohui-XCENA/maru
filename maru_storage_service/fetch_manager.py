@@ -52,7 +52,8 @@ from .drivers.ssd import SsdPool
 from .op_ledger import LedgerEntry, Verdict
 from .page_table import PageRef, PageState
 from .ports import EpochChanged, ServerStopped
-from .transfer_engine import Copy, IOTicket
+from .tiers import IOResult
+from .transfer_engine import Copy
 from .worker_registry import WorkerRecord
 
 logger = logging.getLogger(__name__)
@@ -116,7 +117,7 @@ class _Flight:
     charged: int = 0
     dest: PageRef | None = None
     source_pin: str | None = None
-    ticket: IOTicket | None = None
+    ticket: IOResult | None = None
     # The copy waiters get pins on, and the node pin holding it
     copy: Location | None = None
     node_pin: str | None = None

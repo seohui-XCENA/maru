@@ -15,18 +15,30 @@ import contextlib
 import errno
 import fcntl
 import math
+import mmap
 import os
 import stat
 import struct
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from maru_common.storage_types import PoolDescriptor, PoolInfo, PoolKind
+from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, PoolKind
 
 from ..config import TierConfig
+from ..page_table import PageRef
+from ..tiers import IOResult, L2Tier, Span
 from . import PoolAccess
+from .io_executor import (
+    DEFAULT_IO_QUEUE_SIZE,
+    DEFAULT_TRANSFER_BYTES_PER_S,
+    IO_MIN_BYTES_PER_S,
+    IO_TIMEOUT_S,
+    IOExecutor,
+    IOTicket,
+)
 from .ssd_alignment import (
     DioAlignment,
     SsdAlignmentError,
@@ -432,3 +444,124 @@ class SsdDriver:
             pool.close()
             raise SsdPoolError("SSD pool identity does not match PoolInfo")
         return pool
+
+
+class SsdTier(L2Tier):
+    """One SSD pool and the I/O executor that moves its pages: reads first,
+    writes paced to ``bytes_per_s``, through aligned bounce buffers. The
+    owner closes the pool after drain()."""
+
+    name = "ssd"
+
+    def __init__(
+        self,
+        pool: SsdPool,
+        *,
+        run: str,
+        bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
+        max_queue: int = DEFAULT_IO_QUEUE_SIZE,
+    ):
+        self.pool = pool
+        self.io = IOExecutor(run, max_queue=max_queue, bytes_per_s=bytes_per_s)
+        self._lock = threading.Lock()
+        self._memory: dict[str, mmap.mmap] = {}
+
+    def pool_infos(self) -> list[PoolInfo]:
+        return [self.pool.info()]
+
+    def describe(self, adopted: set[str]) -> str:
+        state = "adopted" if self.pool.pool_id in adopted else "empty"
+        return f"{self.pool.path} ({self.pool.capacity >> 20} MiB), {state}"
+
+    def close(self) -> None:
+        self.pool.close()
+
+    def io_size(self, nbytes: int) -> int:
+        return self.pool.io_size(nbytes)
+
+    def attach(self, pool_id: str, memory: mmap.mmap) -> None:
+        with self._lock:
+            self._memory[pool_id] = memory
+
+    def detach(self, pool_id: str) -> None:
+        with self._lock:
+            self._memory.pop(pool_id, None)
+
+    def submit_store(
+        self,
+        src: Span,
+        dst: Location,
+        *,
+        refs: tuple[PageRef, PageRef],
+        callback: Callable[[IOResult], None] | None = None,
+        deadline: float | None = None,
+    ) -> IOTicket:
+        return self._submit(src, dst, True, refs, callback, deadline)
+
+    def submit_load(
+        self,
+        src: Location,
+        dst: Span,
+        *,
+        refs: tuple[PageRef, PageRef],
+        callback: Callable[[IOResult], None] | None = None,
+        deadline: float | None = None,
+    ) -> IOTicket:
+        return self._submit(dst, src, False, refs, callback, deadline)
+
+    def drain(self) -> None:
+        self.io.drain()
+
+    def _submit(
+        self,
+        span: Span,
+        page: Location,
+        write: bool,
+        refs: tuple[PageRef, PageRef],
+        callback: Callable[[IOResult], None] | None,
+        deadline: float | None,
+    ) -> IOTicket:
+        """Move ``span`` to (``write``) or from the pool page ``page``. By
+        default the I/O gets IO_TIMEOUT_S plus its bytes at
+        IO_MIN_BYTES_PER_S from its start."""
+        pool, n, offset, page_offset = self.pool, span.nbytes, span.offset, page.offset
+        with self._lock:
+            mapping = self._memory.get(span.pool_id)
+        if (
+            mapping is None
+            or page.pool_id != pool.pool_id
+            or n <= 0
+            or offset < 0
+            or offset + n > len(mapping)
+        ):
+            raise ValueError(f"no SSD I/O for {span} and {page}")
+        size = pool.io_size(n)
+
+        def work(ticket: IOTicket) -> None:
+            limit = deadline
+            if limit is None:
+                limit = time.monotonic() + IO_TIMEOUT_S + n / IO_MIN_BYTES_PER_S
+            bounce = ticket.buffer
+            assert bounce is not None
+            # The ticket's own fd: valid until its callback returns
+            if write:
+                with memoryview(mapping) as view:
+                    bounce[:n] = view[offset : offset + n]
+                pool.write(page_offset, bounce, n, deadline=limit, fd=ticket.fd)
+            else:
+                pool.read(page_offset, n, bounce, deadline=limit, fd=ticket.fd)
+                with memoryview(mapping) as view:
+                    view[offset : offset + n] = bounce[:n]
+            ticket._state.late = time.monotonic() > limit
+
+        return self.io.submit(
+            refs[0],
+            refs[1],
+            fd=pool.fd,
+            nbytes=size,
+            write=write,
+            work=work,
+            callback=callback,
+            alignment=pool.alignment.memory,
+            resources=(pool, mapping),
+        )

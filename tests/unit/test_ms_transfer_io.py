@@ -10,15 +10,18 @@ import threading
 import time
 import weakref
 from dataclasses import FrozenInstanceError, dataclass, field
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
-from maru_common.storage_types import Location, PoolKind
+from maru_common.storage_types import Location, PoolInfo, PoolKind
 from maru_storage_service.drivers.io_executor import (
     IOExecutor,
     IOQueueFullError,
     IOTicket,
 )
+from maru_storage_service.drivers.ssd import SsdPool, SsdTier
 from maru_storage_service.page_table import PageRef
 from maru_storage_service.transfer_engine import Copy, TransferEngine
 
@@ -572,11 +575,20 @@ def test_bounce_allocation_failure_fails_the_io_and_leaves_executor_usable(
     assert ticket.ok
 
 
+def ssd_tier(run: str) -> SsdTier:
+    """An SSD tier whose pool file is never touched."""
+    info = PoolInfo("file", PoolKind.SSD, "n", 1, PAGE, PAGE)
+    pool = cast(SsdPool, SimpleNamespace(info=lambda: info))
+    return SsdTier(pool, run=run, bytes_per_s=1 << 40)
+
+
 def test_cpu_copy_still_reports_each_result_and_counts_bytes():
     engine = TransferEngine(1 << 40)
+    tier = ssd_tier("run")
     src, dst = mmap.mmap(-1, PAGE), mmap.mmap(-1, PAGE)
     engine.add_pool("s", src)
     engine.add_pool("d", dst)
+    engine.add_l2(tier)
     source = Location("s", "s0", 1, 0, PAGE, PoolKind.DRAM)
     dest = Location("d", "d0", 2, 0, PAGE, PoolKind.CXL)
     missing = Location("missing", "x", 3, 0, PAGE, PoolKind.CXL)
@@ -587,7 +599,7 @@ def test_cpu_copy_still_reports_each_result_and_counts_bytes():
             [Copy(source, dest, 4), Copy(source, missing, 4), Copy(source, dest, 0)]
         ) == [True, False, False]
         assert dst[:4] == b"copy" and engine.copied_bytes == 4
-        assert not engine.io._threads
+        assert not tier.io._threads
         engine.stop()
         assert engine.run([Copy(source, dest, 4)]) == [False]
     finally:
@@ -596,9 +608,12 @@ def test_cpu_copy_still_reports_each_result_and_counts_bytes():
 
 
 def test_engine_close_drains_io_before_closing_mappings(tmp_path):
-    engine = TransferEngine(1 << 40, run="engine-run")
+    engine = TransferEngine(1 << 40)
+    tier = ssd_tier("engine-run")
     mapping = mmap.mmap(-1, PAGE)
+    engine.add_l2(tier)
     engine.add_pool("mapped", mapping)
+    assert tier._memory == {"mapped": mapping}
     entered, release = threading.Event(), threading.Event()
     closer = threading.Thread(target=engine.close)
 
@@ -609,7 +624,7 @@ def test_engine_close_drains_io_before_closing_mappings(tmp_path):
         mapping[:4] = b"safe"
 
     with (tmp_path / "engine.data").open("w+b") as file:
-        ticket = engine.io.submit(
+        ticket = tier.io.submit(
             PageRef("source", 0, 1),
             PageRef("mapped", 0, 2),
             fd=file.fileno(),
@@ -627,3 +642,4 @@ def test_engine_close_drains_io_before_closing_mappings(tmp_path):
             closer.join(WAIT)
             engine.close()
     assert mapping.closed and ticket.done.is_set() and ticket.ok
+    assert ticket.run == "engine-run" and not tier._memory

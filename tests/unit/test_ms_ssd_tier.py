@@ -34,7 +34,12 @@ from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.drivers.io_executor import IOQueueFullError
-from maru_storage_service.drivers.ssd import SsdPool, SsdPoolError, create_ssd_pool
+from maru_storage_service.drivers.ssd import (
+    SsdPool,
+    SsdPoolError,
+    SsdTier,
+    create_ssd_pool,
+)
 from maru_storage_service.drivers.ssd_alignment import aligned_buffer
 from maru_storage_service.page_table import PageRef
 from maru_storage_service.pool_manager import PageState
@@ -291,11 +296,11 @@ def test_other_ssd_configs_are_refused():
 
 def test_the_engine_writes_and_reads_a_file_pool(ssd_dir):
     pool = create_ssd_pool("n", ssd_dir, 4 * PAGE, PAGE)
-    engine = TransferEngine(1 << 40, run="run-1")
+    engine = TransferEngine(1 << 40)
     memory = mmap.mmap(-1, 4 * PAGE)
     try:
         engine.add_pool("mem", memory)
-        engine.add_file_pool(pool.pool_id, pool)
+        engine.add_l2(SsdTier(pool, run="run-1", bytes_per_s=1 << 40))
         engine.start()
         assert engine.has_pool(pool.pool_id) and engine.has_pool("mem")
         memory[PAGE : PAGE + 5000] = b"w" * 5000
@@ -312,6 +317,7 @@ def test_the_engine_writes_and_reads_a_file_pool(ssd_dir):
             callback=done.append,
         )
         assert write.done.wait(5) and write.ok and write.write
+        assert write.run == "run-1"
         assert done == [write]
         assert ssd_bytes(pool, loc(pool.pool_id, 2 * PAGE, 5000)) == b"w" * 5000
         read = engine.submit_io(
@@ -519,7 +525,7 @@ def test_full_queues_and_late_writes_count_toward_the_pause(
 
         monkeypatch.setattr(node.transfers, "submit_io", full)
     else:
-        monkeypatch.setattr("maru_storage_service.transfer_engine.IO_TIMEOUT_S", 0.05)
+        monkeypatch.setattr("maru_storage_service.drivers.ssd.IO_TIMEOUT_S", 0.05)
         write = node.ssd.write
 
         def slow(*args, **kwargs):

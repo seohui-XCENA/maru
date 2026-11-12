@@ -65,7 +65,8 @@ from .ports import (
     ServerStopped,
     WorkerEndpoint,
 )
-from .transfer_engine import Copy, IOTicket, TransferEngine
+from .tiers import IOResult
+from .transfer_engine import Copy, TransferEngine
 from .worker_registry import WorkerRecord, WorkerRegistry
 
 logger = logging.getLogger(__name__)
@@ -205,7 +206,7 @@ class StorageManager:
         # Demotion writes submitted and not yet ended; ended ones wait for
         # the eviction thread to COMMIT or drop them
         self._writing = 0
-        self._written: collections.deque[tuple[_Move, IOTicket]] = collections.deque()
+        self._written: collections.deque[tuple[_Move, IOResult]] = collections.deque()
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
 
@@ -1018,7 +1019,7 @@ class StorageManager:
                 self._io_result(move.dest.pool_id, e)
                 self._copied([move], [False])
 
-    def _write_ended(self, move: _Move, ticket: IOTicket) -> None:
+    def _write_ended(self, move: _Move, ticket: IOResult) -> None:
         """On the I/O thread: no RPC here."""
         self.pools.io_release([move.src, move.dest])
         with self._lock:
