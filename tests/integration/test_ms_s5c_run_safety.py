@@ -296,7 +296,7 @@ def earlier_service(cfg, address, path, pipe, unholding, release):
     )
     try:
         service.start()
-        pool = service.cxl.pools[0]
+        pool = service.tier("cxl").pools[0]
         _, location = publish(service, pool.pool_id, "ready", b"old-ready")
         pipe.send((service.node_epoch, pool, location))
         assert pipe.recv() == "stop"
@@ -379,7 +379,7 @@ def test_real_rm_quarantine_waits_for_both_earlier_holds(
                     new_worker: second.node_epoch,
                     second.own_holder: second.node_epoch,
                 }
-                assert second.cxl.earlier_holds() == {
+                assert second.tier("cxl").earlier_holds() == {
                     pool.pool_id: {old_worker, old_ss}
                 }
                 assert second.pools.pool_quarantined(pool.pool_id)
@@ -420,7 +420,7 @@ def test_real_rm_quarantine_waits_for_both_earlier_holds(
                 # here immediately instead of merely timing out on a dead watcher.
                 assert real_rm.polls.get(timeout=WAIT) is True
                 remaining = old_ss if first_release == "worker" else old_worker
-                assert second.cxl.earlier_holds() == {pool.pool_id: {remaining}}
+                assert second.tier("cxl").earlier_holds() == {pool.pool_id: {remaining}}
                 assert not cleared.is_set()
                 assert second.pools.pool_quarantined(pool.pool_id)
                 assert second.pools.bytes_in(PageState.FREE, pool.pool_id) == 0
@@ -472,7 +472,7 @@ def test_delayed_real_lookup_cannot_read_a_reused_region_mapping(
     result, answers = queue.Queue(), []
     thread = None
     try:
-        a, b = first.cxl.pools
+        a, b = first.tier("cxl").pools
         publish(first, a.pool_id, "held", b"kept-old")
         _, old_location = publish(first, b.pool_id, "lookup", b"old-data")
         with worker(cfg.socket) as h:
@@ -523,9 +523,11 @@ def test_delayed_real_lookup_cannot_read_a_reused_region_mapping(
             with running_node(cfg, real_rm) as (_, second, _):
                 assert attached.wait(WAIT)
                 assert client.pools.flush(WAIT) and pool_maps._HOLDS.unholds.flush(WAIT)
-                assert second.cxl.pools[1].region.handle == b.region.handle
+                assert second.tier("cxl").pools[1].region.handle == b.region.handle
                 assert not second.pools.pool_quarantined(b.pool_id)
-                (unused,) = second.pools.reserve_transfer(second.dram.pool_id, 1)
+                (unused,) = second.pools.reserve_transfer(
+                    second.tier("dram").pool.pool_id, 1
+                )
                 second.pools.transfer_failed(unused)
                 _, reused = publish(second, b.pool_id, "different", b"new-data")
                 assert reused.pool_id == old_location.pool_id
@@ -593,7 +595,9 @@ def test_unknown_finalize_next_node_run_adopts_copies_and_drops_finalizers(
     cfg = config(url, f"{workdir}/node.sock", real_rm.client._address, dram=True)
     allow_next = threading.Event()
     with running_node(cfg, real_rm, next_run=allow_next) as (node, first, started):
-        ref, source = publish(first, first.dram.pool_id, "copied", b"durable-copy")
+        ref, source = publish(
+            first, first.tier("dram").pool.pool_id, "copied", b"durable-copy"
+        )
         call = first.server._rpc.call
         unknown = []
 
@@ -626,7 +630,7 @@ def test_unknown_finalize_next_node_run_adopts_copies_and_drops_finalizers(
         monkeypatch.setattr(first.server._rpc, "call", past_replay_window)
         first.manager._demote(
             PoolKind.DRAM,
-            [first.dram.pool_id],
+            [first.tier("dram").pool.pool_id],
             PoolKind.CXL,
             [ref],
             [KeyLocation(Key("ns", "copied"), source)],
@@ -723,7 +727,7 @@ def test_real_rm_claim_during_lease_end_exits_lost(
             assert "lease ended" in node.service.ended
             other.node_claim(cfg.node_id, "competitor")
             # A delayed in-flight renewal during teardown discovers the takeover.
-            assert "another run claimed" in node.service.cxl.renew_once()
+            assert "another run claimed" in node.service.tier("cxl").renew_once()
         except BaseException as exc:
             faults.put(exc)
         finally:
@@ -737,7 +741,7 @@ def test_real_rm_claim_during_lease_end_exits_lost(
         assert done.wait(WAIT)
         assert faults.empty(), list(faults.queue)
         node = made[0]
-        assert node.runs == 1 and node.service.cxl.claimed_elsewhere
+        assert node.runs == 1 and node.service.tier("cxl").claimed_elsewhere
         assert node.failed is None and node.service.wait_finished(0)
         assert real_rm.calls.count("node_claim") == 1  # never takes it back
         assert other.node_renew(cfg.node_id, "competitor") > 0

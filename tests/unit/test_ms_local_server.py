@@ -104,7 +104,7 @@ class TestAttach:
         assert len(worker.fds) == 1
         # the worker maps the very pool the node made
         mine = mmap.mmap(worker.fds[0], descriptor.pool.capacity)
-        theirs = mmap.mmap(node.dram.fd, node.dram.capacity)
+        theirs = mmap.mmap(node.tier("dram").pool.fd, node.tier("dram").pool.capacity)
         mine[PAGE : PAGE + 4] = b"same"
         assert theirs[PAGE : PAGE + 4] == b"same"
         mine.close()

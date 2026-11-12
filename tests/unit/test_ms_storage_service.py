@@ -314,7 +314,9 @@ class TestEviction:
             away = refs["away"][1].location
             entry = fake.by_loc.pop(lid(away))
             entry.location = dataclasses.replace(
-                away, allocation_id="elsewhere", offset=node.dram.capacity - PAGE
+                away,
+                allocation_id="elsewhere",
+                offset=node.tier("dram").pool.capacity - PAGE,
             )
             fake.by_loc[lid(entry.location)] = entry
             # the same key at another generation occupies the page
@@ -358,7 +360,7 @@ class TestEviction:
             fake.hidden_pools.add(refs["invalid"][1].location.pool_id)
         retire("invalid")
         assert node.manager.placement.is_held(refs["invalid"][0])
-        assert not node.pools.creditable(node.dram.pool_id)
+        assert not node.pools.creditable(node.tier("dram").pool.pool_id)
         raw = RawWorker(node.config.socket)
         raw.attach()
         assert raw.credit(PAGE).credits == []
@@ -455,7 +457,7 @@ class TestSessions:
             what="usage",
         )
         (usage,) = fake.node("gpu-test").usage
-        assert usage.capacity == node.dram.capacity
+        assert usage.capacity == node.tier("dram").pool.capacity
         assert (
             usage.free
             + usage.credited
@@ -501,7 +503,7 @@ class TestSessions:
         """Its listed pages come back READY; nothing holds it in an RM, so the
         rest is free at once (it is no credit tier's)."""
         first = nodes(ssd_path=ssd_dir, ssd_pages=4)
-        info = first.ssd.info()
+        info = first.tier("ssd").pool.info()
         listed = [
             RecoverItem(
                 key=Key(NS, f"r{i}"),
@@ -573,7 +575,8 @@ class TestRestart:
         assert put(h, "new")
         h.free(held)
         wait_until(
-            lambda: client.pools.pool_ids() == [second.dram.pool_id], what="unmapped"
+            lambda: client.pools.pool_ids() == [second.tier("dram").pool.pool_id],
+            what="unmapped",
         )
         read = h.retrieve("new")
         assert bytes(read.view) == b"new"
@@ -739,7 +742,9 @@ class TestClientRobustness:
 
         monkeypatch.setattr(pool_maps.os, "close", counting_close)
         monkeypatch.setattr(storage_conn.os, "close", counting_close)
-        info = dataclasses.replace(node.dram.info(), pool_id="dram:gpu-test:other")
+        info = dataclasses.replace(
+            node.tier("dram").pool.info(), pool_id="dram:gpu-test:other"
+        )
         reply = AttachResponse(
             status=client.attach_info.status,
             node_id="gpu-test",
@@ -797,7 +802,7 @@ class TestClientNotify:
             lambda: node.pools.held_bytes(client.identity.incarnation) < held,
             what="credit returned",
         )
-        pool_id = node.dram.pool_id
+        pool_id = node.tier("dram").pool.pool_id
         client._on_notify(
             Notify(kind=NotifyKind.POOL_REMOVE, pool_id=pool_id, pool_generation=1),
             client._storage,
@@ -920,7 +925,7 @@ class TestHandlerFacade:
         with fake._lock:
             (entry,) = fake.catalog[Key(NS, "k")]
             entry.location = dataclasses.replace(
-                entry.location, offset=node.dram.capacity
+                entry.location, offset=node.tier("dram").pool.capacity
             )
         assert h.retrieve("k") is None
         assert h._cpu.stats["retrieve_bad_location"] == 1
@@ -1951,7 +1956,9 @@ class TestStaleRuns:
         loc = page.location
         with fake._lock:  # the Catalog has our allocation at another offset
             entry = fake.by_loc.pop((loc.pool_id, loc.allocation_id, loc.generation))
-            entry.location = dataclasses.replace(loc, offset=node.dram.capacity - PAGE)
+            entry.location = dataclasses.replace(
+                loc, offset=node.tier("dram").pool.capacity - PAGE
+            )
             fake.by_loc[(loc.pool_id, loc.allocation_id, loc.generation)] = entry
         node.manager.retire([ref], [KeyLocation(page.key, page.location)])
         retire = fake.requests(MessageType.RETIRE)[-1]
@@ -2036,7 +2043,7 @@ class TestFakeFidelity:
         node = start_node(node_config(fake.url, f"{sockdir}/b.sock"))
         rpc = MsRpcClient(fake.url, timeout_s=2)
         try:
-            loc = Location(node.dram.pool_id, "x", 1, 0, 8, PoolKind.DRAM)
+            loc = Location(node.tier("dram").pool.pool_id, "x", 1, 0, 8, PoolKind.DRAM)
             request = CommitRequest(
                 session=node.server.session,
                 server_epoch=node.server.server_epoch,

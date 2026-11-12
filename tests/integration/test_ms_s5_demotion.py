@@ -123,8 +123,8 @@ def kinds_of(node, key: str) -> set[PoolKind]:
 def test_pages_move_to_cxl_and_stay_readable_while_read(node, agents):
     w = agents("writer")
     r = agents("reader")
-    assert set(w.call("state")["pools"]) == {node.dram.pool_id} | {
-        p.pool_id for p in node.cxl.pools
+    assert set(w.call("state")["pools"]) == {node.tier("dram").pool.pool_id} | {
+        p.pool_id for p in node.tier("cxl").pools
     }
     assert store(w, "k0")
     assert r.call("retrieve", key="k0") == value("k0")  # held: a pin in DRAM

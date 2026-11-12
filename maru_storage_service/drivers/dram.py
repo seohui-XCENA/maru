@@ -58,7 +58,7 @@ def default_huge_page_size() -> int | None:
 
 @dataclass
 class DramPool:
-    """One memfd pool; ``fd`` stays open for the ATTACH replies. A DriverPool."""
+    """One memfd pool; ``fd`` stays open for the ATTACH replies. An L1Pool."""
 
     pool_id: str
     node_id: str
@@ -170,7 +170,7 @@ def create_dram_pool(
 
 
 class DramDriver:
-    """A TierDriver for the dram tier."""
+    """Creates the dram tier's pool."""
 
     def create(
         self, tier: TierConfig, *, node_id: str, node_epoch: str, page_size: int

@@ -346,7 +346,8 @@ def test_a_later_run_waits_while_workers_map_the_old_pool(
     try:
         node = runs()
         first = new_run(node, None)
-        old = mmap.mmap(first.dram.fd, first.dram.capacity, flags=mmap.MAP_SHARED)
+        pool = first.tier("dram").pool
+        old = mmap.mmap(pool.fd, pool.capacity, flags=mmap.MAP_SHARED)
         short_dram[0] = 3
         fake.restart()
         second = new_run(node, first)
@@ -408,7 +409,9 @@ def test_a_later_run_waits_with_a_growing_backoff_until_the_old_mapping_goes(
         return False
 
     service._interrupted.wait = wait
-    assert service._create_dram(service.config.top) == "pool"
+    tier = service._make(service.config.top)
+    service._open(tier)
+    assert tier.pools == ["pool"]
     assert pauses == [0.1, 0.2, 0.4, 0.5, 0.5]  # doubled up to the cap
     assert len(creates) == 6
 
@@ -416,18 +419,20 @@ def test_a_later_run_waits_with_a_growing_backoff_until_the_old_mapping_goes(
 def test_a_stop_ends_the_wait_in_the_middle_of_it(dram_service):
     service, old, creates = dram_service
     service._interrupted.wait = lambda pause: len(creates) >= 2
+    tier = service._make(service.config.top)
     with pytest.raises(ServerStopped):
-        service._create_dram(service.config.top)
+        service._open(tier)
     assert len(creates) == 2 and not old.mapping.closed
 
 
 def test_a_stop_during_a_long_wait_returns_at_once(dram_service, monkeypatch):
     service, old, creates = dram_service
     monkeypatch.setattr(service_module, "DRAM_RETRY_S", 30.0)
+    tier = service._make(service.config.top)
     threading.Timer(0.1, service.interrupt).start()
     start = time.monotonic()
     with pytest.raises(ServerStopped):
-        service._create_dram(service.config.top)
+        service._open(tier)
     assert time.monotonic() - start < 5
 
 

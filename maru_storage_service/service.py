@@ -28,7 +28,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from typing import TypeVar
 
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
@@ -45,12 +44,10 @@ from .drivers.cxl import (
     DEFAULT_RENEW_S,
     OWN_HOLDER,
     CxlRegionPool,
-    CxlTier,
     RegionSource,
 )
-from .drivers.dram import DramPool, DramPoolError, DramTier
+from .drivers.dram import DramPoolError
 from .drivers.registry import TIERS
-from .drivers.ssd import SsdPool, SsdTier
 from .fetch_manager import FetchManager
 from .local_pin import LocalPins
 from .local_server import LocalServer
@@ -86,8 +83,6 @@ STOP_WAIT_S = 30.0
 DRAM_RETRY_S = 1.0
 DRAM_RETRY_MAX_S = 30.0
 DRAM_LOG_S = 30.0
-
-T = TypeVar("T", bound=Tier)
 
 
 def _served_tiers() -> tuple[list[str], ...]:
@@ -216,10 +211,9 @@ class StorageService:
         self._credit_tiers: set[str] = set()
         self._stopped = threading.Event()
 
-    def _named(self, name: str, cls: type[T]) -> T | None:
-        """The run's tier ``name``, if it is a ``cls``."""
-        tier = self._tiers.get(name)
-        return tier if isinstance(tier, cls) else None
+    def tier(self, store: str) -> Tier | None:
+        """The run's tier ``store``, once made."""
+        return self._tiers.get(store)
 
     def _leases(self) -> list[Leased]:
         """The run's leased tiers; a tier's thread may ask during the start."""
@@ -237,29 +231,6 @@ class StorageService:
     def claimed_elsewhere(self) -> bool:
         """A lessor gave the node to another run: never claimed back."""
         return any(t.claimed_elsewhere for t in self._leases())
-
-    @property
-    def _dram_tier(self) -> DramTier | None:
-        return self._named("dram", DramTier)
-
-    @property
-    def _ssd_tier(self) -> SsdTier | None:
-        return self._named("ssd", SsdTier)
-
-    @property
-    def cxl(self) -> CxlTier | None:
-        """The cxl tier, once made."""
-        return self._named("cxl", CxlTier)
-
-    @property
-    def dram(self) -> DramPool | None:
-        """The run's DRAM pool, once created."""
-        return self._dram_tier.pool if self._dram_tier is not None else None
-
-    @property
-    def ssd(self) -> SsdPool | None:
-        """The SSD pool, once open."""
-        return self._ssd_tier.pool if self._ssd_tier is not None else None
 
     def _env(self) -> TierEnv:
         return TierEnv(
@@ -523,13 +494,6 @@ class StorageService:
         for name, tier in tiers.items():
             if tier.pool_infos():
                 logger.info("%s tier: %s", name, tier.describe(adopted_ids))
-
-    def _create_dram(self, tier: TierConfig) -> DramPool:
-        """The run's memfd: its DramTier made and opened."""
-        dram = self._make(tier)
-        assert isinstance(dram, DramTier)
-        self._open(dram)
-        return dram.pools[0]
 
     def _open(self, tier: Tier) -> None:
         """Open ``tier``. A DRAM pool that ran short of memory may fit once

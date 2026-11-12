@@ -363,8 +363,8 @@ def test_the_engine_writes_and_reads_a_file_pool(ssd_dir):
 
 def test_a_full_dram_moves_its_pages_to_the_ssd(fake, nodes, handlers):
     node = nodes()
-    assert node.ssd is not None and node.transfers is not None
-    ssd = node.ssd.pool_id
+    assert node.tier("ssd").pool is not None and node.transfers is not None
+    ssd = node.tier("ssd").pool.pool_id
     assert not node.pools.creditable(ssd)
     assert ssd not in {d.pool.pool_id for d, _ in node.local.pools}  # not to workers
     h = handlers(node)
@@ -377,7 +377,7 @@ def test_a_full_dram_moves_its_pages_to_the_ssd(fake, nodes, handlers):
         (location,) = fake.locations(Key(NS, key))
         ref = node.pools.find(location)
         assert ref is not None and node.pools.page(ref).state == PageState.READY
-        assert ssd_bytes(node.ssd, location) == value_of(key)
+        assert ssd_bytes(node.tier("ssd").pool, location) == value_of(key)
         assert h.retrieve(key) is None  # workers do not fetch yet
     assert all(kinds(fake, f"k{i}") for i in range(10))
     for item in finalized(fake):
@@ -393,14 +393,14 @@ def test_a_copy_is_published_only_once_its_write_returned(
 ):
     node = nodes()
     gate, entered = threading.Event(), threading.Event()
-    write = node.ssd.write
+    write = node.tier("ssd").pool.write
 
     def held(*args, **kwargs):
         entered.set()
         assert gate.wait(10)
         return write(*args, **kwargs)
 
-    monkeypatch.setattr(node.ssd, "write", held)
+    monkeypatch.setattr(node.tier("ssd").pool, "write", held)
     h = handlers(node)
     for i in range(10):
         assert put(h, f"k{i}")
@@ -409,7 +409,7 @@ def test_a_copy_is_published_only_once_its_write_returned(
     wait_until(entered.is_set, what="a write under way")
     time.sleep(0.1)
     # under way: the page below is reserved, referenced and not committed
-    (dest,) = node.pools.pages_in(node.ssd.pool_id, PageState.TRANSFER)[:1]
+    (dest,) = node.pools.pages_in(node.tier("ssd").pool.pool_id, PageState.TRANSFER)[:1]
     assert node.pools.io_refs(dest) == 1
     assert not ssd_commits(fake)
     # the eviction thread goes on meanwhile: a central delete gets done
@@ -438,7 +438,7 @@ def test_a_copy_is_published_only_once_its_write_returned(
 def torn_writes(node, code: int, count: float = float("inf")) -> list[int]:
     """The next ``count`` writes land half their bytes, then fail with
     ``code``; returns the page offsets they tore."""
-    write = node.ssd.write
+    write = node.tier("ssd").pool.write
     torn: list[int] = []
 
     def tear(page_offset, src, n, **kwargs):
@@ -448,7 +448,7 @@ def torn_writes(node, code: int, count: float = float("inf")) -> list[int]:
         write(page_offset, src, max(1, n // 2), **kwargs)
         raise OSError(code, os.strerror(code))
 
-    node.ssd.write = tear
+    node.tier("ssd").pool.write = tear
     return torn
 
 
@@ -457,7 +457,8 @@ def served_right(fake, node, h, names) -> None:
     for name in names:
         for location in fake.locations(Key(NS, name)):
             if location.kind == PoolKind.SSD:
-                assert ssd_bytes(node.ssd, location) == value_of(name), name
+                pool = node.tier("ssd").pool
+                assert ssd_bytes(pool, location) == value_of(name), name
         read = h.retrieve(name)
         if read is not None:
             assert bytes(read.view) == value_of(name), name
@@ -501,7 +502,7 @@ def test_a_persistent_write_failure_lets_stores_go_on(
     assert not ssd_commits(fake) and not finalized(fake)
     served_right(fake, node, h, names)
     node.pools.check()
-    del node.ssd.write  # the disk is back
+    del node.tier("ssd").pool.write  # the disk is back
     for name in [f"n{i}" for i in range(10)]:
         assert put(h, name)
     wait_until(lambda: finalized(fake), what="moves to the SSD again")
@@ -526,20 +527,21 @@ def test_full_queues_and_late_writes_count_toward_the_pause(
         monkeypatch.setattr(node.transfers, "submit_io", full)
     else:
         monkeypatch.setattr("maru_storage_service.drivers.ssd.IO_TIMEOUT_S", 0.05)
-        write = node.ssd.write
+        write = node.tier("ssd").pool.write
 
         def slow(*args, **kwargs):
             done = write(*args, **kwargs)
             time.sleep(0.1)
             return done
 
-        monkeypatch.setattr(node.ssd, "write", slow)
+        monkeypatch.setattr(node.tier("ssd").pool, "write", slow)
     h = handlers(node)
     names = [f"k{i}" for i in range(40)]
     for name in names:
         assert put(h, name)
     wait_until(
-        lambda: node.ssd.pool_id in node.manager._io_paused, what="the SSD paused"
+        lambda: node.tier("ssd").pool.pool_id in node.manager._io_paused,
+        what="the SSD paused",
     )
     assert bool(ssd_commits(fake)) == (how == "late")
     served_right(fake, node, h, names)
@@ -556,7 +558,7 @@ def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers
     (location,) = fake.locations(Key(NS, key))
     ref = node.pools.find(location)
     # as a fetch reading it into DRAM would
-    (dest,) = node.pools.reserve_transfer(node.dram.pool_id, 1)
+    (dest,) = node.pools.reserve_transfer(node.tier("dram").pool.pool_id, 1)
     assert node.pools.io_acquire(ref, dest)
     fake.queue_block(
         "gpu-test",
@@ -583,7 +585,7 @@ def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers
 
 def test_a_demotion_into_the_ssd_reserves_ssd_pages_only(nodes):
     node = nodes()
-    ssd = node.ssd.pool_id
+    ssd = node.tier("ssd").pool.pool_id
     refs = node.manager._reserve_below("ssd", 64)  # more than the SSD has
     try:
         assert refs and {r.pool_id for r in refs} == {ssd}
@@ -601,7 +603,7 @@ def test_a_fetch_demand_makes_room_below_the_watermarks(
     h = handlers(node)
     for i in range(4):
         assert put(h, f"k{i}")
-    dram = node.dram.pool_id
+    dram = node.tier("dram").pool.pool_id
     time.sleep(0.2)
     assert not node.manager.move_results  # far below the high watermark
     free = node.pools.bytes_in(PageState.FREE, dram)
@@ -632,14 +634,14 @@ def test_dram_moves_to_cxl_and_cxl_to_the_ssd(fake, nodes, handlers, sockdir, ss
     assert (PoolKind.CXL, PoolKind.SSD) in pairs
     for item in finalized(fake):
         if item.dest.kind == PoolKind.SSD and fake.locations(item.key) == [item.dest]:
-            assert ssd_bytes(node.ssd, item.dest) == value_of(item.key.key)
+            assert ssd_bytes(node.tier("ssd").pool, item.dest) == value_of(item.key.key)
     node.pools.check()
 
 
 def test_a_cxl_top_tier_moves_to_the_ssd(fake, nodes, regions, sockdir, ssd_dir):
     node = nodes(cxl_ssd(fake.url, sockdir, ssd_dir))
-    assert node.dram is None
-    by_pool = {p.pool_id: p.region.handle.region_id for p in node.cxl.pools}
+    assert node.tier("dram") is None
+    by_pool = {p.pool_id: p.region.handle.region_id for p in node.tier("cxl").pools}
     worker = RawWorker(node.config.socket)
     worker.attach()
     written = 0
@@ -657,7 +659,7 @@ def test_a_cxl_top_tier_moves_to_the_ssd(fake, nodes, regions, sockdir, ssd_dir)
     wait_until(lambda: finalized(fake), what="a page moved to the SSD")
     for item in finalized(fake):
         assert (item.source.kind, item.dest.kind) == (PoolKind.CXL, PoolKind.SSD)
-        assert ssd_bytes(node.ssd, item.dest) == value_of(item.key.key)
+        assert ssd_bytes(node.tier("ssd").pool, item.dest) == value_of(item.key.key)
     worker.close()
     node.pools.check()
 
@@ -679,7 +681,7 @@ def test_a_region_the_node_cannot_map_drops_its_pages(
 
     node = nodes(cxl_ssd(fake.url, sockdir, ssd_dir), map_region=map_some)
     unmapped = mapped[0]
-    by_pool = {p.pool_id: p.region.handle.region_id for p in node.cxl.pools}
+    by_pool = {p.pool_id: p.region.handle.region_id for p in node.tier("cxl").pools}
     worker = RawWorker(node.config.socket)
     worker.attach()
     names = []
@@ -730,16 +732,17 @@ def test_a_new_run_opens_the_file_once_the_old_runs_writes_ended(
         wait_until(lambda: first.wait(0), what="the run ends")
         time.sleep(0.5)
         # its teardown waits for the write; the file stays open and locked
-        assert node.service is first and first.ssd.fd >= 0
+        assert node.service is first and first.tier("ssd").pool.fd >= 0
         gate.set()
         second = new_run(node, first)
-        assert first.ssd.fd == -1
-        assert second.ssd.fd >= 0 and second.ssd.path == first.ssd.path
-        assert second.ssd.device_id == first.ssd.device_id
+        old, new = first.tier("ssd").pool, second.tier("ssd").pool
+        assert old.fd == -1
+        assert new.fd >= 0 and new.path == old.path
+        assert new.device_id == old.device_id
         # another boot of MaruServer: nothing adopted, all of it FREE
         assert second.adopted == []
-        ssd = second.ssd.pool_id
-        assert second.pools.bytes_in(PageState.FREE, ssd) == second.ssd.capacity
+        ssd = new.pool_id
+        assert second.pools.bytes_in(PageState.FREE, ssd) == new.capacity
     finally:
         gate.set()
         node.stop()
@@ -798,16 +801,17 @@ def test_the_same_boot_adopts_the_file_and_a_reboot_empties_it(
 
     second = start_node(config, host_boot_id="boot-1")
     try:
-        ssd = second.ssd.pool_id
-        assert ssd == first.ssd.pool_id and second.adopted == [ssd]
+        pool = second.tier("ssd").pool
+        ssd = pool.pool_id
+        assert ssd == first.tier("ssd").pool.pool_id and second.adopted == [ssd]
         assert not second.pools.pool_quarantined(ssd)
         for key, (location,) in moved.items():
             ref = second.pools.find(location)
             assert ref is not None and second.pools.page(ref).state == PageState.READY
-            assert ssd_bytes(second.ssd, location) == value_of(key)
+            assert ssd_bytes(pool, location) == value_of(key)
         ready = second.pools.bytes_in(PageState.READY, ssd)
         assert ready == len(moved) * PAGE
-        assert second.pools.bytes_in(PageState.FREE, ssd) == second.ssd.capacity - ready
+        assert second.pools.bytes_in(PageState.FREE, ssd) == pool.capacity - ready
         second.pools.check()
     finally:
         second.stop(CloseMode.RESTART)
@@ -815,8 +819,9 @@ def test_the_same_boot_adopts_the_file_and_a_reboot_empties_it(
     third = start_node(config, host_boot_id="boot-2")
     try:
         assert third.adopted == []
-        ssd = third.ssd.pool_id
-        assert third.pools.bytes_in(PageState.FREE, ssd) == third.ssd.capacity
+        pool = third.tier("ssd").pool
+        ssd = pool.pool_id
+        assert third.pools.bytes_in(PageState.FREE, ssd) == pool.capacity
         wait_until(
             lambda: not any(ssd_locations(server, k) for k in moved),
             what="the SSD keys of the old boot gone",
@@ -869,10 +874,14 @@ def test_a_run_on_another_server_in_between_is_never_adopted(
         try:
             # S2's run overwrote extents S1 still lists: never adopted
             assert any(
-                ssd_bytes(c.ssd, loc) != value_of(k) for k, (loc,) in saved.items()
+                ssd_bytes(c.tier("ssd").pool, loc) != value_of(k)
+                for k, (loc,) in saved.items()
             )
             assert c.adopted == []
-            assert c.ssd.pool_generation == a.ssd.pool_generation + 2
+            assert (
+                c.tier("ssd").pool.pool_generation
+                == a.tier("ssd").pool.pool_generation + 2
+            )
             wait_until(
                 lambda: not any(ssd_locations(s1, k) for k in saved),
                 what="S1 dropped the old extents",
@@ -913,18 +922,18 @@ def test_another_node_never_reuses_the_file(real_server, sockdir, ssd_dir, handl
         start_node(other, host_boot_id="boot-1")
     again = start_node(config, host_boot_id="boot-1")
     try:
-        assert again.adopted == [first.ssd.pool_id]
+        assert again.adopted == [first.tier("ssd").pool.pool_id]
         for key, (location,) in saved.items():
-            assert ssd_bytes(again.ssd, location) == value_of(key)
+            assert ssd_bytes(again.tier("ssd").pool, location) == value_of(key)
     finally:
         again.stop(CloseMode.RESTART)
-    os.unlink(first.ssd.path)
+    os.unlink(first.tier("ssd").pool.path)
     taken = start_node(other, host_boot_id="boot-1")
     taken.stop(CloseMode.RESTART)
-    os.unlink(first.ssd.path)
+    os.unlink(first.tier("ssd").pool.path)
     last = start_node(config, host_boot_id="boot-1")
     try:
-        assert last.ssd.device_id != first.ssd.device_id
+        assert last.tier("ssd").pool.device_id != first.tier("ssd").pool.device_id
         assert last.adopted == []
         wait_until(
             lambda: not any(ssd_locations(server, k) for k in saved),

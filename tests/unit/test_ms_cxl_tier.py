@@ -415,7 +415,7 @@ def test_the_regions_are_registered_as_fallback_credit(fake, sockdir, fallback):
         config, region_source=rm, cxl_renew_s=0.02, map_region=anon_region
     )
     try:
-        ids = [p.pool_id for p in node.cxl.pools]
+        ids = [p.pool_id for p in node.tier("cxl").pools]
         assert set(ids) <= set(fake.nodes["gpu-test"].pools)
         for pool_id in ids:
             assert node.pools.creditable(pool_id) is fallback
@@ -624,11 +624,11 @@ def test_a_cxl_only_node_gives_credit_from_its_regions(fake, sockdir):
         cxl_only_config(fake, sockdir), region_source=rm, cxl_renew_s=0.02
     )
     try:
-        assert node.dram is None
+        assert node.tier("dram") is None
         worker = RawWorker(f"{sockdir}/node.sock")
         response = worker.attach()
         assert {d.pool.pool_id for d in response.pools} == {
-            p.pool_id for p in node.cxl.pools
+            p.pool_id for p in node.tier("cxl").pools
         }
         credits = worker.credit(2 * PAGE).credits
         assert credits and all(c.kind == PoolKind.CXL for c in credits)
@@ -688,7 +688,7 @@ def test_a_fuller_region_is_no_pressure_while_the_tier_has_room(fake, sockdir):
             )
         per_region = [
             node.pools.bytes_in(PageState.READY, p.pool_id) // PAGE
-            for p in node.cxl.pools
+            for p in node.tier("cxl").pools
         ]
         assert max(per_region) == 2 and sum(per_region) == 12
         time.sleep(0.3)  # eviction passes run on every commit and on a timer
@@ -737,7 +737,8 @@ def test_credit_dram_lacks_comes_from_cxl(fake, sockdir, fallback):
             assert worker.write_done(second, keys).status.value == "OK"
             wait_until(lambda: node.pools.bytes_in(PageState.READY) == 8 * PAGE)
             cxl_ready = sum(
-                node.pools.bytes_in(PageState.READY, p.pool_id) for p in node.cxl.pools
+                node.pools.bytes_in(PageState.READY, p.pool_id)
+                for p in node.tier("cxl").pools
             )
             assert cxl_ready == PAGE
         worker.close()
@@ -765,7 +766,7 @@ def test_a_cxl_tier_the_rm_gave_no_region_answers_cxl_credit_with_none(
         config, region_source=rm, cxl_renew_s=0.02, map_region=anon_region
     )
     try:
-        assert node.cxl.pools == []
+        assert node.tier("cxl").pools == []
         # The tier's kind, not its pools, makes it a credit tier on the wire
         assert node.manager.credit_kinds == expected
         worker = RawWorker(f"{sockdir}/node.sock")
@@ -793,7 +794,7 @@ def test_leave_gives_no_more_cxl_credit(fake, sockdir):
     from maru_common.storage_types import CloseMode
 
     node = cxl_node(fake, sockdir, FakeRm())
-    ids = [p.pool_id for p in node.cxl.pools]
+    ids = [p.pool_id for p in node.tier("cxl").pools]
     assert all(node.pools.creditable(p) for p in ids)
     node.stop(CloseMode.LEAVE)
     assert not any(node.pools.creditable(p) for p in ids)
@@ -828,7 +829,7 @@ def test_leave_gives_back_every_region_and_holds_keep_mapped_ones(fake, sockdir)
     node = cxl_node(fake, sockdir, rm, unmap_timeout_s=0.3)
     worker = RawWorker(f"{sockdir}/node.sock")
     worker.attach()
-    first, second = node.cxl.pools
+    first, second = node.tier("cxl").pools
     rm.hold(second.region, worker.incarnation, node.node_epoch)
     stopper = threading.Thread(target=node.stop, args=(CloseMode.LEAVE,))
     stopper.start()
@@ -875,7 +876,7 @@ def test_claimed_regions_without_holders_are_free_at_once(fake, sockdir):
     rm.regions["gpu-test"] = [rm.region(2 * PAGE)]
     node = cxl_node(fake, sockdir, rm, gpu_drain_grace_s=30.0)
     try:
-        claimed = node.cxl.pools[0].pool_id
+        claimed = node.tier("cxl").pools[0].pool_id
         assert claimed in node.adopted
         assert node.pools.bytes_in(PageState.FREE, claimed) == 2 * PAGE
         assert not node.pools.pool_quarantined(claimed)
@@ -894,8 +895,8 @@ def test_an_earlier_runs_hold_quarantines_the_region_until_it_goes(fake, sockdir
     rm.hold(free, "agent", "")
     node = cxl_node(fake, sockdir, rm, node_epoch="e1")
     try:
-        held_id, free_id = (p.pool_id for p in node.cxl.pools)
-        assert node.cxl.earlier_holds() == {held_id: {"old-worker@e0"}}
+        held_id, free_id = (p.pool_id for p in node.tier("cxl").pools)
+        assert node.tier("cxl").earlier_holds() == {held_id: {"old-worker@e0"}}
         assert node.pools.pool_quarantined(held_id)
         assert node.pools.bytes_in(PageState.QUARANTINED, held_id) == 2 * PAGE
         assert node.pools.bytes_in(PageState.FREE, free_id) == 2 * PAGE
@@ -909,7 +910,7 @@ def test_an_earlier_runs_hold_quarantines_the_region_until_it_goes(fake, sockdir
         )
         assert not node.pools.pool_quarantined(held_id)
         assert node.pools.creditable(held_id) == node.pools.creditable(free_id)
-        assert node.cxl.earlier_holds() == {}
+        assert node.tier("cxl").earlier_holds() == {}
         node.pools.check()
     finally:
         node.stop()
@@ -996,7 +997,7 @@ def test_a_cxl_only_restart_gives_credit_from_claimed_regions_once_released(
         gpu_drain_grace_s=1.0,
     )
     try:
-        assert all(p.claimed for p in node.cxl.pools)  # nothing new to allocate
+        assert all(p.claimed for p in node.tier("cxl").pools)  # nothing new to allocate
         worker = RawWorker(f"{sockdir}/node.sock")
         worker.attach()
         assert worker.credit(PAGE).credits == []  # all quarantined still
@@ -1019,9 +1020,9 @@ def test_the_node_holds_the_regions_it_maps_for_demotion(fake, sockdir):
         node = cxl_node(fake, sockdir, rm, map_region=None)
         name = node.own_holder
         assert name == f"ss@{node.node_epoch}"
-        ids = [p.region.handle.region_id for p in node.cxl.pools]
+        ids = [p.region.handle.region_id for p in node.tier("cxl").pools]
         assert all(name in rm.holds[r] for r in ids)
-        assert all(node.transfers.has_pool(p.pool_id) for p in node.cxl.pools)
+        assert all(node.transfers.has_pool(p.pool_id) for p in node.tier("cxl").pools)
         node.stop()
         assert all(name not in rm.holds[r] for r in ids)
         assert rm.released == []  # restart keeps the regions
@@ -1425,7 +1426,7 @@ def test_an_invalid_pool_gives_no_credit_when_its_quarantine_ends(fake, sockdir)
     rm.hold(region, "w@e0", "e0")
     node = cxl_node(fake, sockdir, rm, node_epoch="e1")
     try:
-        pool_id = node.cxl.pools[0].pool_id
+        pool_id = node.tier("cxl").pools[0].pool_id
         node.manager._pool_invalid(PageRef(pool_id, 0, 0))
         rm.unhold(region.handle, "w@e0", "w@e0")
         wait_until(lambda: not node.pools.pool_quarantined(pool_id), what="ended")

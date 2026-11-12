@@ -82,13 +82,14 @@ class TestDramDriver:
     def test_meets_the_driver_contract(self):
         from maru_common.storage_types import PoolDescriptor
         from maru_storage_service.config import TierConfig
-        from maru_storage_service.drivers import DriverPool, PoolAccess
+        from maru_storage_service.drivers import PoolAccess
+        from maru_storage_service.tiers import L1Pool
 
         driver = dram.DramDriver()
         tier = TierConfig(store="dram", size=4 * M + 1, hugepage=False)
         pool = driver.create(tier, node_id="n", node_epoch="e", page_size=M)
         try:
-            assert isinstance(pool, DriverPool)
+            assert isinstance(pool, L1Pool)
             assert pool.access == PoolAccess.MAPPED
             assert (pool.pool_id, pool.capacity) == ("dram:n:e", 4 * M)
             assert pool.descriptor(memfd=0) == PoolDescriptor(pool.info(), memfd=0)

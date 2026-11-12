@@ -79,7 +79,9 @@ def test_two_processes_share_one_pool(fake, sockdir, agents):
         for i in range(4):
             store(b, f"b{i}")
         assert (
-            a.call("state")["pools"] == b.call("state")["pools"] == [node.dram.pool_id]
+            a.call("state")["pools"]
+            == b.call("state")["pools"]
+            == [node.tier("dram").pool.pool_id]
         )
         assert node.pools.bytes_in(PageState.READY) == 22 * PAGE
         for reader, key in ((b, "a3"), (b, "a17"), (a, "b0")):

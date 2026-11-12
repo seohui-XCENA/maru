@@ -203,12 +203,12 @@ def test_a_maruserver_restart_starts_a_new_run(fake, runs, handlers):
     first = node.service
     h = handlers(node)
     assert put(h, "k")
-    old_pool = first.dram.pool_id
+    old_pool = first.tier("dram").pool.pool_id
     fake.restart()
     second = new_run(node, first)
     assert first.ended and "restarted" in first.ended and first.new_run
     assert second.node_epoch != first.node_epoch
-    assert second.dram.pool_id != old_pool  # a new memfd
+    assert second.tier("dram").pool.pool_id != old_pool  # a new memfd
     attached_to(h, second, fake)
     assert h.retrieve("k") is None  # gone with the Catalog
     assert put(h, "k2")
@@ -297,7 +297,7 @@ def test_a_lost_lease_leaves_then_starts_a_new_run(fake, runs):
     assert "lease ended" in first.ended and first.new_run
     assert rm.released == [("gpu-test", first.node_epoch)]  # left
     assert rm.epochs["gpu-test"] == second.node_epoch  # claimed again
-    assert second.cxl.pools and not node.kept
+    assert second.tier("cxl").pools and not node.kept
 
 
 def test_another_runs_claim_ends_the_node(fake, runs):
@@ -747,7 +747,7 @@ def test_a_lost_connection_unmaps_an_idle_pool_and_a_same_run_attach_maps_it(
     h = handlers(node)
     client = h._cpu
     assert put(h, "k")
-    pool_id = node.dram.pool_id
+    pool_id = node.tier("dram").pool.pool_id
     before = client.pools.get(pool_id)
     drop_connection(node)
     wait_until(lambda: before.mapping._closed, what="unmapped")
@@ -768,10 +768,10 @@ def test_a_pool_busy_when_the_connection_is_lost_goes_with_its_last_read(
     client = h._cpu
     assert put(h, "k")
     lease = h.retrieve("k")
-    before = client.pools.get(node.dram.pool_id)
+    before = client.pools.get(node.tier("dram").pool.pool_id)
     drop_connection(node)
     wait_until(
-        lambda: client.pools.get(node.dram.pool_id) not in (None, before),
+        lambda: client.pools.get(node.tier("dram").pool.pool_id) not in (None, before),
         what="mapped again",
     )
     assert not before.mapping._closed  # the read holds it

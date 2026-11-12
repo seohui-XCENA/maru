@@ -127,7 +127,7 @@ def cxl_pool_id(rm_domain: str, region_id: int) -> str:
 
 @dataclass
 class CxlRegionPool:
-    """One RM region as a pool. A DriverPool; workers map it by its handle."""
+    """One RM region as a pool. An L1Pool; workers map it by its handle."""
 
     node_id: str
     rm_domain: str

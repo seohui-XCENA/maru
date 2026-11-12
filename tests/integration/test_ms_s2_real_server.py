@@ -247,7 +247,11 @@ def test_two_processes_share_one_pool(servers, nodes, agents):
     for i in range(4):
         assert store(b, f"b{i}")
     assert node.pools.bytes_in(PageState.READY) == 22 * PAGE
-    assert a.call("state")["pools"] == b.call("state")["pools"] == [node.dram.pool_id]
+    assert (
+        a.call("state")["pools"]
+        == b.call("state")["pools"]
+        == [node.tier("dram").pool.pool_id]
+    )
     assert readable(b, "a0") and readable(b, "a17") and readable(a, "b3")
     node.pools.check()
 
@@ -501,7 +505,7 @@ def test_preserved_key_is_kept(servers, nodes, agents, workdir):
 
     ref = next(
         r
-        for r in node.pools.pages_in(node.dram.pool_id, PageState.READY)
+        for r in node.pools.pages_in(node.tier("dram").pool.pool_id, PageState.READY)
         if node.pools.page(r).key == Key("ns", "keep")
     )
     page = node.pools.page(ref)

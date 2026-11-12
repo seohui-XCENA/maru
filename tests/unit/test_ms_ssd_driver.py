@@ -21,7 +21,7 @@ import pytest
 
 from maru_common.storage_types import PoolKind
 from maru_storage_service.config import TierConfig
-from maru_storage_service.drivers import DriverPool, PoolAccess
+from maru_storage_service.drivers import PoolAccess
 from maru_storage_service.drivers import ssd as driver
 from maru_storage_service.drivers import ssd_alignment as dio
 from maru_storage_service.drivers.ssd import SsdDriver, SsdPoolError, create_ssd_pool
@@ -91,7 +91,7 @@ def pool(directory):
 
 def test_pool_contract_and_preallocation(pool, directory):
     info = pool.info()
-    assert isinstance(pool, DriverPool)
+    assert isinstance(pool, driver.SsdPool)
     assert pool.access == PoolAccess.IO_ONLY
     assert pool.worker_fd() is None
     with pytest.raises(SsdPoolError, match="descriptor"):

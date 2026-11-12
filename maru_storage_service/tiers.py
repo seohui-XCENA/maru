@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from maru_common.storage_types import Location, PoolDescriptor, PoolInfo, RmDomain
 
@@ -109,6 +109,7 @@ class Tier(ABC):
         """The start log line."""
 
 
+@runtime_checkable
 class L1Pool(Protocol):
     """A pool workers map."""
 

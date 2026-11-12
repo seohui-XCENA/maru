@@ -124,7 +124,7 @@ def _transfer(
 
 @dataclass
 class SsdPool:
-    """A DriverPool. The executor owns each writable, aligned bounce buffer."""
+    """One SSD pool file. The executor owns each writable, aligned bounce buffer."""
 
     pool_id: str
     node_id: str
@@ -426,7 +426,7 @@ def create_ssd_pool(node_id: str, path: str, size: int, page_size: int) -> SsdPo
 
 
 class SsdDriver:
-    """A TierDriver for the SSD tier; node_epoch does not change file identity."""
+    """Creates and reopens SSD pools; node_epoch does not change file identity."""
 
     def create(
         self, tier: TierConfig, *, node_id: str, node_epoch: str, page_size: int

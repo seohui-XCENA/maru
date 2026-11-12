@@ -146,8 +146,8 @@ def stored_on_ssd(server, node, workers):
     writer = workers(node)
     kv = rank_kv(1, 2)
     store(writer, kv)
-    dram = node.dram.pool_id
-    node.manager.want_room(PoolKind.DRAM, node.dram.capacity)
+    dram = node.tier("dram").pool.pool_id
+    node.manager.want_room(PoolKind.DRAM, node.tier("dram").pool.capacity)
     wait_until(
         lambda: node.pools.bytes_in(PageState.READY, dram) == 0, what="moved down"
     )

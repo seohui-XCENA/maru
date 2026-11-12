@@ -222,7 +222,7 @@ def kinds(fake, key: str) -> set[PoolKind]:
 
 
 def cxl_ids(node) -> list[str]:
-    return [p.pool_id for p in node.cxl.pools]
+    return [p.pool_id for p in node.tier("cxl").pools]
 
 
 def cxl_bytes(node, state: PageState) -> int:
@@ -575,7 +575,9 @@ def test_a_demotion_reserves_pages_of_the_tier_below_only(nodes):
     try:
         assert {r.pool_id for r in refs} == set(cxl_ids(node))
         assert len(refs) * PAGE == cxl_bytes(node, PageState.TRANSFER)
-        assert node.pools.bytes_in(PageState.TRANSFER, node.dram.pool_id) == 0
+        assert (
+            node.pools.bytes_in(PageState.TRANSFER, node.tier("dram").pool.pool_id) == 0
+        )
     finally:
         for ref in refs:
             node.pools.transfer_failed(ref)
@@ -652,7 +654,9 @@ def test_a_new_run_demotes_again(fake, sockdir, regions, handlers):
         fake.restart()
         second = wait_until(lambda: serving(node, first), what="the next run")
         wait_until(lambda: h._cpu.node_epoch == second.node_epoch, what="re-attached")
-        assert all(second.transfers.has_pool(p.pool_id) for p in second.cxl.pools)
+        assert all(
+            second.transfers.has_pool(p.pool_id) for p in second.tier("cxl").pools
+        )
         for i in range(10, 20):
             assert put(h, f"k{i}")
         wait_until(
@@ -933,7 +937,7 @@ def test_credit_of_a_pool_the_worker_did_not_map_goes_back(
     wait_until(lambda: client.stats["credit_unmapped"] >= 1, what="a return")
     assert {c.kind for c in client.credits.take_all()} <= {PoolKind.DRAM}
     incarnation = client.identity.incarnation
-    cxl = [p.pool_id for p in node.cxl.pools]
+    cxl = [p.pool_id for p in node.tier("cxl").pools]
     wait_until(
         lambda: sum(node.pools.bytes_in(PageState.CREDITED, p) for p in cxl) == 0,
         what="the CXL credit back",

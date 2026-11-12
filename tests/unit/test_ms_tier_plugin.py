@@ -334,7 +334,7 @@ def test_a_registered_store_is_started_by_the_service(monkeypatch, caplog):
         service = start_node(config)
         try:
             [tier] = made
-            pool_id, dram_id = tier.info.pool_id, service.dram.pool_id
+            pool_id, dram_id = tier.info.pool_id, service.tier("dram").pool.pool_id
             assert tier.opened
             assert pool_id in server.nodes["gpu-test"].pools  # announced
             assert service.pools.tier_of(pool_id) == "fake"
@@ -543,7 +543,7 @@ def test_a_registered_leased_store_lives_through_a_lost_lease(
         try:
             [tier] = made
             [pool] = tier.pools
-            dram_id = service.dram.pool_id
+            dram_id = service.tier("dram").pool.pool_id
             assert pool.pool_id in server.nodes["gpu-test"].pools  # announced
             assert service.pools.tier_of(pool.pool_id) == "lease"
             assert service.transfers.has_pool(pool.pool_id)

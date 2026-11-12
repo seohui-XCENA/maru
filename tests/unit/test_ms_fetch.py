@@ -217,9 +217,9 @@ class Loader:
         )
         assert self.session.open().status == Status.OK
         self.dram = None
-        if node.dram is not None:  # its memfd comes first
+        if node.tier("dram") is not None:  # its memfd comes first
             self.dram = mmap.mmap(
-                self.raw.fds[0], node.dram.capacity, prot=mmap.PROT_READ
+                self.raw.fds[0], node.tier("dram").pool.capacity, prot=mmap.PROT_READ
             )
 
     @property
@@ -278,7 +278,7 @@ class Reads:
         self.entered = threading.Event()
         self.gate = threading.Event()
         self.gate.set()
-        read = node.ssd.read
+        read = node.tier("ssd").pool.read
 
         def counted(*args, **kwargs):
             self.calls += 1
@@ -288,7 +288,7 @@ class Reads:
                 raise error
             return read(*args, **kwargs)
 
-        monkeypatch.setattr(node.ssd, "read", counted)
+        monkeypatch.setattr(node.tier("ssd").pool, "read", counted)
 
     def hold(self):
         self.gate.clear()
@@ -317,7 +317,7 @@ def node_pins(server, node) -> int:
 
 
 def no_transfer_pages(node) -> bool:
-    return node.pools.bytes_in(PageState.TRANSFER, node.dram.pool_id) == 0
+    return node.pools.bytes_in(PageState.TRANSFER, node.tier("dram").pool.pool_id) == 0
 
 
 # =============================================================================
@@ -505,7 +505,7 @@ def test_the_quota_holds_page_and_bounce_until_the_handoff(env, monkeypatch):
     reads = Reads(node, monkeypatch).hold()
     first = loader.send(loader.request(loader.items(keys[0])))
     assert reads.entered.wait(5)
-    bounce = node.ssd.io_size(len(value_of(keys[0])))
+    bounce = node.tier("ssd").pool.io_size(len(value_of(keys[0])))
     fetches = node.manager.fetches
     assert fetches.inflight_bytes == PAGE + bounce
     # another key does not fit
@@ -574,7 +574,7 @@ def test_what_is_refused(env):
     dram = FetchItem(
         item.key,
         type(item.plan)(
-            Location(node.dram.pool_id, "a", 1, 0, PAGE, PoolKind.DRAM),
+            Location(node.tier("dram").pool.pool_id, "a", 1, 0, PAGE, PoolKind.DRAM),
             item.plan.source_node,
             item.plan.bytes,
         ),
@@ -622,11 +622,13 @@ def test_a_load_larger_than_dram_goes_through_in_windows(env, monkeypatch):
     all_names = [f"k{i}" for i in range(40)]
     wait_until(lambda: len(on_ssd(server, all_names)) >= 24, "on the SSD")
     names = on_ssd(server, all_names)
-    assert len(names) * PAGE > node.dram.capacity
+    assert len(names) * PAGE > node.tier("dram").pool.capacity
     writes = []
-    write = node.ssd.write
+    write = node.tier("ssd").pool.write
     monkeypatch.setattr(
-        node.ssd, "write", lambda *a, **k: writes.append(1) or write(*a, **k)
+        node.tier("ssd").pool,
+        "write",
+        lambda *a, **k: writes.append(1) or write(*a, **k),
     )
     loader = Loader(node, server)
     for i in range(0, len(names), 4):
@@ -667,13 +669,15 @@ def test_after_a_restart_fetched_copies_drop_onto_the_adopted_ssd_pages(
         first.stop(CloseMode.RESTART)
     node = make_node(url, sockdir, ssd_dir)
     try:
-        assert node.adopted == [node.ssd.pool_id]
+        assert node.adopted == [node.tier("ssd").pool.pool_id]
         names = on_ssd(server, all_names)
-        assert len(names) * PAGE > node.dram.capacity
+        assert len(names) * PAGE > node.tier("dram").pool.capacity
         writes = []
-        write = node.ssd.write
+        write = node.tier("ssd").pool.write
         monkeypatch.setattr(
-            node.ssd, "write", lambda *a, **k: writes.append(1) or write(*a, **k)
+            node.tier("ssd").pool,
+            "write",
+            lambda *a, **k: writes.append(1) or write(*a, **k),
         )
         loader = Loader(node, server)
         for i in range(0, len(names), 4):
@@ -689,7 +693,7 @@ def test_after_a_restart_fetched_copies_drop_onto_the_adopted_ssd_pages(
             loader.unpin(*[o.pin_id for o in answer.items])
         moves = node.manager.move_results
         assert not moves["COMMIT:REJECTED"] and not moves["COMMIT:DUPLICATE"]
-        assert moves["RETIRED"] >= len(names) - node.dram.capacity // PAGE
+        assert moves["RETIRED"] >= len(names) - node.tier("dram").pool.capacity // PAGE
         assert not writes  # no rewrite of a page the SSD has
         wait_until(lambda: settled(node, server), "quota back")
         node.pools.check()
@@ -723,7 +727,7 @@ def start_cxl_node(config, regions):
 
 def region_bytes(node, regions, location: Location) -> bytes:
     """What a worker's mapping of the region holds there."""
-    (pool,) = [p for p in node.cxl.pools if p.pool_id == location.pool_id]
+    (pool,) = [p for p in node.tier("cxl").pools if p.pool_id == location.pool_id]
     fd = regions.fds[pool.region.handle.region_id]
     return os.pread(fd, location.length, location.offset)
 
@@ -732,7 +736,7 @@ def test_a_cxl_top_tier_fetches_into_a_region(real_server, sockdir, ssd_dir, reg
     server, url = real_server
     node = start_cxl_node(cxl_ssd(url, sockdir, ssd_dir), regions)
     try:
-        by_pool = {p.pool_id: p.region.handle.region_id for p in node.cxl.pools}
+        by_pool = {p.pool_id: p.region.handle.region_id for p in node.tier("cxl").pools}
         writer = RawWorker(node.config.socket)
         writer.attach()
         names = []
@@ -1111,7 +1115,7 @@ def test_a_full_window_fits_the_inflight_cap(env):
     )
     loader = Loader(node, server)
     # each flight holds a page and its bounce: two fit, not three
-    assert node.ssd.io_size(PAGE) == PAGE
+    assert node.tier("ssd").pool.io_size(PAGE) == PAGE
     assert loader.budgets.fetch_request_max_bytes == 2 * PAGE
     answer = loader.fetch(*keys[:2])
     assert [o.result for o in answer.items] == [ItemResult.HIT] * 2
@@ -1123,12 +1127,14 @@ def test_a_full_window_fits_the_inflight_cap(env):
 
 def seed_ssd(node, names: list[str]) -> None:
     """Commit each name's page straight to the node's SSD."""
-    refs = node.pools.reserve_transfer(node.ssd.pool_id, len(names))
+    refs = node.pools.reserve_transfer(node.tier("ssd").pool.pool_id, len(names))
     assert len(refs) == len(names)
     for name, ref in zip(names, refs, strict=True):
-        with aligned_buffer(PAGE, node.ssd.alignment.memory) as buffer:
+        with aligned_buffer(PAGE, node.tier("ssd").pool.alignment.memory) as buffer:
             buffer[:] = value_of(name, PAGE)
-            node.ssd.write(node.pools.transfer_location(ref).offset, buffer, PAGE)
+            node.tier("ssd").pool.write(
+                node.pools.transfer_location(ref).offset, buffer, PAGE
+            )
         node.pools.transfer_done(ref, Key(NS, name), PAGE)
         location = node.pools.page(ref).location
         commit = node.server.commit([CommitItem(Key(NS, name), location, PAGE)])
@@ -1167,7 +1173,9 @@ def test_the_window_fits_the_regions_fetches_reach(
     )
     loader = None
     try:
-        (reached,) = [p for p in node.cxl.pools if node.transfers.has_pool(p.pool_id)]
+        (reached,) = [
+            p for p in node.tier("cxl").pools if node.transfers.has_pool(p.pool_id)
+        ]
         assert reached.info().capacity == 8 * PAGE
         budgets = config.budgets
         room = (
