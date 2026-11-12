@@ -191,6 +191,8 @@ class StorageManager:
         self._invalid_pools: set[str] = set()
         # FREE bytes a fetch wants now, by tier (see want_room)
         self._demand: dict[PoolKind, int] = {}
+        # FETCH from workers: a FetchManager on a node with an SSD tier
+        self.fetches = None
 
     # ------------------------------------------------------------- lifecycle
 
@@ -219,6 +221,8 @@ class StorageManager:
         self.workers.stop()
         self._evict_wake.set()
         self.metadata.stop()
+        if self.fetches is not None:
+            self.fetches.stop()
         for thread in self._threads:
             thread.join(timeout=10.0)
         self._threads.clear()

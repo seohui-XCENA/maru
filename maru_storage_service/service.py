@@ -9,7 +9,9 @@ run still holds, heartbeat, then accept on the UDS. A GPU node with [dram],
 other configs are refused. The top tier gives credit; each tier makes room by
 demoting its pages to the tier below (write-back), the last one by dropping
 its own. Workers never see the SSD pool: only this process reads and writes
-its file, and it keeps the file's lock until all of its I/O has ended.
+its file, and it keeps the file's lock until all of its I/O has ended. A
+worker that agreed fetch_v1 FETCHes SSD pages into the top tier
+(FetchManager).
 
 A run ends on its own when MaruServer restarted or ended it, when a result
 stays unknown (both close with restart), or when the RM lease is lost (leave);
@@ -24,7 +26,13 @@ import time
 import uuid
 from collections.abc import Callable
 
-from maru_common.storage_types import CloseMode, PoolKind, RmDomain, run_holder
+from maru_common.storage_types import (
+    FETCH_CAPABILITY,
+    CloseMode,
+    PoolKind,
+    RmDomain,
+    run_holder,
+)
 from maru_shm.client import MaruShmClient
 
 from .config import NodeConfig, NodeConfigError, TierConfig
@@ -38,6 +46,7 @@ from .drivers.cxl import (
 )
 from .drivers.dram import DramDriver, DramPool, DramPoolError
 from .drivers.ssd import SsdDriver, SsdPool
+from .fetch_manager import FetchManager
 from .local_pin import LocalPins
 from .local_server import LocalServer
 from .op_ledger import OP_WINDOW
@@ -213,6 +222,11 @@ class StorageService:
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
+            capabilities=(
+                frozenset({FETCH_CAPABILITY})
+                if config.tier("ssd") is not None
+                else frozenset()
+            ),
         )
         self.local.claim()
         dram_tier = config.tier("dram")
@@ -292,6 +306,17 @@ class StorageService:
                 reason, CloseMode.RESTART, new_run=True
             ),
         )
+        if self.ssd is not None:
+            # Workers fetch SSD pages into the top tier
+            self.manager.fetches = FetchManager(
+                self.manager,
+                ssd=self.ssd,
+                node_id=config.node_id,
+                page_size=config.page_size,
+                kind=PoolKind(top.store),
+                request_max_bytes=config.budgets.fetch_request_max_bytes,
+                inflight_max_bytes=config.budgets.fetch_max_inflight_bytes,
+            )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
         self._credit_kinds = {
             kind for kind, t in traits.items() if t.credit or t.credit_fallback

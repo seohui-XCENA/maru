@@ -4,7 +4,9 @@
 
 A record lives from ATTACH until the process exits, or until a DETACH that
 leaves nothing behind. An exit quarantines the worker's credited pages for the
-GPU drain grace and is reported through ``on_exit``.
+GPU drain grace, and is reported through ``on_exit`` once the grace is over:
+until then MaruServer keeps the worker's pins, so no page it may still read
+on its GPU (a fetched copy too) is retired and reused.
 """
 
 import logging
@@ -48,6 +50,8 @@ class WorkerRecord:
     exited: bool = False
     # A probe holds nothing and is forgotten with its connection
     role: SessionRole = SessionRole.WORKER
+    # ATTACH capabilities agreed with this worker
+    capabilities: frozenset[str] = frozenset()
 
     @property
     def incarnation(self) -> str:
@@ -282,11 +286,11 @@ class WorkerRegistry:
             len(refs),
             self.gpu_drain_grace_s,
         )
-        self._on_exit(rec.ref())
-        self._after(self.gpu_drain_grace_s, self._grace_over, incarnation)
+        self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, rec.ref())
         self._ledger.drop(incarnation)
 
-    def _grace_over(self, incarnation: str) -> None:
+    def _grace_over(self, incarnation: str, ref: WorkerRef) -> None:
+        self._on_exit(ref)  # its pins at MaruServer go now
         freed = self._pools.release_quarantine(holder_tag(incarnation))
         if freed:
             logger.info("freed %d pages of ended worker %s", freed, incarnation)

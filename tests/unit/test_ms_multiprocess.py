@@ -127,6 +127,9 @@ def test_kill_9_of_a_writer(fake, sockdir, agents):
             what="quarantined",
         )
         assert node.pools.held_bytes(w.incarnation) == 0
+        # its GPU may still read during the grace: its pins stay until then
+        assert fake.pin_count(w.incarnation) == 1
+        assert not any(r.incarnation == w.incarnation for r, _ in fake.worker_exits)
         wait_until(
             lambda: any(r.incarnation == w.incarnation for r, _ in fake.worker_exits),
             what="WORKER_EXIT",
@@ -136,8 +139,7 @@ def test_kill_9_of_a_writer(fake, sockdir, agents):
         ]
         assert cause == "exit" and ref.pid == w.pid
         assert fake.pin_count(w.incarnation) == 0
-        # the pages wait gpu_drain_grace_s before they are free
-        assert node.pools.bytes_in(PageState.QUARANTINED) == held
+        # the pages are free once the grace is over too
         wait_until(
             lambda: node.pools.bytes_in(PageState.QUARANTINED) == 0, what="freed"
         )

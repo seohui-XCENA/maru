@@ -34,6 +34,7 @@ from maru_common.node_protocol import (
 from maru_common.protocol import MessageHeader
 from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
 from maru_common.storage_types import (
+    FETCH_CAPABILITY,
     MS_PROTOCOL,
     PoolDescriptor,
     SessionRole,
@@ -47,11 +48,11 @@ logger = logging.getLogger(__name__)
 
 _LISTEN_BACKLOG = 128
 _DISABLED = {
-    NodeMessageType.FETCH: "fetch is not supported yet",
-    NodeMessageType.FETCH_CANCEL: "fetch is not supported yet",
     NodeMessageType.LOCAL_PIN: "local pins are not supported yet",
     NodeMessageType.LOCAL_UNPIN: "local pins are not supported yet",
 }
+# Served only to a worker that agreed fetch_v1, by a node with an SSD tier
+_FETCH = (NodeMessageType.FETCH, NodeMessageType.FETCH_CANCEL)
 
 
 class LocalServerError(RuntimeError):
@@ -204,7 +205,7 @@ class LocalServer:
         capabilities: frozenset[str] = frozenset(),
     ):
         self.path = path
-        # ATTACH capabilities this node serves (none until fetch runs)
+        # ATTACH capabilities this node serves (fetch_v1 with an SSD tier)
         self.capabilities = capabilities
         self.socket_group = socket_group
         self.manager = manager
@@ -392,7 +393,24 @@ class LocalServer:
                 response_cls(status=Status.REJECTED, error="a probe only detaches"),
             )
             return
-        if code == NodeMessageType.CREDIT:
+        if code in _FETCH and (
+            manager.fetches is None or FETCH_CAPABILITY not in rec.capabilities
+        ):
+            conn.respond(
+                header,
+                response_cls(status=Status.DISABLED, error="fetch is not served"),
+            )
+            return
+        if code == NodeMessageType.FETCH:
+            manager.fetches.fetch(
+                rec,
+                decoded,
+                lambda response: conn.post_response(header, response),
+                waiter=conn,
+            )
+        elif code == NodeMessageType.FETCH_CANCEL:
+            conn.respond(header, manager.fetches.cancel(rec, request))
+        elif code == NodeMessageType.CREDIT:
             conn.respond(header, manager.credit(rec, decoded))
         elif code == NodeMessageType.CREDIT_RETURN:
             conn.respond(header, manager.credit_return(rec, request))
@@ -468,6 +486,8 @@ class LocalServer:
             rec, why = manager.workers.attach(conn, ident)
         if rec is None:
             return reject(why)
+        agreed = [c for c in req.capabilities if c in self.capabilities]
+        rec.capabilities = frozenset(agreed)
         conn.worker = rec
         budgets = None if probe else self.budgets
         response = AttachResponse(
@@ -482,7 +502,7 @@ class LocalServer:
             local_pin=False,
             pid=node_pid,
             pid_start=pid_start,
-            capabilities=[c for c in req.capabilities if c in self.capabilities],
+            capabilities=agreed,
         )
         fds = [] if probe else [fd for _, fd in self.pools if fd is not None]
         if not conn.respond(header, response, fds):
