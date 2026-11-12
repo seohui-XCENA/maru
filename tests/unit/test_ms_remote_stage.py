@@ -661,3 +661,49 @@ def test_an_unstage_whose_send_fails_neither_blocks_fetches_nor_leaks(routed):
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         assert pool.submit(fetches.flights).result(2) == 0  # its lock is free
     wait_until(lambda: settled(env.gpu, env.gate.server), what="pins released")
+
+
+def test_an_unstage_lost_while_a_reconnect_ran_is_sent_on_the_new_connection(
+    routed, monkeypatch
+):
+    from maru_common.protocol import MessageHeader
+    from maru_storage_service import remote_client
+
+    env = routed
+    tier = env.remote
+    node = tier._nodes[0]
+    got = []
+    tier.stage(Key(NS, "staged"), env.source, time.monotonic() + 5, got.append)
+    wait_until(lambda: got, what="staged")
+    page = got[0]
+    assert page is not None
+    key = (tier.origin, page.stage_id)
+    old = node.conn
+    send = remote_client.send_frame
+
+    def fail_unstage(sock, frame):
+        if sock is old._sock and MessageHeader.unpack(frame).msg_type == R.UNSTAGE:
+            raise BrokenPipeError(32, "Broken pipe")
+        return send(sock, frame)
+
+    monkeypatch.setattr(remote_client, "send_frame", fail_unstage)
+    fetches = env.gpu.manager.fetches
+    # The close hook waits on this lock while the connect loop reconnects:
+    # the UNSTAGE's error arrives after the new connection took the replays
+    with fetches._lock:
+        tier.unstage(page, TransferEnd.NOT_POSTED)
+        wait_until(
+            lambda: node.conn is not old and node.ready, timeout=5, what="reconnected"
+        )
+    old._reader.join(3)
+    assert not old._reader.is_alive()
+    # Sent on the new connection at once: no second reconnect needed
+    wait_until(
+        lambda: (
+            not node.unanswered
+            and key not in env.memory.peer_ops._staged
+            and key not in env.memory.peer_ops._staged_quarantine
+        ),
+        what="the staging page freed",
+    )
+    assert node.conn is not old and not node.conn.closed
