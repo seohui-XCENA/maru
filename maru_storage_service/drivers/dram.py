@@ -250,7 +250,15 @@ SPEC = TierSpec(
     local=True,
     kind=PoolKind.DRAM,
     keys=frozenset(
-        {"store", "size", "demotion", "high_watermark", "low_watermark", "hugepage"}
+        {
+            "store",
+            "size",
+            "demotion",
+            "through_max_inflight",
+            "high_watermark",
+            "low_watermark",
+            "hugepage",
+        }
     ),
     parse=_parse,
     make=_make,

@@ -41,6 +41,7 @@ from maru_common.storage_types import (
     FETCH_CAPABILITY,
     MEMORY_CAPABILITY,
     POOL_KINDS,
+    STAGE_CAPABILITY,
     CloseMode,
     PoolDescriptor,
     PoolInfo,
@@ -127,10 +128,6 @@ def check_servable(config: NodeConfig) -> None:
         )
     for t in config.tiers:
         TIERS[t.store].check_servable(t)
-    if any(t.demotion == "through" for t in config.tiers):
-        raise NotServableError(
-            "write-through demotion is not implemented yet: use demotion back"
-        )
 
 
 def worker_budgets(
@@ -245,7 +242,9 @@ class StorageService:
     def capabilities(self) -> list[str]:
         """What the node asks MaruServer to accept for its run."""
         if self.memory:
-            return [MEMORY_CAPABILITY]
+            # It stages its own SSD pages for peers to READ
+            stages = any(TIERS[t.store].level is Level.L2 for t in self.config.tiers)
+            return [MEMORY_CAPABILITY] + ([STAGE_CAPABILITY] if stages else [])
         return [c for t in self._remote_tiers() for c in t.capabilities()]
 
     def _remote_tiers(self) -> list[RemoteTier]:
@@ -581,7 +580,7 @@ class StorageService:
         rs = self.config.remote_server
         assert rs is not None  # parsing requires it on a memory node
         pools = self.remote.remote_pools(infos)
-        registered = sum(p.capacity for p in pools)
+        registered = sum(p.capacity for p in pools if p.metadata)
         self.peer_ops = PeerOps(
             self.manager,
             reserve_ttl_s=rs.reserve_ttl_s,
@@ -743,6 +742,11 @@ class StorageService:
             self.peer_ops.stop()
         if self.transfers is not None:
             self.transfers.stop()  # the copy under way ends; no new one starts
+        if self.manager is not None and self._remote_tiers():
+            try:  # before GOODBYE: the memory nodes learn how writes ended
+                self.manager.flush_remote()
+            except Exception:
+                logger.exception("reporting the drained remote writes failed")
         for tier in tiers:
             tier.stop()
         # On leave workers unmap these before they go back

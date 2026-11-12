@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """FetchManager: FETCH from workers' loaders, from this node's SSD or a
-memory node's mapped pages.
+memory node's mapped or staged pages.
 
 One flight per key at a time: one destination page in the top tier and one
 read, shared by every FETCH of the key. A flight takes its quota and its page,
@@ -35,6 +35,7 @@ from maru_common.node_protocol import (
     FetchResponse,
 )
 from maru_common.protocol import FetchCompleteItem
+from maru_common.remote_protocol import TransferEnd
 from maru_common.serializer import DecodedRequest
 from maru_common.storage_types import (
     MAX_BATCH,
@@ -51,7 +52,7 @@ from maru_common.storage_types import (
 from .op_ledger import LedgerEntry, Verdict
 from .page_table import PageRef, PageState
 from .ports import EpochChanged, ServerStopped
-from .tiers import IOResult, L2Tier
+from .tiers import IOResult, L2Tier, RemoteTier, Staged
 from .transfer_engine import Copy
 from .worker_registry import WorkerRecord
 
@@ -129,6 +130,8 @@ class _Flight:
     read_over: bool = False
     quarantined: Location | None = None
     read_settled: bool = False
+    staged: Staged | None = None
+    stage_tier: RemoteTier | None = None
 
 
 class FetchManager:
@@ -419,7 +422,10 @@ class FetchManager:
                     remote is None
                     or remote.owner(source.pool_id) != plan.source_node
                     or not remote.ready(plan.source_node)
-                    or not POOL_KINDS[source.kind].mappable  # SSD: needs STAGE
+                    or not (
+                        POOL_KINDS[source.kind].mappable
+                        or remote.stages(plan.source_node)
+                    )
                     or source.length != plan.bytes
                 ):
                     return _miss(MissReason.OFFLINE)
@@ -525,11 +531,14 @@ class FetchManager:
 
     # --------------------------------------------------------------- flights
 
-    def _lead(self, flights: list[_Flight]) -> None:
+    def _lead(self, flights: list[_Flight], *, staged: bool = False) -> None:
         """Run the flights a FETCH started, then serve their other waiters. A
         failure here leaves pages and pins as they are, and ends the run."""
         try:
-            self._run(flights)
+            if staged:
+                self._run(flights, staged=True)
+            else:
+                self._run(flights)
         except Exception as e:
             logger.exception("a fetch failed; its pages stay as they are")
             for flight in flights:
@@ -538,21 +547,22 @@ class FetchManager:
             if not self._stop.is_set():
                 self.manager.end_run(f"a fetch failed: {e!r}")
         finally:
-            self._leave(flights[0].leader.op)
+            if not staged:
+                self._leave(flights[0].leader.op)
 
-    def _run(self, flights: list[_Flight]) -> None:
+    def _run(self, flights: list[_Flight], *, staged: bool = False) -> None:
         """Each flight goes to its SOURCE_PIN and read as soon as it has a
         destination page from the top tier, and is published once read.
         Those short of a page wait for room (want_room) while a waiter is
         within its deadline; FETCHes short of room take pages in the order
         they came. Copies published before are pinned in that turn too: a
         pin keeps its page from eviction."""
-        need = list(flights)
-        ready: collections.deque[_Flight] = collections.deque()
+        need = [] if staged else list(flights)
+        ready: collections.deque[_Flight] = collections.deque(flights if staged else [])
         running: list[_Flight] = []
         wake = threading.Event()
         # The FETCH that leads them took its turn as it came (_lead leaves it)
-        turn = flights[0].leader.op if flights else None
+        turn = flights[0].leader.op if flights and not staged else None
         while need or ready or running:
             wake.clear()
             need = self._expire(need)
@@ -585,7 +595,12 @@ class FetchManager:
             if ended:
                 running = [f for f in running if f not in ended]
                 read = [f for f in ended if self._read_result(f)]
-                for flight in self._publish(read):
+                try:
+                    published = self._publish(read)
+                finally:
+                    for flight in read:
+                        self._unstage(flight, TransferEnd.DONE)
+                for flight in published:
                     self._fan_out(flight)
                 continue
             if need or running:
@@ -780,12 +795,28 @@ class FetchManager:
     def _start_read(self, flight: _Flight, wake: threading.Event) -> bool:
         """Submit the read of the source into the flight's page."""
         assert flight.dest is not None
-        if not self._live(flight):
+        if self._stop.is_set() or not self._live(flight):
+            self._unstage(flight, TransferEnd.NOT_POSTED)
             self._release_source(flight)
             self._drop_page(flight)
             self._fail(flight, _miss())
             return False
         remote = flight.source_ref is None
+        if (
+            remote
+            and not POOL_KINDS[flight.source.kind].mappable
+            and flight.staged is None
+        ):
+            tier = self.transfers.owner_tier(flight.source.pool_id)
+            assert tier is not None
+            flight.stage_tier = tier
+            tier.stage(
+                flight.key,
+                flight.source,
+                self._deadline(flight),
+                lambda staged: self._stage_answered(flight, staged),
+            )
+            return False
         if flight.source_ref is None:
             refs = [flight.dest]
             acquired = self.pools.io_acquire_transfer(flight.dest)
@@ -793,6 +824,7 @@ class FetchManager:
             refs = [flight.source_ref, flight.dest]
             acquired = self.pools.io_acquire(flight.source_ref, flight.dest)
         if not acquired:
+            self._unstage(flight, TransferEnd.NOT_POSTED)
             self._release_source(flight)
             self._drop_page(flight)
             self._fail(flight, _miss(MissReason.ABSENT))
@@ -800,7 +832,11 @@ class FetchManager:
         dest = self.pools.transfer_location(flight.dest)
         try:
             flight.ticket = self.transfers.submit_io(
-                Copy(flight.source, dest, flight.source.length),
+                Copy(
+                    flight.staged.location if flight.staged else flight.source,
+                    dest,
+                    flight.source.length,
+                ),
                 flight.source_ref,
                 flight.dest,
                 callback=lambda t: self._read_ended(flight, refs, wake, t),
@@ -810,11 +846,36 @@ class FetchManager:
         except Exception as e:  # a full queue, or the engine stopped
             logger.debug("cannot read %s: %s", flight.key, e)
             self.pools.io_release(refs)
+            self._unstage(flight, TransferEnd.NOT_POSTED)
             self._release_source(flight)
             self._drop_page(flight)
             self._fail(flight, _miss(MissReason.BUSY))
             return False
         return True
+
+    def _stage_answered(self, flight: _Flight, staged: Staged | None) -> None:
+        """Resume on the executor; waiting for STAGE holds no fetch thread."""
+        flight.staged = staged
+        if staged is not None and not self._stop.is_set():
+            try:
+                self._tasks.submit(self._lead, [flight], staged=True)
+                return
+            except RuntimeError:  # the executor stopped
+                pass
+        self._unstage(flight, TransferEnd.NOT_POSTED)
+        self._release_source(flight)
+        self._drop_page(flight)
+        self._fail(flight, _miss(MissReason.BUSY))
+
+    def _unstage(self, flight: _Flight, end: TransferEnd) -> None:
+        if flight.staged is None:
+            return
+        tier = flight.stage_tier
+        assert tier is not None
+        with self._lock:
+            if end == TransferEnd.UNKNOWN and flight.read_settled:
+                end = TransferEnd.DONE
+            tier.unstage(flight.staged, end)
 
     def _read_ended(
         self,
@@ -839,6 +900,8 @@ class FetchManager:
                 if flight.charged:
                     flight.charged -= flight.bounce
                     self._inflight -= flight.bounce
+            if ticket.kept:
+                self._unstage(flight, TransferEnd.UNKNOWN)
         finally:
             flight.read_over = True
             wake.set()
@@ -853,6 +916,7 @@ class FetchManager:
                 self.pools.resolve_quarantined(
                     flight.quarantined, f"rdma:{flight.source_node}"
                 )
+        self._unstage(flight, TransferEnd.DONE)
 
     def _read_result(self, flight: _Flight) -> bool:
         """Whether the read moved every byte; else the flight ends."""
@@ -864,6 +928,7 @@ class FetchManager:
         if flight.quarantined is not None:
             self._reject_copy(flight)
         else:
+            self._unstage(flight, TransferEnd.NOT_POSTED)
             self._release_source(flight)
             self._drop_page(flight)
         if ticket.cancelled:

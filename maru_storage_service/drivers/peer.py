@@ -19,6 +19,7 @@ kept and the running ones would pass quarantine_max, so the kept never do.
 
 from __future__ import annotations
 
+import functools
 import logging
 import mmap
 import os
@@ -40,13 +41,16 @@ from maru_common.remote_protocol import (
     RemotePool,
     RemoteWriteDoneRequest,
     ReserveRequest,
+    StageRequest,
     TransferEnd,
+    UnstageRequest,
     Written,
     peer_origin,
 )
 from maru_common.storage_types import (
     MAX_BATCH,
     REMOTE_CAPABILITY,
+    STAGE_CAPABILITY,
     ItemOutcome,
     Key,
     Location,
@@ -127,6 +131,10 @@ def _parse(raw: dict, ctx: TierContext) -> dict:
     }
 
 
+def _credit_key(location: Location) -> tuple[str, int, int]:
+    return (location.pool_id, location.offset, location.generation)
+
+
 def agent_name(node_id: str, node_epoch: str) -> str:
     return f"maru-gpu-{node_id}-{node_epoch[:8]}"
 
@@ -185,6 +193,7 @@ class _MemoryNode:
         self.conn_gen = 0
         self.peer = ""  # NIXL agent of its run
         self.pools: dict[str, RemotePool] = {}
+        self.capabilities: list[str] = []
         self.ready = False
         self.room = 0
         self.reserved = 0  # bytes reserved since room was told
@@ -194,6 +203,11 @@ class _MemoryNode:
         self.unanswered: dict[int, tuple[int, Any, Callable[[Any], None]]] = {}
         # RESERVEs whose credits never came back: canceled after a reconnect
         self.lost_reserves: set[int] = set()
+        # Credits given and not posted yet: page -> the connection (conn_gen)
+        # they came on; only those of the current one are written
+        self.credits: dict[tuple[str, int, int], int] = {}
+        # WRITEs running there
+        self.writes = 0
 
 
 class NixlRemoteTier(RemoteTier):
@@ -210,7 +224,9 @@ class NixlRemoteTier(RemoteTier):
         self.page_size = env.page_size
         self.timeout_s = tier.timeout_s or DEFAULT_RDMA_TIMEOUT_S
         self.key_file = tier.options.get("key_file", DEFAULT_COPY_FILE)
-        self.quarantine_max = tier.options.get("quarantine_max", DEFAULT_QUARANTINE_MAX)
+        self.quarantine_max = int(
+            tier.options.get("quarantine_max", DEFAULT_QUARANTINE_MAX)
+        )
         self.rdma_device = tier.rdma_device or ""
         self.origin = peer_origin(env.node_id, env.node_epoch)
         self.agent = agent_name(env.node_id, env.node_epoch)
@@ -238,6 +254,7 @@ class NixlRemoteTier(RemoteTier):
         self._running = 0
         # NIXL peers of earlier memory runs, removed once no handle holds them
         self._stale_peers: set[str] = set()
+        self._next_stage = 1  # stage_id: unique in this run
         self._drained = False
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -259,10 +276,11 @@ class NixlRemoteTier(RemoteTier):
         )
 
     def capabilities(self) -> list[str]:
-        """remote_v1 once every L1 pool is registered with the NIC."""
+        """remote_v1 and stage_v1 once every L1 pool is registered with the
+        NIC."""
         with self._lock:
             usable = self.transport is not None and self._attached and not self._refused
-        return [REMOTE_CAPABILITY] if usable else []
+        return [REMOTE_CAPABILITY, STAGE_CAPABILITY] if usable else []
 
     def opened(self, server_epoch: str, accepted: list[str]) -> None:
         """The run is open: connect to the memory nodes if MaruServer
@@ -424,7 +442,13 @@ class NixlRemoteTier(RemoteTier):
             conn.close()
             raise ConnectionError(f"HELLO refused: {hello.refusal} {hello.error}")
         replay = self._take_run(node, conn, hello)
-        self._load(node)
+        try:
+            self._load(node)
+        except BaseException:
+            with self._lock:  # still to send again on the next connection
+                for entry in replay:
+                    node.unanswered.setdefault(entry[1].op.seq, entry)
+            raise
         logger.info(
             "memory node %s ready: %s@%s, %d pools, room %d MiB",
             node.url,
@@ -448,11 +472,12 @@ class NixlRemoteTier(RemoteTier):
         if self.transport.has_peer(peer) and not self.transport.peer_usable(peer):
             if not self.transport.disconnect(peer):
                 raise ConnectionError(f"{peer} still has transfers held")
-        for pool in pools:
+        reached = [p for p in pools if p.metadata]  # the others are staged
+        for pool in reached:
             self.transport.add_peer(pool.metadata, peer=peer, timeout_s=RPC_TIMEOUT_S)
         if not self.transport.announce(peer):
             raise ConnectionError(f"cannot reach {peer}")
-        if pools and not self._probe_read(node_id, peer, pools[0]):
+        if reached and not self._probe_read(node_id, peer, reached[0]):
             raise ConnectionError(f"the probe READ of {peer} did not end DONE")
         with self._lock:
             node.ready = True
@@ -475,11 +500,13 @@ class NixlRemoteTier(RemoteTier):
                 node.ops = OpOrigin(self.origin)
                 node.unanswered.clear()
                 node.lost_reserves.clear()
+                node.credits.clear()
             if node.peer and node.peer != hello.agent_name:
                 self._stale_peers.add(node.peer)
             node.node_id, node.node_epoch = hello.node_id, hello.node_epoch
             node.conn, node.peer = conn, hello.agent_name
             node.pools = {p.pool_id: p for p in hello.pools}
+            node.capabilities = list(hello.capabilities)
             node.room, node.reserved = hello.room, 0
             replay = sorted(node.unanswered.items())
             node.unanswered.clear()
@@ -557,19 +584,24 @@ class NixlRemoteTier(RemoteTier):
         code: int,
         request: Any,
         callback: Callable[[Any], None],
+        *,
+        resolve: bool = True,
+        abandoned: Callable[[], bool] = lambda: False,
     ) -> None:
         """Send an op; its answer goes to ``callback``. One whose answer is
-        lost is kept to be sent again (same seq) on the next connection."""
+        lost is kept to be sent again (same seq) on the next connection,
+        unless its sender abandoned it. With ``resolve`` False the sender
+        resolves the seq itself."""
         seq = request.op.seq
         ops = node.ops
 
         def answered(response: Any) -> None:
             if isinstance(response, ConnectionError):
                 with self._lock:
-                    if node.ops is ops:  # still the same memory run
+                    if node.ops is ops and not abandoned():  # same memory run
                         node.unanswered[seq] = (code, request, callback)
                 return
-            if ops is not None:
+            if ops is not None and resolve:
                 ops.resolved(seq)
             callback(response)
 
@@ -581,20 +613,32 @@ class NixlRemoteTier(RemoteTier):
             code, ops.refresh(request) if ops is not None else request, answered
         )
 
-    def _call(self, node: _MemoryNode, code: int, request: Any) -> Any:
-        """Send an op and wait for its answer; raises TimeoutError or
-        ConnectionError when it is not known (it is then sent again later)."""
-        got: list[Any] = []
-        event = threading.Event()
+    def _call(
+        self, node: _MemoryNode, code: int, request: Any, *, resolve: bool = True
+    ) -> Any:
+        """Send an op and wait for its answer; raises TimeoutError when it is
+        not known by then: then the op is abandoned with ``resolve`` False
+        (a late answer is dropped, the seq stays outstanding), else sent
+        again later. An answer either arrives in time or is abandoned."""
+        cv = threading.Condition()
+        state: dict[str, Any] = {}
 
         def callback(response: Any) -> None:
-            got.append(response)
-            event.set()
+            with cv:
+                if not state.get("abandoned"):
+                    state["answer"] = response
+                    cv.notify_all()
 
-        self._send(node, code, request, callback)
-        if not event.wait(RPC_TIMEOUT_S):
-            raise TimeoutError(f"no answer from {node.url}")
-        return got[0]
+        def abandoned() -> bool:
+            with cv:
+                return bool(state.get("abandoned")) and not resolve
+
+        self._send(node, code, request, callback, resolve=resolve, abandoned=abandoned)
+        with cv:
+            if not cv.wait_for(lambda: "answer" in state, RPC_TIMEOUT_S):
+                state["abandoned"] = True
+                raise TimeoutError(f"no answer from {node.url}")
+            return state["answer"]
 
     def _pick(self, nbytes: int, skip: set[str]) -> _MemoryNode | None:
         """Caller holds the lock: the ready memory node with the most room."""
@@ -620,7 +664,10 @@ class NixlRemoteTier(RemoteTier):
                 if node is None:
                     break
                 tried.add(node.node_id)
-                want = min(len(keys) - given, MAX_BATCH)
+                slots = IO_DEPTH_PER_NODE - node.writes - len(node.credits)
+                want = min(len(keys) - given, MAX_BATCH, max(0, slots))
+                if want <= 0:
+                    continue
                 node.reserved += want * self.page_size
                 request = self._stamp(node, ReserveRequest(PLACEHOLDER_OP, want))
             credits = self._reserve_from(node, request)
@@ -633,16 +680,26 @@ class NixlRemoteTier(RemoteTier):
         self, node: _MemoryNode, request: ReserveRequest
     ) -> list[Location]:
         seq = request.op.seq
+        ops = node.ops
         try:
-            response = self._call(node, RemoteMessageType.RESERVE, request)
+            response = self._call(
+                node, RemoteMessageType.RESERVE, request, resolve=False
+            )
         except (TimeoutError, ConnectionError):
+            # Its seq stays outstanding until the CANCEL of it is answered,
+            # so no ack passes it before
             with self._lock:
                 node.unanswered.pop(seq, None)  # canceled instead
                 node.lost_reserves.add(seq)
             self._cancel_lost(node)
             return []
+        if ops is not None:
+            ops.resolved(seq)
         with self._lock:
             node.room, node.reserved = response.room, 0
+            if response.status == Status.OK and node.ops is ops:
+                for credit in response.credits:
+                    node.credits[_credit_key(credit)] = node.conn_gen
         if response.status != Status.OK:
             logger.debug("RESERVE refused by %s: %s", node.url, response.error)
             return []
@@ -696,9 +753,22 @@ class NixlRemoteTier(RemoteTier):
                     )
                 for i, outcome in zip(part, response.items, strict=True):
                     out[i] = outcome
+                # Those credits are this run's no longer: room again there
+                self._more_room(node, len(part))
         return [o for o in out if o is not None]
 
+    def _more_room(self, node: _MemoryNode, pages: int) -> None:
+        """Credits this run held there went back (written or canceled): the
+        room it was last told grows by them until the next answer tells."""
+        with self._lock:
+            node.room += pages * self.page_size
+
     def cancel(self, locations: list[Location]) -> None:
+        with self._lock:
+            for location in locations:
+                node = self._node_of(location.pool_id)
+                if node is not None:
+                    node.credits.pop(_credit_key(location), None)
         self._fire(
             locations, lambda part: CancelRequest(PLACEHOLDER_OP, locations=part)
         )
@@ -727,14 +797,101 @@ class NixlRemoteTier(RemoteTier):
                 if isinstance(request, DropRequest)
                 else RemoteMessageType.CANCEL
             )
-            self._send(node, code, request, lambda _r: None)
+            self._send(node, code, request, functools.partial(self._fired, node))
 
-    def stage(self, key: Key, source: Location, deadline: float) -> Staged | None:
-        """Memory nodes do not stage SSD pages for this node: a miss."""
-        return None
+    def _fired(self, node: _MemoryNode, response: Any) -> None:
+        if getattr(response, "status", None) == Status.OK:
+            self._more_room(node, getattr(response, "freed", 0))
+
+    def stages(self, node_id: str) -> bool:
+        with self._lock:
+            return any(
+                n.node_id == node_id and STAGE_CAPABILITY in n.capabilities
+                for n in self._nodes
+            )
+
+    def stage(
+        self,
+        key: Key,
+        source: Location,
+        deadline: float,
+        callback: Callable[[Staged | None], None],
+    ) -> None:
+        """STAGE on the owner; ``callback`` once, with the staging page or
+        None (a miss, or no answer by ``deadline``: that STAGE is then
+        UNSTAGEd as never posted, in case it ran)."""
+        request = None
+        with self._lock:
+            node = self._node_of(source.pool_id)
+            remaining_ms = int(max(0.0, deadline - self._clock()) * 1000)
+            if (
+                node is not None
+                and node.ready
+                and node.ops is not None
+                and not self._full()
+                and remaining_ms > 0
+            ):
+                stage_id = self._next_stage
+                self._next_stage += 1
+                node_id, epoch = node.node_id, node.node_epoch
+                request = self._stamp(
+                    node,
+                    StageRequest(PLACEHOLDER_OP, stage_id, key, source, remaining_ms),
+                )
+        if node is None or request is None:
+            callback(None)
+            return
+        once = threading.Lock()
+
+        def finish(staged: Staged | None) -> bool:
+            if not once.acquire(blocking=False):
+                return False
+            callback(staged)
+            return True
+
+        def answered(response: Any) -> None:
+            staging = getattr(response, "staging", None)
+            if getattr(response, "status", None) == Status.OK and staging is not None:
+                staged = Staged(node_id, epoch, stage_id, staging)
+                if not finish(staged):  # too late: never read
+                    self.unstage(staged, TransferEnd.NOT_POSTED)
+                return
+            if getattr(response, "limit", None) is not None:
+                with self._lock:
+                    node.room, node.reserved = 0, 0
+            finish(None)
+
+        def expired() -> None:
+            if finish(None):
+                self.unstage(
+                    Staged(node_id, epoch, stage_id, source), TransferEnd.NOT_POSTED
+                )
+
+        timer = threading.Timer(remaining_ms / 1000.0, expired)
+        timer.daemon = True
+        timer.start()
+        self._send(node, RemoteMessageType.STAGE, request, answered)
 
     def unstage(self, staged: Staged, end: TransferEnd) -> None:
-        return None
+        """How the READ of a staging page ended; nothing if its memory run
+        is gone (its pages went with it)."""
+        with self._lock:
+            node = next(
+                (
+                    n
+                    for n in self._nodes
+                    if n.node_id == staged.node_id
+                    and n.node_epoch == staged.node_epoch
+                    and n.ops is not None
+                ),
+                None,
+            )
+            if node is None:
+                return
+            request = self._stamp(
+                node, UnstageRequest(PLACEHOLDER_OP, staged.stage_id, end)
+            )
+        self._send(node, RemoteMessageType.UNSTAGE, request, lambda _r: None)
 
     # ----------------------------------------------------------------- I/O
 
@@ -793,10 +950,17 @@ class NixlRemoteTier(RemoteTier):
             node = self._node_of(remote.pool_id)
             if node is None or not node.ready:
                 raise RuntimeError(f"no ready memory node has {remote.pool_id}")
+            if op == "WRITE":
+                # Only a credit of this memory run and connection is written
+                if node.credits.get(_credit_key(remote)) != node.conn_gen:
+                    raise RuntimeError(f"{remote} is no credit of this connection")
+                if node.writes >= IO_DEPTH_PER_NODE:
+                    raise RuntimeError(f"{IO_DEPTH_PER_NODE} writes run there")
             pool = node.pools[remote.pool_id]
             local = self.exporter.export(span.pool_id)
             if (
                 local is None
+                or not pool.metadata  # staged, never reached by RDMA
                 or not 0 < n <= remote.length
                 or span.offset < 0
                 or span.offset + n > local.nbytes
@@ -825,6 +989,9 @@ class NixlRemoteTier(RemoteTier):
             )
             self._transfers.append(transfer)
             self._running += 1
+            if op == "WRITE":
+                node.credits.pop(_credit_key(remote), None)
+                node.writes += 1
             self._wake.notify_all()
         return transfer
 
@@ -856,7 +1023,10 @@ class NixlRemoteTier(RemoteTier):
             transfer.state = state
             if transfer.phase == "kept":
                 if state is TransferState.DONE:
-                    transfer.phase, transfer.kept = "settled", False
+                    if not transfer.done.is_set():
+                        return None  # its end callback runs first
+                    # ``kept`` stays: it tells how the first end went
+                    transfer.phase = "settled"
                     self._kept_bytes -= self.page_size
                     self._transfers.remove(transfer)
                     return "settle"
@@ -872,11 +1042,13 @@ class NixlRemoteTier(RemoteTier):
                 )
                 self._transfers.remove(transfer)
                 self._running -= transfer.nbytes > 0  # the probe is not counted
+                self._write_ended(transfer)
                 return "end"
             if state is TransferState.PENDING and now < transfer.timeout_at:
                 return None
             transfer.phase, transfer.kept = "kept", True
             self._running -= transfer.nbytes > 0
+            self._write_ended(transfer)
             self._kept_bytes += self.page_size
             if state is TransferState.ERR:
                 transfer.error = RuntimeError(f"RDMA {transfer.op} ended in an error")
@@ -896,6 +1068,13 @@ class NixlRemoteTier(RemoteTier):
                     self._kept_bytes >> 20,
                 )
             return "end"
+
+    def _write_ended(self, transfer: RemoteTransfer) -> None:
+        """Caller holds the lock: a WRITE's slot there is free."""
+        if transfer.op == "WRITE" and transfer.nbytes > 0:
+            for node in self._nodes:
+                if node.node_id == transfer.node_id and node.writes > 0:
+                    node.writes -= 1
 
     @staticmethod
     def _report(transfer: RemoteTransfer, action: str) -> None:

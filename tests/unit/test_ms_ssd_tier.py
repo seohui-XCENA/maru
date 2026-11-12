@@ -281,19 +281,15 @@ def test_the_tiers_over_an_ssd_demote_into_it(stores, demotes):
 
 
 def test_other_ssd_configs_are_refused():
-    with pytest.raises(NotServableError, match="write-through"):
-        check_servable(_config(["dram", "ssd"], demotion="through"))
+    check_servable(_config(["dram", "ssd"], demotion="through"))
     with pytest.raises(NotServableError, match="not implemented"):
         check_servable(_config(["dram", "ssd", "remote"]))
-    # A memory node serves the same tiers, and the same refusals hold
+    # A memory node serves the same tiers
     memory = dataclasses.replace(_config(["dram", "ssd"]), role="memory")
     check_servable(memory)
-    with pytest.raises(NotServableError, match="write-through"):
-        check_servable(
-            dataclasses.replace(
-                _config(["dram", "ssd"], demotion="through"), role="memory"
-            )
-        )
+    check_servable(
+        dataclasses.replace(_config(["dram", "ssd"], demotion="through"), role="memory")
+    )
 
 
 # =============================================================================

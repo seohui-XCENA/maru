@@ -16,6 +16,7 @@ ends. A peer node (all peers) past its quarantine cap gets no more room.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import logging
 import threading
 import time
@@ -44,11 +45,13 @@ from maru_common.storage_types import (
     ItemResult,
     KeyLocation,
     Location,
+    MissReason,
     Status,
 )
 
 from .pool_manager import PageRef, PageState
 from .storage_manager import StorageManager
+from .transfer_engine import Copy
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,15 @@ class PeerOps:
         self._tombstones: dict[str, set[int]] = {}
         # Peer runs that ended: no op of theirs is served again
         self._retired: set[str] = set()
+        # Staging pages answered to a peer run, by (origin, stage_id): ref,
+        # location, TTL end; those quarantined; UNSTAGEs before their STAGE;
+        # the bytes of a run's staging pages (in its credit cap); runs whose
+        # connection went since their last op
+        self._staged: dict[tuple[str, int], tuple[PageRef, Location, float]] = {}
+        self._lost: set[str] = set()
+        self._staged_quarantine: dict[tuple[str, int], Location] = {}
+        self._unstaged: set[tuple[str, int]] = set()
+        self._staging_bytes: collections.Counter[str] = collections.Counter()
         self._stop = threading.Event()
         self._sweeper: threading.Thread | None = None
 
@@ -168,8 +180,15 @@ class PeerOps:
                 return ReserveResponse(
                     status=Status.OK, room=0, limit=RoomLimit.QUARANTINE
                 )
-            want = request.pages * self.page_size
-            credits = self.pools.credit(origin, want, self.manager.credit_tiers)
+            self._lost.discard(origin)
+            # Its staging pages count in its credit cap too
+            cap = self.pools.budgets.credit_max_bytes - self._staging_bytes[origin]
+            want = min(request.pages * self.page_size, max(0, cap))
+            credits = (
+                self.pools.credit(origin, want, self.manager.credit_tiers)
+                if want >= self.page_size
+                else []
+            )
             deadline = self._clock() + self.reserve_ttl_s
             for credit in credits:
                 self._credited[_page_key(credit)] = (origin, credit, deadline)
@@ -341,7 +360,108 @@ class PeerOps:
         deadline: float,
         done: Callable[[StageResponse], None],
     ) -> None:
-        done(StageResponse(status=Status.REJECTED, error="stage_v1 is not served"))
+        """On a stage worker: load the exact READY SSD page into a staging
+        page of the top tier for the peer to READ, by ``deadline``. A
+        staging page counts in the peer's credit cap; it is never told to
+        anyone, so it is FREE again unless its location was answered."""
+        done(self._stage(origin, request, deadline))
+
+    def _stage(
+        self, origin: str, request: StageRequest, deadline: float
+    ) -> StageResponse:
+        key = (origin, request.stage_id)
+        ps = self.page_size
+        with self._lock:
+            if origin in self._retired:
+                return StageResponse(status=Status.REJECTED, error="the run ended")
+            self._lost.discard(origin)
+            if key in self._unstaged:  # its UNSTAGE came first
+                return StageResponse(status=Status.OK)
+            if key in self._staged or key in self._staged_quarantine:
+                return StageResponse(status=Status.OK)  # answered before
+            if self._capped(peer_node(origin)):
+                return StageResponse(
+                    status=Status.OK,
+                    reason=MissReason.BUSY,
+                    limit=RoomLimit.QUARANTINE,
+                )
+            held = self.pools.held_bytes(origin) + self._staging_bytes[origin]
+            if held + ps > self.pools.budgets.credit_max_bytes:
+                return StageResponse(status=Status.OK, reason=MissReason.BUSY)
+            self._staging_bytes[origin] += ps  # this run's, while it loads
+        try:
+            staged = self._load(request, deadline)
+        except Exception:
+            logger.exception("STAGE of %s failed", request.source)
+            staged = MissReason.IO_ERROR
+        with self._lock:
+            if isinstance(staged, MissReason):
+                self._staging_bytes[origin] -= ps
+                return StageResponse(status=Status.OK, reason=staged)
+            ref, location = staged
+            gone = origin in self._retired or origin in self._lost
+            late = self._clock() >= deadline or gone
+            if late or key in self._unstaged:
+                # Never answered: nobody reads it
+                self.pools.transfer_failed(ref)
+                self._staging_bytes[origin] -= ps
+                if late:
+                    return StageResponse(status=Status.OK, reason=MissReason.TIMEOUT)
+                return StageResponse(status=Status.OK)
+            ttl = self._clock() + self.reserve_ttl_s
+            # The whole page is what a quarantine and its evidence name
+            self._staged[key] = (ref, self.pools.transfer_location(ref), ttl)
+        return StageResponse(status=Status.OK, staging=location)
+
+    def _load(
+        self, request: StageRequest, deadline: float
+    ) -> tuple[PageRef, Location] | MissReason:
+        """The SSD page read into a new staging page (TRANSFER), or why not."""
+        source = request.source
+        transfers = self.manager.transfers
+        src = self.pools.find(source)
+        page = self.pools.page(src) if src is not None else None
+        if (
+            transfers is None
+            or src is None
+            or page is None
+            or page.state != PageState.READY
+            or page.key != request.key
+            or page.location != source
+        ):
+            return MissReason.ABSENT
+        if self._clock() >= deadline:
+            return MissReason.TIMEOUT
+        top = self.manager.credit_tiers[0] if self.manager.credit_tiers else None
+        refs = self.manager._reserve_below(top, 1) if top is not None else []
+        if not refs:
+            return MissReason.BUSY
+        staging = refs[0]
+        if not self.pools.io_acquire(src, staging):
+            self.pools.transfer_failed(staging)
+            return MissReason.ABSENT
+        location = dataclasses.replace(
+            self.pools.transfer_location(staging), length=source.length
+        )
+        ended = threading.Event()
+        try:
+            ticket = transfers.submit_io(
+                Copy(source, location, source.length),
+                src,
+                staging,
+                callback=lambda _t: ended.set(),
+                deadline=deadline,
+            )
+        except Exception:
+            self.pools.io_release([src, staging])
+            self.pools.transfer_failed(staging)
+            return MissReason.BUSY
+        ended.wait()  # a file read always ends
+        self.pools.io_release([src, staging])
+        if not ticket.ok:
+            self.pools.transfer_failed(staging)
+            return MissReason.TIMEOUT if ticket.late else MissReason.IO_ERROR
+        return staging, location
 
     def unstage(
         self,
@@ -349,25 +469,73 @@ class PeerOps:
         request: UnstageRequest,
         done: Callable[[UnstageResponse], None],
     ) -> None:
-        done(UnstageResponse(status=Status.REJECTED, error="stage_v1 is not served"))
+        """How the peer's READ of a staging page ended: DONE or never
+        posted frees it, UNKNOWN quarantines it (until that run's late
+        DONE). One before its STAGE leaves a tombstone."""
+        key = (origin, request.stage_id)
+        evidence = request.end in (TransferEnd.DONE, TransferEnd.NOT_POSTED)
+        with self._lock:
+            if origin in self._retired:
+                done(UnstageResponse(status=Status.REJECTED, error="the run ended"))
+                return
+            entry = self._staged.pop(key, None)
+            if entry is not None:
+                ref, location, _ = entry
+                self._staging_bytes[origin] -= self.page_size
+                if evidence:
+                    self.pools.transfer_failed(ref)
+                else:
+                    self.pools.quarantine_transfer(ref, origin)
+                    self._staged_quarantine[key] = location
+                    self.quarantined[peer_node(origin)] += self.page_size
+            elif key in self._staged_quarantine:
+                if evidence:
+                    location = self._staged_quarantine[key]
+                    freed, _, _ = self.pools.resolve_quarantined(location, origin)
+                    if freed is not None:
+                        del self._staged_quarantine[key]
+                        self.quarantined[peer_node(origin)] -= self.page_size
+            else:
+                self._unstaged.add(key)
+        done(UnstageResponse(status=Status.OK))
 
     # ------------------------------------------------------------ peer ends
 
     def peer_lost(self, origin: str) -> None:
-        """No live connection: the run's credits are quarantined; its own
-        evidence still releases them."""
+        """No live connection: the run's credits and answered staging pages
+        are quarantined; its own evidence still releases them."""
         with self._lock:
             self._quarantine_holder(origin)
+            self._quarantine_staged(origin)
+            self._lost.add(origin)
 
     def peer_retired(self, origin: str) -> None:
         """The run will never come back: its credits are quarantined until
         the memory run ends, and nothing of it is served again."""
         with self._lock:
             self._quarantine_holder(origin)
+            self._quarantine_staged(origin)
             self._retired.add(origin)
             self._reserves.pop(origin, None)
             self._tombstones.pop(origin, None)
+            self._unstaged = {k for k in self._unstaged if k[0] != origin}
         self.pools.forget_holder(origin)
+
+    def _quarantine_staged(self, origin: str, before: float | None = None) -> int:
+        """Caller holds the lock: the answered staging pages of ``origin``
+        (those past ``before`` only, if given) are quarantined."""
+        n = 0
+        for key in [k for k in self._staged if k[0] == origin]:
+            ref, location, ttl = self._staged[key]
+            if before is not None and ttl > before:
+                continue
+            del self._staged[key]
+            self.pools.quarantine_transfer(ref, origin)
+            self._staged_quarantine[key] = location
+            self._staging_bytes[origin] -= self.page_size
+            self.quarantined[peer_node(origin)] += self.page_size
+            n += 1
+        return n
 
     def _quarantine_holder(self, origin: str) -> None:
         """Caller holds the lock."""
@@ -399,6 +567,8 @@ class PeerOps:
             for origin, location, _ in expired:
                 if self._quarantine_credit(origin, location):
                     n += 1
+            for origin in {k[0] for k in self._staged}:
+                n += self._quarantine_staged(origin, before=now)
         if n:
             logger.warning("%d credited pages past their TTL are quarantined", n)
         return n

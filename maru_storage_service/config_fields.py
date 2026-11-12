@@ -125,6 +125,8 @@ class TierConfig:
     timeout_s: float | None = None
     # A tier below the top that workers map gives the credit the top lacks
     credit_fallback: bool = False
+    # demotion "through": bytes of copies to the tier below in flight at once
+    through_max_inflight: int | None = None
     # Keys of a store that has no field above (read-only)
     options: Mapping[str, Any] = field(default_factory=Options, repr=False, hash=False)
 

@@ -230,12 +230,15 @@ def test_only_a_memory_node_has_a_remote_server():
         parse_node_config(raw)
 
 
-def test_a_memory_node_is_servable_but_not_write_through():
+def test_a_memory_node_is_servable_write_through_too():
     raw = memory_raw("tcp://ms:5555", "/tmp/x", ssd=True)
     Node(parse_node_config(raw))  # check_servable passes
     raw = copy.deepcopy(raw)
     raw["tiers"][0]["demotion"] = "through"
-    with pytest.raises(NotServableError, match="write-through"):
+    traits = Node(parse_node_config(raw)).config.traits()
+    assert traits["dram"].copies_to == traits["dram"].demotes_to == "ssd"
+    raw["tiers"].insert(0, {"store": "ssd", "size": 16 * PAGE, "path": "/x"})
+    with pytest.raises((NotServableError, NodeConfigError)):
         Node(parse_node_config(raw))
 
 

@@ -4,6 +4,7 @@ DONE writes, quarantine of every page a transfer may still touch, release by
 the same run's evidence only, the quarantine caps and the credit TTL."""
 
 import threading
+import time
 
 import pytest
 
@@ -290,7 +291,7 @@ def test_drop_retires_the_exact_ready_location(node, fake):
     check(node)
 
 
-def test_stage_is_not_served(node):
+def test_stage_misses_a_credit_and_unstage_is_served(node):
     ops, seqs = node.peer_ops, Seqs()
     [credit] = reserve(ops, A, 1, seqs).credits
     r = call(
@@ -299,9 +300,54 @@ def test_stage_is_not_served(node):
         StageRequest(seqs.op(A), 1, Key("ns", "k"), credit, 1000),
         1e12,
     )
-    assert r.status == Status.REJECTED
+    assert r.status == Status.OK and r.staging is None
     r = call(ops.unstage, A, UnstageRequest(seqs.op(A), 1, TransferEnd.DONE))
-    assert r.status == Status.REJECTED
+    assert r.status == Status.OK
+    assert state(node, credit) == PageState.CREDITED
+    check(node)
+
+
+@pytest.mark.parametrize("end", [TransferEnd.DONE, TransferEnd.NOT_POSTED])
+def test_stage_loads_a_ready_ssd_page_and_unstage_frees_it(fake, end):
+    root = short_tmpdir()
+    service = memory_node(fake, root, Parts([]), ssd=True)
+    try:
+        key = Key("ns", "stage")
+        ops, seqs = service.peer_ops, Seqs()
+        [credit] = reserve(ops, A, 1, seqs).credits
+        assert (
+            write_done(ops, A, [written(credit, key)], seqs).items[0].result
+            == ItemResult.ADDED
+        )
+        free = service.pools.bytes_in(PageState.FREE, credit.pool_id)
+        service.manager.want_room("dram", free + PAGE)
+        wait_until(
+            lambda: (
+                len(fake.locations(key)) == 1
+                and fake.locations(key)[0].pool_id == service.tier("ssd").pool.pool_id
+            ),
+            what="SSD source",
+        )
+        source = fake.locations(key)[0]
+        answer = call(
+            ops.stage,
+            A,
+            StageRequest(seqs.op(A), 1, key, source, 5000),
+            time.monotonic() + 5,
+        )
+        assert answer.status == Status.OK and answer.staging is not None
+        ref = service.pools.find(answer.staging)
+        assert service.pools.page(ref).state == PageState.TRANSFER
+        assert ops._staging_bytes[A] == PAGE
+        assert (
+            call(ops.unstage, A, UnstageRequest(seqs.op(A), 1, end)).status == Status.OK
+        )
+        assert service.pools.page(ref).state == PageState.FREE
+        assert ops._staging_bytes[A] == 0
+        check(service)
+    finally:
+        service.stop()
+        remove_tree(root)
 
 
 def test_a_refused_op_keeps_the_credits_ttl(node):

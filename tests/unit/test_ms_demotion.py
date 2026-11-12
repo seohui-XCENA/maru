@@ -32,7 +32,6 @@ from maru_storage_service.pool_manager import PageState, PoolManager
 from maru_storage_service.ports import EpochChanged
 from maru_storage_service.service import (
     Node,
-    NotServableError,
     StorageService,
     check_servable,
 )
@@ -270,10 +269,13 @@ def test_one_tier_nodes_drop_as_before():
         assert (only.credit, only.evicts, only.demotes_to) == (True, True, None)
 
 
-def test_write_through_is_refused():
+def test_write_through_is_served():
     check_servable(_config(["dram", "cxl"]))
-    with pytest.raises(NotServableError, match="write-through"):
-        check_servable(_config(["dram", "cxl"], demotion="through"))
+    config = _config(["dram", "cxl"], demotion="through")
+    check_servable(config)
+    dram = config.traits()["dram"]
+    assert dram.demotes_to == dram.copies_to == "cxl"
+    assert dram.through_max_inflight == 256 << 20
 
 
 # =============================================================================

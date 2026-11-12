@@ -14,6 +14,7 @@ import pytest
 from maru_common.remote_protocol import TransferEnd, Written
 from maru_common.storage_types import (
     REMOTE_CAPABILITY,
+    STAGE_CAPABILITY,
     ItemResult,
     Key,
     Location,
@@ -190,7 +191,7 @@ def test_it_connects_probes_and_learns_the_pools(gpu, memory):
     dram = memory.node.tier("dram").pool.pool_id
     assert gpu.tier.owner(dram) == "mem1"
     assert gpu.tier.owner("dram:other:1") is None
-    assert gpu.tier.capabilities() == [REMOTE_CAPABILITY]
+    assert gpu.tier.capabilities() == [REMOTE_CAPABILITY, STAGE_CAPABILITY]
 
 
 def test_a_written_page_is_committed_on_the_memory_node(gpu, memory):
@@ -262,7 +263,7 @@ def test_a_transfer_past_timeout_is_kept_then_settled(fake, memory):
         g.tier.transport.stall(False)
         assert g.tier.transport.finish_stalled() == 1
         assert settled.wait(10)
-        assert g.tier.kept_bytes == 0 and not result.kept
+        assert g.tier.kept_bytes == 0 and result.kept and result.phase == "settled"
     finally:
         g.close()
 
@@ -552,3 +553,113 @@ def test_a_transfer_to_an_ended_memory_run_is_released_and_kept(fake, memory):
     finally:
         g.tier.transport.stall(False)
         g.close()
+
+
+def test_written_and_canceled_credits_give_room_back(gpu, memory):
+    node = gpu.tier._nodes[0]
+    a, b = gpu.tier.reserve([Key("ns", "a"), Key("ns", "b")])
+    assert node.room == 0  # the peer's credit cap is 2 pages
+    assert gpu.tier.reserve([Key("ns", "c")]) == [None]
+    store(gpu, 0, a, 1)
+    gpu.tier.write_done([Written(Key("ns", "a"), a, PAGE, TransferEnd.DONE)])
+    assert node.room == PAGE
+    gpu.tier.cancel([b])
+    wait_until(lambda: node.room == 2 * PAGE, what="canceled credit back")
+    assert gpu.tier.reserve([Key("ns", "d")]) != [None]
+
+
+def test_a_credit_of_an_ended_connection_is_never_written(quick, fake, memory):
+    g = Gpu(fake, [memory.url])
+    try:
+        g.wait_ready()
+        node = g.tier._nodes[0]
+        [credit] = g.tier.reserve([Key("ns", "old-conn")])
+        gen = node.conn_gen
+        node.conn.close()  # the same memory run, a new connection
+        wait_until(lambda: node.conn_gen > gen and g.tier.ready("mem1"))
+        with pytest.raises(RuntimeError, match="no credit of this connection"):
+            store(g, 0, credit, 1)
+        g.tier.cancel([credit])  # never posted: it goes back
+        wait_until(lambda: memory.state(credit) is None, what="credit freed")
+    finally:
+        g.close()
+
+
+def test_a_settle_waits_for_the_end_callback(fake, memory):
+    g = Gpu(fake, [memory.url], timeout_s=0.1)
+    try:
+        g.wait_ready()
+        [credit] = g.tier.reserve([Key("ns", "race")])
+        g.tier.transport.stall()
+        in_end, release = threading.Event(), threading.Event()
+        order = []
+
+        def end(result):
+            in_end.set()
+            release.wait(10)
+            order.append(("end", result.kept))
+
+        def settled(result):
+            order.append(("settled", result.kept))
+
+        g.tier.submit_store(
+            Span(LOCAL, 0, PAGE),
+            credit,
+            refs=(PageRef(LOCAL, 0, 1), None),
+            callback=end,
+            settled=settled,
+        )
+        assert in_end.wait(10)  # kept past timeout_s, its callback running
+        g.tier.transport.stall(False)
+        g.tier.transport.finish_stalled()  # DONE now, while the end callback runs
+        release.set()
+        wait_until(lambda: len(order) == 2, what="both reported")
+        assert order == [("end", True), ("settled", True)]
+    finally:
+        g.tier.transport.stall(False)
+        g.close()
+
+
+def test_an_abandoned_reserve_stays_outstanding_until_canceled(
+    quick, fake, memory, monkeypatch
+):
+    import maru_storage_service.drivers.peer as peer
+
+    g = Gpu(fake, [memory.url])
+    try:
+        g.wait_ready()
+        monkeypatch.setattr(peer, "RPC_TIMEOUT_S", 0.2)
+        ops = memory.node.peer_ops
+        real = ops.reserve
+        gate = threading.Event()
+
+        def slow(origin, request, done):
+            gate.wait(5)  # answered after the GPU gave up
+            real(origin, request, done)
+
+        monkeypatch.setattr(ops, "reserve", slow)
+        node = g.tier._nodes[0]
+        assert g.tier.reserve([Key("ns", "slow")]) == [None]
+        seq = max(node.ops.outstanding)
+        gate.set()
+        monkeypatch.setattr(ops, "reserve", real)
+        # The CANCEL by its seq frees the credits; then the seq is resolved
+        wait_until(
+            lambda: (
+                memory.node.pools.held_bytes(g.tier.origin) == 0
+                and seq not in node.ops.outstanding
+            ),
+            what="canceled and resolved",
+        )
+    finally:
+        g.close()
+
+
+def test_writes_per_memory_node_are_bounded(gpu, memory):
+    import maru_storage_service.drivers.peer as peer
+
+    node = gpu.tier._nodes[0]
+    node.writes = peer.IO_DEPTH_PER_NODE
+    assert gpu.tier.reserve([Key("ns", "deep")]) == [None]
+    node.writes = 0
+    assert gpu.tier.reserve([Key("ns", "deep")]) != [None]

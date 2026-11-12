@@ -124,6 +124,9 @@ class _Move:
     # The copy is READY below already (left by a KEPT move): the COMMIT of the
     # same location only places a finalizer on it again
     existing: bool = False
+    # A write-through copy of a page of this tier: committed with no
+    # finalizer, its source never moves
+    through: str | None = None
 
 
 @dataclass(eq=False)
@@ -137,6 +140,8 @@ class _RemoteMove:
     dest: Location  # what is committed there: the logical bytes
     # The copy is READY there already: only FINALIZE_MOVE runs
     existing: bool = False
+    # As _Move.through
+    through: str | None = None
 
 
 class StorageManager:
@@ -239,6 +244,12 @@ class StorageManager:
         # Source -> its READY copy on a memory node: the next demotion only
         # finalizes onto it
         self._remote_copies: dict[PageRef, Location] = {}
+        # Write-through: pages to copy below now, the bytes of copies in
+        # flight per tier, and how the copies went (COPIED bytes, SKIPPED,
+        # NO_ROOM, COPY_FAILED, COMMIT:<result>)
+        self._through: collections.deque[PageRef] = collections.deque()
+        self._through_inflight: collections.Counter[str] = collections.Counter()
+        self.through_results: collections.Counter[str] = collections.Counter()
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
 
@@ -310,11 +321,13 @@ class StorageManager:
             pending = len(self._tickets)
             retire = dict(self.retire_results)
             demotions = dict(self.move_results)
+            through = dict(self.through_results)
         return {
             "ended": self._ended,
             "pending_commits": pending,
             "retire_results": retire,
             "demotions": demotions,
+            "through": through,
             "credit_short": dict(self.pools.credit_short),
             "credit_short_bytes": dict(self.pools.credit_short_bytes),
         }
@@ -736,6 +749,7 @@ class StorageManager:
         if result == ItemResult.ADDED:
             self.pools.commit_added(ticket.ref)
             self.placement.on_ready(ticket.ref)
+            self._note_ready(ticket.ref)
             return outcome, True
         if result in (ItemResult.DUPLICATE, ItemResult.REJECTED):
             self.pools.commit_freed(ticket.ref)
@@ -760,6 +774,7 @@ class StorageManager:
                 self._writes_ended()
                 self._remote_writes_ended()
                 if run:
+                    self._copy_through()
                     self._retire_queued()
                     self._evict_once()
             except ServerStopped:
@@ -943,6 +958,129 @@ class StorageManager:
             if drop:
                 self.retire([r for r, _ in drop], [i for _, i in drop])
 
+    # ---------------------------------------------------------- write-through
+
+    def _note_ready(self, ref: PageRef) -> None:
+        """A page became READY in its tier (written, demoted or copied in):
+        copied below at once if the tier writes through."""
+        name = self.pools.tier_of(ref.pool_id)
+        traits = self.traits.get(name) if name is not None else None
+        if traits is not None and traits.copies_to is not None:
+            with self._lock:
+                self._through.append(ref)
+            self._evict_wake.set()
+
+    def _copy_through(self) -> None:
+        """Copy the pages noted READY in write-through tiers to the tier
+        below, each tier within its in-flight bytes (past it a page is
+        skipped: pressure demotes it later). The copy is committed with no
+        finalizer and kept as the source's copy below; nothing waits."""
+        with self._lock:
+            queued = list(dict.fromkeys(self._through))
+            self._through.clear()
+        if not queued or self.transfers is None or self._halted():
+            return
+        by_tier: dict[str, list[PageRef]] = {}
+        for ref in queued:
+            name = self.pools.tier_of(ref.pool_id)
+            if name is not None and self.traits.get(name) is not None:
+                by_tier.setdefault(name, []).append(ref)
+        for name, refs in by_tier.items():
+            try:
+                self._copy_tier(name, refs)
+            except ServerStopped:
+                raise
+            except Exception:
+                logger.exception("write-through copies of %s failed", name)
+
+    def _copy_tier(self, name: str, refs: list[PageRef]) -> None:
+        traits = self.traits[name]
+        below = traits.copies_to
+        if below is None:
+            return
+        todo: list[tuple[PageRef, KeyLocation]] = []
+        with self._lock:
+            room = traits.through_max_inflight - self._through_inflight[name]
+        for ref in refs:
+            page = self.pools.page(ref)
+            if (
+                page is None
+                or page.state != PageState.READY
+                or page.key is None
+                or page.location is None
+            ):
+                continue
+            with self._lock:
+                copied = ref in self._copies or ref in self._remote_copies
+            if copied:
+                continue
+            nbytes = page.location.length
+            if nbytes > room:
+                with self._lock:
+                    self.through_results["SKIPPED"] += 1
+                continue
+            room -= nbytes
+            todo.append((ref, KeyLocation(key=page.key, location=page.location)))
+        if not todo:
+            return
+        if below in self.remote:
+            tier = self.remote[below]
+            credits = tier.reserve([item.key for _, item in todo])
+            for (ref, item), credit in zip(todo, credits, strict=True):
+                if credit is None:
+                    with self._lock:
+                        self.through_results["NO_ROOM"] += 1
+                    continue
+                dest = dataclasses.replace(credit, length=item.location.length)
+                self._write_remote(
+                    tier,
+                    _RemoteMove(
+                        ref, item.key, item.location, credit, dest, through=name
+                    ),
+                )
+            return
+        dests = self._reserve_below(below, len(todo))
+        with self._lock:
+            self.through_results["NO_ROOM"] += len(todo) - len(dests)
+        moves = [
+            _Move(
+                ref,
+                item.key,
+                item.location,
+                dest,
+                dataclasses.replace(
+                    self.pools.transfer_location(dest), length=item.location.length
+                ),
+                through=name,
+            )
+            for (ref, item), dest in zip(todo, dests, strict=False)
+        ]
+        if moves:
+            self._run_moves(moves, io=self.traits[below].io_only)
+
+    def _release(
+        self, moves: list[_Move] | list[_RemoteMove], backoff: bool = True
+    ) -> None:
+        """Offer the moves' sources again; a write-through copy never took
+        its source."""
+        refs = [m.src for m in moves if m.through is None]
+        if refs:
+            self.placement.release(refs, backoff=backoff)
+
+    def _count(self, move: _Move | _RemoteMove, result: str) -> None:
+        with self._lock:
+            if move.through is None:
+                self.move_results[result] += 1
+                return
+            self.through_results[result] += 1
+            if result == "COMMIT:ADDED":
+                self.through_results["COPIED"] += move.source.length
+
+    def _through_ended(self, move: _Move | _RemoteMove) -> None:
+        """Caller holds the lock: a write-through copy left the wire."""
+        if move.through is not None:
+            self._through_inflight[move.through] -= move.source.length
+
     # ------------------------------------------------- demotion to memory nodes
 
     def _demote_remote(
@@ -996,7 +1134,7 @@ class StorageManager:
             existing = [m for m in moves if m.existing]
             if self._halted():  # nothing posted: the credits go back
                 tier.cancel([m.credit for m in fresh])
-                self.placement.release([m.src for m in moves], backoff=False)
+                self._release(moves, backoff=False)
                 return
             for move in fresh:
                 self._write_remote(tier, move)
@@ -1012,10 +1150,12 @@ class StorageManager:
         assert self.transfers is not None
         if not self.pools.io_acquire_one(move.src):  # the source went
             tier.cancel([move.credit])
-            self.placement.release([move.src])
+            self._release([move])
             return
         with self._lock:
             self._remote_writing += 1
+            if move.through is not None:
+                self._through_inflight[move.through] += move.source.length
         try:
             self.transfers.submit_io(
                 Copy(move.source, move.dest, move.source.length),
@@ -1027,11 +1167,12 @@ class StorageManager:
         except Exception as e:  # not posted: the credit goes back
             with self._lock:
                 self._remote_writing -= 1
-                self.move_results["COPY_FAILED"] += 1
+                self._through_ended(move)
+            self._count(move, "COPY_FAILED")
             self.pools.io_release([move.src])
             logger.debug("cannot write %s to a memory node: %s", move.src, e)
             tier.cancel([move.credit])
-            self.placement.release([move.src])
+            self._release([move])
 
     def _remote_write_ended(self, move: _RemoteMove, result: IOResult) -> None:
         """On the tier's thread: no RPC here."""
@@ -1039,6 +1180,7 @@ class StorageManager:
             self.pools.io_release([move.src])
         with self._lock:
             self._remote_writing -= 1
+            self._through_ended(move)
             self._remote_written.append((move, result))
         self._evict_wake.set()
 
@@ -1048,6 +1190,11 @@ class StorageManager:
         with self._lock:
             self._remote_settled.append(move)
         self._evict_wake.set()
+
+    def flush_remote(self) -> None:
+        """Tell the memory nodes how the drained writes ended (the teardown,
+        before the remote tier says GOODBYE)."""
+        self._remote_writes_ended()
 
     def _remote_writes_ended(self) -> None:
         """Tell the memory nodes how the writes ended; FINALIZE_MOVE the
@@ -1063,9 +1210,8 @@ class StorageManager:
         ok = [m for m, r in done if r.ok]
         failed = [m for m, r in done if not r.ok]
         for move in failed:  # the source stays; the memory node quarantines
-            with self._lock:
-                self.move_results["COPY_FAILED"] += 1
-            self.placement.release([move.src])
+            self._count(move, "COPY_FAILED")
+            self._release([move])
         self._remote_write_done(tier, failed, TransferEnd.UNKNOWN)
         # A late DONE commits there: the next demotion finalizes onto it
         for move, outcome in zip(
@@ -1078,13 +1224,14 @@ class StorageManager:
             return
         outcomes = self._remote_write_done(tier, ok, TransferEnd.DONE)
         if outcomes is None:  # unknown: the sources stay
-            self.placement.release([m.src for m in ok])
+            self._release(ok)
             return
         finals: list[_RemoteMove] = []
         for move, outcome in zip(ok, outcomes, strict=True):
-            with self._lock:
-                self.move_results[f"COMMIT:{outcome.result.value}"] += 1
-            if outcome.result == ItemResult.ADDED:
+            self._count(move, f"COMMIT:{outcome.result.value}")
+            if move.through is not None:  # a copy: noted, the source stays
+                self._note_remote_copy(move, outcome)
+            elif outcome.result == ItemResult.ADDED:
                 finals.append(move)
             elif (
                 outcome.result == ItemResult.DUPLICATE and outcome.location is not None
@@ -1288,7 +1435,7 @@ class StorageManager:
         if self._halted():  # no copy started: all go back
             for move in fresh:
                 self.pools.transfer_failed(move.dest)
-            self.placement.release([m.src for m in moves], backoff=False)
+            self._release(moves, backoff=False)
             return
         if io:
             self._write_io(fresh)
@@ -1308,17 +1455,16 @@ class StorageManager:
                     out.append(move)
                     continue
                 self.pools.transfer_failed(move.dest)
-                with self._lock:
-                    self.move_results["COPY_FAILED"] += 1
+                self._count(move, "COPY_FAILED")
             except Exception:
                 logger.exception("ending the copy to %s failed", move.dest)
-            self.placement.release([move.src])
+            self._release([move])
         return out
 
     def _moved(self, copied: list[_Move]) -> None:
         if self._halted():
             # The run is over: the copies go with it
-            self.placement.release([m.src for m in copied])
+            self._release(copied)
         elif copied:
             finals = self._commit_moves(copied)
             if finals:
@@ -1333,10 +1479,12 @@ class StorageManager:
         for move in moves:
             if not self.pools.io_acquire(move.src, move.dest):
                 self.pools.transfer_failed(move.dest)  # the source went
-                self.placement.release([move.src])
+                self._release([move])
                 continue
             with self._lock:
                 self._writing += 1
+                if move.through is not None:
+                    self._through_inflight[move.through] += move.source.length
             try:
                 self.transfers.submit_io(
                     Copy(move.source, move.dest_location, move.source.length),
@@ -1347,6 +1495,7 @@ class StorageManager:
             except Exception as e:  # a full queue, or the engine stopped
                 with self._lock:
                     self._writing -= 1
+                    self._through_ended(move)
                 self.pools.io_release([move.src, move.dest])
                 logger.debug("cannot write %s below: %s", move.src, e)
                 self._io_result(move.dest.pool_id, e)
@@ -1357,6 +1506,7 @@ class StorageManager:
         self.pools.io_release([move.src, move.dest])
         with self._lock:
             self._writing -= 1
+            self._through_ended(move)
             self._written.append((move, ticket))
         self._evict_wake.set()
 
@@ -1408,7 +1558,7 @@ class StorageManager:
         live = []
         for move in moves:
             if move.existing and not self._is_ready(move.dest, move.key):
-                self.placement.release([move.src])  # the copy went meanwhile
+                self._release([move])  # the copy went meanwhile
             elif self._is_ready(move.src, move.key):
                 live.append(move)
             elif not move.existing:
@@ -1422,14 +1572,14 @@ class StorageManager:
                         key=m.key,
                         location=m.dest_location,
                         logical_bytes=m.source.length,
-                        finalizer=True,
+                        finalizer=m.through is None,
                     )
                     for m in live
                 ]
             )
         except (EpochChanged, ServerStopped) as e:
             # The run is over: the copies go with it
-            self.placement.release([m.src for m in live])
+            self._release(live)
             if isinstance(e, ServerStopped):
                 raise
             self.end_run(f"MaruServer no longer knows the session ({e})")
@@ -1438,7 +1588,7 @@ class StorageManager:
             # Sent, maybe applied with a finalizer whose id is unknown
             if not isinstance(e, ReplyError):
                 logger.exception("COMMIT of %d demoted pages failed", len(live))
-            self.placement.release([m.src for m in live])
+            self._release(live)
             self.end_run(f"COMMIT of {len(live)} demoted pages: result unknown ({e})")
             return []
         if response.status == Status.OK:
@@ -1458,15 +1608,14 @@ class StorageManager:
                     finals.append(move)
             except Exception:
                 logger.exception("applying the COMMIT result of %s failed", move.dest)
-                self.placement.release([move.src])
+                self._release([move])
         return finals
 
     def _apply_move_commit(self, move: _Move, outcome: ItemOutcome) -> bool:
         """True if the copy has its finalizer for FINALIZE_MOVE. An unknown
         result ends the run."""
         result = outcome.result
-        with self._lock:
-            self.move_results[f"COMMIT:{result.value}"] += 1
+        self._count(move, f"COMMIT:{result.value}")
         if result == ItemResult.ADDED:
             if not move.existing:
                 self.pools.commit_added(move.dest)
@@ -1486,7 +1635,7 @@ class StorageManager:
                 self._note_copy(move.src, move.key, outcome.location)
         else:
             self.end_run(f"COMMIT of demoted page {move.dest} answered {result}")
-        self.placement.release([move.src])
+        self._release([move])
         return False
 
     def _note_copy(self, src: PageRef, key: Key, location: Location) -> None:
@@ -1585,6 +1734,7 @@ class StorageManager:
         )
         if not foreign:
             self.placement.on_ready(move.dest)  # a location of the key either way
+            self._note_ready(move.dest)
             if result == ItemResult.KEPT:
                 with self._lock:
                     self._copies[move.src] = move.dest
@@ -1604,6 +1754,7 @@ class StorageManager:
 
     def _keep_copy(self, move: _Move) -> None:
         self.placement.on_ready(move.dest)
+        self._note_ready(move.dest)
         with self._lock:
             self._copies[move.src] = move.dest
 

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from maru_common.remote_protocol import RemotePool
-from maru_common.storage_types import PoolInfo
+from maru_common.storage_types import POOL_KINDS, PoolInfo
 from maru_remote.checked import require_checked_transport
 from maru_remote.exporter import Export, NixlExporter
 from maru_remote.progress import ConnectProgress
@@ -49,21 +49,24 @@ class RemoteParts:
         self._close = close
 
     def remote_pools(self, infos: list[PoolInfo]) -> list[RemotePool]:
-        """What peers need to reach each registered pool of ``infos``."""
+        """What peers need to know of ``infos``: where each registered pool
+        is; a pool peers never reach by RDMA (SSD: staged) with no address
+        and no metadata, so they know its owner."""
         pools = []
         for info in infos:
             export = self.exporter.export(info.pool_id)
-            if export is not None:
-                pools.append(
-                    RemotePool(
-                        pool_id=info.pool_id,
-                        kind=info.kind,
-                        pool_generation=info.pool_generation,
-                        capacity=info.capacity,
-                        base=export.base,
-                        metadata=export.metadata,
-                    )
+            if export is None and POOL_KINDS[info.kind].mappable:
+                continue  # not registered: not in this run
+            pools.append(
+                RemotePool(
+                    pool_id=info.pool_id,
+                    kind=info.kind,
+                    pool_generation=info.pool_generation,
+                    capacity=info.capacity,
+                    base=export.base if export is not None else 0,
+                    metadata=export.metadata if export is not None else b"",
                 )
+            )
         return pools
 
     def close(self) -> None:

@@ -158,6 +158,10 @@ class Pair:
                 if e.pool.state == PoolState.ACTIVE
             ]
 
+    def on_memory_any(self, key: str) -> bool:
+        node = self.memory.config.node_id
+        return any(loc.pool_id.split(":")[1] == node for loc in self.locations(key))
+
     def on_memory(self, key: str) -> bool:
         mem_pool = self.memory.tier("dram").pool.pool_id
         return [loc.pool_id for loc in self.locations(key)] == [mem_pool]
@@ -260,3 +264,106 @@ def test_the_remote_tier_takes_demotions(ms):
         assert threading.active_count() > 0
     finally:
         p.close()
+
+
+def test_write_through_copies_to_the_memory_node_at_once(ms, workers):
+    import dataclasses
+
+    server, url = ms
+    p = Pair.__new__(Pair)
+    p.server = server
+    p.sockdir = short_tmpdir()
+    p.port = free_port()
+    p.memory = start_node(memory_config(url, p.port), make_transport=fake_transport)
+    config = gpu_config(url, p.sockdir, p.port)
+    top = dataclasses.replace(
+        config.tiers[0], demotion="through", through_max_inflight=64 * PAGE
+    )
+    p.gpu = start_node(
+        dataclasses.replace(config, tiers=(top, config.tiers[1])),
+        make_transport=fake_transport,
+    )
+    p.remote = p.gpu.tier("remote")
+    try:
+        wait_until(lambda: p.remote.ready("mem1"), what="remote ready")
+        h = workers(p.gpu)
+        for i in range(3):
+            assert put(h, f"k{i}")
+        mem_pool = p.memory.tier("dram").pool.pool_id
+        for i in range(3):
+            wait_until(
+                lambda i=i: mem_pool in {loc.pool_id for loc in p.locations(f"k{i}")},
+                what="a copy on the memory node",
+            )
+        stats = p.gpu.manager.through_results
+        assert stats["COMMIT:ADDED"] >= 3
+        assert len(p.gpu.manager._remote_copies) >= 3
+        assert p.gpu.manager.move_results["RETIRED"] == 0  # the sources stay
+        # Pressure then only finalizes onto those copies
+        for i in range(3, 12):
+            assert put(h, f"k{i}")
+        wait_until(
+            lambda: p.gpu.manager.move_results["RETIRED"] >= 3, what="pressure moved"
+        )
+        assert p.on_memory("k0")
+        wait_until(lambda: p.gpu.manager._remote_writing == 0, what="writes ended")
+        p.gpu.pools.check()
+        p.memory.pools.check()
+    finally:
+        p.close()
+
+
+def test_a_memory_node_writes_remote_ingress_through_to_its_ssd(ms, workers):
+    import dataclasses
+    import shutil
+    import tempfile
+
+    server, url = ms
+    ssd_dir = tempfile.mkdtemp(prefix="maru-mem-ssd-", dir="/var/tmp")
+    p = Pair.__new__(Pair)
+    p.server = server
+    p.sockdir = short_tmpdir()
+    p.port = free_port()
+    raw_mem = memory_config(url, p.port)
+    ssd = parse_node_config(
+        {
+            "node_id": "x",
+            "server": url,
+            "page_size": PAGE,
+            "tiers": [
+                {"store": "dram", "size": 32 * PAGE, "hugepage": False},
+                {"store": "ssd", "size": 64 * PAGE, "path": ssd_dir},
+            ],
+            "budgets": SMALL_CREDIT | {"transfer_reserve_bytes": PAGE},
+        }
+    ).tiers[1]
+    top = dataclasses.replace(
+        raw_mem.tiers[0], demotion="through", through_max_inflight=64 * PAGE
+    )
+    p.memory = start_node(
+        dataclasses.replace(raw_mem, tiers=(top, ssd)), make_transport=fake_transport
+    )
+    p.gpu = start_node(
+        gpu_config(url, p.sockdir, p.port), make_transport=fake_transport
+    )
+    p.remote = p.gpu.tier("remote")
+    try:
+        wait_until(lambda: p.remote.ready("mem1"), what="remote ready")
+        h = workers(p.gpu)
+        for i in range(12):
+            assert put(h, f"k{i}")
+        wait_until(
+            lambda: sum(p.on_memory_any(f"k{i}") for i in range(12)) >= 3,
+            what="pages on the memory node",
+        )
+        wait_until(
+            lambda: p.memory.manager.through_results["COMMIT:ADDED"] >= 3,
+            what="copied to the memory node's ssd",
+        )
+        kinds = {loc.kind for k in range(12) for loc in p.locations(f"k{k}")}
+        assert PoolKind.SSD in kinds
+        wait_until(lambda: p.memory.manager._writing == 0, what="ssd writes ended")
+        p.memory.pools.check()
+    finally:
+        p.close()
+        shutil.rmtree(ssd_dir, ignore_errors=True)

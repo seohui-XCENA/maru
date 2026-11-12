@@ -76,7 +76,8 @@ class IOResult(Protocol):
     def kept(self) -> bool:
         """It did not end DONE and the tier took its local pages over: they
         stay in use (a destination quarantined, a source held) until a late
-        DONE or the run's end, and the caller neither frees nor reuses them."""
+        DONE (``settled``) or the run's end, and the caller neither frees nor
+        reuses them before. It keeps telling how the first end went."""
         ...
 
     @property
@@ -332,9 +333,20 @@ class RemoteTier(L2Tier):
         """Credited pages never posted to go back."""
 
     @abstractmethod
-    def stage(self, key: Key, source: Location, deadline: float) -> Staged | None:
+    def stages(self, node_id: str) -> bool:
+        """The memory node stages its SSD pages for this node (stage_v1)."""
+
+    @abstractmethod
+    def stage(
+        self,
+        key: Key,
+        source: Location,
+        deadline: float,
+        callback: Callable[[Staged | None], None],
+    ) -> None:
         """The owner loads its SSD page ``source`` into a staging page by
-        ``deadline`` (monotonic); None on a miss."""
+        ``deadline`` (monotonic); ``callback`` gets it, or None on a miss.
+        Never waits."""
 
     @abstractmethod
     def unstage(self, staged: Staged, end: TransferEnd) -> None:

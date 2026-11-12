@@ -39,6 +39,8 @@ ROLES = ("gpu", "memory")
 
 DEFAULT_HIGH_WATERMARK = 0.9
 DEFAULT_LOW_WATERMARK = 0.8
+# Write-through copies in flight to the tier below, per tier
+DEFAULT_THROUGH_MAX_INFLIGHT = 256 << 20
 
 # Budget defaults (all provisional until measured)
 CREDIT_MAX_PAGES = 16
@@ -102,9 +104,14 @@ class TierTraits:
     kind: PoolKind | None  # the wire kind of its pools
     credit: bool  # workers get credit from it (the top tier)
     evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
-    demotes_to: str | None = None  # write-back target tier (demotion "back")
+    # Demotion back and through: pressure moves its pages to that tier
+    demotes_to: str | None = None
+    # Demotion through: pages that become READY here are copied there at once
+    copies_to: str | None = None
     # Workers get the credit the tiers above lack from it
     credit_fallback: bool = False
+    # Bytes of those copies in flight at once; past it a page is skipped
+    through_max_inflight: int = 0
 
     @property
     def io_only(self) -> bool:
@@ -163,12 +170,17 @@ class NodeConfig:
             spec = TIERS[t.store]
             if not spec.local:
                 out[t.store] = TierTraits(
-                    name=t.store, level=spec.level, kind=None, credit=False, evicts=False
+                    name=t.store,
+                    level=spec.level,
+                    kind=None,
+                    credit=False,
+                    evicts=False,
                 )
                 receives = False
                 continue
             below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
-            demotes = t.demotion == "back" and below is not None
+            demotes = t.demotion in DEMOTIONS and below is not None
+            through = t.demotion == "through" and below is not None
             fallback = i > 0 and t.credit_fallback
             out[t.store] = TierTraits(
                 name=t.store,
@@ -177,7 +189,9 @@ class NodeConfig:
                 credit=i == 0,
                 evicts=receives or fallback,
                 demotes_to=below.store if demotes and below else None,
+                copies_to=below.store if through and below else None,
                 credit_fallback=fallback,
+                through_max_inflight=t.through_max_inflight or 0,
             )
             receives = demotes
         return out
@@ -228,6 +242,22 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
                 raise NodeConfigError(
                     f"{what}.demotion: one of {list(DEMOTIONS)}, got {demotion!r}"
                 )
+        through_max = None
+        if "through_max_inflight" in raw:
+            if demotion != "through":
+                raise NodeConfigError(
+                    f"{what}.through_max_inflight: only with demotion through"
+                )
+            through_max = parse_size(
+                raw["through_max_inflight"], f"{what}.through_max_inflight"
+            )
+            if through_max < page_size:
+                raise NodeConfigError(
+                    f"{what}.through_max_inflight: {through_max} is smaller than "
+                    f"page_size {page_size}"
+                )
+        elif demotion == "through":
+            through_max = DEFAULT_THROUGH_MAX_INFLIGHT
 
         high = _number(raw, "high_watermark", what, DEFAULT_HIGH_WATERMARK)
         low = _number(raw, "low_watermark", what, DEFAULT_LOW_WATERMARK)
@@ -236,7 +266,11 @@ def _parse_tier(raw: Any, index: int, page_size: int, last: bool) -> TierConfig:
                 f"{what}: need 0 < low_watermark < high_watermark <= 1, got {low} and {high}"
             )
         tier.update(
-            size=size, demotion=demotion, high_watermark=high, low_watermark=low
+            size=size,
+            demotion=demotion,
+            high_watermark=high,
+            low_watermark=low,
+            through_max_inflight=through_max,
         )
 
     ctx = TierContext(what=what, index=index, page_size=page_size, last=last, size=size)

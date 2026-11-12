@@ -455,8 +455,11 @@ class _Remote(RemoteTier):
     def cancel(self, locations):
         pass
 
-    def stage(self, key, source, deadline):
-        return None
+    def stages(self, node_id):
+        return False
+
+    def stage(self, key, source, deadline, callback):
+        callback(None)
 
     def unstage(self, staged, end):
         pass

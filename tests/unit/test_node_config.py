@@ -389,7 +389,9 @@ class TestFileAndCli:
 
     def test_does_not_pretend_to_serve(self, tmp_path, capsys):
         raw = copy.deepcopy(GPU_NODE)
-        raw["tiers"][0]["demotion"] = "through"
+        raw["tiers"][1] = {"store": "ssd", "size": "1T", "path": "/mnt/a"}
+        raw["tiers"][2] = {"store": "remote", "url": "tcp://mem-1:5600"}
+        raw["budgets"] = {}
         path = tmp_path / "node.json"
         path.write_text(json.dumps(raw))
         assert main(["--config", str(path)]) == EXIT_NOT_SERVING
@@ -524,14 +526,18 @@ class TestRegistry:
         raw["budgets"] = {"transfer_reserve_bytes": {"cxl": "1G"}}
         config = parse_node_config(raw)
         dram, cxl, ssd = config.tiers
-        # combination, then the cxl size, then write-through
+        # combination, then the cxl size; write-through is served
         for tiers, match in (
             ((cxl, dram), "serving the tiers"),
             ((dram, cxl, ssd), "the cxl tier needs a size"),
-            ((dram, dataclasses.replace(cxl, size=T), ssd), "write-through"),
         ):
             with pytest.raises(NotServableError, match=match):
                 check_servable(dataclasses.replace(config, tiers=tiers))
+        check_servable(
+            dataclasses.replace(
+                config, tiers=(dram, dataclasses.replace(cxl, size=T), ssd)
+            )
+        )
         # A memory node serves the same tier combinations
         with pytest.raises(NotServableError, match="serving the tiers"):
             check_servable(

@@ -708,6 +708,7 @@ SPEC = TierSpec(
             "store",
             "size",
             "demotion",
+            "through_max_inflight",
             "high_watermark",
             "low_watermark",
             "region_size",
