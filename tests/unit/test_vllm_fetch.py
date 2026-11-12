@@ -262,6 +262,32 @@ def test_the_scheduler_probe_counts_a_fetch_only_for_parked_loads(
         probe.close()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [{}, {"maru_use_layerwise": True}, {"maru_overlap_load_with_compute": True}],
+)
+def test_the_probe_counts_a_fetch_only_for_leased_loads(mode):
+    """A layerwise or overlap load reads its prefix at once, so a prefix past
+    the window would miss: its probe counts no FETCH. Workers still fetch;
+    the deadline knobs reach both."""
+    extra = node_extra(
+        "/nonexistent/node.sock",
+        maru_async_load=True,
+        maru_fetch_deadline_ms=400,
+        maru_fetch_deadline_per_page_ms=0.5,
+        **mode,
+    )
+    for metadata_only in (True, False):
+        made = connector_module._create_node_handler(extra, metadata_only, False)
+        try:
+            config = made._cpu.config
+            assert config.fetch_loads is not (metadata_only and bool(mode))
+            assert config.fetch_deadline_ms == 400
+            assert config.fetch_deadline_per_page_ms == 0.5
+        finally:
+            made.close()
+
+
 @needs_cuda
 def test_the_engine_thread_never_waits_for_a_fetch(
     real_server, nodes, workers, monkeypatch

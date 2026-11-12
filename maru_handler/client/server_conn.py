@@ -122,6 +122,8 @@ class ServerConn:
         self.on_server_epoch: list = []
         # Called with the node epoch MaruServer no longer accepts
         self.on_stale_node: list = []
+        # Called once MaruServer answered UNPINs
+        self.on_unpinned: list = []
         self.late_hits = 0
 
     # ---------------------------------------------------------------- session
@@ -642,6 +644,8 @@ class ServerConn:
             with self._lock:
                 done = set(batch)
                 self._unpins = [p for p in self._unpins if p not in done]
+            for callback in self.on_unpinned:
+                callback()
         return True
 
     def pending_unpins(self) -> int:

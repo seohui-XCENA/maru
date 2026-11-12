@@ -1455,8 +1455,20 @@ def _create_node_handler(
         else int(extra_config.get("_maru_step_objects", 0)),
         credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 0)) / 1000,
         lookup_timeout_ms=int(extra_config.get("maru_lookup_timeout_ms", 100)),
-        # Parked loads fetch what only the node reads (its SSD)
-        fetch_loads=bool(_get_knob(extra_config, "maru_async_load")),
+        # Parked loads fetch what only the node reads (its SSD); the probe
+        # counts it only for leased loads, which go window by window
+        fetch_loads=bool(_get_knob(extra_config, "maru_async_load"))
+        and not (
+            metadata_only
+            and bool(
+                extra_config.get("maru_use_layerwise", False)
+                or _get_knob(extra_config, "maru_overlap_load_with_compute")
+            )
+        ),
+        fetch_deadline_ms=int(extra_config.get("maru_fetch_deadline_ms", 250)),
+        fetch_deadline_per_page_ms=float(
+            extra_config.get("maru_fetch_deadline_per_page_ms", 2.0)
+        ),
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)

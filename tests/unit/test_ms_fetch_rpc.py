@@ -48,6 +48,7 @@ from maru_common.storage_types import (
     StorageUnavailableError,
 )
 from maru_handler.client.maru_client import MaruClient
+from maru_handler.client.server_conn import ServerConn
 from maru_handler.client.storage_conn import OpTracker, StorageConn
 from maru_storage_service.ports import EpochChanged, ReplyError, ServerStopped
 from maru_storage_service.server_client import ServerClient
@@ -296,6 +297,34 @@ def client():
     c.pools.close()
 
 
+def parked(c, window=8, **config):
+    """Retrieves on this thread fetch, within ``window`` pages."""
+    c.config = dataclasses.replace(c.config, fetch_loads=True, **config)
+    c.attach_info.budgets = SimpleNamespace(fetch_request_max_bytes=window * PAGE)
+    c.attach_info.page_size = PAGE
+    c._fetch_local.request_id = "parked"
+
+
+def answer(c, *responses):
+    """The node answers the next FETCHes at once."""
+    queued, fetch = list(responses), c._storage.fetch
+
+    def answered(request):
+        future = fetch(request)
+        if queued:
+            future.set_result(queued.pop(0))
+        return future
+
+    c._storage.fetch = answered
+
+
+def looked_up(c, *outcomes, node_epoch="run"):
+    c._server.lookup_and_pin = lambda _keys: (list(outcomes), "server", node_epoch)
+
+
+PLANNED = ItemOutcome(ItemResult.FETCH, plan=ITEMS[0].plan)
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_unknown_fetch_replays_same_op_and_cancelled_hit_is_unpinned(client, cancelled):
     c, unpins = client
@@ -331,7 +360,7 @@ def test_fetch_deadline_keeps_unknown_op_until_late_pin_cleanup(client):
     assert scope.cancelled and c._ops.unresolved()
     c._storage.replies[0].set_result(HIT)
     assert unpins == ["worker-pin"] and not c._ops.unresolved()
-    assert c.stats["fetch_timeout"] == c.stats["fetch_late_hit"] == 1
+    assert c.stats["fetch_scope_timeout"] == c.stats["fetch_late_hit"] == 1
     with c._lock:
         assert c._fetch_used() == 1  # the slot stays while the UNPIN is queued
         unpins.clear()  # confirmed
@@ -412,17 +441,163 @@ def test_fetch_unknown_records_are_bounded_and_cancel_retains_them(client, monke
     assert len(c._ops.unresolved()) == len(c._storage.requests) == 1
 
 
-def test_fetch_busy_retry_keeps_the_original_op_and_deadline(client, monkeypatch):
+def test_a_busy_fetch_misses_at_once_and_its_op_still_resolves(client, monkeypatch):
     c, unpins = client
     monkeypatch.setattr("maru_handler.client.maru_client.BUSY_RESEND_S", 0.001)
-    result = c._fetch(c._new_fetch_scope("busy", deadline_ms=5000), ITEMS, PAGE)
+    scope = c._new_fetch_scope("busy", deadline_ms=5000)
+    result = c._fetch(scope, ITEMS, PAGE)
     first = c._storage.requests[0]
     c._storage.replies[0].set_result(FetchResponse(Status.BUSY))
-    wait_until(lambda: len(c._storage.requests) == 2, what="same-op retry")
-    assert not result.done()
-    assert c._storage.requests[1] == first
-    c._storage.replies[1].set_result(HIT)
-    assert result.result(2) == HIT and not unpins
+    # The load misses now, not at its deadline; the node hears the cancel
+    assert result.result(0).items[0].reason == MissReason.BUSY
+    assert scope.cancelled and c.stats["fetch_scope_busy"] == 1
+    assert c._storage.cancels == [first.op]
+    wait_until(lambda: len(c._storage.requests) == 2, what="same-op resend")
+    assert c._storage.requests[1] == first and c._ops.unresolved()
+    c._storage.replies[1].set_result(HIT)  # late: unpinned, never read
+    assert unpins == ["worker-pin"] and not c._ops.unresolved() and not scope.pending
+
+
+def test_a_busy_fetch_cancel_is_sent_again_while_its_op_is_open(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setattr("maru_handler.client.maru_client.BUSY_RESEND_S", 0.001)
+    conn = c._storage
+    answers = [Status.BUSY, Status.OK]
+
+    def cancel(target):
+        conn.cancels.append(target)
+        future = Future()
+        future.set_result(FetchCancelResponse(answers.pop(0)))
+        return future
+
+    conn.fetch_cancel = cancel
+    scope = c._new_fetch_scope("cancel", deadline_ms=5000)
+    c._fetch(scope, ITEMS, PAGE)
+    c._cancel_fetch_scope(scope)
+    wait_until(lambda: len(conn.cancels) == 2, what="cancel resent")
+    assert conn.cancels == [conn.requests[0].op] * 2 and not answers
+
+
+def test_a_large_fetch_gets_a_longer_deadline(client):
+    c, _ = client
+    parked(c, window=64, fetch_deadline_ms=250, fetch_deadline_per_page_ms=10)
+    for keys, longest in ((3, 250), (40, 400)):
+        looked_up(c, *[PLANNED] * keys)
+        answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * keys))
+        assert c._retrieve_chunk([f"k{i}" for i in range(keys)]) == [None] * keys
+        assert longest - 10 < c._storage.requests[-1].deadline_ms <= longest
+    c.config = dataclasses.replace(c.config, fetch_deadline_per_page_ms=10_000)
+    answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * 40))
+    c._retrieve_chunk([f"k{i}" for i in range(40)])
+    assert 59_000 < c._storage.requests[-1].deadline_ms <= 60_000  # the node's cap
+
+
+def test_a_loader_waits_briefly_for_its_unpins_to_be_answered(client, monkeypatch):
+    c, _ = client
+    parked(c, window=2)
+    # Long enough that only the answered UNPIN can end the wait in time
+    monkeypatch.setattr("maru_handler.client.maru_client.FETCH_UNPIN_WAIT_S", 30.0)
+    server = ServerConn(
+        "tcp://127.0.0.1:1",
+        c.identity,
+        node_id="n",
+        node_epoch="run",
+        pid=1,
+        pid_start=1,
+        timeout_s=1,
+    )
+    server.session, server.server_epoch = "worker", "server"
+    server.on_unpinned.append(c._unpins_answered)
+    server._rpc.call = lambda _code, _request: UnpinResponse(
+        Status.OK, items=[ItemOutcome(ItemResult.OK)]
+    )
+    c._server = server
+    server.unpin(["p"])  # queued: its slot is held
+    c._fetch_unpinning.add("p")
+    checked, pending = threading.Event(), server.unpin_pending
+
+    def spy(ids):
+        found = pending(ids)
+        checked.set()
+        return found
+
+    server.unpin_pending = spy
+    got = []
+
+    def loader():
+        with c.fetch_scope("r"):
+            got.append(c.retrieve_capacity())
+
+    thread = threading.Thread(target=loader)
+    try:
+        thread.start()
+        assert checked.wait(2)
+        assert server._flush_unpins()
+        thread.join(5)
+        assert not thread.is_alive() and got == [2]
+    finally:
+        server._rpc.close()
+
+
+def test_capacity_is_unbounded_without_the_node_connection(client, monkeypatch):
+    c, unpins = client
+    parked(c, window=2)
+    monkeypatch.setattr("maru_handler.client.maru_client.FETCH_UNPIN_WAIT_S", 0)
+    unpins.append("p")  # an UNPIN not answered: its slot is held
+    c._fetch_unpinning.add("p")
+    assert c.retrieve_capacity() == 1
+    c._storage.closed = True  # nothing frees until the node is back
+    assert c.retrieve_capacity() is None
+
+
+def test_fetched_hits_and_scope_timeouts_count_apart(client, monkeypatch):
+    c, unpins = client
+    parked(c)
+    monkeypatch.setattr(c.pools, "view", lambda *_a, **_kw: memoryview(bytearray(PAGE)))
+    looked_up(c, PLANNED, ItemOutcome(ItemResult.HIT, COPY, "memory-pin"))
+    answer(c, HIT)
+    reads = c._retrieve_chunk(["fetched", "memory"])
+    assert all(reads)
+    assert c.stats["retrieve_hit"] == 1  # the memory hit only
+    assert c.stats["retrieve_fetch_hit"] == c.stats["fetch_hit"] == 1
+    c.release_retrieved(reads)
+    c.config = dataclasses.replace(c.config, fetch_deadline_ms=1)
+    looked_up(c, PLANNED, PLANNED)
+    assert c._retrieve_chunk(["late", "later"]) == [None, None]  # never answered
+    assert c.stats["fetch_scope_timeout"] == 1 and c.stats["fetch_timeout"] == 2
+
+
+def test_a_failure_mid_fetch_reply_unpins_the_pins_not_taken(client, monkeypatch):
+    c, unpins = client
+    parked(c)
+    monkeypatch.setattr(c.pools, "view", lambda *_a, **_kw: memoryview(bytearray(PAGE)))
+    looked_up(c, PLANNED, PLANNED)
+    pins = [ItemOutcome(ItemResult.HIT, COPY, p) for p in ("p1", "p2")]
+    answer(c, FetchResponse(Status.OK, items=pins))
+    take, calls = c._take_outcome, []
+
+    def flaky(*args, **kwargs):
+        calls.append(args[1])
+        if len(calls) == 2:
+            raise RuntimeError("mapping failed")
+        return take(*args, **kwargs)
+
+    monkeypatch.setattr(c, "_take_outcome", flaky)
+    with pytest.raises(RuntimeError):
+        c._retrieve_chunk(["a", "b"])
+    # p2 goes back from the reply, p1 with its released read: each once
+    assert unpins == ["p2", "p1"] and not c._reads
+    with c._lock:
+        assert c._fetch_unpinning == {"p1", "p2"} and c._fetch_reserved == 0
+
+
+def test_a_lookup_of_another_node_run_is_not_fetched(client):
+    c, unpins = client
+    parked(c)
+    looked_up(c, PLANNED, node_epoch="old-run")
+    assert c._retrieve_chunk(["k"]) == [None]
+    assert not c._storage.requests and not unpins
+    assert c.stats["retrieve_fetch"] == 1
 
 
 def test_fetch_socket_send_leaves_the_client_lock_available(client):

@@ -122,6 +122,9 @@ class MaruConfig:
     # maru_node: parked loads may fetch what only the node reads (its SSD):
     # asks for fetch_v1, and a scheduler probe counts such keys as found
     fetch_loads: bool = False
+    # maru_node: a FETCH's deadline, max(base, pages x per page) ms
+    fetch_deadline_ms: int = 250
+    fetch_deadline_per_page_ms: float = 2.0
 
     @property
     def server_urls(self) -> list[str]:
@@ -150,6 +153,10 @@ class MaruConfig:
             )
         if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
             raise ValueError("lookup_timeout_ms must be a positive integer")
+        if type(self.fetch_deadline_ms) is not int or self.fetch_deadline_ms <= 0:
+            raise ValueError("fetch_deadline_ms must be a positive integer")
+        if not self.fetch_deadline_per_page_ms >= 0:
+            raise ValueError("fetch_deadline_per_page_ms must not be negative")
         if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
             raise ValueError(
                 "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
