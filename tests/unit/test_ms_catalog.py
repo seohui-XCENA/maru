@@ -724,6 +724,182 @@ class TestFetch:
         assert wire.call(MessageType.FETCH_COMPLETE, request) == first
 
 
+class TestHoldCopy:
+    """FETCH_COMPLETE with hold_copy: the node's pin on the copy comes with
+    the worker's, so a shared fetch's copy outlives its first worker."""
+
+    _setup = TestFetch._setup
+
+    def _first(self, a, worker, k, source, copy):
+        pin = a.source_pin((k, source)).items[0].pin_id
+        return a.fetch_complete(worker.token, (k, pin, copy, True)).items[0]
+
+    def test_both_pins_at_once(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        copy = a.loc(a.dram(), 1)
+        item = self._first(a, worker, k, source, copy)
+        assert item.result == "HIT" and item.location == copy
+        assert item.pin_id and item.node_pin_id and item.pin_id != item.node_pin_id
+        node_pin = service.pins.get(item.node_pin_id)
+        assert (node_pin.holder, node_pin.holder_kind) == (a.token, "node")
+        assert node_pin.location == copy
+        assert service.pins.count(k, copy) == 2
+        # the source pin went as without hold_copy
+        assert service.pins.held_by(a.token) == [node_pin]
+
+    def test_the_node_pin_blocks_removal_until_the_node_unpins(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        copy = a.loc(a.dram(), 1)
+        item = self._first(a, worker, k, source, copy)
+        worker.unpin(item.pin_id)
+        assert a.retire((k, copy)).items[0].cause == KeptCause.PINNED
+        dest = a.loc(a.ssd(), 1)
+        finalizer = a.commit((k, dest), finalizer=True).items[0].finalizer_id
+        moved = a.finalize_move((k, copy, dest, finalizer)).items[0]
+        assert moved.cause == KeptCause.PINNED
+        # only the node session may release it
+        assert results(b.unpin(item.node_pin_id)) == ["REJECTED"]
+        assert results(worker.unpin(item.node_pin_id)) == ["REJECTED"]
+        assert results(a.unpin(item.node_pin_id)) == ["OK"]
+        assert results(a.retire((k, copy))) == ["RETIRED"]
+
+    def test_other_waiters_pin_the_held_copy_after_the_first_worker_exits(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        copy = a.loc(a.dram(), 1)
+        first = self._first(a, worker, k, source, copy)
+        other = FakeWorker(wire, a, tp_rank=1)
+        other.open()
+        assert results(a.worker_exit(worker.ref())) == ["OK"]
+        assert service.pins.get(first.pin_id) is None
+        assert a.retire((k, copy)).items[0].cause == KeptCause.PINNED
+        # a waiter names the exact copy: its own pin, no node pin, no read
+        again = a.fetch_complete(other.token, (k, "", copy)).items[0]
+        assert again.result == "HIT" and again.location == copy
+        assert again.pin_id and again.node_pin_id is None
+        assert a.unpin(first.node_pin_id).items[0].result == "OK"
+        assert a.retire((k, copy)).items[0].cause == KeptCause.PINNED
+        other.unpin(again.pin_id)
+        assert results(a.retire((k, copy))) == ["RETIRED"]
+
+    def test_a_cancel_before_handoff_unpins_both_and_keeps_the_cache(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        copy = a.loc(a.dram(), 1)
+        item = self._first(a, worker, k, source, copy)
+        # the node made both pins, so it may release both
+        assert results(a.unpin(item.pin_id, item.node_pin_id)) == ["OK", "OK"]
+        assert service.pins.count(k, copy) == 0
+        assert worker.lookup(k).items[0].location == copy
+        worker.unpin(service.pins.held_by(worker.token)[0].pin_id)
+        assert results(a.retire((k, copy))) == ["RETIRED"]
+
+    def test_with_no_worker_the_copy_is_named_and_held(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        token = worker.token
+        worker.close()
+        copy = a.loc(a.dram(), 1)
+        pin = a.source_pin((k, source)).items[0].pin_id
+        item = a.fetch_complete(token, (k, pin, copy, True)).items[0]
+        assert item.result == "ADDED" and item.pin_id is None
+        assert item.location == copy and item.node_pin_id
+        assert service.pins.count(k, copy) == 1
+        assert a.retire((k, copy)).items[0].cause == KeptCause.PINNED
+        # with a copy there already, that copy is the one held
+        pin = a.source_pin((k, source)).items[0].pin_id
+        late = a.fetch_complete(token, (k, pin, a.loc(a.dram(), 2), True)).items[0]
+        assert late.result == "DUPLICATE" and late.location == copy
+        assert service.pins.get(late.node_pin_id).location == copy
+        assert service.pins.count(k, copy) == 2
+
+    def test_the_pins_go_on_the_copy_chosen(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        copy = a.loc(a.dram(), 1)
+        a.commit((k, copy))
+        item = self._first(a, worker, k, source, a.loc(a.dram(), 2))
+        assert item.result == "HIT" and item.location == copy
+        assert service.pins.get(item.node_pin_id).location == copy
+        assert service.pins.count(k, copy) == 2
+        assert len(service.catalog.locations(k)) == 2  # source and one copy
+
+    def test_a_resend_replays_the_node_pin(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        from maru_common.protocol import (
+            FetchCompleteItem,
+            FetchCompleteRequest,
+            MessageType,
+        )
+
+        pin = a.source_pin((k, source)).items[0].pin_id
+        copy = a.loc(a.dram(), 1)
+        request = a.build(
+            FetchCompleteRequest,
+            **a.envelope(),
+            worker_session=worker.token,
+            items=[FetchCompleteItem(k, pin, copy, copy.length, hold_copy=True)],
+        )
+        first = wire.call(MessageType.FETCH_COMPLETE, request)
+        assert first.items[0].node_pin_id
+        worker.close()
+        # the reply was lost: same pins back, none made again
+        assert wire.call(MessageType.FETCH_COMPLETE, request) == first
+        assert service.pins.count(k, copy) == 1  # the worker's went at close
+        assert service.pins.get(first.items[0].node_pin_id) is not None
+        # the same op with another hold_copy is another request
+        changed = replace(request, items=[FetchCompleteItem(k, pin, copy, copy.length)])
+        assert wire.call(MessageType.FETCH_COMPLETE, changed).status == "REJECTED"
+
+    def test_a_failing_worker_pin_leaves_neither_pin(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        original = service.pins.pin
+
+        def failing(*args, **kwargs):
+            if kwargs.get("creator"):
+                raise RuntimeError("boom")
+            return original(*args, **kwargs)
+
+        service.pins.pin = failing
+        copy = a.loc(a.dram(), 1)
+        item = self._first(a, worker, k, source, copy)
+        service.pins.pin = original
+        assert item.result == "REJECTED" and item.node_pin_id is None
+        assert service.catalog.entry_exact(k, copy) is None
+        assert len(service.pins) == 0
+
+    def test_no_node_pin_when_the_item_fails(self, env):
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        done = a.fetch_complete(worker.token, (k, "nope", a.loc(a.dram(), 1), True))
+        assert results(done) == ["REJECTED"] and done.items[0].node_pin_id is None
+        b_worker = FakeWorker(wire, b)
+        b_worker.open()
+        pin = a.source_pin((k, source)).items[0].pin_id
+        done = a.fetch_complete(b_worker.token, (k, pin, a.loc(a.dram(), 2), True))
+        assert results(done) == ["REJECTED"] and done.items[0].node_pin_id is None
+        assert len(service.pins) == 0
+
+    def test_a_new_node_run_releases_it(self, env):
+        # on CXL too, whose pins are kept apart
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        a.restart()
+        assert a.open(pools=[a.dram(), a.ssd(), a.cxl()]).status == Status.OK
+        worker = FakeWorker(wire, a)
+        worker.open()
+        item = self._first(a, worker, k, source, a.loc(a.cxl(), 1))
+        assert item.result == "HIT" and item.node_pin_id
+        worker.close()
+        a.restart()
+        assert a.open(pools=[a.dram(), a.ssd(), a.cxl()]).status == Status.OK
+        assert service.pins.get(item.node_pin_id) is None
+
+
 class TestUnpin:
     def test_unknown_is_ok_foreign_is_rejected(self, env):
         _, service, wire = env

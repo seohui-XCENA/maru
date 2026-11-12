@@ -31,12 +31,14 @@ from maru_common.node_protocol import (
 from maru_common.protocol import MessageType
 from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import (
+    FETCH_CAPABILITY,
     MAX_BATCH,
     ItemResult,
     Key,
     NotifyKind,
     OpRef,
     PoolKind,
+    SessionRole,
     Status,
     StorageUnavailableError,
     make_generation,
@@ -150,6 +152,22 @@ class TestAttach:
                 other.attach(engine_id="someone-else")
         finally:
             other.close()
+
+    def test_capabilities_are_those_asked_and_served(self, node):
+        def attach(**overrides):
+            w = RawWorker(node.config.socket)
+            try:
+                return w.attach(**overrides).capabilities
+            finally:
+                w.close()
+
+        asked = [FETCH_CAPABILITY, "later_v9"]
+        assert attach(capabilities=asked) == []  # no fetch served yet
+        node.local.capabilities = frozenset({FETCH_CAPABILITY})
+        assert attach(capabilities=asked) == [FETCH_CAPABILITY]
+        assert attach() == []
+        probe = attach(capabilities=asked, role=SessionRole.PROBE, groups=[])
+        assert probe == [FETCH_CAPABILITY]
 
     def test_requests_need_an_attach(self, worker):
         ser = Serializer(NODE_MESSAGE_CLASSES)

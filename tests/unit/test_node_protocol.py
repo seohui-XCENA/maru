@@ -2,6 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """StorageService local protocol: messages, framing and descriptor passing."""
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -65,6 +66,54 @@ def test_round_trip(code):
     response = sample(response_cls)
     _, decoded = ser.decode_response(ser.encode_response(header, response))
     assert decoded == response
+
+
+def test_fetch_contract_on_the_wire():
+    from maru_common.node_protocol import Budgets, FetchResponse
+    from maru_common.storage_types import (
+        FETCH_CAPABILITY,
+        ItemOutcome,
+        ItemResult,
+        MissReason,
+        Status,
+    )
+
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    assert FETCH_CAPABILITY == "fetch_v1"
+    assert 0x1A not in CODES  # no FETCH_RELEASE: pins end by UNPIN
+    request = sample(NODE_MESSAGE_CLASSES[NodeMessageType.ATTACH][0])
+    header, _ = ser.decode_request(ser.encode(NodeMessageType.ATTACH, request))
+    # an older node's reply has no capabilities, and an older batch cap
+    reply = dataclasses.asdict(sample(AttachResponse))
+    reply["capabilities"] = [FETCH_CAPABILITY]
+    _, back = ser.decode_response(ser.encode_response(header, reply))
+    assert back.capabilities == [FETCH_CAPABILITY]
+    del reply["capabilities"]
+    reply["budgets"]["fetch_max_batch_bytes"] = 1
+    _, back = ser.decode_response(ser.encode_response(header, reply))
+    assert back.capabilities == []
+    assert isinstance(back.budgets, Budgets)
+    # FETCH items: MISS once taken (busy, timeout, io_error), MISS with no
+    # reason for a cancel before the reply
+    header, _ = ser.decode_request(
+        ser.encode(
+            NodeMessageType.FETCH,
+            sample(NODE_MESSAGE_CLASSES[NodeMessageType.FETCH][0]),
+        )
+    )
+    items = [ItemOutcome(ItemResult.MISS, reason=r) for r in MissReason]
+    items.append(ItemOutcome(ItemResult.MISS))
+    response = FetchResponse(status=Status.OK, items=items)
+    _, back = ser.decode_response(ser.encode_response(header, response))
+    assert back == response
+    assert [i.reason for i in back.items] == [
+        "absent",
+        "offline",
+        "busy",
+        "timeout",
+        "io_error",
+        None,
+    ]
 
 
 def test_codes_belong_to_their_endpoint():

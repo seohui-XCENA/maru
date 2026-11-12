@@ -126,11 +126,9 @@ class TestExamples:
             "dram": int(64 * G * 0.05),
             "cxl": int(256 * G * 0.05),
         }
-        assert (
-            b.fetch_request_max_bytes,
-            b.fetch_max_inflight_bytes,
-            b.fetch_max_batch_bytes,
-        ) == (G, 4 * G, 256 * M)
+        # two fetch caps; the batch cap was dropped (the leased window bounds it)
+        assert (b.fetch_request_max_bytes, b.fetch_max_inflight_bytes) == (G, 4 * G)
+        assert not hasattr(b, "fetch_max_batch_bytes")
 
     @pytest.mark.parametrize(
         "page, pages",
@@ -294,9 +292,21 @@ class TestRules:
         c = parse_node_config(edit(GPU_NODE, budgets={"credit_total_max_bytes": "64M"}))
         assert c.budgets.credit_max_bytes == 64 * M
         rejects(
-            edit(GPU_NODE, budgets={"fetch_max_batch_bytes": "2G"}),
-            "fetch_max_batch_bytes <=",
+            edit(GPU_NODE, budgets={"fetch_request_max_bytes": "16M"}),
+            "page_size <= fetch_request_max_bytes",
         )
+        rejects(
+            edit(GPU_NODE, budgets={"fetch_request_max_bytes": "8G"}),
+            "fetch_request_max_bytes <= fetch_max_inflight_bytes",
+        )
+        rejects(
+            edit(GPU_NODE, budgets={"fetch_max_batch_bytes": "256M"}),
+            r"unknown keys \['fetch_max_batch_bytes'\]",
+        )
+        c = parse_node_config(
+            edit(GPU_NODE, budgets={"fetch_request_max_bytes": "32M"})
+        )
+        assert c.budgets.fetch_request_max_bytes == 32 * M
 
     def test_budgets_fit_the_tiers_credit_comes_from(self):
         # dram + cxl hold 320 GiB, less the pending budget and both reserves

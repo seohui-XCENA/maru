@@ -45,6 +45,8 @@ class StorageUnavailableError(ConnectionError):
 # =============================================================================
 
 MS_PROTOCOL = "ms1"
+# ATTACH capability: the worker can run FETCH, the node serves it
+FETCH_CAPABILITY = "fetch_v1"
 # Items in one multi-storage request
 MAX_BATCH = MAX_STORAGE_BATCH
 # generation = epoch_seq << 40 | counter: a new run always gives higher
@@ -134,6 +136,10 @@ class KeptCause(StrEnum):
 class MissReason(StrEnum):
     ABSENT = "absent"
     OFFLINE = "offline"
+    # FETCH only: no room after it was taken, past its deadline, a failed read
+    BUSY = "busy"
+    TIMEOUT = "timeout"
+    IO_ERROR = "io_error"
 
 
 @unique
@@ -283,6 +289,8 @@ class ItemOutcome:
     cause: KeptCause | None = None
     # KEPT(MOVED): the key of the location now occupying the page
     key: Key | None = None
+    # FETCH_COMPLETE with hold_copy: the node's own pin on ``location``
+    node_pin_id: str | None = None
 
 
 @dataclass(frozen=True)

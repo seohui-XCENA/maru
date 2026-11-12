@@ -134,6 +134,7 @@ def result_bytes(result: Any) -> int:
     size = 64
     for item in getattr(result, "items", ()):
         size += 48 + len(item.pin_id or "") + len(item.finalizer_id or "")
+        size += len(item.node_pin_id or "")
         for loc in (item.location, item.plan.source if item.plan else None):
             if loc is not None:
                 size += 64 + len(loc.pool_id) + len(loc.allocation_id)

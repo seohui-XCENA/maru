@@ -654,6 +654,9 @@ class FetchCompleteItem:
     source_pin_id: str
     copy: Location
     logical_bytes: int
+    # Also pin the copy chosen for the node session, in the same step (the
+    # first completion of a shared fetch); the node UNPINs it
+    hold_copy: bool = False
 
 
 @dataclass
@@ -944,7 +947,12 @@ class FinalizeMoveResponse:
 @dataclass
 class FetchCompleteRequest:
     """FETCH_COMPLETE (0x5B) - Commits a fetched copy, pins it for the worker
-    and releases the source pin, as one request."""
+    and releases the source pin, as one request.
+
+    An item with ``hold_copy`` also gets a node pin on the copy chosen
+    (``node_pin_id``), and its success names that copy even with no worker
+    pin. A resend replays both pins.
+    """
 
     session: str
     server_epoch: str

@@ -17,7 +17,7 @@ from maru_common.storage_types import Key, Location, PoolKind
 @unique
 class HolderKind(StrEnum):
     WORKER = "worker"  # LOOKUP_AND_PIN, FETCH_COMPLETE copies
-    NODE = "node"  # SOURCE_PIN
+    NODE = "node"  # SOURCE_PIN, FETCH_COMPLETE with hold_copy
     # COMMIT with a finalizer: keeps a demotion destination until
     # FINALIZE_MOVE or the end of the node session
     FINALIZER = "finalizer"

@@ -81,9 +81,9 @@ class Budgets:
     credit_refill_high: int
     commit_pending_max_bytes: int
     transfer_reserve_bytes: dict[str, int] = field(default_factory=dict)
+    # Page-rounded bytes of one FETCH, and of the node's fetches until handoff
     fetch_request_max_bytes: int = 0
     fetch_max_inflight_bytes: int = 0
-    fetch_max_batch_bytes: int = 0
 
 
 @dataclass
@@ -141,7 +141,8 @@ class AttachRequest:
 
 @dataclass
 class AttachResponse:
-    """A probe's reply has no pools and no budgets."""
+    """A probe's reply has no pools and no budgets. ``capabilities``: those
+    of the request this node serves."""
 
     status: Status
     error: str | None = None
@@ -156,6 +157,7 @@ class AttachResponse:
     # Node-view identity of the worker, for WORKER_OPEN
     pid: int = 0
     pid_start: int = 0
+    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -234,7 +236,15 @@ class AbortResponse:
 
 @dataclass
 class FetchRequest:
-    """FETCH (0x18)."""
+    """FETCH (0x18) - Only with fetch_v1 agreed at ATTACH.
+
+    ``deadline_ms`` counts from the first receipt; a resend joins the same
+    fetch and does not extend it. A malformed request or one over
+    fetch_request_max_bytes is REJECTED, a full node before taking it is
+    BUSY. Items: HIT(location, pin_id), MISS(reason), REJECTED; MISS busy,
+    timeout or io_error once taken. From the reply on, the HIT pin is the
+    worker's: it UNPINs after its GPU reads.
+    """
 
     op: OpRef
     worker_session: str
@@ -252,7 +262,14 @@ class FetchResponse:
 
 @dataclass
 class FetchCancelRequest:
-    """FETCH_CANCEL (0x19) - ``target`` is the op of the FETCH to cancel."""
+    """FETCH_CANCEL (0x19) - ``target`` is the op of the FETCH to cancel.
+
+    Means "no longer needed", never "GPU reads are done"; answered OK. Before
+    the FETCH reply the node cleans up and the FETCH may end MISS with no
+    reason. A HIT already recorded stays; the worker UNPINs it, after its
+    GPU reads if it submitted any. A cancel before its FETCH stops that
+    FETCH from running.
+    """
 
     target: OpRef
 

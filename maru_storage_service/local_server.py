@@ -201,8 +201,11 @@ class LocalServer:
         pools: list[tuple[PoolDescriptor, int | None]],
         transfer_defaults: TransferDefaults | None = None,
         socket_group: str | None = None,
+        capabilities: frozenset[str] = frozenset(),
     ):
         self.path = path
+        # ATTACH capabilities this node serves (none until fetch runs)
+        self.capabilities = capabilities
         self.socket_group = socket_group
         self.manager = manager
         self.node_id = node_id
@@ -479,6 +482,7 @@ class LocalServer:
             local_pin=False,
             pid=node_pid,
             pid_start=pid_start,
+            capabilities=[c for c in req.capabilities if c in self.capabilities],
         )
         fds = [] if probe else [fd for _, fd in self.pools if fd is not None]
         if not conn.respond(header, response, fds):

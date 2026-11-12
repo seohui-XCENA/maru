@@ -499,8 +499,9 @@ class Catalog:
     ) -> ItemOutcome:
         """Commit the copy, pin it for the worker, release the source pin. An
         existing copy in the node's DRAM (or the copy's pool) is used instead.
-        With no worker the copy stays as cache. Every outcome releases this
-        node's source pin."""
+        With no worker the copy stays as cache. With ``hold_copy`` the node
+        also pins the copy chosen. Every outcome releases this node's source
+        pin."""
         source_pin = self.pins.get(item.source_pin_id)
         own_source = (
             source_pin is not None
@@ -512,6 +513,7 @@ class Catalog:
                 node_id,
                 creator,
                 worker_holder,
+                node_holder if item.hold_copy else None,
                 item,
                 copy_error,
                 own_source,
@@ -522,48 +524,80 @@ class Catalog:
                 self.pins.unpin(item.source_pin_id)
 
     def _fetch_complete(
-        self, node_id, creator, worker_holder, item, copy_error, own_source, source_pin
+        self,
+        node_id,
+        creator,
+        worker_holder,
+        copy_holder,
+        item,
+        copy_error,
+        own_source,
+        source_pin,
     ) -> ItemOutcome:
+        def outcome(entry: Entry, cached: ItemResult) -> ItemOutcome:
+            return self._copy_outcome(
+                entry, worker_holder, copy_holder, creator, cached
+            )
+
         exact = self.entry_exact(item.key, item.copy)
         if exact is not None and self.own_pool(node_id, item.copy.pool_id):
             # this copy is in already (a re-run)
-            return self._copy_outcome(exact, worker_holder, creator, ItemResult.ADDED)
+            return outcome(exact, ItemResult.ADDED)
         if source_pin is None or not own_source or source_pin.key != item.key:
             return ItemOutcome(ItemResult.REJECTED)
         existing = self._node_copy(node_id, item.key, item.copy.pool_id)
         if existing is not None:
-            return self._copy_outcome(
-                existing, worker_holder, creator, ItemResult.DUPLICATE
-            )
+            return outcome(existing, ItemResult.DUPLICATE)
         if copy_error is not None:
             return ItemOutcome(ItemResult.REJECTED)
         pool = self._pools[item.copy.pool_id]
         if self._page_holder(pool, item.copy) is not None:
             return ItemOutcome(ItemResult.REJECTED)
         entry = Entry(item.key, item.copy, item.logical_bytes, pool)
-        return self._add_pinned(
-            entry,
-            lambda: self._copy_outcome(entry, worker_holder, creator, ItemResult.ADDED),
-        )
+        return self._add_pinned(entry, lambda: outcome(entry, ItemResult.ADDED))
 
     def _copy_outcome(
         self,
         entry: Entry,
         worker_holder: str | None,
+        copy_holder: str | None,
         creator: tuple[str, str],
         cached: ItemResult,
     ) -> ItemOutcome:
         """HIT with a worker pin; without a worker ``cached`` (ADDED, or
-        DUPLICATE with the location already there)."""
+        DUPLICATE with the location already there). With ``copy_holder`` a
+        node pin too, and the location in every case; both pins or none."""
+        node_pin_id = None
+        if copy_holder is not None:
+            node_pin_id = self.pins.pin(
+                entry.key, entry.location, copy_holder, HolderKind.NODE
+            )
         if worker_holder is None:
-            if cached == ItemResult.DUPLICATE:
-                return ItemOutcome(cached, location=entry.location)
-            return ItemOutcome(cached)
-        # every request gets its own pin: two readers never share one
-        pin_id = self.pins.pin(
-            entry.key, entry.location, worker_holder, HolderKind.WORKER, creator=creator
+            named = cached == ItemResult.DUPLICATE or node_pin_id is not None
+            return ItemOutcome(
+                cached,
+                location=entry.location if named else None,
+                node_pin_id=node_pin_id,
+            )
+        try:
+            # every request gets its own pin: two readers never share one
+            pin_id = self.pins.pin(
+                entry.key,
+                entry.location,
+                worker_holder,
+                HolderKind.WORKER,
+                creator=creator,
+            )
+        except BaseException:
+            if node_pin_id is not None:
+                self.pins.unpin(node_pin_id)
+            raise
+        return ItemOutcome(
+            ItemResult.HIT,
+            location=entry.location,
+            pin_id=pin_id,
+            node_pin_id=node_pin_id,
         )
-        return ItemOutcome(ItemResult.HIT, location=entry.location, pin_id=pin_id)
 
     def _node_copy(self, node_id: str, key: Key, copy_pool: str) -> Entry | None:
         same_pool = None

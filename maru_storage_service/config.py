@@ -50,7 +50,6 @@ CREDIT_REFILL_LOW_FRACTION = 0.25
 TRANSFER_RESERVE_FRACTION = 0.05
 DEFAULT_FETCH_REQUEST_MAX = 1 << 30
 DEFAULT_FETCH_MAX_INFLIGHT = 4 << 30
-DEFAULT_FETCH_MAX_BATCH = 256 << 20
 
 _TOP_KEYS = {
     "node_id",
@@ -97,7 +96,6 @@ _BUDGET_KEYS = {
     "transfer_reserve_bytes",
     "fetch_request_max_bytes",
     "fetch_max_inflight_bytes",
-    "fetch_max_batch_bytes",
 }
 _REMOTE_SERVER_KEYS = {"listen", "key_file"}
 
@@ -447,7 +445,6 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
 
     fetch_request = size_or("fetch_request_max_bytes", DEFAULT_FETCH_REQUEST_MAX)
     fetch_inflight = size_or("fetch_max_inflight_bytes", DEFAULT_FETCH_MAX_INFLIGHT)
-    fetch_batch = size_or("fetch_max_batch_bytes", DEFAULT_FETCH_MAX_BATCH)
 
     if credit_max < page_size:
         raise NodeConfigError(
@@ -460,10 +457,10 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
             f"{credit_total} (values not set in budgets are defaults; a top tier this "
             "small cannot give one page of credit)"
         )
-    if not 0 < fetch_batch <= fetch_request <= fetch_inflight:
+    if not page_size <= fetch_request <= fetch_inflight:
         raise NodeConfigError(
-            "budgets: need 0 < fetch_max_batch_bytes <= fetch_request_max_bytes "
-            f"<= fetch_max_inflight_bytes, got {fetch_batch}, {fetch_request}, {fetch_inflight}"
+            "budgets: need page_size <= fetch_request_max_bytes <= "
+            f"fetch_max_inflight_bytes, got {page_size}, {fetch_request}, {fetch_inflight}"
         )
     if top.size is not None:
         # Credit comes from the top tier and the fallback tiers, each less
@@ -488,7 +485,6 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
         transfer_reserve_bytes=reserve,
         fetch_request_max_bytes=fetch_request,
         fetch_max_inflight_bytes=fetch_inflight,
-        fetch_max_batch_bytes=fetch_batch,
     )
 
 

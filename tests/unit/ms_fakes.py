@@ -355,7 +355,7 @@ class FakeNode(_OpSender):
         )
 
     def fetch_complete(self, worker_session: str, *items):
-        """fetch_complete(worker_session, (key, source_pin_id, copy), ...)"""
+        """fetch_complete(worker_session, (key, source_pin_id, copy[, hold]), ...)"""
         return self.send(
             MessageType.FETCH_COMPLETE,
             self.build(
@@ -363,8 +363,8 @@ class FakeNode(_OpSender):
                 **self.envelope(),
                 worker_session=worker_session,
                 items=[
-                    FetchCompleteItem(k, pin, copy, copy.length)
-                    for k, pin, copy in items
+                    FetchCompleteItem(k, pin, copy, copy.length, *hold)
+                    for k, pin, copy, *hold in items
                 ],
             ),
         )

@@ -352,3 +352,40 @@ def test_finalizer_fields_round_trip():
         items=[MoveItem(Key("ns", "k"), location, location, finalizer_id="f-1")],
     )
     assert ser.decode_request(ser.encode(MessageType.FINALIZE_MOVE, move))[1] == move
+
+
+def test_hold_copy_and_node_pin_round_trip():
+    from maru_common.protocol import FetchCompleteItem, FetchCompleteResponse
+    from maru_common.storage_types import ItemOutcome, ItemResult, Status
+
+    copy = Location("dram:n:e", "a1", make_generation(3, 7), 0, 8, PoolKind.DRAM)
+    ser = Serializer()
+    request = FetchCompleteRequest(
+        session="s",
+        server_epoch="e",
+        op=OpRef("o", 1, b"d" * 16, 0),
+        worker_session="w",
+        items=[FetchCompleteItem(Key("ns", "k"), "src", copy, 8, hold_copy=True)],
+    )
+    frame = ser.encode(MessageType.FETCH_COMPLETE, request)
+    assert ser.decode_request(frame)[1] == request
+    # an older sender leaves it out: no node pin
+    payload = dataclasses.asdict(request)
+    del payload["items"][0]["hold_copy"]
+    _, decoded = ser.decode_request(ser.encode(MessageType.FETCH_COMPLETE, payload))
+    assert decoded.items[0].hold_copy is False
+    # it is part of the op: the same op with another value is another request
+    plain = dataclasses.replace(
+        request, items=[dataclasses.replace(request.items[0], hold_copy=False)]
+    )
+    assert op_digest(plain) != op_digest(request)
+    reply = FetchCompleteResponse(
+        status=Status.OK,
+        items=[
+            ItemOutcome(ItemResult.HIT, location=copy, pin_id="p", node_pin_id="n"),
+            ItemOutcome(ItemResult.ADDED, location=copy, node_pin_id="n2"),
+        ],
+    )
+    request_header, _ = ser.decode(frame)
+    _, back = ser.decode_response(ser.encode_response(request_header, reply))
+    assert back == reply
