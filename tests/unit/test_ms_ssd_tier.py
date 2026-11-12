@@ -8,6 +8,7 @@ a reboot starts it empty. Workers do not fetch yet. The files live under
 
 import dataclasses
 import errno
+import fcntl
 import mmap
 import os
 import shutil
@@ -332,10 +333,19 @@ def test_the_engine_writes_and_reads_a_file_pool(ssd_dir):
         # not a file pool and a mapped pool
         with pytest.raises(ValueError):
             engine.submit_io(Copy(loc("mem", 0), loc("mem", PAGE), 5), mem_ref, mem_ref)
+        engine.close()
+        # the file pool stays open and locked for its owner until it closes it
+        assert pool.fd >= 0 and os.fstat(pool.fd).st_size > 0
+        assert ssd_bytes(pool, loc(pool.pool_id, 2 * PAGE, 5000)) == b"w" * 5000
+        other = os.open(pool.path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(other)
     finally:
         engine.close()
         pool.close()
-    # the file pool stays open for its owner until it closes it
     assert pool.fd == -1
 
 
