@@ -7,6 +7,11 @@ import itertools
 
 import pytest
 
+from maru_common.node_protocol import (
+    NODE_MESSAGE_CLASSES,
+    FetchRequest,
+    NodeMessageType,
+)
 from maru_common.protocol import (
     MESSAGE_CLASSES,
     MS_MESSAGE_CLASSES,
@@ -309,6 +314,18 @@ class TestDigestAcrossVersions:
             request, session="new", server_epoch="new", worker_session="new"
         )
         assert op_digest(request) == op_digest(reopened)
+
+    def test_a_resent_fetch_may_carry_less_of_its_deadline(self):
+        ser = Serializer(NODE_MESSAGE_CLASSES)
+        request = sample(FetchRequest)
+        later = dataclasses.replace(request, deadline_ms=request.deadline_ms // 2 + 1)
+        decoded = ser.decode_request_payload(ser.encode(NodeMessageType.FETCH, later))
+        assert decoded.request == later
+        assert op_digest(decoded.payload) == op_digest(request)
+        # what it fetches is still part of the op
+        assert op_digest(dataclasses.replace(request, max_bytes=1)) != op_digest(
+            request
+        )
 
 
 def test_header_sequence_wraps_and_skips_zero():

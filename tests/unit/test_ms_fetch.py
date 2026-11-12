@@ -6,6 +6,7 @@ a pin each, cancel and deadline before and after the handoff, the node's
 quota, failed reads, and a load larger than DRAM. A worker here is a raw
 UDS connection plus its MaruServer session; Events hold the reads."""
 
+import dataclasses
 import errno
 import mmap
 import os
@@ -20,12 +21,14 @@ import pytest
 from maru_common.config import MaruConfig
 from maru_common.ms_rpc import PLACEHOLDER_OP
 from maru_common.node_protocol import (
+    DetachRequest,
     FetchCancelRequest,
     FetchItem,
     FetchRequest,
     NodeMessageType,
     process_start_time,
 )
+from maru_common.protocol import UnpinResponse
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
     ItemOutcome,
@@ -294,9 +297,21 @@ class Reads:
         self.gate.set()
 
 
-def settled(node) -> bool:
+def settled(node, server) -> bool:
+    """No flight, no quota, and no source or node pin left."""
     fetches = node.manager.fetches
-    return fetches.flights() == 0 and fetches.inflight_bytes == 0
+    return (
+        fetches.flights() == 0
+        and fetches.inflight_bytes == 0
+        and node_pins(server, node) == 0
+    )
+
+
+def node_pins(server, node) -> int:
+    """Pins the node session holds (source and copy pins)."""
+    service = server.ms_service
+    with service.lock:
+        return len(service.pins.held_by(node.server.session))
 
 
 def no_transfer_pages(node) -> bool:
@@ -335,7 +350,7 @@ def test_two_workers_share_one_read_and_get_their_own_pins(env, monkeypatch):
     assert pins(server, name, copy) == 1
     b.unpin(two.pin_id)
     assert pins(server, name, copy) == 0
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     node.pools.check()
     a.close()
     b.close()
@@ -359,17 +374,31 @@ def test_the_leader_leaving_does_not_hold_up_the_others(env, monkeypatch, how):
         assert answer.items[0].result == ItemResult.MISS
         assert answer.items[0].reason is None
     else:
-        a.session.close()  # its MaruServer session goes with the process
+        # its MaruServer session stays open: the node reports the exit
         node.manager.workers.on_process_exit(f"worker:{a.raw.incarnation}")
+        # its FETCH is answered at the exit, not at its deadline
+        wait_until(
+            lambda: node.manager.fetches.results["MISS"] == 1,
+            "answered at the exit",
+            timeout=2.0,
+        )
     reads.release()
     hit = second.result(10).items[0]
     assert hit.result == ItemResult.HIT and b.read(hit.location) == value_of(name)
     assert reads.calls == 1
     wait_until(lambda: pins(server, name, hit.location) == 1, "only b's pin")
+    if how == "exit":
+        wait_until(
+            lambda: (
+                node.manager.workers.settled(a.raw.incarnation)
+                and node.manager.pending_exits() == 0
+            ),
+            "WORKER_EXIT reported",
+        )
     with server.ms_service.lock:
         assert server.ms_service.pins.held_by(a.token) == []
     b.unpin(hit.pin_id)
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     node.pools.check()
     a.close()
     b.close()
@@ -394,7 +423,7 @@ def test_a_cancel_before_the_handoff_cleans_up_and_keeps_the_copy(env, monkeypat
     assert reply.result(10).items[0] == miss()
     # the read under way ends; the copy stays as cache, with no pin
     reads.release()
-    wait_until(lambda: settled(node), "the flight ended")
+    wait_until(lambda: settled(node, server), "the flight ended")
     wait_until(lambda: len(locations(server, name)) == 2, "the copy published")
     copy = next(c for c in locations(server, name) if c.kind == PoolKind.DRAM)
     wait_until(lambda: pins(server, name, copy) == 0, "no pin left")
@@ -433,7 +462,7 @@ def test_a_cancel_that_comes_first_stops_its_fetch(env, monkeypatch):
     request = loader.request(loader.items(keys[0]))
     assert loader.cancel(request).status == Status.OK
     assert loader.send(request).result(10).items[0] == miss()
-    assert reads.calls == 0 and settled(node)
+    assert reads.calls == 0 and settled(node, server)
     # another worker's op cannot be cancelled
     other = Loader(node, server, tp_rank=1)
     assert other.cancel(request).status == Status.REJECTED
@@ -452,7 +481,7 @@ def test_a_deadline_answers_timeout_and_the_read_still_lands(env, monkeypatch):
     assert reply.result(10).items[0] == miss(MissReason.TIMEOUT)
     assert time.monotonic() - started < 2.0
     reads.release()
-    wait_until(lambda: settled(node), "the flight ended")
+    wait_until(lambda: settled(node, server), "the flight ended")
     wait_until(lambda: len(locations(server, name)) == 2, "the copy published")
     with server.ms_service.lock:
         assert server.ms_service.pins.held_by(loader.token) == []
@@ -486,7 +515,7 @@ def test_the_quota_holds_page_and_bounce_until_the_handoff(env, monkeypatch):
     reads.release()
     hit = first.result(10).items[0]
     assert hit.result == ItemResult.HIT
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     assert loader.fetch(keys[1]).items[0].result == ItemResult.HIT
     loader.close()
 
@@ -501,7 +530,7 @@ def test_a_failed_read_is_an_io_error_and_frees_all_it_held(env, monkeypatch, co
     Reads(node, monkeypatch, error=OSError(code, os.strerror(code)))
     answer = loader.fetch(name)
     assert answer.items[0] == miss(MissReason.IO_ERROR)
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     wait_until(lambda: pins(server, name, source) == 0, "the source unpinned")
     assert locations(server, name) == [source]  # nothing published
     assert no_transfer_pages(node)
@@ -613,7 +642,7 @@ def test_a_load_larger_than_dram_goes_through_in_windows(env, monkeypatch):
     assert node.manager.move_results["RETIRED"] > 40
     assert len(writes) <= 40 - len(names)
     assert not fetches.results["MISS:busy"] and not fetches.results["MISS:timeout"]
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     node.pools.check()
     loader.close()
 
@@ -675,7 +704,7 @@ def test_a_cxl_top_tier_fetches_into_a_region(real_server, sockdir, ssd_dir, reg
             assert copy.kind == PoolKind.CXL and copy.pool_id in by_pool
             assert region_bytes(node, regions, copy) == value_of(name)
         loader.unpin(*[o.pin_id for o in answer.items])
-        wait_until(lambda: settled(node), "quota back")
+        wait_until(lambda: settled(node, server), "quota back")
         node.pools.check()
         loader.close()
     finally:
@@ -702,7 +731,7 @@ def test_dram_over_cxl_over_ssd_fetches_into_dram(
             assert outcome.location.kind == PoolKind.DRAM
             assert loader.read(outcome.location) == value_of(name)
         loader.unpin(*[o.pin_id for o in answer.items])
-        wait_until(lambda: settled(node), "quota back")
+        wait_until(lambda: settled(node, server), "quota back")
         node.pools.check()
         loader.close()
     finally:
@@ -712,13 +741,6 @@ def test_dram_over_cxl_over_ssd_fetches_into_dram(
 # =============================================================================
 # Review fixes: whose session, early cancels, waiters, deadlines, late plans
 # =============================================================================
-
-
-def node_pins(server, node) -> int:
-    """Pins the node session holds (source and copy pins)."""
-    service = server.ms_service
-    with service.lock:
-        return len(service.pins.held_by(node.server.session))
 
 
 def test_a_worker_cannot_fetch_with_another_workers_session(env, monkeypatch):
@@ -861,7 +883,7 @@ def test_each_waiter_waits_for_room_until_its_own_deadline(env, monkeypatch):
     hit = second.result(5).items[0]
     assert hit.result == ItemResult.HIT
     b.unpin(hit.pin_id)
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     a.close()
     b.close()
 
@@ -874,7 +896,7 @@ def test_a_late_plan_uses_the_copy_published_before(env, monkeypatch):
     late = b.request(b.items(keys[0]))  # planned on the SSD, sent later
     first = a.fetch(keys[0]).items[0]
     assert first.result == ItemResult.HIT
-    wait_until(lambda: settled(node), "the first flight ended")
+    wait_until(lambda: settled(node, server), "the first flight ended")
     second = b.send(late).result(10).items[0]
     assert second.result == ItemResult.HIT and second.location == first.location
     assert reads.calls == 1
@@ -917,8 +939,8 @@ def test_the_window_fits_the_top_tier_and_a_load_goes_through_it(env):
     server, make = env
     node, _ = make(keys=40)
     names = on_ssd(server, [f"k{i}" for i in range(40)])
-    # 16 DRAM pages, less 2 of credit and 1 of transfer reserve
-    window = 13
+    # 16 DRAM pages, less 2 of credit, 2 of commit pending, 1 of reserve
+    window = 11
     assert len(names) > window
     h = loader_client(node)
     try:
@@ -1044,7 +1066,7 @@ def test_a_full_window_fits_the_inflight_cap(env):
     assert [o.result for o in answer.items] == [ItemResult.HIT] * 2
     assert node.manager.fetches.results["MISS:busy"] == 0
     loader.unpin(*[o.pin_id for o in answer.items])
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     loader.close()
 
 
@@ -1067,7 +1089,12 @@ def test_the_window_fits_the_regions_the_rm_gave(
         worker = RawWorker(node.config.socket)
         reply = worker.attach(capabilities=[FETCH_CAPABILITY])
         budgets = config.budgets
-        room = 8 * PAGE - budgets.credit_total_max_bytes - PAGE
+        room = (
+            8 * PAGE
+            - budgets.credit_total_max_bytes
+            - budgets.commit_pending_max_bytes
+            - PAGE
+        )
         assert PAGE <= room < budgets.fetch_request_max_bytes
         assert reply.budgets.fetch_request_max_bytes == room
         worker.close()
@@ -1103,7 +1130,198 @@ def test_a_waiter_pins_the_source_once_the_leader_left(env, monkeypatch, how):
     wait_until(lambda: pins(server, name, hit.location) == 1, "only b's pin")
     b.unpin(hit.pin_id)
     wait_until(lambda: node_pins(server, node) == 0, "no node pin left")
-    wait_until(lambda: settled(node), "quota back")
+    wait_until(lambda: settled(node, server), "quota back")
     node.pools.check()
+    a.close()
+    b.close()
+
+
+# =============================================================================
+# Review fixes: per-flight progress, shared room, resends, exits, ends
+# =============================================================================
+
+
+def test_a_flight_reads_while_another_of_its_op_waits_for_room(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    fetches = node.manager.fetches
+    reserve, room = fetches._reserve, threading.Event()
+    given = []
+
+    def one_page(count):
+        if given and not room.is_set():
+            return []
+        refs = reserve(min(count, 1))
+        given.extend(refs)
+        return refs
+
+    monkeypatch.setattr(fetches, "_reserve", one_page)
+    reads = Reads(node, monkeypatch)
+    loader = Loader(node, server)
+    reply = loader.send(loader.request(loader.items(*keys[:2])))
+    # the first read runs while the second flight still has no page
+    wait_until(lambda: reads.calls == 1 and fetches.results["reads"] == 1, "read")
+    assert len(given) == 1 and not reply.done()
+    room.set()
+    answer = reply.result(10)
+    assert [o.result for o in answer.items] == [ItemResult.HIT] * 2
+    loader.unpin(*[o.pin_id for o in answer.items])
+    wait_until(lambda: settled(node, server), "quota back")
+    loader.close()
+
+
+def test_two_loaders_share_the_room_and_both_go_on(env, monkeypatch):
+    """Each worker's window is its share of the room at its ATTACH. FETCHes
+    short of room take it in turn: even windows that add up to more than the
+    room (an earlier worker's) never hold pages the other waits for, also
+    when room comes a page at a time."""
+    server, make = env
+    node, _ = make(keys=40)
+    fetches = node.manager.fetches
+    reserve = fetches._reserve
+    monkeypatch.setattr(fetches, "_reserve", lambda count: reserve(min(count, 1)))
+    names = on_ssd(server, [f"k{i}" for i in range(40)])
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    room = 11  # 16 DRAM pages less credit, commit pending and reserve
+    assert a.budgets.fetch_request_max_bytes == room * PAGE
+    assert b.budgets.fetch_request_max_bytes == room // 2 * PAGE
+    halves = {a: names[::2], b: names[1::2]}
+    done, errors = {a: 0, b: 0}, []
+    together = threading.Barrier(2)
+
+    def load(loader):
+        try:
+            mine = halves[loader]
+            for i in range(0, len(mine), room):  # both as large as a's window
+                batch = mine[i : i + room]
+                request = loader.request(loader.items(*batch), deadline_ms=2000)
+                together.wait(10)
+                answer = loader.send(request).result(10)
+                assert [o.result for o in answer.items] == [ItemResult.HIT] * len(
+                    batch
+                ), [(o.result, o.reason) for o in answer.items]
+                for name, outcome in zip(batch, answer.items, strict=True):
+                    assert loader.read(outcome.location) == value_of(name)
+                loader.unpin(*[o.pin_id for o in answer.items])
+                done[loader] += len(batch)
+        except BaseException as e:
+            together.abort()
+            errors.append(e)
+
+    threads = [threading.Thread(target=load, args=(w,)) for w in (a, b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert not errors, errors
+    assert done == {a: len(halves[a]), b: len(halves[b])}
+    wait_until(lambda: settled(node, server), "quota back")
+    node.pools.check()
+    a.close()
+    b.close()
+
+
+def test_a_resend_may_carry_less_of_its_deadline(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    loader = Loader(node, server)
+    reads = Reads(node, monkeypatch).hold()
+    request = loader.request(loader.items(keys[0]), deadline_ms=5000)
+    first = loader.send(request)
+    assert reads.entered.wait(5)
+    # the same op with the time left: joins it, its first deadline stands
+    resent = loader.send(dataclasses.replace(request, deadline_ms=10))
+    time.sleep(0.1)
+    assert not resent.done()
+    reads.release()
+    answer = first.result(10)
+    assert answer.items[0].result == ItemResult.HIT
+    assert resent.result(10) == answer and reads.calls == 1
+    loader.unpin(answer.items[0].pin_id)
+    loader.close()
+
+
+def test_cancels_after_the_answer_or_of_a_detached_worker_are_not_kept(env):
+    server, make = env
+    node, keys = make()
+    fetches = node.manager.fetches
+    loader = Loader(node, server)
+    request = loader.request(loader.items(keys[0]))
+    hit = loader.send(request).result(10).items[0]
+    assert hit.result == ItemResult.HIT
+    assert loader.cancel(request).status == Status.OK
+    with fetches._lock:
+        assert not fetches._cancelled.get(loader.raw.incarnation)
+    # one for a FETCH not seen yet is kept, until the worker detaches
+    assert loader.cancel(loader.request(loader.items(keys[1]))).status == Status.OK
+    with fetches._lock:
+        assert len(fetches._cancelled[loader.raw.incarnation]) == 1
+    loader.unpin(hit.pin_id)
+    detached = loader.raw.request(NodeMessageType.DETACH, DetachRequest())
+    assert detached.status == Status.OK
+    with fetches._lock:
+        assert loader.raw.incarnation not in fetches._cancelled
+    loader.close()
+
+
+def test_a_refused_unpin_ends_the_run(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    loader = Loader(node, server)
+
+    def refused(ids):
+        return UnpinResponse(
+            status=Status.OK, items=[ItemOutcome(ItemResult.REJECTED)] * len(ids)
+        )
+
+    monkeypatch.setattr(node.manager.metadata, "unpin", refused)
+    loader.fetch(keys[0])  # its node pin goes after the fan-out
+    wait_until(lambda: node.manager.ended is not None, "the run ends")
+    assert "UNPIN" in node.manager.ended
+    loader.close()
+
+
+def test_a_failure_inside_a_fetch_ends_the_run(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    loader = Loader(node, server)
+
+    def broken(flights):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(node.manager.fetches, "_run", broken)
+    answer = loader.fetch(keys[0])
+    assert answer.items[0] == miss(MissReason.BUSY)
+    wait_until(lambda: node.manager.ended is not None, "the run ends")
+    assert "injected" in node.manager.ended
+    loader.close()
+
+
+def test_a_copy_is_published_for_a_waiter_once_the_leader_left(env, monkeypatch):
+    server, make = env
+    node, keys = make()
+    name = keys[0]
+    sessions = []
+    complete = node.manager.metadata.fetch_complete
+
+    def recorded(session, items, **kwargs):
+        sessions.append((session, [i.hold_copy for i in items]))
+        return complete(session, items, **kwargs)
+
+    monkeypatch.setattr(node.manager.metadata, "fetch_complete", recorded)
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    reads = Reads(node, monkeypatch).hold()
+    first = a.send(a.request(a.items(name), deadline_ms=150))
+    assert reads.entered.wait(5)
+    second = b.send(b.request(b.items(name)))
+    wait_until(lambda: node.manager.fetches.results["joined"] == 1, "joined")
+    assert first.result(10).items[0] == miss(MissReason.TIMEOUT)
+    reads.release()
+    hit = second.result(10).items[0]
+    assert hit.result == ItemResult.HIT and b.read(hit.location) == value_of(name)
+    # published with b's session, b's pin in the same request
+    assert sessions == [(b.token, [True])]
+    b.unpin(hit.pin_id)
+    wait_until(lambda: settled(node, server), "quota back")
     a.close()
     b.close()

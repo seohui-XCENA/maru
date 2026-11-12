@@ -118,26 +118,31 @@ def check_servable(config: NodeConfig) -> None:
         )
 
 
-def worker_budgets(config: NodeConfig, top_bytes: int, bounce: int) -> Budgets:
-    """The budgets each worker gets at ATTACH. With an SSD tier its
+def worker_budgets(
+    config: NodeConfig, top_bytes: int, bounce: int, workers: int = 1
+) -> Budgets:
+    """The budgets a worker gets at ATTACH. With an SSD tier its
     fetch_request_max_bytes is its fetch window: the pages it may hold
-    fetched at once, within the per-op cap, the flights the node's in-flight
-    cap holds (a page and its ``bounce`` each), and the ``top_bytes`` really
-    mapped for the top tier less its credit and transfer reserve (one page
-    at least)."""
+    fetched at once. Within the per-op cap, its share among ``workers``
+    (the fetch_v1 workers attached, itself included) of the flights the
+    node's in-flight cap holds (a page and its ``bounce`` each) and of the
+    ``top_bytes`` really mapped for the top tier less its credit, commit
+    pending and transfer reserve; one page at least."""
     budgets = config.budgets
     if config.tier("ssd") is None:
         return budgets
     ps = config.page_size
+    workers = max(1, workers)
     room = (
         top_bytes
         - budgets.credit_total_max_bytes
+        - budgets.commit_pending_max_bytes
         - budgets.transfer_reserve_bytes.get(config.top.store, 0)
     )
     window = min(
         budgets.fetch_request_max_bytes,
-        budgets.fetch_max_inflight_bytes // (ps + bounce) * ps,
-        room,
+        budgets.fetch_max_inflight_bytes // workers // (ps + bounce) * ps,
+        room // workers,
     )
     return dataclasses.replace(
         budgets, fetch_request_max_bytes=max(ps, window // ps * ps)
@@ -424,8 +429,10 @@ class StorageService:
             top_bytes = sum(
                 i.capacity for i in infos if i is not None and i.kind == top.store
             )
-            self.local.budgets = worker_budgets(
-                config, top_bytes, self.ssd.io_size(config.page_size)
+            bounce = self.ssd.io_size(config.page_size)
+            self.local.budgets = worker_budgets(config, top_bytes, bounce)
+            self.local.fetch_budgets = lambda workers: worker_budgets(
+                config, top_bytes, bounce, workers
             )
         self.local.start()
         logger.info(

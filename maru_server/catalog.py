@@ -539,6 +539,8 @@ class Catalog:
                 entry, worker_holder, copy_holder, creator, cached
             )
 
+        if item.copy.kind not in MAPPABLE_KINDS:
+            return ItemOutcome(ItemResult.REJECTED)  # never pinned for a worker
         exact = self.entry_exact(item.key, item.copy)
         if exact is not None and self.own_pool(node_id, item.copy.pool_id):
             # this copy is in already (a re-run)
@@ -622,10 +624,15 @@ class Catalog:
         key: Key,
         location: Location,
         online: Callable[[str], bool],
+        own_only: bool = False,
     ) -> ItemOutcome:
+        """A NODE pin on the exact location. ``own_only`` (for a worker's
+        fetch): only in the node's own pools."""
         entry = self.entry_exact(key, location)
         if entry is None or entry.pool.state == PoolState.REMOVING:
             return ItemOutcome(ItemResult.MISS, reason=MissReason.ABSENT)
+        if own_only and entry.pool.node_id != node_id:
+            return ItemOutcome(ItemResult.REJECTED)
         if entry.pool.state == PoolState.HIDDEN:
             return ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
         if entry.pool.node_id != node_id and not online(entry.pool.node_id):

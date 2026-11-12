@@ -15,6 +15,7 @@ import os
 import socket
 import stat
 import threading
+from collections.abc import Callable
 
 from maru_common.node_protocol import (
     NODE_MESSAGE_CLASSES,
@@ -214,6 +215,8 @@ class LocalServer:
         self.server_address = server_address
         self.page_size = page_size
         self.budgets = budgets
+        # A fetch_v1 worker's budgets, given how many such workers attached
+        self.fetch_budgets: Callable[[int], Budgets] | None = None
         # (descriptor, fd or None); memfd indexes the fds sent with the reply
         self.pools = pools
         self.transfer_defaults = transfer_defaults or TransferDefaults()
@@ -427,6 +430,8 @@ class LocalServer:
             conn.respond(header, manager.unmap_ack(rec, request))
         elif code == NodeMessageType.DETACH:
             conn.respond(header, manager.workers.detach(rec))
+            if manager.fetches is not None:
+                manager.fetches.forget(rec.incarnation)
             manager.workers.after_detach_reply(rec)
         else:  # every code of the table is handled above
             conn.respond(header, response_cls(status=Status.REJECTED, error="unknown"))
@@ -490,6 +495,11 @@ class LocalServer:
         rec.capabilities = frozenset(agreed)
         conn.worker = rec
         budgets = None if probe else self.budgets
+        if budgets is not None and FETCH_CAPABILITY in agreed and self.fetch_budgets:
+            # Its share of the fetch room, among the fetch_v1 workers now
+            budgets = self.fetch_budgets(
+                manager.workers.count(lambda r: FETCH_CAPABILITY in r.capabilities)
+            )
         response = AttachResponse(
             status=Status.OK,
             node_id=self.node_id,

@@ -728,7 +728,51 @@ class TestWorkerBinding:
     """SOURCE_PIN and FETCH_COMPLETE for a named worker: only its own open
     session on this node's run, with its namespace, gets a pin."""
 
-    _setup = TestFetch._setup
+    def _setup(self, wire):
+        """A key on node a's own SSD, as a worker's fetch reads it."""
+        a = open_node(wire, "a", ssd=True)
+        b = open_node(wire, "b", ssd=True)
+        worker = FakeWorker(wire, a)
+        worker.open()
+        k = key("k")
+        source = a.loc(a.ssd(), 1)
+        a.commit((k, source))
+        return a, b, worker, k, source
+
+    def _bound_pin(self, a, worker, k, location):
+        from maru_common.protocol import MessageType, SourcePinRequest
+        from maru_common.storage_types import KeyLocation
+
+        return a.send(
+            MessageType.SOURCE_PIN,
+            a.build(
+                SourcePinRequest,
+                **a.envelope(),
+                items=[KeyLocation(k, location)],
+                worker_session=worker.token,
+                worker_incarnation=worker.incarnation,
+            ),
+        )
+
+    def test_a_workers_source_pin_is_only_on_the_nodes_own_pools(self, env):
+        _, service, wire = env
+        a, b, worker, _, _ = self._setup(wire)
+        k = key("on-b")
+        elsewhere = b.loc(b.ssd(), 2)
+        b.commit((k, elsewhere))
+        assert results(self._bound_pin(a, worker, k, elsewhere)) == ["REJECTED"]
+        assert len(service.pins) == 0
+        # the node's own SOURCE_PIN, for no worker, is not limited
+        assert results(a.source_pin((k, elsewhere))) == ["HIT"]
+
+    def test_an_exact_copy_off_the_mapped_tiers_is_never_handed_over(self, env):
+        _, service, wire = env
+        a, _, worker, k, source = self._setup(wire)
+        # the SSD location itself, sent as the copy: in already, but not
+        # a location a worker maps
+        done = a.fetch_complete(worker.token, (k, "", source))
+        assert results(done) == ["REJECTED"] and done.items[0].pin_id is None
+        assert not service.pins.held_by(worker.token)
 
     def test_source_pin_refuses_another_workers_session(self, env):
         from maru_common.protocol import MessageType, SourcePinRequest

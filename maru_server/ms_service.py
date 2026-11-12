@@ -594,6 +594,7 @@ class MsService:
                             item.key,
                             item.location,
                             online,
+                            own_only=bool(req.worker_incarnation),
                         )
                     )
                 return SourcePinResponse(status=Status.OK, items=batch.outcomes)

@@ -167,6 +167,7 @@ class StorageManager:
             watcher=self.watcher,
             on_exit=self._queue_exit,
             on_settled=on_worker_settled,
+            on_ended=self._worker_ended,
             gpu_drain_grace_s=gpu_drain_grace_s,
         )
 
@@ -1487,6 +1488,10 @@ class StorageManager:
         self._evict_wake.set()
 
     # ----------------------------------------------------------- worker exit
+
+    def _worker_ended(self, incarnation: str) -> None:
+        if self.fetches is not None:
+            self.fetches.worker_ended(incarnation)
 
     def _queue_exit(self, ref: WorkerRef) -> None:
         if self.fetches is not None:

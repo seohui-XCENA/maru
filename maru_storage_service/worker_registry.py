@@ -88,6 +88,7 @@ class WorkerRegistry:
         on_exit: Callable[[WorkerRef], None],
         gpu_drain_grace_s: float,
         on_settled: Callable[[str], None] = lambda incarnation: None,
+        on_ended: Callable[[str], None] = lambda incarnation: None,
     ):
         self.node_epoch = node_epoch
         self.gpu_drain_grace_s = gpu_drain_grace_s
@@ -98,6 +99,8 @@ class WorkerRegistry:
         # A worker whose exit is confirmed and whose GPU drain grace is over:
         # nothing of it touches the pools any more, so its region holds can go
         self._on_settled = on_settled
+        # Its process ended: what it waits for is answered now
+        self._on_ended = on_ended
         # incarnation -> when its exit's GPU drain grace ends
         self._settles_at: dict[str, float] = {}
         self._lock = threading.RLock()
@@ -279,6 +282,7 @@ class WorkerRegistry:
             refs = self._pools.quarantine_holder(incarnation)
         if conn is not None:
             conn.close()
+        self._on_ended(incarnation)
         logger.info(
             "worker %s (pid %d) ended: %d credited pages quarantined for %.1f s",
             incarnation,
@@ -321,6 +325,15 @@ class WorkerRegistry:
                 return
             self._timers.add(timer)
         timer.start()
+
+    def count(self, pred: Callable[[WorkerRecord], bool]) -> int:
+        """Attached workers, neither detached nor ended, that ``pred`` takes."""
+        with self._lock:
+            return sum(
+                1
+                for rec in self._workers.values()
+                if not (rec.exited or rec.detached) and pred(rec)
+            )
 
     def mapping(self) -> dict[str, WorkerEndpoint | None]:
         """Workers of this run that may map its pools, with their connection

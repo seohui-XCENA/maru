@@ -7,9 +7,11 @@ One flight per key at a time: one destination page in the top tier and one
 read, shared by every FETCH of the key. A flight takes its quota and its page,
 pins the source (SOURCE_PIN), reads it through the I/O executor, then
 publishes the copy with FETCH_COMPLETE: the source is unpinned and the copy
-pinned for the leading worker, plus a node pin (hold_copy) that keeps the copy
+pinned for a waiting worker, plus a node pin (hold_copy) that keeps the copy
 while the other waiters get their own pins on it (the exact copy). The node
-pin goes once no waiter is left.
+pin goes once no waiter is left. Each flight goes on as soon as it has its
+page; FETCHes short of room take pages in the order they came, so two never
+hold part of their pages while each waits for the other's.
 
 A FETCH is answered once every item has its outcome; at its deadline or its
 cancel it is answered at once, with MISS for each item without a pin handed
@@ -120,6 +122,9 @@ class _Flight:
     closed: bool = False
     # A copy published before: no read, unless it is gone by its SOURCE_PIN
     cached: bool = False
+    # The op whose session pinned the source; its read's callback has run
+    pinned_by: _Op | None = None
+    read_over: bool = False
 
 
 class FetchManager:
@@ -157,6 +162,8 @@ class FetchManager:
             collections.OrderedDict()
         )
         self._inflight = 0
+        # FETCHes short of room, in the order they came: the first takes pages
+        self._room: collections.deque[object] = collections.deque()
         self._stop = threading.Event()
         self._tasks = concurrent.futures.ThreadPoolExecutor(
             threads, thread_name_prefix="maru-fetch"
@@ -281,6 +288,8 @@ class FetchManager:
                         self.results["joined"] += 1
                         continue
                     ref, bounce = source
+                    if copy is None:  # published since it was looked up
+                        copy = self._published.get(item.key)
                     # A copy published before costs no read and no quota
                     cost = 0 if copy is not None else self.page_size + bounce
                     if self._inflight + cost > self.inflight_max_bytes:
@@ -314,7 +323,7 @@ class FetchManager:
         timer.start()
         if led:
             try:
-                self._tasks.submit(self._lead, op, led)
+                self._tasks.submit(self._lead, led)
             except RuntimeError:  # stopping
                 for flight in led:
                     self._fail(flight, _miss(MissReason.BUSY))
@@ -329,6 +338,8 @@ class FetchManager:
             )
         with self._lock:
             op = self._ops.get((target.origin, target.seq))
+            if op is None and self.manager.ledger.finished(target.origin, target.seq):
+                return FetchCancelResponse(status=Status.OK)  # answered already
             if op is None:
                 marks = self._marks(target.origin, target.ack)
                 if target.seq not in marks and len(marks) >= CANCEL_MARKS:
@@ -349,9 +360,18 @@ class FetchManager:
         return marks
 
     def forget(self, incarnation: str) -> None:
-        """The worker ended: its early cancels go."""
+        """The worker detached or ended: its early cancels go."""
         with self._lock:
             self._cancelled.pop(incarnation, None)
+
+    def worker_ended(self, incarnation: str) -> None:
+        """The worker's process ended: its open FETCHes are answered MISS at
+        once (pins made for them go); flights go on for other waiters."""
+        with self._lock:
+            ops = [op for (origin, _), op in self._ops.items() if origin == incarnation]
+            self._cancelled.pop(incarnation, None)
+        for op in ops:
+            self._answer(op, None)
 
     def _check(self, req: FetchRequest) -> str | None:
         """Why the request is malformed or too large, or None."""
@@ -473,8 +493,9 @@ class FetchManager:
 
     # --------------------------------------------------------------- flights
 
-    def _lead(self, op: _Op, flights: list[_Flight]) -> None:
-        """Run the flights ``op`` started, then serve their other waiters."""
+    def _lead(self, flights: list[_Flight]) -> None:
+        """Run the flights a FETCH started, then serve their other waiters. A
+        failure here leaves pages and pins as they are, and ends the run."""
         try:
             cached = [f for f in flights if f.cached]
             todo = [f for f in flights if not f.cached]
@@ -483,43 +504,82 @@ class FetchManager:
                 for flight in held:
                     self._fan_out(flight)
                 todo += gone
-            todo = self._take_pages(todo)
-            todo = self._pin_sources(todo)
-            todo = self._read(todo)
-            for flight in self._publish(op, todo):
-                self._fan_out(flight)
-        except Exception:
+            self._run(todo)
+        except Exception as e:
             logger.exception("a fetch failed; its pages stay as they are")
             for flight in flights:
                 if not flight.closed:
                     self._fail(flight, _miss(MissReason.BUSY))
+            if not self._stop.is_set():
+                self.manager.end_run(f"a fetch failed: {e!r}")
 
-    def _take_pages(self, flights: list[_Flight]) -> list[_Flight]:
-        """A destination page for each flight, from the top tier's mapped
-        pools. Short of room, eviction is asked to make it (want_room) while
-        a waiter of the flight is within its deadline; each waiter is
-        answered at its own."""
-        out: list[_Flight] = []
+    def _run(self, flights: list[_Flight]) -> None:
+        """Each flight goes to its SOURCE_PIN and read as soon as it has a
+        destination page from the top tier, and is published once read.
+        Those short of a page wait for room (want_room) while a waiter is
+        within its deadline; FETCHes short of room take pages in the order
+        they came."""
         need = list(flights)
-        while need:
-            now = time.monotonic()
-            for flight in [f for f in need if self._deadline(f) <= now]:
-                need.remove(flight)
+        ready: collections.deque[_Flight] = collections.deque()
+        running: list[_Flight] = []
+        wake = threading.Event()
+        turn = object()
+        with self._lock:
+            self._room.append(turn)
+        try:
+            while need or ready or running:
+                wake.clear()
+                need = self._expire(need)
+                got = []
+                if need and self._first(turn):
+                    refs = self._reserve(len(need))
+                    for flight, ref in zip(need, refs, strict=False):
+                        flight.dest = ref
+                        got.append(flight)
+                    need = need[len(refs) :]
+                    if need:
+                        self.manager.want_room(self.kind, len(need) * self.page_size)
+                if not need:
+                    self._leave(turn)
+                if got:
+                    ready.extend(self._pin_sources(got))
+                while ready and len(running) < FETCH_IO_DEPTH:
+                    flight = ready.popleft()
+                    if self._start_read(flight, wake):
+                        running.append(flight)
+                with self._lock:
+                    ended = [f for f in running if f.read_over]
+                if ended:
+                    running = [f for f in running if f not in ended]
+                    read = [f for f in ended if self._read_result(f)]
+                    for flight in self._publish(read):
+                        self._fan_out(flight)
+                    continue
+                if need or running:
+                    wake.wait(ROOM_POLL_S if need else 1.0)
+        finally:
+            self._leave(turn)
+
+    def _expire(self, need: list[_Flight]) -> list[_Flight]:
+        """Those still waiting for room: not past every waiter's deadline,
+        and not stopping."""
+        now = time.monotonic()
+        out = []
+        for flight in need:
+            if self._stop.is_set() or self._deadline(flight) <= now:
                 self._fail(flight, _miss(MissReason.BUSY))
-            refs = self._reserve(len(need))
-            for flight, ref in zip(need, refs, strict=False):
-                flight.dest = ref
+            else:
                 out.append(flight)
-            need = need[len(refs) :]
-            if not need:
-                break
-            if self._stop.is_set():
-                for flight in need:
-                    self._fail(flight, _miss(MissReason.BUSY))
-                break
-            self.manager.want_room(self.kind, len(need) * self.page_size)
-            self._stop.wait(ROOM_POLL_S)
         return out
+
+    def _first(self, turn: object) -> bool:
+        with self._lock:
+            return bool(self._room) and self._room[0] is turn
+
+    def _leave(self, turn: object) -> None:
+        with self._lock:
+            if turn in self._room:
+                self._room.remove(turn)
 
     def _deadline(self, flight: _Flight) -> float:
         """The latest deadline of the flight's unanswered waiters (0: none)."""
@@ -569,11 +629,15 @@ class FetchManager:
 
     def _pinner(self, flight: _Flight) -> _Op | None:
         """The op whose worker the flight is pinned for: an unanswered
-        waiter's (the leader first), so a leader that left holds up no one."""
+        waiter's (the one that pinned its source, else the leader first), so
+        a leader that left holds up no one."""
         with self._lock:
-            for waiter in (flight.leader, *flight.waiters):
-                if not (waiter.op.answered or waiter.op.refused):
-                    return waiter.op
+            ops = [w.op for w in (flight.leader, *flight.waiters)]
+            if flight.pinned_by is not None:
+                ops.insert(0, flight.pinned_by)
+            for op in ops:
+                if not (op.answered or op.refused):
+                    return op
         return None
 
     def _source_pin(
@@ -618,11 +682,11 @@ class FetchManager:
                         out[i] = _miss(MissReason.BUSY)
                     continue
                 for i, o in zip(idx, response.items, strict=True):
-                    out[i] = (
-                        o.pin_id
-                        if o.result == ItemResult.HIT and o.pin_id
-                        else _miss(o.reason or MissReason.ABSENT)
-                    )
+                    if o.result == ItemResult.HIT and o.pin_id:
+                        out[i] = o.pin_id
+                        flights[i].pinned_by = op
+                    else:
+                        out[i] = _miss(o.reason or MissReason.ABSENT)
         return out
 
     def _refuse(self, op: _Op, flights: list[_Flight]) -> None:
@@ -649,6 +713,10 @@ class FetchManager:
         pins = self._source_pin(flights, [f.copy for f in flights])
         held, gone = [], []
         for flight, pin in zip(flights, pins, strict=True):
+            assert flight.copy is not None
+            if isinstance(pin, str) and not self._usable(flight.key, flight.copy):
+                self._unpin_later([pin])  # held, but no longer handed over
+                pin = _miss(MissReason.ABSENT)
             if isinstance(pin, str):
                 flight.node_pin = pin
                 with self._lock:
@@ -672,79 +740,73 @@ class FetchManager:
                 self._fail(flight, _miss(MissReason.BUSY))
         return held, gone
 
-    def _read(self, flights: list[_Flight]) -> list[_Flight]:
-        """Read each source into its page, FETCH_IO_DEPTH at a time; the
-        flights whose read moved every byte."""
-        out: list[_Flight] = []
-        running: collections.deque[_Flight] = collections.deque()
-
-        def wait_one() -> None:
-            flight = running.popleft()
-            ticket = flight.ticket
-            assert ticket is not None
-            ticket.done.wait()
-            if ticket.ok:
-                self.results["reads"] += 1
-                out.append(flight)
-                return
+    def _start_read(self, flight: _Flight, wake: threading.Event) -> bool:
+        """Submit the read of the source into the flight's page."""
+        assert flight.dest is not None
+        if not self._live(flight):
             self._release_source(flight)
             self._drop_page(flight)
-            if ticket.cancelled:
-                reason = None
-            elif isinstance(ticket.error, TimeoutError):
-                reason = MissReason.TIMEOUT
-            else:
-                reason = MissReason.IO_ERROR
-                logger.warning("fetch read of %s failed: %s", flight.key, ticket.error)
-            self._fail(flight, _miss(reason))
+            self._fail(flight, _miss())
+            return False
+        refs = [flight.source_ref, flight.dest]
+        if not self.pools.io_acquire(flight.source_ref, flight.dest):
+            self._release_source(flight)
+            self._drop_page(flight)
+            self._fail(flight, _miss(MissReason.ABSENT))
+            return False
+        dest = self.pools.transfer_location(flight.dest)
+        try:
+            flight.ticket = self.transfers.submit_io(
+                Copy(flight.source, dest, flight.source.length),
+                flight.source_ref,
+                flight.dest,
+                callback=lambda _t, f=flight: self._read_ended(f, refs, wake),
+            )
+        except Exception as e:  # a full queue, or the engine stopped
+            logger.debug("cannot read %s: %s", flight.key, e)
+            self.pools.io_release(refs)
+            self._release_source(flight)
+            self._drop_page(flight)
+            self._fail(flight, _miss(MissReason.BUSY))
+            return False
+        return True
 
-        for flight in flights:
-            while len(running) >= FETCH_IO_DEPTH:
-                wait_one()
-            assert flight.dest is not None
-            if not self._live(flight):
-                self._release_source(flight)
-                self._drop_page(flight)
-                self._fail(flight, _miss())
-                continue
-            refs = [flight.source_ref, flight.dest]
-            if not self.pools.io_acquire(flight.source_ref, flight.dest):
-                self._release_source(flight)
-                self._drop_page(flight)
-                self._fail(flight, _miss(MissReason.ABSENT))
-                continue
-            dest = self.pools.transfer_location(flight.dest)
-            try:
-                flight.ticket = self.transfers.submit_io(
-                    Copy(flight.source, dest, flight.source.length),
-                    flight.source_ref,
-                    flight.dest,
-                    callback=lambda _t, f=flight, refs=refs: self._read_ended(f, refs),
-                )
-            except Exception as e:  # a full queue, or the engine stopped
-                logger.debug("cannot read %s: %s", flight.key, e)
-                self.pools.io_release(refs)
-                self._release_source(flight)
-                self._drop_page(flight)
-                self._fail(flight, _miss(MissReason.BUSY))
-                continue
-            running.append(flight)
-        while running:
-            wait_one()
-        return out
-
-    def _read_ended(self, flight: _Flight, refs: list[PageRef]) -> None:
+    def _read_ended(
+        self, flight: _Flight, refs: list[PageRef], wake: threading.Event
+    ) -> None:
         """The read's syscalls ended: its pages and bounce are free of it."""
         self.pools.io_release(refs)
         with self._lock:
             if flight.charged:
                 flight.charged -= flight.bounce
                 self._inflight -= flight.bounce
+            flight.read_over = True
+        wake.set()
 
-    def _publish(self, op: _Op, flights: list[_Flight]) -> list[_Flight]:
-        """FETCH_COMPLETE the copies, one request: each is published (or the
-        node's copy there already is used), pinned for ``op``'s worker and
-        held by a node pin; the sources are unpinned."""
+    def _read_result(self, flight: _Flight) -> bool:
+        """Whether the read moved every byte; else the flight ends."""
+        ticket = flight.ticket
+        assert ticket is not None
+        if ticket.ok:
+            self.results["reads"] += 1
+            return True
+        self._release_source(flight)
+        self._drop_page(flight)
+        if ticket.cancelled:
+            reason = None
+        elif isinstance(ticket.error, TimeoutError):
+            reason = MissReason.TIMEOUT
+        else:
+            reason = MissReason.IO_ERROR
+            logger.warning("fetch read of %s failed: %s", flight.key, ticket.error)
+        self._fail(flight, _miss(reason))
+        return False
+
+    def _publish(self, flights: list[_Flight]) -> list[_Flight]:
+        """FETCH_COMPLETE the copies, one request per worker: each is
+        published (or the node's copy there already is used), pinned for an
+        unanswered waiter (the one that pinned its source first) and held by
+        a node pin; the sources are unpinned."""
         if not flights:
             return []
         copies = []
@@ -754,9 +816,20 @@ class FetchManager:
             page = self.pools.page(flight.dest)
             assert page is not None and page.location is not None
             copies.append(page.location)
-        with self._lock:
-            # No pin for a worker already answered or refused
-            session = "" if op.answered or op.refused else op.session
+        groups: dict[_Op | None, list[int]] = {}
+        for i, flight in enumerate(flights):
+            groups.setdefault(self._pinner(flight), []).append(i)
+        out = []
+        for op, idx in groups.items():
+            out += self._complete(
+                op, [flights[i] for i in idx], [copies[i] for i in idx]
+            )
+        return out
+
+    def _complete(
+        self, op: _Op | None, flights: list[_Flight], copies: list[Location]
+    ) -> list[_Flight]:
+        """FETCH_COMPLETE with ``op``'s session (none: published as cache)."""
         items = [
             FetchCompleteItem(
                 key=f.key,
@@ -769,7 +842,9 @@ class FetchManager:
         ]
         try:
             response = self.metadata.fetch_complete(
-                session, items, worker_incarnation=op.origin if session else ""
+                op.session if op else "",
+                items,
+                worker_incarnation=op.origin if op else "",
             )
         except Exception as e:
             # Unknown whether published: the pages stay PENDING, with the run
@@ -787,9 +862,15 @@ class FetchManager:
                 self.pools.commit_freed(flight.dest)
                 self._fail(flight, _miss(MissReason.BUSY))
             return []
+        if response.error and op is not None:
+            # Another worker's session: its items are REJECTED (the sources
+            # were unpinned with them, so the copies are not published)
+            logger.warning("FETCH of %s refused: %s", op.origin, response.error)
+            self._refuse(op, flights)
         out = []
         for flight, copy, outcome in zip(flights, copies, response.items, strict=True):
             assert flight.dest is not None
+            flight.source_pin = None  # released with this answer
             location = outcome.location
             if (
                 outcome.result
@@ -818,15 +899,36 @@ class FetchManager:
                 self._published.move_to_end(flight.key)
                 while len(self._published) > PUBLISHED_KEYS:
                     self._published.popitem(last=False)
+                winner = self._take_waiter(flight, op)
+                if winner is not flight.leader:
+                    # Answered or refused by now; else the fan-out pins it
+                    flight.waiters.insert(0, flight.leader)
             if outcome.result == ItemResult.HIT and outcome.pin_id:
                 hit = ItemOutcome(
                     ItemResult.HIT, location=location, pin_id=outcome.pin_id
                 )
-                self._resolve(flight.leader, hit)
-            else:
-                self._resolve(flight.leader, _miss())
+                if winner is not None:
+                    self._resolve(winner, hit)
+                else:
+                    self._unpin_later([outcome.pin_id])
+            elif winner is not None:
+                self._resolve(winner, _miss())
             out.append(flight)
         return out
+
+    @staticmethod
+    def _take_waiter(flight: _Flight, op: _Op | None) -> _Waiter | None:
+        """Caller holds the lock: ``op``'s waiter of the flight, out of the
+        fan-out (the leader if it is op's)."""
+        if op is None:
+            return None
+        if flight.leader.op is op:
+            return flight.leader
+        for waiter in flight.waiters:
+            if waiter.op is op:
+                flight.waiters.remove(waiter)
+                return waiter
+        return None
 
     def _copy(self, key: Key) -> Location | None:
         """A copy of ``key`` published here before and still usable."""
@@ -958,6 +1060,11 @@ class FetchManager:
                     return None
         return None
 
+    def _stop_unpins(self, reason: str) -> None:
+        logger.error("%s", reason)
+        if not self._stop.is_set():
+            self.manager.end_run(reason)
+
     def _release_loop(self) -> None:
         """UNPIN, a batch at a time, off the fetch path."""
         while True:
@@ -979,9 +1086,9 @@ class FetchManager:
                 if o.result != ItemResult.OK
             ]
             if response.status != Status.OK or refused:
-                logger.error(
-                    "UNPIN of fetch pins refused: %s %s %s",
-                    response.status,
-                    response.error,
-                    refused,
+                # A pin left that should have gone: the run ends
+                self._stop_unpins(
+                    f"UNPIN of fetch pins refused: {response.status} "
+                    f"{response.error} {refused}"
                 )
+                return

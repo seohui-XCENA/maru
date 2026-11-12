@@ -239,7 +239,8 @@ class FetchRequest:
     """FETCH (0x18) - Only with fetch_v1 agreed at ATTACH.
 
     ``deadline_ms`` counts from the first receipt; a resend joins the same
-    fetch and does not extend it. A malformed request or one over
+    fetch and does not extend it (it is not part of the op digest, so a
+    resend may carry the time left). A malformed request or one over
     fetch_request_max_bytes is REJECTED, a full node before taking it is
     BUSY. Items: HIT(location, pin_id), MISS(reason), REJECTED; MISS busy,
     timeout or io_error once taken. From the reply on, the HIT pin is the

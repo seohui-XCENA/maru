@@ -127,6 +127,15 @@ class OpLedger:
                 log.dropped = True
                 self._drop_if_idle(origin, log)
 
+    def finished(self, origin: str, seq: int) -> bool:
+        """Whether op ``seq`` of ``origin`` has its result (or was acked)."""
+        with self._lock:
+            log = self._origins.get(origin)
+            if log is None:
+                return False
+            entry = log.entries.get(seq)
+            return seq <= log.ack or (entry is not None and entry.done.is_set())
+
     def size(self, origin: str) -> int:
         with self._lock:
             log = self._origins.get(origin)
