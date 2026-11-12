@@ -476,17 +476,17 @@ class NodeRegistry:
         req: NodeOpenRequest,
         listed: dict[str, PoolInfo],
     ) -> bool:
-        """Only a listed pool. CXL: the same region, with a run before
-        on the same boot; SSD: unchanged. A changed one starts empty; DRAM
-        never stays."""
+        """Only a listed pool, with a run before on the same boot. CXL: the
+        same region; SSD: unchanged (its writes are not synced, so a reboot
+        may lose them). A changed one starts empty; DRAM never stays."""
         info, was = listed.get(pool.pool_id), pool.info
         if info is None or pool.kind == PoolKind.DRAM:
             return False
+        if old is None or old.host_boot_id != req.host_boot_id:
+            return False
         if pool.kind == PoolKind.CXL:
             return (
-                old is not None
-                and old.host_boot_id == req.host_boot_id
-                and info.rm_domain == was.rm_domain
+                info.rm_domain == was.rm_domain
                 and info.region_id == was.region_id
                 and info.capacity == was.capacity
                 and info.page_size == was.page_size

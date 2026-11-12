@@ -28,6 +28,8 @@ STORE_ALIASES = {"cpu": "dram"}
 # node_id goes into pool ids such as dram:{node_id}:{node_epoch}
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MEMORY_STORES = ("dram", "cxl")
+# Tiers of this node's own pools: the ones demotion moves pages between
+LOCAL_STORES = ("dram", "cxl", "ssd")
 DEMOTIONS = ("back", "through")
 ROLES = ("gpu", "memory")
 
@@ -152,6 +154,8 @@ class TierTraits:
     demotes_to: PoolKind | None = None  # write-back target (demotion "back")
     # Workers get the credit the tiers above lack from it
     credit_fallback: bool = False
+    # Only the I/O executor moves its pages (SSD); workers never map them
+    io_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,19 +187,23 @@ class NodeConfig:
         return next((t for t in self.tiers if t.store == store), None)
 
     def traits(self) -> dict[PoolKind, TierTraits]:
-        """Traits of each memory tier, by the kind of its pools. The top tier
-        gives credit, and a tier with credit_fallback the credit the tiers
-        above lack. A tier with demotion "back" over a memory tier evicts by
-        moving its pages there; a tier that gets new pages (credit or
-        demotion) and demotes nowhere evicts by dropping."""
+        """Traits of each local tier (memory and SSD), by the kind of its
+        pools. The top tier gives credit, and a tier with credit_fallback the
+        credit the tiers above lack. A tier with demotion "back" over a local
+        tier evicts by moving its pages there; a tier that gets new pages
+        (credit or demotion) and demotes nowhere evicts by dropping."""
         out: dict[PoolKind, TierTraits] = {}
         receives = True  # the top tier gets the writes
         for i, t in enumerate(self.tiers):
-            if not t.is_memory:
+            if t.store not in LOCAL_STORES:
                 receives = False
                 continue
             below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
-            demotes = t.demotion == "back" and below is not None and below.is_memory
+            demotes = (
+                t.demotion == "back"
+                and below is not None
+                and below.store in LOCAL_STORES
+            )
             fallback = i > 0 and t.credit_fallback
             out[PoolKind(t.store)] = TierTraits(
                 kind=PoolKind(t.store),
@@ -203,6 +211,7 @@ class NodeConfig:
                 evicts=receives or fallback,
                 demotes_to=PoolKind(below.store) if demotes and below else None,
                 credit_fallback=fallback,
+                io_only=not t.is_memory,
             )
             receives = demotes
         return out
@@ -418,6 +427,9 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
     commit_pending = size_or("commit_pending_max_bytes", credit_total)
 
     memory_tiers = [t for t in tiers if t.is_memory]
+    # A tier only reached by I/O (SSD, remote): its pages are fetched into the
+    # top tier, which keeps a page of its transfer reserve for that
+    fetches = any(not t.is_memory for t in tiers)
     reserve_raw = raw.get("transfer_reserve_bytes")
     reserve: dict[str, int] = {}
     for t in memory_tiers:
@@ -441,6 +453,8 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
             raise NodeConfigError(
                 f"budgets.transfer_reserve_bytes: required for the {t.store} tier because it has no size"
             )
+        if fetches and t is top:
+            default = max(default, page_size)
         reserve[t.store] = default
 
     fetch_request = size_or("fetch_request_max_bytes", DEFAULT_FETCH_REQUEST_MAX)
@@ -457,10 +471,22 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
             f"{credit_total} (values not set in budgets are defaults; a top tier this "
             "small cannot give one page of credit)"
         )
-    if not page_size <= fetch_request <= fetch_inflight:
+    # The fetch caps bind only a node that fetches
+    if fetches and not page_size <= fetch_request <= fetch_inflight:
         raise NodeConfigError(
             "budgets: need page_size <= fetch_request_max_bytes <= "
             f"fetch_max_inflight_bytes, got {page_size}, {fetch_request}, {fetch_inflight}"
+        )
+    if fetches and fetch_inflight < 2 * page_size:
+        raise NodeConfigError(
+            f"budgets.fetch_max_inflight_bytes: {fetch_inflight} cannot hold one "
+            f"page and its bounce buffer (2 x page_size = {2 * page_size})"
+        )
+    if fetches and reserve.get(top.store, 0) < page_size:
+        raise NodeConfigError(
+            f"budgets.transfer_reserve_bytes: the {top.store} tier keeps "
+            f"{reserve.get(top.store, 0)}, less than one page ({page_size}) to "
+            "fetch into"
         )
     if top.size is not None:
         # Credit comes from the top tier and the fallback tiers, each less

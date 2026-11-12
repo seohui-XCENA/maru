@@ -396,6 +396,46 @@ class TestServiceTransitions:
             pm.reclaim(ref)
         pm.check()
 
+    def test_a_page_with_io_running_never_becomes_free(self):
+        pm = manager()
+        (c,) = pm.credit("w", PS)
+        ref, _, _ = pm.write_done("w", c, Key("ns", "a"), 10)
+        pm.commit_added(ref)
+        (dest,) = pm.reserve_transfer("dram:n:e", 1)
+        assert pm.io_acquire([ref, dest])
+        assert (pm.io_refs(ref), pm.io_refs(dest)) == (1, 1)
+        # a write that failed, a page retired meanwhile: neither is FREE yet
+        with pytest.raises(InvalidTransitionError, match="I/O running"):
+            pm.transfer_failed(dest)
+        pm.retired(ref)
+        with pytest.raises(InvalidTransitionError, match="I/O running"):
+            pm.reclaim(ref)
+        pm.check()
+        pm.io_release([ref, dest])
+        pm.transfer_failed(dest)
+        pm.reclaim(ref)
+        assert pm.io_refs(ref) == 0
+        # FREE, at another generation or released twice: refused
+        assert not pm.io_acquire([ref])
+        (other,) = pm.reserve_transfer("dram:n:e", 1)
+        stale = dataclasses.replace(other, generation=other.generation + 1)
+        assert not pm.io_acquire([other, stale]) and pm.io_refs(other) == 0
+        with pytest.raises(InvalidTransitionError):
+            pm.io_release([other])
+        pm.check()
+
+    def test_an_ssd_pool_never_gives_credit(self):
+        pm = manager()
+        info = dataclasses.replace(
+            dram(), pool_id="ssd:n:/x/pool.data", kind=PoolKind.SSD, path="/x"
+        )
+        with pytest.raises(ValueError, match="no credit"):
+            pm.add_pool(info)
+        pm.add_pool(info, creditable=False)
+        pm.enable_pool(info.pool_id)
+        assert not pm.creditable(info.pool_id)
+        assert all(c.kind == PoolKind.DRAM for c in pm.credit("w", 4 * PS))
+
     def test_quarantine_and_release_by_holder(self):
         pm = manager()
         pm.credit("w", 3 * PS)

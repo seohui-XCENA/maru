@@ -11,7 +11,7 @@ import heapq
 import itertools
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 
 from maru_common.storage_types import AccessInfo, KeptCause
 
@@ -105,11 +105,15 @@ class PlacementPolicy:
         retiring_bytes: int,
         page_size: int,
         limit: int,
+        demand_bytes: int = 0,
+        prefer: Collection[PageRef] = (),
     ) -> list[PageRef]:
         """READY pages of ``pool_ids`` to retire, LRU first across them: from
-        above the tier's ``high`` down to its ``low``. ``capacity`` and the
-        bytes are those pools' sums. In-flight and RETIRING pages count as
-        leaving."""
+        above the tier's ``high`` down to its ``low``, and until FREE bytes
+        reach ``demand_bytes`` (a fetch needs them now, whatever the
+        watermarks). ``capacity`` and the bytes are those pools' sums.
+        In-flight and RETIRING pages count as leaving. Pages in ``prefer``
+        come first."""
         pools = set(pool_ids)
         with self._lock:
             high, low = self._marks.get(tier, (self.high, self.low))
@@ -120,13 +124,15 @@ class PlacementPolicy:
             if used <= low * capacity:
                 evicting = False
             self._evicting[tier] = evicting
-            if not evicting:
-                return []
             inflight = sum(1 for r in self._inflight if r.pool_id in pools)
-            need = used - retiring_bytes - inflight * page_size - low * capacity
+            leaving = retiring_bytes + inflight * page_size
+            need = used - leaving - low * capacity if evicting else 0
+            need = max(need, demand_bytes - free_bytes - leaving)
+            if need <= 0:
+                return []
             now = self._clock()
             out: list[PageRef] = []
-            oldest_first = heapq.merge(
+            oldest_first: Iterable[tuple[int, PageRef]] = heapq.merge(
                 *(
                     ((seq, ref) for ref, seq in self._lru[p].items())
                     for p in pools
@@ -134,6 +140,11 @@ class PlacementPolicy:
                 ),
                 key=lambda item: item[0],
             )
+            if prefer:
+                ordered = list(oldest_first)
+                oldest_first = [i for i in ordered if i[1] in prefer] + [
+                    i for i in ordered if i[1] not in prefer
+                ]
             for _, ref in oldest_first:
                 if need <= 0 or len(out) >= limit:
                     break

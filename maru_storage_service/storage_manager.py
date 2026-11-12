@@ -65,7 +65,7 @@ from .ports import (
     ServerStopped,
     WorkerEndpoint,
 )
-from .transfer_engine import Copy, TransferEngine
+from .transfer_engine import Copy, IOTicket, TransferEngine
 from .worker_registry import WorkerRecord, WorkerRegistry
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,11 @@ DEFAULT_EVICT_INTERVAL_S = 0.05
 COMMIT_LINGER_S = 0.002
 EXIT_RETRY_S = 0.5
 EXIT_RETRY_MAX_S = 30.0
+# Demotion into an I/O tier (SSD): at most this much a pass, so room comes in
+# steps, and this many writes queued at a time: reads keep the rest of the
+# executor's queue
+IO_BATCH_BYTES = 1 << 30
+IO_DEPTH = 2
 
 
 @dataclass(eq=False)
@@ -184,6 +189,8 @@ class StorageManager:
         self._copies: dict[PageRef, PageRef] = {}
         # Pools MaruServer called INVALID: no demotion goes there
         self._invalid_pools: set[str] = set()
+        # FREE bytes a fetch wants now, by tier (see want_room)
+        self._demand: dict[PoolKind, int] = {}
 
     # ------------------------------------------------------------- lifecycle
 
@@ -684,18 +691,33 @@ class StorageManager:
             except Exception:
                 logger.exception("eviction pass failed")
 
+    def want_room(self, kind: PoolKind, nbytes: int) -> None:
+        """A fetch needs ``nbytes`` FREE in the tier of ``kind`` now: the next
+        pass evicts up to that much whatever the watermarks, pages with a
+        copy below first. Asked again, the larger demand stands."""
+        with self._lock:
+            self._demand[kind] = max(self._demand.get(kind, 0), nbytes)
+        self._evict_wake.set()
+
     def _evict_once(self) -> None:
         # Lower tiers first: the room they make takes the pages from above
         for kind in reversed(list(self.traits)):
             if self._halted():  # the session went during this pass
                 return
             traits = self.traits[kind]
+            with self._lock:
+                demand = self._demand.pop(kind, 0)
+                prefer = set(self._copies) if demand else set()
             if not traits.evicts:
                 continue
             pools = self._evictable_pools(kind)
             if not pools:
                 continue
             capacity, free, retiring, page_size = self._tier_usage(pools)
+            below = traits.demotes_to
+            limit = MAX_BATCH
+            if below is not None and self.traits[below].io_only:
+                limit = max(1, min(limit, IO_BATCH_BYTES // page_size))
             candidates = self.placement.candidates(
                 kind.value,
                 pools,
@@ -703,13 +725,15 @@ class StorageManager:
                 free_bytes=free,
                 retiring_bytes=retiring,
                 page_size=page_size,
-                limit=MAX_BATCH,
+                limit=limit,
+                demand_bytes=demand,
+                prefer=prefer,
             )
             refs, items = self._ready_items(candidates)
             if not refs:
                 continue
-            if traits.demotes_to is not None and self.transfers is not None:
-                self._demote(kind, pools, traits.demotes_to, refs, items)
+            if below is not None and self.transfers is not None:
+                self._demote(kind, pools, below, refs, items)
             else:
                 self.retire(refs, items)
 
@@ -827,7 +851,7 @@ class StorageManager:
         # Every reserved page and every candidate is settled, also on an error
         try:
             if moves:
-                self._run_moves(moves)
+                self._run_moves(moves, io=self.traits[below].io_only)
         finally:
             if drop:
                 self.retire([r for r, _ in drop], [i for _, i in drop])
@@ -887,7 +911,9 @@ class StorageManager:
                 out += self.pools.reserve_transfer(pool_id, n)
         return out
 
-    def _run_moves(self, moves: list[_Move]) -> None:
+    def _run_moves(self, moves: list[_Move], io: bool = False) -> None:
+        """Copy, COMMIT and FINALIZE_MOVE ``moves``; by the I/O executor when
+        ``io`` (the pages below are in a file pool)."""
         assert self.transfers is not None
         fresh = [m for m in moves if not m.existing]
         copied = [m for m in moves if m.existing]
@@ -897,7 +923,10 @@ class StorageManager:
             self.placement.release([m.src for m in moves], backoff=False)
             return
         copies = [Copy(m.source, m.dest_location, m.source.length) for m in fresh]
-        results = self.transfers.run(copies) if copies else []
+        if io:
+            results = self._write_io(fresh, copies)
+        else:
+            results = self.transfers.run(copies) if copies else []
         for move, ok in zip(fresh, results, strict=True):
             try:
                 if ok:
@@ -919,6 +948,43 @@ class StorageManager:
             if finals:
                 self._finalize_moves(finals)
         self._reclaim_retiring()
+
+    def _write_io(self, moves: list[_Move], copies: list[Copy]) -> list[bool]:
+        """Write the copies to their file pool pages, IO_DEPTH at a time;
+        answers once every write has ended, True for each that wrote all its
+        bytes. Both pages of a write keep an I/O reference until it ends."""
+        assert self.transfers is not None
+        results = [False] * len(moves)
+        running: collections.deque[tuple[int, IOTicket]] = collections.deque()
+
+        def wait_one() -> None:
+            j, ticket = running.popleft()
+            ticket.done.wait()
+            results[j] = ticket.ok
+            if ticket.error is not None:
+                logger.warning("writing %s below failed: %s", ticket.src, ticket.error)
+
+        for i, (move, copy) in enumerate(zip(moves, copies, strict=True)):
+            while len(running) >= IO_DEPTH:
+                wait_one()
+            refs = [move.src, move.dest]
+            if not self.pools.io_acquire(refs):
+                continue
+            try:
+                ticket = self.transfers.submit_io(
+                    copy,
+                    move.src,
+                    move.dest,
+                    callback=lambda _t, refs=refs: self.pools.io_release(refs),
+                )
+            except Exception as e:  # a full queue, or the engine stopped
+                self.pools.io_release(refs)
+                logger.debug("cannot write %s below: %s", move.src, e)
+                continue
+            running.append((i, ticket))
+        while running:
+            wait_one()
+        return results
 
     def _commit_moves(self, moves: list[_Move]) -> list[_Move]:
         """COMMIT the copies with a finalizer; returns those to FINALIZE_MOVE.
@@ -1279,7 +1345,8 @@ class StorageManager:
         with self._lock:
             refs = list(self._retiring)
         for ref in refs:
-            if self.local_pins.readers(ref):
+            # Not reused while a reader or an I/O may still touch it
+            if self.local_pins.readers(ref) or self.pools.io_refs(ref):
                 continue
             self.pools.reclaim(ref)
             self.local_pins.forget(ref)

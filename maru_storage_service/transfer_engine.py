@@ -5,7 +5,9 @@
 Copies run on the engine's own thread, outside every metadata lock, paced to
 a bandwidth budget. A batch is answered once every copy in it has ended, one
 result per copy; after stop() what has not started fails. Blocking I/O uses
-a separate bounded executor, with one slot kept available for reads.
+a separate bounded executor, with one slot kept available for reads: it
+moves pages between a mapped pool and a file pool (SSD) through a bounce
+buffer.
 """
 
 import collections
@@ -17,16 +19,24 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from maru_common.storage_types import Location
 
 from .page_table import PageRef
+
+if TYPE_CHECKING:
+    from .drivers.ssd import SsdPool
 
 logger = logging.getLogger(__name__)
 
 # Provisional: leaves most of a CXL device's bandwidth to the workers' reads
 DEFAULT_TRANSFER_BYTES_PER_S = 4 << 30
 DEFAULT_IO_QUEUE_SIZE = 64
+# A file I/O without a deadline gets this long from its start, plus its
+# bytes at this rate; one that ends later counts as failed
+IO_TIMEOUT_S = 1.0
+IO_MIN_BYTES_PER_S = 64 << 20
 
 
 class IOQueueFullError(RuntimeError):
@@ -314,6 +324,8 @@ class TransferEngine:
         # Held while a copy reads or writes a mapping
         self._lock = threading.Lock()
         self._maps: dict[str, mmap.mmap] = {}
+        # IO_ONLY pools: only the I/O executor moves their pages
+        self._files: dict[str, SsdPool] = {}
         self._cv = threading.Condition()
         self._queue: collections.deque[_Batch] = collections.deque()
         self._stopped = threading.Event()
@@ -326,9 +338,75 @@ class TransferEngine:
         with self._lock:
             self._maps[pool_id] = mapping
 
-    def has_pool(self, pool_id: str) -> bool:
+    def add_file_pool(self, pool_id: str, pool: "SsdPool") -> None:
+        """An IO_ONLY pool; its owner closes it after stop()."""
         with self._lock:
-            return pool_id in self._maps
+            self._files[pool_id] = pool
+
+    def has_pool(self, pool_id: str) -> bool:
+        """Whether transfers reach the pool: mapped here, or a file pool."""
+        with self._lock:
+            return pool_id in self._maps or pool_id in self._files
+
+    def submit_io(
+        self,
+        copy: Copy,
+        src: PageRef,
+        dst: PageRef,
+        *,
+        callback: Callable[[IOTicket], None] | None = None,
+        deadline: float | None = None,
+    ) -> IOTicket:
+        """Move ``copy`` between a mapped page and a file pool page on the I/O
+        executor: a write when ``copy.dst`` is in the file pool, else a read.
+        ``src`` and ``dst`` are the pages; the caller holds their I/O
+        references until ``callback``. ``deadline`` (monotonic) bounds the
+        syscalls; by default the I/O gets IO_TIMEOUT_S plus its bytes at
+        IO_MIN_BYTES_PER_S from its start. ``ticket.ok`` only once all bytes
+        moved. Raises if not accepted (e.g. IOQueueFullError, or RuntimeError
+        once drained)."""
+        n = copy.nbytes
+        with self._lock:
+            write = copy.dst.pool_id in self._files
+            file = self._files.get(copy.dst.pool_id if write else copy.src.pool_id)
+            mapping = self._maps.get(copy.src.pool_id if write else copy.dst.pool_id)
+        page_offset = (copy.dst if write else copy.src).offset
+        offset = (copy.src if write else copy.dst).offset
+        if (
+            file is None
+            or mapping is None
+            or not 0 < n <= min(copy.src.length, copy.dst.length)
+            or offset < 0
+            or offset + n > len(mapping)
+        ):
+            raise ValueError(f"no file I/O for {copy}")
+        size = file.io_size(n)
+
+        def work(ticket: IOTicket) -> None:
+            limit = deadline
+            if limit is None:
+                limit = time.monotonic() + IO_TIMEOUT_S + n / IO_MIN_BYTES_PER_S
+            bounce = ticket.buffer
+            if write:
+                with memoryview(mapping) as view:
+                    bounce[:n] = view[offset : offset + n]
+                file.write(page_offset, bounce, n, deadline=limit)
+            else:
+                file.read(page_offset, n, bounce, deadline=limit)
+                with memoryview(mapping) as view:
+                    view[offset : offset + n] = bounce[:n]
+
+        return self.io.submit(
+            src,
+            dst,
+            fd=file.fd,
+            nbytes=size,
+            write=write,
+            work=work,
+            callback=callback,
+            alignment=file.alignment.memory,
+            resources=(file, mapping),
+        )
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -359,10 +437,11 @@ class TransferEngine:
         self.io.drain()
 
     def close(self) -> None:
-        """Stop, then unmap every pool."""
+        """Stop, then unmap every pool (file pools stay open)."""
         self.stop()
         with self._lock:
             maps, self._maps = self._maps, {}
+            self._files = {}
         for mapping in maps.values():
             mapping.close()
 

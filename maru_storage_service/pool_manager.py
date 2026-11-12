@@ -84,6 +84,9 @@ class PoolManager:
         self._waiting: dict[str, tuple[int, float]] = {}
         # When each holder was last asked to return credit
         self._asked: dict[str, float] = {}
+        # Running I/O per page (pool_id, index), whatever its generation: the
+        # page never becomes FREE while one may run
+        self._io: collections.Counter[tuple[str, int]] = collections.Counter()
         # How many times each transition ran, for tests and metrics
         self.transitions: Transitions = collections.Counter()
         # CREDITs answered short, and the bytes they lacked, by the limit
@@ -100,9 +103,12 @@ class PoolManager:
         creditable: bool = True,
         state: PageState = PageState.FREE,
     ) -> None:
-        """Add a pool: FREE if made here, QUARANTINED if adopted."""
+        """Add a pool: FREE if made here, QUARANTINED if adopted. An SSD pool
+        never gives credit: workers do not map it."""
         if state not in (PageState.FREE, PageState.QUARANTINED):
             raise ValueError(f"a pool starts FREE or QUARANTINED, not {state}")
+        if creditable and info.kind == PoolKind.SSD:
+            raise ValueError(f"pool {info.pool_id}: an SSD pool gives no credit")
         if info.page_size != self.page_size:
             raise ValueError(
                 f"pool {info.pool_id}: page_size {info.page_size} is not the "
@@ -134,9 +140,10 @@ class PoolManager:
             return True
 
     def enable_pool(self, pool_id: str) -> None:
-        """Credit from a pool from now on."""
+        """Credit from a pool from now on (never an SSD pool)."""
         with self._lock:
-            if pool_id in self._tables:
+            table = self._tables.get(pool_id)
+            if table is not None and table.info.kind != PoolKind.SSD:
                 self._creditable.add(pool_id)
 
     def quarantine_pool(self, pool_id: str) -> None:
@@ -636,6 +643,42 @@ class PoolManager:
             table, page = self._page(ref, PageState.TRANSFER)
             self._to_free(table, page, PageState.TRANSFER)
 
+    # -------------------------------------------------------- I/O references
+
+    def io_acquire(self, refs: Sequence[PageRef]) -> bool:
+        """An I/O reference on each page, if every one is at its generation
+        and neither FREE nor QUARANTINED; else none is taken."""
+        with self._lock:
+            for ref in refs:
+                table = self._tables.get(ref.pool_id)
+                if table is None or not 0 <= ref.index < len(table.pages):
+                    return False
+                page = table.pages[ref.index]
+                if page.generation != ref.generation or page.state in (
+                    PageState.FREE,
+                    PageState.QUARANTINED,
+                ):
+                    return False
+            for ref in refs:
+                self._io[(ref.pool_id, ref.index)] += 1
+            return True
+
+    def io_release(self, refs: Sequence[PageRef]) -> None:
+        """The I/O on these pages has ended."""
+        with self._lock:
+            for ref in refs:
+                key = (ref.pool_id, ref.index)
+                if self._io[key] <= 0:
+                    raise InvalidTransitionError(f"no I/O runs on {ref}")
+                self._io[key] -= 1
+                if not self._io[key]:
+                    del self._io[key]
+
+    def io_refs(self, ref: PageRef) -> int:
+        """I/O that may still run on the page, at any generation."""
+        with self._lock:
+            return self._io.get((ref.pool_id, ref.index), 0)
+
     # ---------------------------------------------------------------- queries
 
     def page(self, ref: PageRef) -> Page | None:
@@ -697,6 +740,9 @@ class PoolManager:
             for table in self._tables.values():
                 held += table.check()
             assert +held == +self._held, (held, self._held)
+            for pool_id, index in self._io:
+                page = self._tables[pool_id].pages[index]
+                assert page.state != PageState.FREE, (pool_id, index)
 
     # ---------------------------------------------------------------- helpers
 
@@ -711,6 +757,8 @@ class PoolManager:
 
     def _to_free(self, table: PageTable, page: Page, src: PageState) -> None:
         """``src`` -> FREE, or QUARANTINED while its pool is quarantined."""
+        if self._io.get((table.pool_id, page.index)):
+            raise InvalidTransitionError(f"page {page.index} has I/O running")
         if table.pool_id in self._quarantined:
             if src == PageState.QUARANTINED:
                 page.tag = RECOVERY_TAG

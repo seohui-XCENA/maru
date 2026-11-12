@@ -382,8 +382,10 @@ class TestFileAndCli:
         assert "role" in capsys.readouterr().err
 
     def test_does_not_pretend_to_serve(self, tmp_path, capsys):
+        raw = copy.deepcopy(GPU_NODE)
+        raw["tiers"][2] = {"store": "remote", "url": "tcp://mem-1:5600"}
         path = tmp_path / "node.json"
-        path.write_text(json.dumps(GPU_NODE))
+        path.write_text(json.dumps(raw))
         assert main(["--config", str(path)]) == EXIT_NOT_SERVING
         assert "not implemented" in capsys.readouterr().err
 
@@ -400,6 +402,46 @@ class TestReviewEdges:
     def test_top_tier_too_small_for_one_page_names_the_defaults(self):
         raw = edit(GPU_NODE, tiers=[{"store": "dram", "size": "64M"}])
         rejects(raw, "defaults")
+
+    def test_a_memory_only_node_does_not_check_the_fetch_caps(self):
+        raw = edit(GPU_NODE, page_size="2G", tiers=[{"store": "dram", "size": "64G"}])
+        b = parse_node_config(raw).budgets
+        assert (b.fetch_request_max_bytes, b.fetch_max_inflight_bytes) == (G, 4 * G)
+
+    def test_a_fetch_node_holds_a_page_and_its_bounce_in_flight(self):
+        caps = {"fetch_request_max_bytes": "32M", "fetch_max_inflight_bytes": "32M"}
+        rejects(edit(GPU_NODE, budgets=caps), "one page and its bounce buffer")
+        caps["fetch_max_inflight_bytes"] = "64M"
+        c = parse_node_config(edit(GPU_NODE, budgets=caps))
+        assert c.budgets.fetch_max_inflight_bytes == 64 * M
+        # with 2 GiB pages the default caps are too small
+        tiers = [
+            {"store": "dram", "size": "64G"},
+            {"store": "ssd", "size": "1T", "path": "/x"},
+        ]
+        raw = edit(GPU_NODE, page_size="2G", tiers=tiers)
+        rejects(raw, "page_size <= fetch_request_max_bytes")
+        caps = {"fetch_request_max_bytes": "2G", "fetch_max_inflight_bytes": "2G"}
+        rejects(edit(raw, budgets=caps), "one page and its bounce buffer")
+        caps["fetch_max_inflight_bytes"] = "4G"
+        b = parse_node_config(edit(raw, budgets=caps)).budgets
+        assert (b.fetch_request_max_bytes, b.fetch_max_inflight_bytes) == (2 * G, 4 * G)
+
+    def test_a_fetch_node_keeps_a_page_to_fetch_into(self):
+        tiers = [
+            {"store": "dram", "size": "512M"},
+            {"store": "ssd", "size": "1T", "path": "/x"},
+        ]
+        raw = edit(GPU_NODE, tiers=tiers)
+        # 5% of 512 MiB is less than a 32 MiB page: the page is the default
+        b = parse_node_config(raw).budgets
+        assert b.transfer_reserve_bytes == {"dram": 32 * M}
+        rejects(
+            edit(raw, budgets={"transfer_reserve_bytes": "16M"}), "less than one page"
+        )
+        # a memory-only node keeps its 5%
+        b = parse_node_config(edit(raw, tiers=tiers[:1])).budgets
+        assert b.transfer_reserve_bytes == {"dram": int(512 * M * 0.05)}
 
     def test_cpu_is_read_as_dram(self):
         raw = with_tier(GPU_NODE, 0, store="cpu")

@@ -339,23 +339,27 @@ class TestEpochReplacement:
             (keys["c"], locs["c"], True)
         ]
 
-    def test_reboot_drops_cxl(self, env):
+    def test_reboot_drops_cxl_and_ssd(self, env):
         _, service, wire = env
         node, worker, keys, locs = self._node(wire, service)
         worker.lookup(keys["c"])  # its pin goes with the old run
         node.restart(boot="boot-2")
         response = node.open(pools=self._pools(node))
-        assert [p.pool_id for p in response.adopted] == [node.ssd().pool_id]
+        # SSD writes are not synced: a reboot may have lost them
+        assert response.adopted == []
         # hidden at once, removed with no pin left
         worker.open()
-        assert worker.lookup(keys["c"]).items[0].result == "MISS"
+        response = worker.lookup(keys["c"], keys["s"])
+        assert results(response) == ["MISS", "MISS"]
         drain(service)
         assert not service.catalog.locations(keys["c"])
-        # the region, listed again, starts empty in this run
-        pool = service.catalog.pool(node.cxl().pool_id)
-        assert pool.state == PoolState.ACTIVE and not pool.entries
-        assert pool.since_epoch_seq == 2
-        assert results(node.commit((keys["c"], node.loc(node.cxl(), 1)))) == ["ADDED"]
+        assert not service.catalog.locations(keys["s"])
+        # the region and the file, listed again, start empty in this run
+        for info, store in ((node.cxl(), "c"), (node.ssd(), "s")):
+            pool = service.catalog.pool(info.pool_id)
+            assert pool.state == PoolState.ACTIVE and not pool.entries
+            assert pool.since_epoch_seq == 2
+            assert results(node.commit((keys[store], node.loc(info, 1)))) == ["ADDED"]
 
     def test_cxl_needs_the_same_rm_domain(self, env):
         _, service, wire = env

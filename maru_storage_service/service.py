@@ -2,12 +2,14 @@
 # Copyright 2026 XCENA Inc.
 """StorageService: builds and runs the parts of one node for one run.
 
-Start order: claim the socket, DRAM pool, the node's CXL regions from the RM,
-NODE_OPEN, adopted ledgers, quarantine of the regions an earlier run still
-holds, heartbeat, then accept on the UDS. A GPU node with [dram], [cxl] or
-[dram, cxl] is served; other configs are refused. The top tier gives credit;
-in [dram, cxl] DRAM makes room by demoting its pages to CXL (write-back), and
-CXL by dropping its own.
+Start order: claim the socket, DRAM pool, SSD file, the node's CXL regions
+from the RM, NODE_OPEN, adopted ledgers, quarantine of the regions an earlier
+run still holds, heartbeat, then accept on the UDS. A GPU node with [dram],
+[cxl], [dram, cxl], [dram, ssd], [cxl, ssd] or [dram, cxl, ssd] is served;
+other configs are refused. The top tier gives credit; each tier makes room by
+demoting its pages to the tier below (write-back), the last one by dropping
+its own. Workers never see the SSD pool: only this process reads and writes
+its file, and it keeps the file's lock until all of its I/O has ended.
 
 A run ends on its own when MaruServer restarted or ended it, when a result
 stays unknown (both close with restart), or when the RM lease is lost (leave);
@@ -35,6 +37,7 @@ from .drivers.cxl import (
     map_region,
 )
 from .drivers.dram import DramDriver, DramPool, DramPoolError
+from .drivers.ssd import SsdDriver, SsdPool
 from .local_pin import LocalPins
 from .local_server import LocalServer
 from .op_ledger import OP_WINDOW
@@ -74,15 +77,26 @@ class NotServableError(RuntimeError):
     """The config asks for something not supported yet."""
 
 
+SERVED_TIERS = (
+    ["dram"],
+    ["cxl"],
+    ["dram", "cxl"],
+    ["dram", "ssd"],
+    ["cxl", "ssd"],
+    ["dram", "cxl", "ssd"],
+)
+
+
 def check_servable(config: NodeConfig) -> None:
     """Refuse configs that cannot be served in full yet."""
     if config.role != "gpu":
         raise NotServableError("serving a memory node is not implemented yet")
     stores = [t.store for t in config.tiers]
-    if stores not in (["dram"], ["cxl"], ["dram", "cxl"]):
+    if stores not in SERVED_TIERS:
+        served = ", ".join(f"[{', '.join(s)}]" for s in SERVED_TIERS)
         raise NotServableError(
-            f"serving the tiers {stores} is not implemented yet: only [dram], "
-            "[cxl] and [dram, cxl] are served"
+            f"serving the tiers {stores} is not implemented yet: only {served} "
+            "are served"
         )
     cxl = config.tier("cxl")
     if cxl is not None and cxl.size is None:
@@ -133,6 +147,7 @@ class StorageService:
         self.transfers: TransferEngine | None = None
         self.dram: DramPool | None = None
         self.cxl: CxlTier | None = None
+        self.ssd: SsdPool | None = None
         # Why the run ended on its own, and whether a new run follows
         self.ended: str | None = None
         self.new_run = False
@@ -203,6 +218,17 @@ class StorageService:
         dram_tier = config.tier("dram")
         if dram_tier is not None:
             self.dram = self._create_dram(dram_tier)
+        ssd_tier = config.tier("ssd")
+        if ssd_tier is not None:
+            # Before NODE_OPEN. Its lock is free only once every earlier run's
+            # I/O on it has ended: an earlier run of this process drained
+            # and closed it, an earlier process exited
+            self.ssd = SsdDriver().create(
+                ssd_tier,
+                node_id=config.node_id,
+                node_epoch=self.node_epoch,
+                page_size=config.page_size,
+            )
         cxl_tier = config.tier("cxl")
         if cxl_tier is not None:
             # Before NODE_OPEN: only regions this run owns are announced
@@ -225,7 +251,9 @@ class StorageService:
             self._check_stopped()
         traits = config.traits()
         if any(t.demotes_to is not None for t in traits.values()):
-            self.transfers = TransferEngine(self.transfer_bytes_per_s)
+            self.transfers = TransferEngine(
+                self.transfer_bytes_per_s, run=self.node_epoch
+            )
             self._map_for_transfers(self.transfers)
         self.pools = PoolManager(config.budgets, config.page_size)
         if self.dram is not None:
@@ -242,15 +270,11 @@ class StorageService:
         if self._interrupted.is_set():  # before interrupt() could stop it
             raise ServerStopped()
         placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
-        if (
-            cxl_tier is not None
-            and cxl_tier is not top
-            and cxl_tier.high_watermark is not None
-            and cxl_tier.low_watermark is not None
-        ):
-            placement.set_watermarks(
-                PoolKind.CXL.value, cxl_tier.high_watermark, cxl_tier.low_watermark
-            )
+        for tier in config.tiers[1:]:
+            if tier.high_watermark is not None and tier.low_watermark is not None:
+                placement.set_watermarks(
+                    tier.store, tier.high_watermark, tier.low_watermark
+                )
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,
@@ -278,6 +302,7 @@ class StorageService:
             rm_domains = [RmDomain(self.cxl.rm_domain, tuple(devices))]
         opened = self.server.open(
             ([self.dram.info()] if self.dram is not None else [])
+            + ([self.ssd.info()] if self.ssd is not None else [])
             + [p.info() for p in cxl_pools],
             rm_domains=rm_domains,
         )
@@ -285,7 +310,10 @@ class StorageService:
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
-            # Its committed pages come back READY, the rest stay quarantined
+            # Its committed pages come back READY, the rest stay quarantined.
+            # MaruServer adopts the SSD pool only on the same boot; the
+            # file lock shows its earlier I/O ended, so its quarantine ends
+            # below once listed
             self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
             self.pools.quarantine_pool(info.pool_id)
             items = self.server.recover_list(info.pool_id)
@@ -311,6 +339,10 @@ class StorageService:
                 self.pools.add_pool(
                     pool.info(), creditable=PoolKind.CXL in self._credit_kinds
                 )
+        if self.ssd is not None and self.ssd.pool_id not in adopted_ids:
+            # Not adopted (first run, another boot, a new MaruServer): the
+            # file is reused from scratch
+            self.pools.add_pool(self.ssd.info(), creditable=False)
         self.manager.start()
         # Quarantined while an earlier run holds the region in the RM
         earlier = self.cxl.earlier_holds() if self.cxl is not None else {}
@@ -345,6 +377,13 @@ class StorageService:
                 "dram tier: pool %s (%d MiB)",
                 self.dram.pool_id,
                 self.dram.capacity >> 20,
+            )
+        if self.ssd is not None:
+            logger.info(
+                "ssd tier: %s (%d MiB), %s",
+                self.ssd.path,
+                self.ssd.capacity >> 20,
+                "adopted" if self.ssd.pool_id in adopted_ids else "empty",
             )
         if cxl_pools:
             logger.info(
@@ -411,6 +450,8 @@ class StorageService:
                         pool.pool_id,
                         e,
                     )
+        if self.ssd is not None:
+            engine.add_file_pool(self.ssd.pool_id, self.ssd)
         engine.start()
 
     def _end_quarantine(self, pool_id: str) -> None:
@@ -521,6 +562,10 @@ class StorageService:
             self._rm_client.close()
         if self.dram is not None:
             self.dram.close()
+        if self.ssd is not None:
+            # Every I/O was drained above (transfers.stop); closing ends the
+            # lock, so the next run may open the file
+            self.ssd.close()
 
     def _unmap_cxl(self) -> set[str]:
         """The CXL pools no worker can map any more, before they go back."""

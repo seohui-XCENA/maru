@@ -148,6 +148,22 @@ class TestPlacement:
             ref(1, "a"),
         ]
 
+    def test_a_demand_evicts_below_the_watermarks_preferred_first(self):
+        now = [0.0]
+        p = self.policy(now)
+        for i in range(4):
+            p.on_ready(ref(i))
+        kw = {"capacity": 8, "retiring_bytes": 0, "page_size": 1, "limit": 100}
+        # half used: no pressure, but a fetch wants 6 FREE (4 are)
+        assert p.candidates("t", ["p"], free_bytes=4, **kw) == []
+        got = p.candidates(
+            "t", ["p"], free_bytes=4, demand_bytes=6, prefer={ref(2)}, **kw
+        )
+        assert got == [ref(2), ref(0)]
+        # what is leaving counts toward the demand
+        assert p.candidates("t", ["p"], free_bytes=4, demand_bytes=6, **kw) == []
+        assert p.candidates("t", ["p"], free_bytes=4, demand_bytes=7, **kw) == [ref(1)]
+
     def test_lru_runs_across_the_tiers_pools(self):
         now = [0.0]
         p = self.policy(now)
