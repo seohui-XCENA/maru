@@ -128,10 +128,28 @@ def test_a_failed_detach_keeps_the_registration(mem, exporter, monkeypatch):
     monkeypatch.setattr(mem, "deregister", refuse)
     with pytest.raises(RuntimeError, match="NIC busy"):
         exporter.detach("dram:m:1")
-    assert exporter.export("dram:m:1") is not None
+    assert exporter.export("dram:m:1") is None  # never told to peers again
     assert mem.agent.registered == [(addr, N)]
+    with pytest.raises(ValueError, match="already registered"):
+        exporter.attach("dram:m:1", pool)
     monkeypatch.undo()
     exporter.detach("dram:m:1")
+    assert mem.agent.registered == []
+
+
+def test_a_registration_it_could_not_undo_stays_held(mem, exporter, monkeypatch):
+    def refuse(_):
+        raise RuntimeError("refused")
+
+    monkeypatch.setattr(mem, "partial_metadata", refuse)
+    monkeypatch.setattr(mem, "deregister", refuse)
+    pool, addr = mapped(N)
+    with pytest.raises(RuntimeError, match="refused"):
+        exporter.attach("dram:m:1", pool)
+    assert mem.agent.registered == [(addr, N)]
+    assert exporter.export("dram:m:1") is None and exporter.exports() == []
+    monkeypatch.undo()
+    exporter.detach("dram:m:1")  # ends it
     assert mem.agent.registered == []
 
 
@@ -196,13 +214,46 @@ def test_the_engine_exports_only_its_mappings():
     engine.close()
 
 
-def test_a_refused_export_is_not_detached():
-    log: list = []
+def test_a_refused_export_registers_nothing_to_detach():
+    mem = FakeTransport("mem")
+    mem.agent.close()  # the NIC refuses every registration
     engine, maps = _engine("dram:a:1")
-    with pytest.raises(RuntimeError, match="NIC refused"):
-        engine.export("dram:a:1", LoggedExporter(log, refuse=True))
+    with pytest.raises(RuntimeError):
+        engine.export("dram:a:1", NixlExporter(mem))
     assert engine.close() == set()
-    assert log == [] and maps["dram:a:1"].closed
+    assert maps["dram:a:1"].closed
+
+
+@pytest.mark.parametrize("undone", [True, False])
+def test_a_failed_export_is_still_detached_before_unmapping(monkeypatch, undone):
+    """An attach that fails after registering, and cannot undo it, leaves the
+    registration for close() to end before it unmaps."""
+    mem = FakeTransport("mem")
+    exporter = NixlExporter(mem)
+    engine, maps = _engine("dram:a:1")
+    calls = {"deregister": 0}
+    real = mem.deregister
+
+    def refuse_metadata(_):
+        raise RuntimeError("no metadata")
+
+    def deregister(handle):
+        calls["deregister"] += 1
+        if calls["deregister"] == 1 or not undone:
+            raise RuntimeError("NIC busy")
+        real(handle)
+
+    monkeypatch.setattr(mem, "partial_metadata", refuse_metadata)
+    monkeypatch.setattr(mem, "deregister", deregister)
+    with pytest.raises(RuntimeError, match="NIC busy"):
+        engine.export("dram:a:1", exporter)
+    assert len(mem.agent.registered) == 1
+    if undone:
+        assert engine.close() == set()
+        assert mem.agent.registered == [] and maps["dram:a:1"].closed
+    else:
+        assert engine.close() == {"dram:a:1"}
+        assert len(mem.agent.registered) == 1 and not maps["dram:a:1"].closed
 
 
 def test_a_pool_that_cannot_be_deregistered_stays_mapped():

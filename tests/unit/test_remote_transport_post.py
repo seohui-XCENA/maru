@@ -337,3 +337,78 @@ def test_an_interrupted_post_hands_the_transfer_over(pair, monkeypatch):
     assert not pending.in_flight and pending.poll_state() is TransferState.PENDING
     pair.gpu.finish_stalled()
     assert pending.poll_state() is TransferState.DONE
+
+
+class TwoPools:
+    """A GPU node with two local pages, a memory node with two registered
+    pools: one transfer names both."""
+
+    def __init__(self) -> None:
+        self.gpu = FakeTransport("gpu")
+        self.locals = [mapped(N, 7), mapped(N, 7)]
+        self.local_regs = [self.gpu.register(addr, N) for _, addr in self.locals]
+        self.mem = FakeTransport("mem")
+        self.pools = [mapped(N, 9), mapped(N, 9)]
+        self.regs = [self.mem.register(addr, N) for _, addr in self.pools]
+        md = [self.mem.partial_metadata(r) for r in self.regs]
+        self.peer = self.gpu.add_peer(md[0])
+        self.gpu.add_peer(md[1], peer=self.peer)
+
+    def post(self, op: str):
+        pairs = [
+            (local_addr, addr, N)
+            for (_, local_addr), (_, addr) in zip(self.locals, self.pools, strict=True)
+        ]
+        return self.gpu.post(op, self.peer, pairs)
+
+
+@pytest.mark.parametrize("op", ["READ", "WRITE"])
+def test_a_late_packet_lands_in_every_destination_still_held(op):
+    two = TwoPools()
+    two.gpu.stall()
+    two.post(op)
+    two.gpu.fail_stalled(late=True)
+    if op == "READ":  # the second destination ends
+        two.gpu.deregister(two.local_regs[1])
+    else:
+        two.mem.deregister(two.regs[1])
+    assert two.gpu.deliver_late() == 1
+    if op == "READ":
+        assert bytes(two.locals[0][0]) == bytes([9]) * N
+        assert bytes(two.locals[1][0]) == bytes([7]) * N
+    else:
+        assert bytes(two.pools[0][0]) == bytes([7]) * N
+        assert bytes(two.pools[1][0]) == bytes([9]) * N
+
+
+def test_an_access_error_may_still_move_the_ranges_it_did_not_touch():
+    two = TwoPools()
+    two.mem.deregister(two.regs[1])
+    pending = two.post("WRITE")
+    assert pending.poll_state() is TransferState.ERR
+    assert bytes(two.pools[0][0]) == bytes([7]) * N  # it may have landed
+    assert bytes(two.pools[1][0]) == bytes([9]) * N
+
+
+def test_no_notification_crosses_a_connection_an_access_error_broke(pair):
+    pair.mem.deregister(pair.pool_reg)
+    assert pair.post("WRITE").poll_state() is TransferState.ERR
+    assert not pair.gpu.announce(pair.peer)
+    assert pair.mem.take_notifs() == {}
+
+
+def test_stale_metadata_never_connects_to_a_later_agent(pair):
+    stale = pair.mem.partial_metadata(pair.pool_reg)
+    pair.mem.kill()
+    nxt = FakeTransport("mem")  # same name, range and key
+    nxt.register(pair.pool_addr, N)
+    assert pair.gpu.disconnect(pair.peer)
+    peer = pair.gpu.add_peer(stale)  # loads, but reaches the ended agent
+    for op in ("WRITE", "READ"):
+        assert (
+            pair.gpu.post(op, peer, [(pair.local_addr, pair.pool_addr, N)]).poll_state()
+            is TransferState.ERR
+        )
+    assert bytes(pair.pool) == bytes([9]) * N
+    assert bytes(pair.local) == bytes([7]) * N
+    assert not pair.gpu.announce(peer) and nxt.take_notifs() == {}

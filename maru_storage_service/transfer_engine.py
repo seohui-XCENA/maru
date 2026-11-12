@@ -85,14 +85,15 @@ class TransferEngine:
 
     def export(self, pool_id: str, exporter: Exporter) -> None:
         """Register the pool's mapping with ``exporter`` until close(), which
-        deregisters it before unmapping. Raises, registering nothing, if the
-        pool is not mapped here or the exporter refuses it."""
+        detaches it before unmapping, also after a failed attach (one may
+        leave a registration it could not undo). Raises if the pool is not
+        mapped here or the exporter refuses it."""
         with self._lock:
             mapping = self._maps.get(pool_id)
             if mapping is None:
                 raise KeyError(f"{pool_id} is not mapped for transfers")
-            exporter.attach(pool_id, mapping)
             self._exports.setdefault(pool_id, []).append(exporter)
+            exporter.attach(pool_id, mapping)
 
     def has_pool(self, pool_id: str) -> bool:
         """Whether transfers reach the pool: mapped here, or an L2 pool."""

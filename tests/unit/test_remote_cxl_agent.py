@@ -95,7 +95,7 @@ def test_a_map_reply_names_only_that_region(node):
     h1, h2 = node.region(), node.region()
     reply = node.service.map(1, h1)
     node.service.map(1, h2)
-    name, conn, ranges = reply["metadata"].decode().split("|")
+    name, conn, ranges, _ = reply["metadata"].decode().split("|")
     assert name == "mapper" and conn == "1"
     assert [tuple(map(int, r.split(":")[:2])) for r in ranges.split(";")] == [
         (reply["addr"], h1["length"])

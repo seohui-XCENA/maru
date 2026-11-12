@@ -37,43 +37,48 @@ class NixlExporter:
     def __init__(self, transport: NixlTransport) -> None:
         self.transport = transport
         self._lock = threading.Lock()
-        self._exports: dict[str, tuple[Export, Any]] = {}
+        # Every registration this exporter holds, usable or not
+        self._registrations: dict[str, Any] = {}
+        # The usable ones: peers may be told about them
+        self._exports: dict[str, Export] = {}
 
     def attach(self, pool_id: str, memory: mmap.mmap) -> None:
-        """Register the whole mapping; raises, registering nothing, if the
-        NIC refuses it or the pool is already registered."""
+        """Register the whole mapping. Raises if the pool is registered
+        already or the NIC refuses it; a registration it could not undo
+        stays held (unusable) until detach ends it."""
         base, nbytes = buffer_address(memory), len(memory)
         with self._lock:
-            if pool_id in self._exports:
+            if pool_id in self._registrations:
                 raise ValueError(f"{pool_id} is already registered")
             registration = self.transport.register(base, nbytes, tag=pool_id)
+            self._registrations[pool_id] = registration
             try:
                 metadata = self.transport.partial_metadata(registration)
             except BaseException:
-                self.transport.deregister(registration)
+                self.transport.deregister(registration)  # if this raises, held
+                del self._registrations[pool_id]
                 raise
-            export = Export(pool_id, base, nbytes, metadata)
-            self._exports[pool_id] = (export, registration)
+            self._exports[pool_id] = Export(pool_id, base, nbytes, metadata)
         logger.info("registered %s (%d bytes) with the NIC", pool_id, nbytes)
 
     def detach(self, pool_id: str) -> None:
-        """Deregister; a pool never registered is a no-op. If this raises,
+        """Deregister; a pool not registered is a no-op. If this raises,
         the pool stays registered and must stay mapped."""
         with self._lock:
-            entry = self._exports.get(pool_id)
-            if entry is None:
+            registration = self._registrations.get(pool_id)
+            if registration is None:
                 return
-            self.transport.deregister(entry[1])
-            del self._exports[pool_id]
+            self._exports.pop(pool_id, None)  # never told to peers again
+            self.transport.deregister(registration)
+            del self._registrations[pool_id]
         logger.info("deregistered %s from the NIC", pool_id)
 
     def export(self, pool_id: str) -> Export | None:
-        """The pool's registration, or None if it is not registered."""
+        """The pool's usable registration, or None."""
         with self._lock:
-            entry = self._exports.get(pool_id)
-        return None if entry is None else entry[0]
+            return self._exports.get(pool_id)
 
     def exports(self) -> list[Export]:
-        """Every registered pool, in the order registered."""
+        """Every usable registration, in the order registered."""
         with self._lock:
-            return [export for export, _ in self._exports.values()]
+            return list(self._exports.values())

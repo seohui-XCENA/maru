@@ -66,9 +66,15 @@ class FakeNixlAgent:
     """
 
     registry: dict[str, FakeNixlAgent] = {}
+    # Every agent by its incarnation: metadata names the one it came from
+    incarnations: dict[int, FakeNixlAgent] = {}
+    _next_incarnation = 1
 
     def __init__(self, name: str, *args, **kwargs) -> None:
         self.name = name
+        self.incarnation = FakeNixlAgent._next_incarnation
+        FakeNixlAgent._next_incarnation += 1
+        FakeNixlAgent.incarnations[self.incarnation] = self
         self.regs: list[tuple[int, int, int]] = []  # (addr, size, key)
         self.peers: set[str] = set()
         # peer -> registrations loaded from its metadata (addr, size, key);
@@ -139,21 +145,27 @@ class FakeNixlAgent:
         self.regs.clear()
 
     def get_agent_metadata(self) -> bytes:
-        return f"{self.name}|1|*".encode()
+        return f"{self.name}|1|*|{self.incarnation}".encode()
 
     def get_partial_agent_metadata(self, descs, inc_conn_info=False, backends=()):
         ranges = ";".join(f"{addr}:{size}:{key}" for addr, size, key in descs)
-        return f"{self.name}|{int(bool(inc_conn_info))}|{ranges}".encode()
+        conn = int(bool(inc_conn_info))
+        return f"{self.name}|{conn}|{ranges}|{self.incarnation}".encode()
 
     def add_remote_agent(self, md: bytes) -> bytes:
-        name, conn, ranges = md.decode().split("|")
-        assert name in FakeNixlAgent.registry, name
+        """Metadata carries its agent's connection address (its
+        incarnation): stale metadata connects to the agent it came from,
+        never to a later one of the same name."""
+        name, conn, ranges, incarnation = md.decode().split("|")
+        target = FakeNixlAgent.incarnations[int(incarnation)]
+        assert target.name == name, name
         if conn != "1" and name not in self.peers:
             raise RuntimeError(f"no connection info for new agent {name}")
         if name in self.failed:
             raise LoadIntoFailedEndpoint(name)
         self.peers.add(name)
-        self.conns[name] = FakeNixlAgent.registry[name]
+        if conn == "1" or name not in self.conns:
+            self.conns[name] = target
         if ranges == "*":
             self.known[name] = None
         else:
@@ -184,7 +196,7 @@ class FakeNixlAgent:
         if target.closed:  # the peer's end failed the connection
             self.failed.add(name)
             self.broken.add(name)
-        if name in self.failed:
+        if name in self.failed or name in self.broken:  # an RC error is final
             raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
         target.notifs.append((self.name, bytes(notif_msg)))
 
@@ -234,38 +246,47 @@ class FakeNixlAgent:
         return [*handle, target, local_keys]
 
     @staticmethod
-    def _holds(agent: FakeNixlAgent, descs, keys) -> bool:
-        """Whether an open agent still holds every range under its key."""
-        return not agent.closed and all(
-            key is not None
+    def _held(agent: FakeNixlAgent, desc, key) -> bool:
+        """Whether an open agent still holds the range under its key."""
+        ra, rn, _ = desc
+        return (
+            not agent.closed
+            and key is not None
             and any(k == key and a <= ra and ra + rn <= a + n for a, n, k in agent.regs)
-            for (ra, rn, _), key in zip(descs, keys, strict=True)
         )
 
-    def _remote_ok(self, handle) -> bool:
-        """Whether the peer still holds every registration the transfer names."""
-        return self._holds(handle[6], handle[2], handle[5])
-
-    def _local_ok(self, handle) -> bool:
-        """Whether this agent still holds every local range the transfer names."""
-        return self._holds(self, handle[1], handle[7])
+    def _sides(self, handle) -> tuple[list[bool], list[bool]]:
+        """Per range, whether its local and its remote end are still held."""
+        local = [
+            self._held(self, d, k) for d, k in zip(handle[1], handle[7], strict=True)
+        ]
+        remote = [
+            self._held(handle[6], d, k)
+            for d, k in zip(handle[2], handle[5], strict=True)
+        ]
+        return local, remote
 
     def _complete(self, handle) -> None:
-        if (
-            handle[4] in self.broken
-            or not self._local_ok(handle)
-            or not self._remote_ok(handle)
-        ):
-            self.broken.add(handle[4])  # an access error breaks the connection
+        """All ranges held: DONE. Otherwise ERR, and the connection breaks;
+        the ranges whose ends are both held may still have moved."""
+        if handle[4] in self.broken:  # the connection failed before
             handle[3] = "ERR"
             return
-        self._move(handle)
-        handle[3] = "DONE"
+        local, remote = self._sides(handle)
+        ok = [a and b for a, b in zip(local, remote, strict=True)]
+        self._move(handle, ok)
+        if all(ok):
+            handle[3] = "DONE"
+            return
+        self.broken.add(handle[4])  # an access error breaks the connection
+        handle[3] = "ERR"
 
     @staticmethod
-    def _move(handle) -> None:
+    def _move(handle, which: list[bool]) -> None:
         op, local, remote = handle[:3]
-        for (la, ln, _), (ra, _rn, _) in zip(local, remote, strict=True):
+        for (la, ln, _), (ra, _rn, _), go in zip(local, remote, which, strict=True):
+            if not go:
+                continue
             if op == "READ":
                 ctypes.memmove(la, ra, ln)
             else:
@@ -307,8 +328,10 @@ class FakeNixlAgent:
         for handle in self._stalled:
             handle[3] = "ERR"
             self.broken.add(handle[4])
-            if late and self._source_ok(handle):
-                self._late.append((handle, self._read_source(handle)))
+            if late:
+                payload = self._read_source(handle)
+                if any(data is not None for data in payload):
+                    self._late.append((handle, payload))
         n = len(self._stalled)
         self._stalled.clear()
         return n
@@ -323,34 +346,27 @@ class FakeNixlAgent:
         """
         n = 0
         for handle, payload in self._late:
-            if self._dest_ok(handle):
-                self._land(handle, payload)
-                n += 1
+            local, remote = self._sides(handle)
+            held = local if handle[0] == "READ" else remote
+            dest = handle[1] if handle[0] == "READ" else handle[2]
+            landed = False
+            for (addr, size, _), data, ok in zip(dest, payload, held, strict=True):
+                if data is not None and ok:
+                    ctypes.memmove(addr, data, size)
+                    landed = True
+            n += landed
         self._late.clear()
         return n
 
-    def _source_ok(self, handle) -> bool:
-        if handle[0] == "READ":
-            return self._remote_ok(handle)
-        return self._local_ok(handle)
-
-    def _dest_ok(self, handle) -> bool:
-        if handle[0] == "READ":
-            return self._local_ok(handle)
-        return self._remote_ok(handle)
-
-    @staticmethod
-    def _read_source(handle) -> list[bytes]:
-        op, local, remote = handle[:3]
-        source = remote if op == "READ" else local
-        return [ctypes.string_at(addr, n) for addr, n, _ in source]
-
-    @staticmethod
-    def _land(handle, payload: list[bytes]) -> None:
-        op, local, remote = handle[:3]
-        dest = local if op == "READ" else remote
-        for (addr, n, _), data in zip(dest, payload, strict=True):
-            ctypes.memmove(addr, data, n)
+    def _read_source(self, handle) -> list[bytes | None]:
+        """Per range, the bytes the NIC read, or None if the source was gone."""
+        local, remote = self._sides(handle)
+        held = remote if handle[0] == "READ" else local
+        source = handle[2] if handle[0] == "READ" else handle[1]
+        return [
+            ctypes.string_at(addr, size) if ok else None
+            for (addr, size, _), ok in zip(source, held, strict=True)
+        ]
 
     def check_xfer_state(self, handle) -> str:
         return handle[3]
@@ -375,6 +391,7 @@ class FakeClock:
 def reset_fake_agents() -> None:
     """Forget every fake agent and NIC key (call from fixtures between tests)."""
     FakeNixlAgent.registry.clear()
+    FakeNixlAgent.incarnations.clear()
     FakeNixlAgent._keys_by_range.clear()
     FakeNixlAgent._next_key = 1
 
