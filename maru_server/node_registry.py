@@ -262,6 +262,7 @@ class NodeRegistry:
         return Requester(
             node_id=worker.node_id,
             can_map=lambda pool: self.can_map(worker, pool),
+            can_fetch=lambda pool: self.can_fetch(worker.node_id, pool),
             online=lambda node_id: self.node_online(node_id, now),
         )
 
@@ -282,6 +283,12 @@ class NodeRegistry:
     def _maps_shared_cxl(worker: WorkerSession, pool: PoolRecord) -> bool:
         """Another host's CXL region mapped directly: not supported yet."""
         return False
+
+    @staticmethod
+    def can_fetch(node_id: str, pool: PoolRecord) -> bool:
+        """The node's StorageService reads the pool for its workers' FETCH:
+        only its own L2 pools, never another node's."""
+        return pool.node_id == node_id and not POOL_KINDS[pool.kind].mappable
 
     # ============================================================ node open
 

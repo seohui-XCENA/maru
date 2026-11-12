@@ -64,7 +64,7 @@ from maru_common.storage_types import (
     Status,
 )
 
-from .catalog import Catalog
+from .catalog import Catalog, PoolRecord
 from .node_registry import (
     NodeRegistry,
     NodeSession,
@@ -585,6 +585,9 @@ class MsService:
                 def online(node_id: str) -> bool:
                     return self.registry.node_online(node_id, now)
 
+                def can_fetch(pool: PoolRecord) -> bool:
+                    return self.registry.can_fetch(session.node_id, pool)
+
                 batch.applying = True
                 for item in req.items:
                     batch.outcomes.append(
@@ -594,7 +597,7 @@ class MsService:
                             item.key,
                             item.location,
                             online,
-                            own_only=bool(req.worker_incarnation),
+                            can_fetch if req.worker_incarnation else None,
                         )
                     )
                 return SourcePinResponse(status=Status.OK, items=batch.outcomes)

@@ -43,6 +43,7 @@ from maru_common.serializer import MessageDecodeError, Serializer, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
     MS_PROTOCOL,
+    POOL_KINDS,
     AccessInfo,
     BlockRequest,
     CloseMode,
@@ -783,7 +784,12 @@ class FakeMaruServer:
         )
         if mappable:
             return "hit", entry
-        if node is None or not node.online:
+        # As MaruServer: a node fetches only from its own L2 pools
+        fetchable = (
+            entry.node_id == worker.node_id
+            and not POOL_KINDS[entry.location.kind].mappable
+        )
+        if not fetchable or node is None or not node.online:
             return "offline", None
         return "fetch", entry
 

@@ -11,6 +11,7 @@ import pytest
 from maru_common.storage_types import (
     KeptCause,
     MissReason,
+    PoolKind,
     SessionRole,
     Status,
 )
@@ -70,12 +71,11 @@ class TestLookupOrder:
         probe = FakeWorker(wire, a, role=SessionRole.PROBE)
         assert probe.open().status == Status.OK
 
+        # b's copies are another GPU node's: never a HIT or a FETCH for a
         expected = [
             ("HIT", a_dram, a),  # node DRAM
             ("HIT", a_cxl, a),  # node CXL
-            ("FETCH", b_dram, b),  # memory node DRAM
             ("FETCH", a_ssd, a),  # node SSD
-            ("FETCH", b_ssd, b),  # memory node SSD
         ]
         for result, location, owner in expected:
             response = worker.lookup(k)
@@ -96,19 +96,21 @@ class TestLookupOrder:
             # retire the chosen one; the next one is chosen after it
             assert results(owner.retire((k, location))) == ["RETIRED"]
         miss = worker.lookup(k).items[0]
+        assert miss.result == "MISS" and miss.reason == MissReason.OFFLINE
+        assert results(b.retire((k, b_dram), (k, b_ssd))) == ["RETIRED"] * 2
+        miss = worker.lookup(k).items[0]
         assert miss.result == "MISS" and miss.reason == MissReason.ABSENT
 
     def test_fetch_plan_names_source_node(self, env):
         _, _, wire = env
-        a = open_node(wire, "a")
-        b = open_node(wire, "b")
+        a = open_node(wire, "a", ssd=True)
         k = key("k")
-        b.commit((k, b.loc(b.dram(), 3), 100))
+        a.commit((k, a.loc(a.ssd(), 3), 100))
         worker = FakeWorker(wire, a)
         worker.open()
         item = worker.lookup(k).items[0]
         assert item.result == "FETCH"
-        assert item.plan.source_node == "b" and item.plan.bytes == 100
+        assert item.plan.source_node == "a" and item.plan.bytes == 100
 
     def test_probe_session_gives_no_pins(self, env):
         _, service, wire = env
@@ -129,17 +131,15 @@ class TestLookupOrder:
 class TestMissReasons:
     def test_absent_vs_offline(self, env):
         clock, _, wire = env
-        a = open_node(wire, "a")
-        b = open_node(wire, "b")
+        a = open_node(wire, "a", ssd=True)
         k = key("k")
-        b.commit((k, b.loc(b.dram(), 1)))
+        a.commit((k, a.loc(a.ssd(), 1)))
         worker = FakeWorker(wire, a)
         worker.open()
         assert worker.lookup(key("other")).items[0].reason == MissReason.ABSENT
         assert worker.lookup(k).items[0].result == "FETCH"
-        # b's session expires: its StorageService cannot send the bytes
+        # a's session expires: its StorageService cannot send the bytes
         clock.advance(20)
-        a.heartbeat()
         worker.heartbeat()
         clock.advance(15)
         item = worker.lookup(k).items[0]
@@ -156,8 +156,9 @@ class TestMissReasons:
         a.commit((k_dram, a.loc(a.dram(), 2)))
         worker = FakeWorker(wire, a)
         worker.open()
+        # another GPU node's DRAM is never fetched
         assert results(worker.lookup(k_remote, k_ssd, k_dram)) == [
-            "FETCH",
+            "MISS",
             "FETCH",
             "HIT",
         ]
@@ -185,6 +186,65 @@ class TestMissReasons:
         assert response.items[0].reason == MissReason.OFFLINE
         # the closed session's requests get EPOCH
         assert a.heartbeat().status == Status.EPOCH
+
+
+class TestFetchSources:
+    """A node fetches only from its own L2 pools: another GPU node's
+    StorageService refuses its FETCH, so those copies are never a plan."""
+
+    def test_own_ssd_is_fetched_before_another_gpu_nodes_memory(self, env):
+        _, _, wire = env
+        a = open_node(wire, "a", ssd=True)
+        b = open_node(wire, "b", cxl=True)
+        k = key("k")
+        own = a.loc(a.ssd(), 1)
+        a.commit((k, own))
+        # cheaper by cost than a's SSD, but not fetchable by a
+        b.commit((k, b.loc(b.dram(), 1)))
+        b.commit((k, b.loc(b.cxl(region_id=hash("b") % 1000), 1)))
+        worker = FakeWorker(wire, a)
+        worker.open()
+        probe = FakeWorker(wire, a, role=SessionRole.PROBE)
+        probe.open()
+        item = worker.lookup(k).items[0]
+        assert item.result == "FETCH"
+        assert item.plan.source == own and item.plan.source_node == "a"
+        assert probe.probe(k).items[0].result == "FETCH"
+
+    def test_only_another_gpu_nodes_copy_is_an_offline_miss(self, env):
+        _, _, wire = env
+        a = open_node(wire, "a", ssd=True)
+        b = open_node(wire, "b", ssd=True)
+        k = key("k")
+        b_dram, b_ssd = b.loc(b.dram(), 1), b.loc(b.ssd(), 1)
+        b.commit((k, b_dram), (k, b_ssd))
+        worker = FakeWorker(wire, a)
+        worker.open()
+        probe = FakeWorker(wire, a, role=SessionRole.PROBE)
+        probe.open()
+        # a location, but none a maps or fetches: OFFLINE, as for any
+        # copy the requester cannot reach
+        item = worker.lookup(k).items[0]
+        assert item.result == "MISS" and item.reason == MissReason.OFFLINE
+        assert item.plan is None
+        assert probe.probe(k).items[0].reason == MissReason.OFFLINE
+        # b's own worker still maps it
+        b_probe = FakeWorker(wire, b, role=SessionRole.PROBE)
+        b_probe.open()
+        assert b_probe.probe(k).items[0].result == "HIT"
+        assert results(b.retire((k, b_dram), (k, b_ssd))) == ["RETIRED"] * 2
+        assert worker.lookup(k).items[0].reason == MissReason.ABSENT
+
+    def test_can_fetch_is_only_the_nodes_own_l2(self, env):
+        _, service, wire = env
+        open_node(wire, "a", ssd=True, cxl=True)
+        open_node(wire, "b", ssd=True, cxl=True)
+        pools = service.catalog.pools_of("a") + service.catalog.pools_of("b")
+        assert len(pools) == 6
+        fetchable = [
+            (p.node_id, p.kind) for p in pools if service.registry.can_fetch("a", p)
+        ]
+        assert fetchable == [("a", PoolKind.SSD)]
 
 
 class TestCommit:
@@ -536,21 +596,23 @@ class TestFetch:
 
     def test_source_pin_and_fetch_complete(self, env):
         _, service, wire = env
-        a, b, worker, k, source = self._setup(wire)
+        a, _, worker, _, _ = self._setup(wire)
+        k, source = key("own"), a.loc(a.ssd(), 1)
+        a.commit((k, source))
         plan = worker.lookup(k).items[0]
         assert plan.result == "FETCH" and plan.plan.source == source
         pinned = a.source_pin((k, plan.plan.source))
         assert results(pinned) == ["HIT"]
         source_pin = pinned.items[0].pin_id
-        # the source pin keeps the source from its own node's retire
-        assert b.retire((k, source)).items[0].cause == KeptCause.PINNED
+        # the source pin keeps the source from its node's retire
+        assert a.retire((k, source)).items[0].cause == KeptCause.PINNED
         copy = a.loc(a.dram(), 1)
         done = a.fetch_complete(worker.token, (k, source_pin, copy))
         assert results(done) == ["HIT"]
         assert done.items[0].location == copy and done.items[0].pin_id
         # the source pin went with it
         assert service.pins.get(source_pin) is None
-        assert results(b.retire((k, source))) == ["RETIRED"]
+        assert results(a.retire((k, source))) == ["RETIRED"]
         # the copy is a location of its own, pinned for the worker
         assert a.retire((k, copy)).items[0].cause == KeptCause.PINNED
         other = FakeWorker(wire, a, tp_rank=1)
@@ -786,6 +848,20 @@ class TestWorkerBinding:
         assert len(service.pins) == 0
         # the node's own SOURCE_PIN, for no worker, is not limited
         assert results(a.source_pin((k, elsewhere))) == ["HIT"]
+
+    def test_a_workers_source_pin_agrees_with_the_lookup(self, env):
+        _, _, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        b_dram = b.loc(b.dram(), 2)
+        b.commit((k, b_dram))
+        # the lookup's source is pinned; another GPU node's DRAM is not
+        assert worker.lookup(k).items[0].plan.source == source
+        assert results(self._bound_pin(a, worker, k, source)) == ["HIT"]
+        assert results(self._bound_pin(a, worker, k, b_dram)) == ["REJECTED"]
+        # a copy in the node's own DRAM is pinned for its worker
+        copy = a.loc(a.dram(), 2)
+        a.commit((k, copy))
+        assert results(self._bound_pin(a, worker, k, copy)) == ["HIT"]
 
     def test_an_exact_copy_off_the_mapped_tiers_is_never_handed_over(self, env):
         _, service, wire = env

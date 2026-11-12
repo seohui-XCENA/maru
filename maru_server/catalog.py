@@ -85,10 +85,12 @@ class Entry:
 
 @dataclass
 class Requester:
-    """Who looks up: which pools it maps, and which StorageServices are up."""
+    """Who looks up: which pools it maps, which its node can fetch, and
+    which StorageServices are up."""
 
     node_id: str
     can_map: Callable[[PoolRecord], bool]
+    can_fetch: Callable[[PoolRecord], bool]
     online: Callable[[str], bool]
 
 
@@ -635,14 +637,18 @@ class Catalog:
         key: Key,
         location: Location,
         online: Callable[[str], bool],
-        own_only: bool = False,
+        can_fetch: Callable[[PoolRecord], bool] | None = None,
     ) -> ItemOutcome:
-        """A NODE pin on the exact location. ``own_only`` (for a worker's
-        fetch): only in the node's own pools."""
+        """A NODE pin on the exact location. With ``can_fetch`` (for a
+        worker's fetch): another node's pool only if the node can fetch it."""
         entry = self.entry_exact(key, location)
         if entry is None or entry.pool.state == PoolState.REMOVING:
             return ItemOutcome(ItemResult.MISS, reason=MissReason.ABSENT)
-        if own_only and entry.pool.node_id != node_id:
+        if (
+            can_fetch is not None
+            and entry.pool.node_id != node_id
+            and not can_fetch(entry.pool)
+        ):
             return ItemOutcome(ItemResult.REJECTED)
         if entry.pool.state == PoolState.HIDDEN:
             return ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
@@ -655,8 +661,9 @@ class Catalog:
 
     def select(self, key: Key, requester: Requester) -> Selection:
         """The cheapest mapped location is a HIT (no StorageService
-        needed); else the cheapest one both StorageServices can fetch; else
-        MISS, offline if the key still has a location, absent if not."""
+        needed); else the cheapest one the requester's node can fetch, with
+        both StorageServices up; else MISS, offline if the key still has a
+        location, absent if not."""
         entries = self._by_key.get(key)
         if not entries:
             return Selection(ItemResult.MISS, reason=MissReason.ABSENT)
@@ -676,8 +683,8 @@ class Catalog:
                 if best_hit is None or cost < hit_cost:
                     best_hit, hit_cost = entry, cost
                 continue
-            if pool.node_id == requester.node_id and POOL_KINDS[pool.kind].mappable:
-                continue  # own memory the worker has not mapped: no fetch
+            if not requester.can_fetch(pool):
+                continue
             if requester_online is None:
                 requester_online = requester.online(requester.node_id)
             if not requester_online:
