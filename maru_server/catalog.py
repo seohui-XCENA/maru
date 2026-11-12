@@ -446,37 +446,56 @@ class Catalog:
 
     # ------------------------------------------------------- finalize_move
 
-    def finalize_move(self, node_id: str, holder: str, item: MoveItem) -> ItemOutcome:
-        """Check the target and remove the source at once; the finalizer
-        ``finalizer_id`` is released whatever the result when it is this
-        session's."""
+    def finalize_move(
+        self,
+        node_id: str,
+        holder: str,
+        item: MoveItem,
+        remote_dest: Callable[[PoolRecord], bool] | None = None,
+    ) -> ItemOutcome:
+        """Check the target and remove the source at once. A remote target
+        needs authorization; this session's finalizer is always released."""
         finalizer = self.pins.get(item.finalizer_id)
         if finalizer is not None and (
             finalizer.holder != holder or finalizer.holder_kind != HolderKind.FINALIZER
         ):
             finalizer = None  # not this session's finalizer: left alone
         try:
-            return self._finalize_move(node_id, holder, item, finalizer)
+            return self._finalize_move(node_id, item, finalizer, remote_dest)
         finally:
             if finalizer is not None:
                 self.pins.unpin(item.finalizer_id)
 
-    def _finalize_move(self, node_id, holder, item: MoveItem, finalizer) -> ItemOutcome:
+    def _finalize_move(
+        self, node_id, item: MoveItem, finalizer, remote_dest
+    ) -> ItemOutcome:
         src, dest = item.source, item.dest
         if src.pool_id == dest.pool_id:
             return ItemOutcome(ItemResult.REJECTED)  # one location per pool
         dest_pool = self._pools.get(dest.pool_id)
-        # KEPT(INVALID) names the invalid pool by its location
-        if dest_pool is None or dest_pool.state != PoolState.ACTIVE:
-            return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=dest)
-        if (
-            finalizer is None
-            or finalizer.key != item.key
-            or finalizer.location != dest
-            or self.entry_exact(item.key, dest) is None
+        if not item.finalizer_id and (
+            dest_pool is None or dest_pool.node_id != node_id
         ):
-            # the target is not the location this session protected: the
-            # item fails, the source stays published
+            if (
+                dest_pool is None
+                or dest_pool.state != PoolState.ACTIVE
+                or remote_dest is None
+                or not remote_dest(dest_pool)
+            ):
+                return ItemOutcome(ItemResult.REJECTED)
+        else:
+            # KEPT(INVALID) names the invalid pool by its location
+            if dest_pool is None or dest_pool.state != PoolState.ACTIVE:
+                return ItemOutcome(
+                    ItemResult.KEPT, cause=KeptCause.INVALID, location=dest
+                )
+            if (
+                finalizer is None
+                or finalizer.key != item.key
+                or finalizer.location != dest
+            ):
+                return ItemOutcome(ItemResult.REJECTED)
+        if self.entry_exact(item.key, dest) is None:
             return ItemOutcome(ItemResult.REJECTED)
         if self.own_pool(node_id, src.pool_id) is None:
             return ItemOutcome(ItemResult.KEPT, cause=KeptCause.INVALID, location=src)

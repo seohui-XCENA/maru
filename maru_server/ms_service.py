@@ -56,6 +56,8 @@ from maru_common.protocol import (
 from maru_common.serializer import op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
+    MEMORY_CAPABILITY,
+    REMOTE_CAPABILITY,
     ItemOutcome,
     ItemResult,
     Key,
@@ -194,6 +196,7 @@ class MsService:
             heartbeat_s=heartbeat_s,
             node_give_up_s=node_give_up_s,
             wall_clock=wall_clock,
+            clock=clock,
         )
         self._policy_file = policy_file
         self._policy_mtime: int | None = None  # of the policy in force
@@ -688,11 +691,19 @@ class MsService:
             if rejected:
                 return rejected
 
+            def remote_dest(pool: PoolRecord) -> bool:
+                return (
+                    REMOTE_CAPABILITY in session.capabilities
+                    and MEMORY_CAPABILITY in self.registry.capabilities_of(pool.node_id)
+                )
+
             def run(batch: _Batch) -> FinalizeMoveResponse:
                 batch.applying = True
                 for item in req.items:
                     batch.outcomes.append(
-                        self.catalog.finalize_move(session.node_id, session.token, item)
+                        self.catalog.finalize_move(
+                            session.node_id, session.token, item, remote_dest
+                        )
                     )
                 return FinalizeMoveResponse(status=Status.OK, items=batch.outcomes)
 

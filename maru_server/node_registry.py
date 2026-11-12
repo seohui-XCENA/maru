@@ -13,7 +13,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 
 from maru_common.protocol import (
@@ -29,8 +29,11 @@ from maru_common.protocol import (
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     MAX_BATCH,
+    MEMORY_CAPABILITY,
     MS_PROTOCOL,
     POOL_KINDS,
+    REMOTE_CAPABILITY,
+    STAGE_CAPABILITY,
     AccessInfo,
     BlockRequest,
     CloseMode,
@@ -56,6 +59,7 @@ from .pin_manager import PinManager
 logger = logging.getLogger(__name__)
 
 NODE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY, STAGE_CAPABILITY})
 # ended node_epochs kept per node, so a late old process cannot come back
 RETIRED_EPOCHS_KEPT = 4096
 # access info locations kept per node, and sent per heartbeat
@@ -193,6 +197,7 @@ class NodeRegistry:
         heartbeat_s: float,
         node_give_up_s: float,
         wall_clock=time.time,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.catalog = catalog
         self.pins = pins
@@ -202,6 +207,7 @@ class NodeRegistry:
         self.heartbeat_s = heartbeat_s
         self.node_give_up_s = node_give_up_s
         self._wall = wall_clock
+        self._clock = clock
         self.nodes: dict[str, NodeRecord] = {}
         self._node_sessions: dict[str, NodeSession] = {}
         self._workers: dict[str, WorkerSession] = {}
@@ -251,6 +257,17 @@ class NodeRegistry:
         node = self.nodes.get(node_id)
         return bool(node and node.session and node.session.valid(now))
 
+    def capabilities_of(self, node_id: str) -> tuple[str, ...]:
+        """Accepted capabilities of the node's live session."""
+        node = self.nodes.get(node_id)
+        if (
+            node is None
+            or node.session is None
+            or not node.session.valid(self._clock())
+        ):
+            return ()
+        return node.session.capabilities
+
     def stale_run(self, worker: WorkerSession) -> bool:
         """A worker attached to a node run that has been replaced."""
         if worker.role != SessionRole.WORKER:
@@ -284,11 +301,22 @@ class NodeRegistry:
         """Another host's CXL region mapped directly: not supported yet."""
         return False
 
-    @staticmethod
-    def can_fetch(node_id: str, pool: PoolRecord) -> bool:
-        """The node's StorageService reads the pool for its workers' FETCH:
-        only its own L2 pools, never another node's."""
-        return pool.node_id == node_id and not POOL_KINDS[pool.kind].mappable
+    def can_fetch(self, node_id: str, pool: PoolRecord) -> bool:
+        """Own L2 pools, or active memory-node pools with remote I/O agreed."""
+        if pool.node_id == node_id:
+            return not POOL_KINDS[pool.kind].mappable
+        if pool.state != PoolState.ACTIVE:
+            return False
+        requester = self.capabilities_of(node_id)
+        owner = self.capabilities_of(pool.node_id)
+        return (
+            REMOTE_CAPABILITY in requester
+            and MEMORY_CAPABILITY in owner
+            and (
+                POOL_KINDS[pool.kind].mappable
+                or (STAGE_CAPABILITY in requester and STAGE_CAPABILITY in owner)
+            )
+        )
 
     # ============================================================ node open
 
@@ -515,7 +543,11 @@ class NodeRegistry:
             epoch_seq=node.epoch_seq,
             host_boot_id=req.host_boot_id,
             rm_domains={d.rm_domain: frozenset(d.device_ids) for d in req.rm_domains},
-            capabilities=tuple(req.capabilities),
+            capabilities=tuple(
+                cap
+                for cap in dict.fromkeys(req.capabilities)
+                if cap in NODE_CAPABILITIES
+            ),
             deadline=now + self.session_ttl_s,
         )
         node.session = session
@@ -536,6 +568,7 @@ class NodeRegistry:
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
             adopted=adopted,
+            capabilities=list(session.capabilities),
         )
 
     def _end_run(
