@@ -2,7 +2,8 @@
 # Copyright 2026 XCENA Inc.
 """One locked, preallocated O_DIRECT file per SSD pool.
 
-Only a new file is initialized. Completed bytes survive a process restart;
+Only a new file is initialized. Its header names the node that owns it;
+another node cannot open it. Completed bytes survive a process restart;
 boot fencing and extent recovery belong to the caller, not this driver.
 """
 
@@ -31,8 +32,11 @@ from .ssd_alignment import (
 )
 
 _MAGIC = b"MARUSSD\0"
-_VERSION = 1
-_HEADER = struct.Struct("<8sI16sQQIIQQ")
+_VERSION = 2
+# The owning node_id is the last field (NUL padded): a file is never reused
+# by another node, whose pages its Catalog locations would then read
+_OWNER_BYTES = 256
+_HEADER = struct.Struct(f"<8sI16sQQIIQQ{_OWNER_BYTES}s")
 DEFAULT_IO_TIMEOUT_S = 0.250
 _MAX_REWINDS = 3
 
@@ -215,6 +219,9 @@ def _open_pool(
             "the SSD tier needs a positive page size and at least one page"
         )
     capacity = size // page_size * page_size
+    owner = node_id.encode()
+    if not owner or len(owner) > _OWNER_BYTES:
+        raise SsdPoolError(f"node_id must be 1..{_OWNER_BYTES} bytes for an SSD pool")
     if not os.path.isabs(path):
         raise SsdPoolError("the SSD pool path must be absolute")
     path = os.path.realpath(path)
@@ -264,9 +271,10 @@ def _open_pool(
                     alignment.offset,
                     header_size,
                     1,
+                    owner,
                 )
             _transfer(fd, 0, header, alignment, write=new, deadline=deadline)
-            magic, version, identity, p, cap, mem, off, h, generation = (
+            magic, version, identity, p, cap, mem, off, h, generation, stored = (
                 _HEADER.unpack_from(header)
             )
             if (magic, version, p, cap, mem, off, h, generation) != (
@@ -280,6 +288,14 @@ def _open_pool(
                 1,
             ) or not any(identity):
                 raise SsdPoolError("SSD header does not match the configured pool")
+            stored = stored.rstrip(b"\0")
+            if stored != owner:
+                raise SsdPoolError(
+                    f"the SSD file {path} belongs to node "
+                    f"{stored.decode(errors='replace')!r}, not {node_id!r}: give "
+                    "each node its own path, or remove the file to hand it over "
+                    "(a new file gets a new UUID)"
+                )
         return SsdPool(
             pool_id=ssd_pool_id(node_id, path),
             node_id=node_id,

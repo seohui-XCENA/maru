@@ -228,6 +228,25 @@ def test_header_mismatch_is_preserved(pool, directory, field):
     assert path.read_bytes() == data
 
 
+def test_another_node_cannot_open_the_file(pool, directory):
+    info = pool.info()
+    pool.close()
+    path = Path(info.path)
+    before = path.read_bytes()
+    with pytest.raises(SsdPoolError, match="belongs to node 'node', not 'other'"):
+        create_ssd_pool("other", str(directory), 4 * PAGE, PAGE)
+    with pytest.raises(SsdPoolError, match="belongs to node"):
+        SsdDriver().open(replace(info, node_id="other"))
+    assert path.read_bytes() == before
+    with pytest.raises(SsdPoolError, match="node_id"):
+        create_ssd_pool("n" * 257, str(directory / "long"), 4 * PAGE, PAGE)
+    # handed over by removing it: a new file, a new UUID
+    path.unlink()
+    taken = create_ssd_pool("other", str(directory), 4 * PAGE, PAGE)
+    assert taken.device_id != info.device_id
+    taken.close()
+
+
 @pytest.mark.parametrize("delta", [-512, 512])
 def test_size_mismatch_is_preserved(pool, directory, delta):
     path = Path(pool.path)

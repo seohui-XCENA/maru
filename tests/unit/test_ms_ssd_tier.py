@@ -32,7 +32,7 @@ from maru_server.catalog import PoolState
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
 from maru_storage_service.config import parse_node_config
-from maru_storage_service.drivers.ssd import SsdPool, create_ssd_pool
+from maru_storage_service.drivers.ssd import SsdPool, SsdPoolError, create_ssd_pool
 from maru_storage_service.drivers.ssd_alignment import aligned_buffer
 from maru_storage_service.page_table import PageRef
 from maru_storage_service.pool_manager import PageState
@@ -655,3 +655,46 @@ def test_the_same_boot_adopts_the_file_and_a_reboot_empties_it(
         )
     finally:
         third.stop()
+
+
+def test_another_node_never_reuses_the_file(real_server, sockdir, ssd_dir, handlers):
+    """A stops with its keys on the SSD; B, configured with the same path,
+    cannot open the file, so A adopts its own bytes again. Handing the file
+    over (removing it) gives a new UUID: A's old locations are not adopted."""
+    server, url = real_server
+    config = dram_ssd(url, sockdir, ssd_dir)
+    first = start_node(config, host_boot_id="boot-1")
+    try:
+        h = handlers(first)
+        for i in range(10):
+            assert put(h, f"a{i}")
+        wait_until(lambda: first.manager.move_results["RETIRED"] >= 3, what="moved")
+        h.close()
+    finally:
+        first.stop(CloseMode.RESTART)
+    saved = {k: loc for i in range(10) if (loc := ssd_locations(server, k := f"a{i}"))}
+    assert saved
+    other = dataclasses.replace(config, node_id="node-b")
+    with pytest.raises(SsdPoolError, match="belongs to node 'gpu-test'"):
+        start_node(other, host_boot_id="boot-1")
+    again = start_node(config, host_boot_id="boot-1")
+    try:
+        assert again.adopted == [first.ssd.pool_id]
+        for key, (location,) in saved.items():
+            assert ssd_bytes(again.ssd, location) == value_of(key)
+    finally:
+        again.stop(CloseMode.RESTART)
+    os.unlink(first.ssd.path)
+    taken = start_node(other, host_boot_id="boot-1")
+    taken.stop(CloseMode.RESTART)
+    os.unlink(first.ssd.path)
+    last = start_node(config, host_boot_id="boot-1")
+    try:
+        assert last.ssd.device_id != first.ssd.device_id
+        assert last.adopted == []
+        wait_until(
+            lambda: not any(ssd_locations(server, k) for k in saved),
+            what="A's old SSD keys gone",
+        )
+    finally:
+        last.stop()
