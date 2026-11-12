@@ -37,6 +37,7 @@ from maru_common.storage_types import (
     Status,
 )
 from maru_handler import MaruHandler
+from maru_handler.client import pool_maps
 from maru_server.catalog import PoolState
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
@@ -51,8 +52,9 @@ from tests.unit.ms_node_helpers import (
     start_node,
 )
 from tests.unit.ms_node_helpers import wait_until as _wait_until
-from tests.unit.test_ms_demotion import SMALL_CREDIT, put, value_of
-from tests.unit.test_ms_ssd_tier import _free_port
+from tests.unit.test_ms_cxl_tier import FakeRm
+from tests.unit.test_ms_demotion import SMALL_CREDIT, Regions, put, value_of
+from tests.unit.test_ms_ssd_tier import _free_port, cxl_ssd, dram_ssd
 
 NS = "ns"
 
@@ -206,7 +208,11 @@ class Loader:
             process_start_time(os.getpid()),
         )
         assert self.session.open().status == Status.OK
-        self.dram = mmap.mmap(self.raw.fds[0], node.dram.capacity, prot=mmap.PROT_READ)
+        self.dram = None
+        if node.dram is not None:  # its memfd comes first
+            self.dram = mmap.mmap(
+                self.raw.fds[0], node.dram.capacity, prot=mmap.PROT_READ
+            )
 
     @property
     def token(self) -> str:
@@ -251,7 +257,8 @@ class Loader:
         return self.session.unpin(*pin_ids)
 
     def close(self):
-        self.dram.close()
+        if self.dram is not None:
+            self.dram.close()
         self.raw.close()
 
 
@@ -606,3 +613,94 @@ def test_a_load_larger_than_dram_goes_through_in_windows(env, monkeypatch):
     wait_until(lambda: settled(node), "quota back")
     node.pools.check()
     loader.close()
+
+
+# =============================================================================
+# Into CXL: [cxl, ssd] fetches into a region, [dram, cxl, ssd] into DRAM
+# =============================================================================
+
+
+@pytest.fixture
+def regions(monkeypatch):
+    stand_in = Regions()
+    monkeypatch.setattr(pool_maps, "CxlRegionMapping", stand_in.worker_map)
+    yield stand_in
+    stand_in.close()
+
+
+def start_cxl_node(config, regions):
+    return start_node(
+        config,
+        host_boot_id="boot-1",
+        region_source=FakeRm(),
+        cxl_renew_s=0.05,
+        map_region=regions.node_map,
+    )
+
+
+def region_bytes(node, regions, location: Location) -> bytes:
+    """What a worker's mapping of the region holds there."""
+    (pool,) = [p for p in node.cxl.pools if p.pool_id == location.pool_id]
+    fd = regions.fds[pool.region.handle.region_id]
+    return os.pread(fd, location.length, location.offset)
+
+
+def test_a_cxl_top_tier_fetches_into_a_region(real_server, sockdir, ssd_dir, regions):
+    server, url = real_server
+    node = start_cxl_node(cxl_ssd(url, sockdir, ssd_dir), regions)
+    try:
+        by_pool = {p.pool_id: p.region.handle.region_id for p in node.cxl.pools}
+        writer = RawWorker(node.config.socket)
+        writer.attach()
+        names = []
+        while len(names) < 12:
+            for credit in writer.credit(2 * PAGE).credits:
+                name = f"k{len(names)}"
+                fd = regions.fds[by_pool[credit.pool_id]]
+                os.pwrite(fd, value_of(name), credit.offset)
+                done = writer.write_done([credit], [name], len(value_of(name)))
+                assert done.status == Status.OK
+                names.append(name)
+        writer.close()
+        wait_until(lambda: len(on_ssd(server, names)) >= 3, "moved to the SSD")
+        moved = on_ssd(server, names)[:3]
+        loader = Loader(node, server)
+        answer = loader.fetch(*moved)
+        assert [o.result for o in answer.items] == [ItemResult.HIT] * 3
+        for name, outcome in zip(moved, answer.items, strict=True):
+            copy = outcome.location
+            assert copy.kind == PoolKind.CXL and copy.pool_id in by_pool
+            assert region_bytes(node, regions, copy) == value_of(name)
+        loader.unpin(*[o.pin_id for o in answer.items])
+        wait_until(lambda: settled(node), "quota back")
+        node.pools.check()
+        loader.close()
+    finally:
+        node.stop()
+
+
+def test_dram_over_cxl_over_ssd_fetches_into_dram(
+    real_server, sockdir, ssd_dir, regions, handlers
+):
+    server, url = real_server
+    node = start_cxl_node(dram_ssd(url, sockdir, ssd_dir, cxl_pages=8), regions)
+    try:
+        h = handlers(node)
+        names = [f"k{i}" for i in range(24)]
+        for name in names:
+            assert put(h, name)
+        wait_until(lambda: len(on_ssd(server, names)) >= 3, "moved down to the SSD")
+        h.close()
+        moved = on_ssd(server, names)[:3]
+        loader = Loader(node, server)
+        answer = loader.fetch(*moved)
+        assert [o.result for o in answer.items] == [ItemResult.HIT] * 3
+        for name, outcome in zip(moved, answer.items, strict=True):
+            assert outcome.location.kind == PoolKind.DRAM
+            assert loader.read(outcome.location) == value_of(name)
+        loader.unpin(*[o.pin_id for o in answer.items])
+        wait_until(lambda: settled(node), "quota back")
+        node.pools.check()
+        loader.close()
+    finally:
+        node.stop()
