@@ -106,6 +106,8 @@ MAX_UNRESOLVED_FETCHES = 32
 FETCH_WAIT_SLACK_S = 1.0
 # The node's cap on a FETCH deadline
 FETCH_DEADLINE_MAX_MS = 60_000
+# Unset fetch_deadline_per_page_ms: a node page is read at 2 GB/s
+FETCH_READ_BYTES_PER_S = 2_000_000_000
 # How long a loader's retrieve_capacity waits for fetched pins' UNPINs
 FETCH_UNPIN_WAIT_S = 0.02
 
@@ -1135,6 +1137,20 @@ class MaruClient:
                 reply.set_exception(StorageUnavailableError("the run ended"))
                 return reply
             if resend:
+                if code == NodeMessageType.FETCH:
+                    # The scope's time left; past it, 1 ms: its cancel went
+                    # first, so the node answers at once and the op resolves
+                    deadline = next(
+                        (
+                            s.deadline
+                            for s in self._fetch_scopes
+                            if request.op.seq in s.pending
+                        ),
+                        None,
+                    )
+                    if deadline is not None:
+                        left = int((deadline - time.monotonic()) * 1000)
+                        request = dataclasses.replace(request, deadline_ms=max(1, left))
                 if not ops.update(request):
                     reply.set_exception(StorageUnavailableError("already resolved"))
                     return reply
@@ -1480,12 +1496,15 @@ class MaruClient:
         if not wanted or info is None:
             return
         window = self._fetch_window()
+        per_page_ms = self.config.fetch_deadline_per_page_ms
+        if per_page_ms is None:
+            per_page_ms = info.page_size * 1000 / FETCH_READ_BYTES_PER_S
         # Longer for a large FETCH, within the node's cap
         deadline_ms = min(
             FETCH_DEADLINE_MAX_MS,
             max(
                 self.config.fetch_deadline_ms,
-                math.ceil(len(wanted) * self.config.fetch_deadline_per_page_ms),
+                math.ceil(len(wanted) * per_page_ms),
             ),
         )
         with self._lock:

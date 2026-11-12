@@ -1466,9 +1466,10 @@ def _create_node_handler(
             )
         ),
         fetch_deadline_ms=int(extra_config.get("maru_fetch_deadline_ms", 250)),
-        fetch_deadline_per_page_ms=float(
-            extra_config.get("maru_fetch_deadline_per_page_ms", 2.0)
-        ),
+        # Unset: scaled to the node page
+        fetch_deadline_per_page_ms=None
+        if extra_config.get("maru_fetch_deadline_per_page_ms") is None
+        else float(extra_config["maru_fetch_deadline_per_page_ms"]),
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)

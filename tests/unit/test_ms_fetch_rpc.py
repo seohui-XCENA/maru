@@ -5,6 +5,7 @@
 import dataclasses
 import socket
 import threading
+import time
 from concurrent.futures import Future, TimeoutError
 from types import SimpleNamespace
 
@@ -339,7 +340,7 @@ def test_unknown_fetch_replays_same_op_and_cancelled_hit_is_unpinned(client, can
     c._storage = FetchConn()
     c._resend_unresolved()
     replay = c._storage.requests[0]
-    assert replay.op == first.op and replay.deadline_ms == first.deadline_ms
+    assert replay.op == first.op and replay.deadline_ms <= first.deadline_ms
     assert scope.request_id == "request"
     if cancelled:
         assert c._storage.cancels == [first.op]
@@ -453,9 +454,38 @@ def test_a_busy_fetch_misses_at_once_and_its_op_still_resolves(client, monkeypat
     assert scope.cancelled and c.stats["fetch_scope_busy"] == 1
     assert c._storage.cancels == [first.op]
     wait_until(lambda: len(c._storage.requests) == 2, what="same-op resend")
-    assert c._storage.requests[1] == first and c._ops.unresolved()
+    resent = c._storage.requests[1]
+    assert resent.deadline_ms <= first.deadline_ms  # the time left
+    assert dataclasses.replace(resent, deadline_ms=first.deadline_ms) == first
+    assert c._ops.unresolved()
     c._storage.replies[1].set_result(HIT)  # late: unpinned, never read
     assert unpins == ["worker-pin"] and not c._ops.unresolved() and not scope.pending
+
+
+def test_a_resent_fetch_carries_the_time_left(client):
+    c, _ = client
+    scope = c._new_fetch_scope("left", deadline_ms=5000)
+    c._fetch(scope, ITEMS, PAGE)
+    first = c._storage.requests[0]
+    c._storage.replies[0].set_exception(StorageUnavailableError("UDS broke"))
+    scope.deadline = time.monotonic() + 1.0
+    c._storage = FetchConn()
+    c._resend_unresolved()
+    resent = c._storage.requests[0]
+    assert resent.op == first.op and 900 < resent.deadline_ms <= 1000
+    # Past it: 1 ms behind its cancel, so the node answers and the op resolves
+    c._storage.replies[0].set_exception(StorageUnavailableError("UDS broke"))
+    scope.deadline = time.monotonic() - 1.0
+    c._cancel_fetch_scope(scope, MissReason.TIMEOUT)
+    c._storage = FetchConn()
+    c._resend_unresolved()
+    assert c._storage.cancels == [first.op]
+    resent = c._storage.requests[0]
+    assert resent.op == first.op and resent.deadline_ms == 1
+    c._storage.replies[0].set_result(
+        FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)])
+    )
+    assert not c._ops.unresolved() and not scope.pending
 
 
 def test_a_busy_fetch_cancel_is_sent_again_while_its_op_is_open(client, monkeypatch):
@@ -490,6 +520,24 @@ def test_a_large_fetch_gets_a_longer_deadline(client):
     answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * 40))
     c._retrieve_chunk([f"k{i}" for i in range(40)])
     assert 59_000 < c._storage.requests[-1].deadline_ms <= 60_000  # the node's cap
+
+
+def test_an_unset_per_page_deadline_follows_the_node_page(client):
+    c, _ = client
+    assert c.config.fetch_deadline_per_page_ms is None
+    with pytest.raises(ValueError, match="fetch_deadline_per_page_ms"):
+        dataclasses.replace(c.config, fetch_deadline_per_page_ms=-1)
+    page = 32 << 20
+    parked(c, window=64, fetch_deadline_ms=1)
+    c.attach_info.page_size = page
+    c.attach_info.budgets.fetch_request_max_bytes = 64 * page
+    # 32 MiB at 2 GB/s is 16.8 ms a page; a set value wins
+    for per_page, longest in ((None, 51), (10, 30)):
+        c.config = dataclasses.replace(c.config, fetch_deadline_per_page_ms=per_page)
+        looked_up(c, *[PLANNED] * 3)
+        answer(c, FetchResponse(Status.OK, items=[ItemOutcome(ItemResult.MISS)] * 3))
+        assert c._retrieve_chunk(["a", "b", "c"]) == [None] * 3
+        assert longest - 10 < c._storage.requests[-1].deadline_ms <= longest
 
 
 def test_a_loader_waits_briefly_for_its_unpins_to_be_answered(client, monkeypatch):

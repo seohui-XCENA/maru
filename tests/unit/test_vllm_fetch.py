@@ -288,6 +288,15 @@ def test_the_probe_counts_a_fetch_only_for_leased_loads(mode):
             made.close()
 
 
+def test_an_unset_per_page_fetch_deadline_is_left_to_the_node_page():
+    extra = node_extra("/nonexistent/node.sock", maru_async_load=True)
+    made = connector_module._create_node_handler(extra, False, False)
+    try:
+        assert made._cpu.config.fetch_deadline_per_page_ms is None
+    finally:
+        made.close()
+
+
 @needs_cuda
 def test_the_engine_thread_never_waits_for_a_fetch(
     real_server, nodes, workers, monkeypatch
