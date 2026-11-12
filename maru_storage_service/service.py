@@ -27,7 +27,7 @@ import mmap
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TypeVar
 
 from maru_common.node_protocol import Budgets
@@ -65,13 +65,13 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
-from .tiers import L1Tier, L2Tier, Leased, Level, Tier, TierEnv
+from .tiers import L1Pool, L1Tier, L2Tier, Leased, Level, Tier, TierEnv
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
 
 
-# How long a leave waits for the workers to unmap the CXL regions
+# How long a leave waits for the workers to unmap the leased pools (CXL)
 DEFAULT_UNMAP_TIMEOUT_S = 30.0
 # Pause between a run that ended and the next one, doubled up to the max for
 # runs that end soon after they start
@@ -220,6 +220,23 @@ class StorageService:
         """The run's tier ``name``, if it is a ``cls``."""
         tier = self._tiers.get(name)
         return tier if isinstance(tier, cls) else None
+
+    def _leases(self) -> list[Leased]:
+        """The run's leased tiers; a tier's thread may ask during the start."""
+        return [t for t in list(self._tiers.values()) if isinstance(t, Leased)]
+
+    def _closing_order(self) -> list[Tier]:
+        """How a teardown stops and closes the tiers: the leased ones first,
+        then the others in the order they started."""
+        tiers = list(self._tiers.values())
+        return [t for t in tiers if isinstance(t, Leased)] + [
+            t for t in tiers if not isinstance(t, Leased)
+        ]
+
+    @property
+    def claimed_elsewhere(self) -> bool:
+        """A lessor gave the node to another run: never claimed back."""
+        return any(t.claimed_elsewhere for t in self._leases())
 
     @property
     def _dram_tier(self) -> DramTier | None:
@@ -575,9 +592,9 @@ class StorageService:
         )
 
     def _worker_settled(self, incarnation: str) -> None:
-        """Its GPU drain grace is over: its region holds can go."""
-        if self.cxl is not None:
-            self.cxl.worker_settled(incarnation)
+        """Its GPU drain grace is over: its holds on leased pools can go."""
+        for lease in self._leases():
+            lease.worker_settled(incarnation)
 
     def interrupt(self) -> None:
         """Stop a start still waiting for the RM or MaruServer."""
@@ -586,11 +603,10 @@ class StorageService:
             self.server.stop()
 
     def _lose_regions(self, reason: str) -> None:
-        """The lease may end: stop with leave so no location keeps pointing at
-        the regions and no worker copies into them. A new run follows unless
-        another run claimed the node."""
-        assert self.cxl is not None
-        self._end_run(reason, CloseMode.LEAVE, new_run=not self.cxl.claimed_elsewhere)
+        """A lease may end: stop with leave so no location keeps pointing at
+        the leased pools and no worker copies into them. A new run follows
+        unless another run claimed the node."""
+        self._end_run(reason, CloseMode.LEAVE, new_run=not self.claimed_elsewhere)
 
     def _end_run(self, reason: str, mode: CloseMode, new_run: bool) -> None:
         """The run ends on its own: stop with ``mode`` on a thread of its own
@@ -622,17 +638,29 @@ class StorageService:
             self._finished.set()
 
     def _teardown(self, mode: CloseMode) -> None:
+        tiers = self._closing_order()
+        leases = self._leases()
         if self.transfers is not None:
             self.transfers.stop()  # the copy under way ends; no new one starts
-        if self.cxl is not None:
-            self.cxl.stop()
-        if self.cxl is not None and mode == CloseMode.LEAVE:
-            still = {p.pool_id for p in self.cxl.pools} - self._unmap_cxl()
-            if still:
-                # Their holds keep them out of reuse in the RM until unmapped
-                logger.warning(
-                    "cxl regions still mapped by a worker: %s", sorted(still)
-                )
+        for tier in tiers:
+            tier.stop()
+        # On leave workers unmap these before they go back
+        unmapped = [
+            t
+            for t in tiers
+            if isinstance(t, L1Tier) and isinstance(t, Leased) and t.unmap_on_leave
+        ]
+        if unmapped and mode == CloseMode.LEAVE:
+            gone = self._unmap_leased(unmapped, [p for t in unmapped for p in t.pools])
+            for tier in unmapped:
+                still = {p.pool_id for p in tier.pools} - gone
+                if still:
+                    # Their holds keep them out of reuse in the RM until unmapped
+                    logger.warning(
+                        "%s regions still mapped by a worker: %s",
+                        tier.name,
+                        sorted(still),
+                    )
         if self.local is not None:
             self.local.stop()
         if self.server is not None:
@@ -654,42 +682,47 @@ class StorageService:
                 logger.error(
                     "pools %s stay mapped: their hold and regions stay", sorted(kept)
                 )
-            elif self.cxl is not None:
-                self.cxl.after_transfers_closed()
+            else:
+                for lease in leases:
+                    lease.after_transfers_closed()
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)
             self.server.close()
-        if self.cxl is not None and mode == CloseMode.LEAVE and not kept:
-            self.cxl.release()
-        if self.cxl is not None:
-            self.cxl.close()  # its RM client
-        if self._dram_tier is not None:
-            self._dram_tier.close()
-        if self._ssd_tier is not None:
-            # Every I/O was drained above (transfers.stop); closing ends the
-            # lock, so the next run may open the file
-            self._ssd_tier.close()
+        if mode == CloseMode.LEAVE and not kept:
+            for lease in leases:
+                lease.release()
+        # Leased first (their RM clients). Every L2 I/O was drained above
+        # (transfers.stop): closing an SSD file ends its lock, so the next run
+        # may open it
+        for tier in tiers:
+            tier.close()
 
-    def _unmap_cxl(self) -> set[str]:
-        """The CXL pools no worker can map any more, before they go back."""
-        assert self.cxl is not None
-        cxl = self.cxl
+    def _unmap_leased(
+        self, tiers: Sequence[Leased], pools: Sequence[L1Pool]
+    ) -> set[str]:
+        """Of the leased tiers' ``pools``, those no worker can map any more,
+        before they go back."""
         # A pool an earlier run still holds stays held after this
-        earlier = set(cxl.earlier_holds())
+        earlier: set[str] = set()
+        for tier in tiers:
+            earlier |= set(tier.earlier_holds())
         if self.manager is None or self.local is None or not self.local.started:
             # No worker of this run mapped them
-            return {p.pool_id for p in cxl.pools} - earlier
+            return {p.pool_id for p in pools} - earlier
         # A new ATTACH maps none of them: its record exists before its reply;
         # and no credit comes from them any more
-        self.local.pools = [(d, fd) for d, fd in self.local.pools if d.dax is None]
-        for pool in cxl.pools:
+        ids = {p.pool_id for p in pools}
+        self.local.pools = [
+            (d, fd) for d, fd in self.local.pools if d.pool.pool_id not in ids
+        ]
+        for pool in pools:
             self.pools.disable_pool(pool.pool_id)
         timeout = self.unmap_timeout_s
-        if self.ended is not None:  # the RM may free them once the lease ends
-            timeout = min(timeout, cxl.time_left() / 2)
+        if self.ended is not None:  # the lessor may free them once the lease ends
+            timeout = min([timeout, *(t.time_left() / 2 for t in tiers)])
         done = self.manager.unmap_pools(
-            [(p.pool_id, p.pool_generation) for p in cxl.pools], max(0.0, timeout)
+            [(p.pool_id, p.pool_generation) for p in pools], max(0.0, timeout)
         )
         return done - earlier
 
@@ -806,7 +839,7 @@ class Node:
 
     def _claimed_elsewhere(self, service: StorageService, reason: str) -> bool:
         """Another run claimed the node in the RM: never claim it back."""
-        if service.cxl is None or not service.cxl.claimed_elsewhere:
+        if not service.claimed_elsewhere:
             return False
         self.ended = f"another run claimed the node ({reason})"
         return True

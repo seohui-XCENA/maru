@@ -10,7 +10,6 @@ import os
 import signal
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -53,7 +52,7 @@ class FakeRun:
         self.new_run = new_run
         self.later_run = False
         self.teardown_failed = None
-        self.cxl = SimpleNamespace(claimed_elsewhere=claimed)
+        self.claimed_elsewhere = claimed
         self.interrupted = threading.Event()
         self._end, self._failed, self._error = end, teardown_failed, start_error
         self._finishes = finishes
