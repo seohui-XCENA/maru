@@ -1374,6 +1374,75 @@ def test_room_goes_by_arrival_not_by_which_task_runs_first(env, monkeypatch):
             worker.close()
 
 
+def test_published_copies_are_pinned_in_turn_too(env, monkeypatch):
+    """b comes after a with four keys published after its LOOKUP, plus a's
+    last. b pins none of those copies before a's turn: the pins would keep
+    pages a waits for, while b waits for a's flight."""
+    server, make = env
+    node, _ = make(keys=40)
+    names = on_ssd(server, [f"k{i}" for i in range(40)])
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    assert a.budgets.fetch_request_max_bytes == 11 * PAGE
+    assert b.budgets.fetch_request_max_bytes == 5 * PAGE
+    a_names, cached = names[:11], names[11:15]
+    b_items = b.items(*cached, a_names[-1])  # planned before the copies
+    warm = a.fetch(*cached)
+    assert [o.result for o in warm.items] == [ItemResult.HIT] * 4
+    a.unpin(*[o.pin_id for o in warm.items])
+    wait_until(lambda: settled(node, server), "the copies published")
+    writer = RawWorker(node.config.socket)
+    writer.attach()
+    assert len(writer.credit(2 * PAGE).credits) == 2
+    fetches = node.manager.fetches
+    run, first = fetches._run, fetches._first
+    paused, go, waits = threading.Event(), threading.Event(), threading.Event()
+
+    def a_runs_late(flights):
+        if any(f.leader.op.origin == a.raw.incarnation for f in flights):
+            paused.set()
+            assert go.wait(10)
+        return run(flights)
+
+    def b_waits(turn):
+        ok = first(turn)
+        if not ok and turn.origin == b.raw.incarnation:
+            waits.set()
+        return ok
+
+    def b_pins() -> int:
+        with server.ms_service.lock:
+            return len(server.ms_service.pins.held_by(b.token))
+
+    monkeypatch.setattr(fetches, "_run", a_runs_late)
+    monkeypatch.setattr(fetches, "_first", b_waits)
+
+    def unpin_on_answer(loader, future):
+        loader.unpin(*[o.pin_id for o in future.result().items if o.pin_id])
+
+    try:
+        first_reply = a.send(a.request(a.items(*a_names), deadline_ms=3000))
+        first_reply.add_done_callback(lambda f: unpin_on_answer(a, f))
+        assert paused.wait(10)
+        second = b.send(b.request(b_items, deadline_ms=3000))
+        second.add_done_callback(lambda f: unpin_on_answer(b, f))
+        wait_until(lambda: waits.is_set() or b_pins() == 4, "b waits or pins")
+        assert b_pins() == 0 and fetches.results["joined"] == 1
+        with fetches._lock:
+            flights = list(fetches._flights.values())
+        led = [f for f in flights if f.leader.op.origin == b.raw.incarnation]
+        assert len(led) == 4 and all(f.cached for f in led)
+        go.set()
+        for reply, count in ((first_reply, 11), (second, 5)):
+            outcomes = [(o.result, o.reason) for o in reply.result(10).items]
+            assert outcomes == [(ItemResult.HIT, None)] * count
+        wait_until(lambda: settled(node, server), "quota back")
+        node.pools.check()
+    finally:
+        go.set()
+        for worker in (a, b, writer):
+            worker.close()
+
+
 def test_a_resend_may_carry_less_of_its_deadline(env, monkeypatch):
     server, make = env
     node, keys = make()

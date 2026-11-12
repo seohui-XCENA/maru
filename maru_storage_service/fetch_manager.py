@@ -10,8 +10,9 @@ publishes the copy with FETCH_COMPLETE: the source is unpinned and the copy
 pinned for a waiting worker, plus a node pin (hold_copy) that keeps the copy
 while the other waiters get their own pins on it (the exact copy). The node
 pin goes once no waiter is left. Each flight goes on as soon as it has its
-page; FETCHes short of room take pages in the order they came, so two never
-hold part of their pages while each waits for the other's.
+page; FETCHes short of room take pages (and pin copies published before) in
+the order they came, so two never hold part of their pages while each waits
+for the other's.
 
 A FETCH is answered once every item has its outcome; at its deadline or its
 cancel it is answered at once, with MISS for each item without a pin handed
@@ -163,7 +164,7 @@ class FetchManager:
         )
         self._inflight = 0
         # FETCHes leading flights, in the order they came, until their
-        # flights have pages: the first takes pages
+        # flights have pages: the first takes pages and pins copies
         self._room: collections.deque[_Op] = collections.deque()
         self._stop = threading.Event()
         self._tasks = concurrent.futures.ThreadPoolExecutor(
@@ -507,14 +508,7 @@ class FetchManager:
         """Run the flights a FETCH started, then serve their other waiters. A
         failure here leaves pages and pins as they are, and ends the run."""
         try:
-            cached = [f for f in flights if f.cached]
-            todo = [f for f in flights if not f.cached]
-            if cached:
-                held, gone = self._hold_copies(cached)
-                for flight in held:
-                    self._fan_out(flight)
-                todo += gone
-            self._run(todo)
+            self._run(flights)
         except Exception as e:
             logger.exception("a fetch failed; its pages stay as they are")
             for flight in flights:
@@ -530,7 +524,8 @@ class FetchManager:
         destination page from the top tier, and is published once read.
         Those short of a page wait for room (want_room) while a waiter is
         within its deadline; FETCHes short of room take pages in the order
-        they came."""
+        they came. Copies published before are pinned in that turn too: a
+        pin keeps its page from eviction."""
         need = list(flights)
         ready: collections.deque[_Flight] = collections.deque()
         running: list[_Flight] = []
@@ -542,7 +537,14 @@ class FetchManager:
             need = self._expire(need)
             got = []
             if need and self._first(turn):
-                refs = self._reserve(len(need))
+                cached = [f for f in need if f.cached]
+                if cached:
+                    need = [f for f in need if not f.cached]
+                    held, gone = self._hold_copies(cached)
+                    for flight in held:
+                        self._fan_out(flight)
+                    need += gone
+                refs = self._reserve(len(need)) if need else []
                 for flight, ref in zip(need, refs, strict=False):
                     flight.dest = ref
                     got.append(flight)
