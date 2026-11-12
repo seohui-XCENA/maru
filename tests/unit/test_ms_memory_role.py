@@ -182,7 +182,7 @@ def test_remote_server_defaults():
 def test_remote_server_keys():
     raw = memory_raw("tcp://ms:5555", "/tmp/x")
     raw["remote_server"].update(
-        listen="tcp://200.200.2.22:9871",
+        listen="tcp://192.0.2.22:9871",
         rdma_device="rocep193s0",
         reserve_ttl_s=30,
         peer_quarantine_max="1G",
@@ -191,7 +191,7 @@ def test_remote_server_keys():
         stage_queue=8,
     )
     rs = parse_node_config(raw).remote_server
-    assert rs.listen == "200.200.2.22:9871"
+    assert rs.listen == "192.0.2.22:9871"
     assert rs.rdma_device == "rocep193s0"
     assert rs.reserve_ttl_s == 30.0
     assert (rs.peer_quarantine_max, rs.quarantine_max) == (1 << 30, 8 << 30)
@@ -201,7 +201,7 @@ def test_remote_server_keys():
 @pytest.mark.parametrize(
     ("key", "value", "match"),
     [
-        ("listen", "200.200.2.22", "host:port"),
+        ("listen", "192.0.2.22", "host:port"),
         ("listen", ":9871", "host:port"),
         ("listen", "h:0", "host:port"),
         ("listen", "h:70000", "host:port"),
