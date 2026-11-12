@@ -75,6 +75,24 @@ def ref_of(credit: Location) -> PageRef:
     return PageRef(credit.pool_id, credit.offset // PS, credit.generation)
 
 
+class TestTiers:
+    def test_a_pool_is_in_the_tier_it_was_added_to(self):
+        pm = PoolManager(budgets(transfer_reserve_bytes={"fast": 14 * PS}), PS)
+        pm.add_pool(dram())
+        pm.add_pool(dram("dram:n:f"), tier="fast")
+        pm.set_epoch_seq(3)
+        assert [pm.tier_of(p) for p in ("dram:n:e", "dram:n:f", "x")] == [
+            "dram",
+            "fast",
+            None,
+        ]
+        assert pm.tier_kind("fast") == PoolKind.DRAM and pm.tier_kind("cxl") is None
+        # credit and the transfer reserve go by tier, not by kind
+        got = pm.credit("w", 4 * PS, "fast")
+        assert [c.pool_id for c in got] == ["dram:n:f"] * 2
+        pm.check()
+
+
 class TestCredit:
     def test_no_credit_before_epoch_seq(self):
         pm = PoolManager(budgets(), PS)

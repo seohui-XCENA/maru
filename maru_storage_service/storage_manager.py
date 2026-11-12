@@ -65,7 +65,7 @@ from .ports import (
     ServerStopped,
     WorkerEndpoint,
 )
-from .tiers import IOResult
+from .tiers import IOResult, Level
 from .transfer_engine import Copy, TransferEngine
 from .worker_registry import WorkerRecord, WorkerRegistry
 
@@ -136,20 +136,20 @@ class StorageManager:
         gpu_drain_grace_s: float = DEFAULT_GPU_DRAIN_GRACE_S,
         evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
         op_window: int = OP_WINDOW,
-        traits: dict[PoolKind, TierTraits] | None = None,
+        traits: dict[str, TierTraits] | None = None,
         on_worker_settled: Callable[[str], None] = lambda incarnation: None,
         transfers: TransferEngine | None = None,
         on_end: Callable[[str], None] = lambda reason: None,
     ):
         """``on_end(reason)``: this run cannot go on (once, from any thread)."""
         self.node_epoch = node_epoch
+        # By tier name, in config order
         self.traits = traits or {
-            PoolKind.DRAM: TierTraits(PoolKind.DRAM, credit=True, evicts=True)
+            "dram": TierTraits("dram", Level.L1, credit=True, evicts=True)
         }
-        self.credit_kind = next(k for k, t in self.traits.items() if t.credit)
         # Credit comes from the top tier, then from the fallback tiers in order
-        self.credit_kinds = [self.credit_kind] + [
-            k for k, t in self.traits.items() if t.credit_fallback
+        self.credit_tiers = [n for n, t in self.traits.items() if t.credit] + [
+            n for n, t in self.traits.items() if t.credit_fallback
         ]
         self.pools = pool_manager
         self.placement = placement
@@ -198,7 +198,7 @@ class StorageManager:
         # Pools MaruServer called INVALID: no demotion goes there
         self._invalid_pools: set[str] = set()
         # FREE bytes a fetch wants now, by tier (see want_room)
-        self._demand: dict[PoolKind, int] = {}
+        self._demand: dict[str, int] = {}
         # Pools below whose writes keep failing: failures in a row, and until
         # when the pool takes no demotion
         self._io_failures: collections.Counter[str] = collections.Counter()
@@ -329,6 +329,13 @@ class StorageManager:
             )
         return response_cls(status=Status.BUSY, error="too many unacknowledged ops")
 
+    @property
+    def credit_kinds(self) -> list[PoolKind]:
+        """The kinds of the credit tiers' pools, in credit order (the wire
+        names tiers by kind)."""
+        kinds = (self.pools.tier_kind(t) for t in self.credit_tiers)
+        return [k for k in kinds if k is not None]
+
     def credit(self, rec: WorkerRecord, decoded: DecodedRequest) -> CreditResponse:
         req: CreditRequest = decoded.request
         if not req.worker_session:
@@ -336,10 +343,11 @@ class StorageManager:
                 status=Status.REJECTED,
                 error="credit needs the worker_session of MaruServer",
             )
-        if req.kind is not None and req.kind not in self.credit_kinds:
+        credit_kinds = self.credit_kinds
+        if req.kind is not None and req.kind not in credit_kinds:
             return CreditResponse(
                 status=Status.REJECTED,
-                error=f"credit comes from the {self.credit_kinds} tiers, not {req.kind}",
+                error=f"credit comes from the {credit_kinds} tiers, not {req.kind}",
             )
         if req.want_bytes <= 0:
             return CreditResponse(
@@ -362,7 +370,11 @@ class StorageManager:
             credits = self.pools.credit(
                 rec.incarnation,
                 req.want_bytes,
-                self.credit_kinds if req.kind is None else req.kind,
+                self.credit_tiers
+                if req.kind is None
+                else [
+                    t for t in self.credit_tiers if self.pools.tier_kind(t) == req.kind
+                ],
             )
             asks = [
                 (conn, nbytes)
@@ -712,26 +724,26 @@ class StorageManager:
             except Exception:
                 logger.exception("eviction pass failed")
 
-    def want_room(self, kind: PoolKind, nbytes: int) -> None:
-        """A fetch needs ``nbytes`` FREE in the tier of ``kind`` now: the next
+    def want_room(self, tier: str, nbytes: int) -> None:
+        """A fetch needs ``nbytes`` FREE in ``tier`` now: the next
         pass evicts up to that much whatever the watermarks, pages with a
         copy below first. Asked again, the larger demand stands."""
         with self._lock:
-            self._demand[kind] = max(self._demand.get(kind, 0), nbytes)
+            self._demand[tier] = max(self._demand.get(tier, 0), nbytes)
         self._evict_wake.set()
 
     def _evict_once(self) -> None:
         # Lower tiers first: the room they make takes the pages from above
-        for kind in reversed(list(self.traits)):
+        for name in reversed(list(self.traits)):
             if self._halted():  # the session went during this pass
                 return
-            traits = self.traits[kind]
+            traits = self.traits[name]
             with self._lock:
-                demand = self._demand.pop(kind, 0)
+                demand = self._demand.pop(name, 0)
                 prefer = set(self._copies) if demand else set()
             if not traits.evicts:
                 continue
-            pools = self._evictable_pools(kind)
+            pools = self._evictable_pools(name)
             if not pools:
                 continue
             capacity, free, retiring, page_size = self._tier_usage(pools)
@@ -740,7 +752,7 @@ class StorageManager:
             if below is not None and self.traits[below].io_only:
                 limit = max(1, min(limit, IO_BATCH_BYTES // page_size))
             candidates = self.placement.candidates(
-                kind.value,
+                name,
                 pools,
                 capacity=capacity,
                 free_bytes=free,
@@ -754,7 +766,7 @@ class StorageManager:
             if not refs:
                 continue
             if below is not None and self.transfers is not None:
-                self._demote(kind, pools, below, refs, items)
+                self._demote(name, pools, below, refs, items)
             else:
                 self.retire(refs, items)
 
@@ -764,19 +776,17 @@ class StorageManager:
             paused = self._paused() or self._stopping
         return paused or self.metadata.epoch_lost
 
-    def _evictable_pools(self, kind: PoolKind) -> list[str]:
+    def _evictable_pools(self, name: str) -> list[str]:
         """The tier's pools pressure is measured over and removed from: not
         invalid, not quarantined for an earlier run and (in the credit tier)
         creditable."""
-        traits = self.traits[kind]
+        traits = self.traits[name]
         with self._lock:
             invalid = set(self._invalid_pools)
         pools = []
         for pool_id in self.pools.pool_ids():
-            info = self.pools.pool_info(pool_id)
             if (
-                info is None
-                or info.kind != kind
+                self.pools.tier_of(pool_id) != name
                 or pool_id in invalid
                 or self.pools.pool_quarantined(pool_id)
                 or (
@@ -822,9 +832,9 @@ class StorageManager:
 
     def _demote(
         self,
-        kind: PoolKind,
+        name: str,
         pools: list[str],
-        below: PoolKind,
+        below: str,
         refs: list[PageRef],
         items: list[KeyLocation],
     ) -> None:
@@ -870,10 +880,8 @@ class StorageManager:
         rest = todo[len(dests) :]
         if rest:
             capacity, free, _, _ = self._tier_usage(pools)
-            if self.placement.above_high(
-                kind.value, capacity=capacity, free_bytes=free
-            ):
-                logger.debug("no room below %s: dropping %d pages", kind, len(rest))
+            if self.placement.above_high(name, capacity=capacity, free_bytes=free):
+                logger.debug("no room below %s: dropping %d pages", name, len(rest))
                 with self._lock:
                     self.move_results["DROPPED"] += len(rest)
                 drop += rest
@@ -911,8 +919,8 @@ class StorageManager:
         page = self.pools.page(ref)
         return page is not None and page.state == PageState.READY and page.key == key
 
-    def _reserve_below(self, kind: PoolKind, count: int) -> list[PageRef]:
-        """Destination pages, each from the pool of ``kind`` with the most
+    def _reserve_below(self, tier: str, count: int) -> list[PageRef]:
+        """Destination pages, each from the pool of ``tier`` with the most
         room: one region filled past its high watermark would drop pages
         while the others have room."""
         assert self.transfers is not None
@@ -925,7 +933,7 @@ class StorageManager:
             info = self.pools.pool_info(pool_id)
             if (
                 info is not None
-                and info.kind == kind
+                and self.pools.tier_of(pool_id) == tier
                 and pool_id not in invalid
                 and pool_id not in paused
                 and self.transfers.has_pool(pool_id)

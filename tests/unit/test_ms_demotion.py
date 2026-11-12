@@ -568,6 +568,20 @@ def test_the_budget_reaches_the_engine(nodes):
     assert node.transfers.bytes_per_s == 123 * PAGE
 
 
+def test_a_demotion_reserves_pages_of_the_tier_below_only(nodes):
+    node = nodes()
+    free = node.pools.bytes_in(PageState.FREE)
+    refs = node.manager._reserve_below("cxl", 64)  # more than CXL has
+    try:
+        assert {r.pool_id for r in refs} == set(cxl_ids(node))
+        assert len(refs) * PAGE == cxl_bytes(node, PageState.TRANSFER)
+        assert node.pools.bytes_in(PageState.TRANSFER, node.dram.pool_id) == 0
+    finally:
+        for ref in refs:
+            node.pools.transfer_failed(ref)
+    assert node.pools.bytes_in(PageState.FREE) == free
+
+
 def test_cxl_keeps_its_own_watermarks(nodes):
     node = nodes(high=0.5, low=0.25)  # the cxl tier's are 0.9 and 0.8
     placement = node.manager.placement

@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from maru_common.node_protocol import DEFAULT_NODE_SOCKET, Budgets, TransferDefaults
-from maru_common.storage_types import PoolKind, Visibility
+from maru_common.storage_types import Visibility
+
+from .tiers import Level
 
 
 class NodeConfigError(ValueError):
@@ -148,14 +150,18 @@ class TierTraits:
     """What the StorageService does with a tier's pools, instead of asking
     which medium they are."""
 
-    kind: PoolKind
+    name: str  # the store name
+    level: Level
     credit: bool  # workers get credit from it (the top tier)
     evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
-    demotes_to: PoolKind | None = None  # write-back target (demotion "back")
+    demotes_to: str | None = None  # write-back target tier (demotion "back")
     # Workers get the credit the tiers above lack from it
     credit_fallback: bool = False
-    # Only the I/O executor moves its pages (SSD); workers never map them
-    io_only: bool = False
+
+    @property
+    def io_only(self) -> bool:
+        """Only the tier's I/O moves its pages; workers never map them."""
+        return self.level is Level.L2
 
 
 @dataclass(frozen=True)
@@ -186,13 +192,13 @@ class NodeConfig:
     def tier(self, store: str) -> TierConfig | None:
         return next((t for t in self.tiers if t.store == store), None)
 
-    def traits(self) -> dict[PoolKind, TierTraits]:
-        """Traits of each local tier (memory and SSD), by the kind of its
-        pools. The top tier gives credit, and a tier with credit_fallback the
+    def traits(self) -> dict[str, TierTraits]:
+        """Traits of each local tier (memory and SSD), by store name in config
+        order. The top tier gives credit, and a tier with credit_fallback the
         credit the tiers above lack. A tier with demotion "back" over a local
         tier evicts by moving its pages there; a tier that gets new pages
         (credit or demotion) and demotes nowhere evicts by dropping."""
-        out: dict[PoolKind, TierTraits] = {}
+        out: dict[str, TierTraits] = {}
         receives = True  # the top tier gets the writes
         for i, t in enumerate(self.tiers):
             if t.store not in LOCAL_STORES:
@@ -205,13 +211,13 @@ class NodeConfig:
                 and below.store in LOCAL_STORES
             )
             fallback = i > 0 and t.credit_fallback
-            out[PoolKind(t.store)] = TierTraits(
-                kind=PoolKind(t.store),
+            out[t.store] = TierTraits(
+                name=t.store,
+                level=Level.L1 if t.is_memory else Level.L2,
                 credit=i == 0,
                 evicts=receives or fallback,
-                demotes_to=PoolKind(below.store) if demotes and below else None,
+                demotes_to=below.store if demotes and below else None,
                 credit_fallback=fallback,
-                io_only=not t.is_memory,
             )
             receives = demotes
         return out

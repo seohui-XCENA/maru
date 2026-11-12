@@ -31,7 +31,6 @@ from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
     CloseMode,
-    PoolKind,
     RmDomain,
     run_holder,
 )
@@ -209,7 +208,7 @@ class StorageService:
         self.local: LocalServer | None = None
         # Pools taken over from the run before: adopted or claimed from the RM
         self.adopted: list[str] = []
-        self._credit_kinds: set[PoolKind] = set()
+        self._credit_tiers: set[str] = set()
         self._stopped = threading.Event()
 
     def start(self) -> None:
@@ -303,7 +302,7 @@ class StorageService:
         self.pools = PoolManager(config.budgets, config.page_size)
         if self.dram is not None:
             self.pools.add_pool(
-                self.dram.info(), creditable=traits[PoolKind.DRAM].credit
+                self.dram.info(), creditable=traits["dram"].credit, tier="dram"
             )
         self.server = ServerClient(
             config.server,
@@ -341,17 +340,23 @@ class StorageService:
             # Workers fetch SSD pages into the top tier
             self.manager.fetches = FetchManager(
                 self.manager,
-                ssd=self.ssd,
+                sources=self.transfers.l2_pools() if self.transfers is not None else {},
                 node_id=config.node_id,
                 page_size=config.page_size,
-                kind=PoolKind(top.store),
+                tier=top.store,
                 request_max_bytes=config.budgets.fetch_request_max_bytes,
                 inflight_max_bytes=config.budgets.fetch_max_inflight_bytes,
             )
         cxl_pools = self.cxl.pools if self.cxl is not None else []
-        self._credit_kinds = {
-            kind for kind, t in traits.items() if t.credit or t.credit_fallback
+        self._credit_tiers = {
+            name for name, t in traits.items() if t.credit or t.credit_fallback
         }
+        # The tier of each pool this run opens: adopted ones are among them
+        pool_tiers = {p.pool_id: "cxl" for p in cxl_pools}
+        if self.dram is not None:
+            pool_tiers[self.dram.pool_id] = "dram"
+        if self.ssd is not None:
+            pool_tiers[self.ssd.pool_id] = "ssd"
         rm_domains = []
         if self.cxl is not None and self.cxl.rm_domain is not None:
             devices = sorted({p.region.device_uuid for p in cxl_pools} - {""})
@@ -370,7 +375,12 @@ class StorageService:
             # MaruServer adopts the SSD pool only on the same boot and when
             # no other run opened the file since; the file lock shows its
             # earlier I/O ended, so its quarantine ends below once listed
-            self.pools.add_pool(info, creditable=False, state=PageState.QUARANTINED)
+            name = pool_tiers.get(info.pool_id)
+            if name is None:
+                raise RuntimeError(f"MaruServer adopted {info.pool_id}, not opened")
+            self.pools.add_pool(
+                info, creditable=False, state=PageState.QUARANTINED, tier=name
+            )
             self.pools.quarantine_pool(info.pool_id)
             items = self.server.recover_list(info.pool_id)
             refs = self.pools.recovered(
@@ -387,18 +397,21 @@ class StorageService:
                 # The run before may have written it: quarantined as an
                 # adopted pool, with no committed page
                 self.pools.add_pool(
-                    pool.info(), creditable=False, state=PageState.QUARANTINED
+                    pool.info(),
+                    creditable=False,
+                    state=PageState.QUARANTINED,
+                    tier="cxl",
                 )
                 self.pools.quarantine_pool(pool.pool_id)
                 self.adopted.append(pool.pool_id)
             else:
                 self.pools.add_pool(
-                    pool.info(), creditable=PoolKind.CXL in self._credit_kinds
+                    pool.info(), creditable="cxl" in self._credit_tiers, tier="cxl"
                 )
         if self.ssd is not None and self.ssd.pool_id not in adopted_ids:
             # Not adopted (first run, another boot, another MaruServer or a
             # run on one in between): the file is reused from scratch
-            self.pools.add_pool(self.ssd.info(), creditable=False)
+            self.pools.add_pool(self.ssd.info(), creditable=False, tier="ssd")
         self.manager.start()
         # Quarantined while an earlier run holds the region in the RM
         earlier = self.cxl.earlier_holds() if self.cxl is not None else {}
@@ -538,11 +551,9 @@ class StorageService:
         with self._stop_lock:
             if self._stopped.is_set():
                 return
-            info = self.pools.pool_info(pool_id)
-            creditable = (
-                info is not None
-                and info.kind in self._credit_kinds
-                and not self.manager.is_invalid(pool_id)
+            tier = self.pools.tier_of(pool_id)
+            creditable = tier in self._credit_tiers and not self.manager.is_invalid(
+                pool_id
             )
             freed = self.pools.end_pool_quarantine(pool_id, creditable)
         logger.info(

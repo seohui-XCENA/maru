@@ -86,6 +86,11 @@ class TransferEngine:
         with self._lock:
             return pool_id in self._maps or pool_id in self._l2
 
+    def l2_pools(self) -> dict[str, L2Tier]:
+        """The L2 tier of each L2 pool."""
+        with self._lock:
+            return dict(self._l2)
+
     def _tiers(self) -> list[L2Tier]:
         """Caller holds the lock: each L2 tier once, in the order added."""
         return list({id(t): t for t in self._l2.values()}.values())

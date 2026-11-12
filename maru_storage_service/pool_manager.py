@@ -71,6 +71,8 @@ class PoolManager:
         self.page_size = page_size
         self._lock = threading.RLock()
         self._tables: dict[str, PageTable] = {}
+        # The tier (store name) of each pool
+        self._tier: dict[str, str] = {}
         # Pools that give credit; a quarantined or a disabled one does not
         self._creditable: set[str] = set()
         # Pools an earlier run may still write (see quarantine_pool)
@@ -103,9 +105,11 @@ class PoolManager:
         *,
         creditable: bool = True,
         state: PageState = PageState.FREE,
+        tier: str | None = None,
     ) -> None:
-        """Add a pool: FREE if made here, QUARANTINED if adopted. An SSD pool
-        never gives credit: workers do not map it."""
+        """Add a pool of ``tier`` (by default the one named as its kind):
+        FREE if made here, QUARANTINED if adopted. An SSD pool never gives
+        credit: workers do not map it."""
         if state not in (PageState.FREE, PageState.QUARANTINED):
             raise ValueError(f"a pool starts FREE or QUARANTINED, not {state}")
         if creditable and not POOL_KINDS[info.kind].mappable:
@@ -119,6 +123,7 @@ class PoolManager:
             if info.pool_id in self._tables:
                 raise ValueError(f"pool {info.pool_id} added twice")
             self._tables[info.pool_id] = PageTable(info, state, self.transitions)
+            self._tier[info.pool_id] = info.kind.value if tier is None else tier
             if creditable:
                 self._creditable.add(info.pool_id)
 
@@ -126,6 +131,19 @@ class PoolManager:
         with self._lock:
             table = self._tables.get(pool_id)
             return table.info if table else None
+
+    def tier_of(self, pool_id: str) -> str | None:
+        """The pool's tier; None for a pool this node does not have."""
+        with self._lock:
+            return self._tier.get(pool_id)
+
+    def tier_kind(self, tier: str) -> PoolKind | None:
+        """The kind of the tier's pools; None while it has none."""
+        with self._lock:
+            return next(
+                (t.info.kind for p, t in self._tables.items() if self._tier[p] == tier),
+                None,
+            )
 
     def creditable(self, pool_id: str) -> bool:
         with self._lock:
@@ -216,10 +234,10 @@ class PoolManager:
         self,
         holder: str,
         want_bytes: int,
-        kinds: PoolKind | Sequence[PoolKind] | None = None,
+        tiers: str | Sequence[str] | None = None,
     ) -> list[Location]:
-        """FREE pages for ``holder`` within every budget, from the tiers of
-        ``kinds`` in order (all creditable pools when None): the first tier's
+        """FREE pages for ``holder`` within every budget, from ``tiers`` in
+        order (all creditable pools when None): the first tier's
         pages come first, and within a tier the roomiest pool gives each page.
         Each tier keeps its transfer reserve. Empty when credit is stopped or
         the workers' commit-pending bytes reached their cap. A short grant
@@ -235,8 +253,8 @@ class PoolManager:
             if self._write_pending() >= self.budgets.commit_pending_max_bytes:
                 self._short("pending", want)
                 return []
-            tiers = self._credit_tiers(kinds)
-            space = sum(room for _, room in tiers)
+            rooms = self._credit_tiers(tiers)
+            space = sum(room for _, room in rooms)
             now = time.monotonic()
             self._waiting = {
                 h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
@@ -276,7 +294,7 @@ class PoolManager:
                     logger.error("New credit stopped: %s", self._credit_stopped)
                     return []
             out: list[Location] = []
-            for tables, room in tiers:
+            for tables, room in rooms:
                 # Roomiest pool first, the earlier one on a tie
                 heap = [(-t.free_count(), i) for i, t in enumerate(tables)]
                 heapq.heapify(heap)
@@ -293,32 +311,30 @@ class PoolManager:
             return out
 
     def _credit_tiers(
-        self, kinds: PoolKind | Sequence[PoolKind] | None
+        self, tiers: str | Sequence[str] | None
     ) -> list[tuple[list[PageTable], int]]:
         """Caller holds the lock. Per tier in credit order: its creditable
         pools and the pages it may give (FREE less its transfer reserve)."""
-        if kinds is None:
+        if tiers is None:
             order = list(
                 dict.fromkeys(
-                    t.info.kind
-                    for p, t in self._tables.items()
-                    if p in self._creditable
+                    self._tier[p] for p in self._tables if p in self._creditable
                 )
             )
-        elif isinstance(kinds, PoolKind):
-            order = [kinds]
+        elif isinstance(tiers, str):
+            order = [tiers]
         else:
-            order = list(kinds)
+            order = list(tiers)
         out = []
-        for kind in order:
+        for tier in order:
             tables = [
                 t
                 for p, t in self._tables.items()
-                if p in self._creditable and t.info.kind == kind
+                if p in self._creditable and self._tier[p] == tier
             ]
             if not tables:
                 continue
-            reserve = self.budgets.transfer_reserve_bytes.get(kind.value, 0)
+            reserve = self.budgets.transfer_reserve_bytes.get(tier, 0)
             free = sum(t.bytes[PageState.FREE] for t in tables)
             out.append((tables, max(0, (free - reserve) // self.page_size)))
         return out

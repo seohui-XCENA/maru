@@ -44,15 +44,13 @@ from maru_common.storage_types import (
     KeyLocation,
     Location,
     MissReason,
-    PoolKind,
     Status,
 )
 
-from .drivers.ssd import SsdPool
 from .op_ledger import LedgerEntry, Verdict
 from .page_table import PageRef, PageState
 from .ports import EpochChanged, ServerStopped
-from .tiers import IOResult
+from .tiers import IOResult, L2Tier
 from .transfer_engine import Copy
 from .worker_registry import WorkerRecord
 
@@ -136,24 +134,25 @@ class FetchManager:
         self,
         manager,
         *,
-        ssd: SsdPool,
+        sources: dict[str, L2Tier],
         node_id: str,
         page_size: int,
-        kind: PoolKind,
+        tier: str,
         request_max_bytes: int,
         inflight_max_bytes: int,
         threads: int = FETCH_THREADS,
     ):
-        """``kind``: the top tier, where copies go (workers map it)."""
+        """``sources``: the L2 tier of each pool fetched from. ``tier``: the
+        top tier, where copies go (workers map it)."""
         assert manager.transfers is not None
         self.manager = manager
         self.pools = manager.pools
         self.metadata = manager.metadata
         self.transfers = manager.transfers
-        self.ssd = ssd
+        self.sources = sources
         self.node_id = node_id
         self.page_size = page_size
-        self.kind = kind
+        self.tier = tier
         self.request_max_bytes = request_max_bytes
         self.inflight_max_bytes = inflight_max_bytes
         self._lock = threading.Lock()
@@ -404,13 +403,16 @@ class FetchManager:
 
     def _source(self, rec: WorkerRecord, key: Key, plan) -> ItemOutcome | tuple:
         """(the source page, its bounce bytes), or the item's outcome. Only a
-        READY page of this node's SSD holding exactly the plan's location."""
+        READY page of this node's L2 pools holding exactly the plan's location."""
         source = plan.source
+        tier = self.sources.get(source.pool_id)
+        info = self.pools.pool_info(source.pool_id)
         if (
             key.namespace != rec.ident.namespace
             or plan.source_node != self.node_id
-            or source.pool_id != self.ssd.pool_id
-            or source.kind != PoolKind.SSD
+            or tier is None
+            or info is None
+            or source.kind != info.kind
         ):
             return ItemOutcome(ItemResult.REJECTED)
         ref = self.pools.find(source)
@@ -423,7 +425,7 @@ class FetchManager:
             or source.length != plan.bytes
         ):
             return _miss(MissReason.ABSENT)
-        return ref, self.ssd.io_size(plan.bytes)
+        return ref, tier.io_size(plan.bytes)
 
     # ------------------------------------------------------------- outcomes
 
@@ -551,7 +553,7 @@ class FetchManager:
                     got.append(flight)
                 need = need[len(refs) :]
                 if need:
-                    self.manager.want_room(self.kind, len(need) * self.page_size)
+                    self.manager.want_room(self.tier, len(need) * self.page_size)
             if not need:
                 self._leave(turn)
             if got:
@@ -603,10 +605,8 @@ class FetchManager:
         map them, none quarantined) and that this node mapped for transfer."""
         out = []
         for pool_id in self.pools.pool_ids():
-            info = self.pools.pool_info(pool_id)
             if (
-                info is not None
-                and info.kind == self.kind
+                self.pools.tier_of(pool_id) == self.tier
                 and self.pools.creditable(pool_id)
                 and self.transfers.has_pool(pool_id)
             ):
@@ -967,11 +967,14 @@ class FetchManager:
         otherwise)."""
         ref = self.pools.find(location)
         page = self.pools.page(ref) if ref is not None else None
+        info = self.pools.pool_info(location.pool_id)
         return (
             page is not None
             and page.state == PageState.READY
             and page.key == key
-            and location.kind == self.kind
+            and info is not None
+            and location.kind == info.kind
+            and self.pools.tier_of(location.pool_id) == self.tier
             and self.pools.creditable(location.pool_id)
         )
 

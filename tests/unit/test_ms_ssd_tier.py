@@ -581,6 +581,19 @@ def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers
     node.pools.check()
 
 
+def test_a_demotion_into_the_ssd_reserves_ssd_pages_only(nodes):
+    node = nodes()
+    ssd = node.ssd.pool_id
+    refs = node.manager._reserve_below("ssd", 64)  # more than the SSD has
+    try:
+        assert refs and {r.pool_id for r in refs} == {ssd}
+        assert node.pools.bytes_in(PageState.TRANSFER) == len(refs) * PAGE
+        assert node.pools.bytes_in(PageState.FREE, ssd) == 0
+    finally:
+        for ref in refs:
+            node.pools.transfer_failed(ref)
+
+
 def test_a_fetch_demand_makes_room_below_the_watermarks(
     fake, nodes, handlers, sockdir, ssd_dir
 ):

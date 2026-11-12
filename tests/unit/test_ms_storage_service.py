@@ -5,8 +5,10 @@
 import dataclasses
 import grp
 import os
+import shutil
 import socket
 import stat
+import tempfile
 import threading
 import time
 
@@ -71,6 +73,13 @@ def sockdir():
     path = short_tmpdir()
     yield path
     remove_tree(path)
+
+
+@pytest.fixture
+def ssd_dir():
+    path = tempfile.mkdtemp(prefix="maru-ssd-", dir="/var/tmp")  # O_DIRECT
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture
@@ -488,19 +497,11 @@ class TestSessions:
         assert put(h, "b")
         assert len(fake.requests(MessageType.HANDSHAKE)) >= 1
 
-    def test_an_adopted_pool_no_run_holds_is_free_at_once(self, fake, nodes):
+    def test_an_adopted_pool_no_run_holds_is_free_at_once(self, fake, nodes, ssd_dir):
         """Its listed pages come back READY; nothing holds it in an RM, so the
         rest is free at once (it is no credit tier's)."""
-        first = nodes()
-        info = PoolInfo(
-            pool_id="ssd:gpu-test:/data",
-            kind=PoolKind.SSD,
-            node_id="gpu-test",
-            pool_generation=1,
-            capacity=4 * PAGE,
-            page_size=PAGE,
-            path="/data",
-        )
+        first = nodes(ssd_path=ssd_dir, ssd_pages=4)
+        info = first.ssd.info()
         listed = [
             RecoverItem(
                 key=Key(NS, f"r{i}"),
@@ -519,7 +520,7 @@ class TestSessions:
         ]
         first.stop()
         fake.set_adopted("gpu-test", [(info, listed)])
-        node = nodes()
+        node = nodes(ssd_path=ssd_dir, ssd_pages=4)
         assert node.adopted == [info.pool_id]
         assert node.pools.bytes_in(PageState.READY, info.pool_id) == 3 * PAGE
         assert node.pools.bytes_in(PageState.FREE, info.pool_id) == PAGE
@@ -530,6 +531,23 @@ class TestSessions:
         assert all(c.kind == PoolKind.DRAM for c in raw.credit(PAGE).credits)
         raw.close()
         node.pools.check()
+
+    def test_a_pool_adopted_but_not_opened_fails_the_start(self, fake, nodes):
+        nodes().stop()
+        info = PoolInfo(
+            pool_id="ssd:gpu-test:/data",
+            kind=PoolKind.SSD,
+            node_id="gpu-test",
+            pool_generation=1,
+            capacity=4 * PAGE,
+            page_size=PAGE,
+            path="/data",
+        )
+        fake.set_adopted("gpu-test", [(info, [])])
+        with pytest.raises(
+            RuntimeError, match="adopted ssd:gpu-test:/data, not opened"
+        ):
+            nodes()
 
 
 class TestRestart:
