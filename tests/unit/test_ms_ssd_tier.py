@@ -285,8 +285,15 @@ def test_other_ssd_configs_are_refused():
         check_servable(_config(["dram", "ssd"], demotion="through"))
     with pytest.raises(NotServableError, match="not implemented"):
         check_servable(_config(["dram", "ssd", "remote"]))
-    with pytest.raises(NotServableError, match="memory node"):
-        check_servable(dataclasses.replace(_config(["dram", "ssd"]), role="memory"))
+    # A memory node serves the same tiers, and the same refusals hold
+    memory = dataclasses.replace(_config(["dram", "ssd"]), role="memory")
+    check_servable(memory)
+    with pytest.raises(NotServableError, match="write-through"):
+        check_servable(
+            dataclasses.replace(
+                _config(["dram", "ssd"], demotion="through"), role="memory"
+            )
+        )
 
 
 # =============================================================================
@@ -384,7 +391,8 @@ def test_a_full_dram_moves_its_pages_to_the_ssd(fake, nodes, handlers):
         assert (item.source.kind, item.dest.kind) == (PoolKind.DRAM, PoolKind.SSD)
     assert all(i.finalizer for i in ssd_commits(fake))
     wait_until(lambda: fake.pin_count() == 0, what="every finalizer released")
-    assert no_io(node)
+    # A later demotion's write may still run
+    wait_until(lambda: no_io(node), what="every write ended")
     node.pools.check()
 
 

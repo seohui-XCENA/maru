@@ -76,7 +76,20 @@ _BUDGET_KEYS = {
     "fetch_request_max_bytes",
     "fetch_max_inflight_bytes",
 }
-_REMOTE_SERVER_KEYS = {"listen", "key_file"}
+_REMOTE_SERVER_KEYS = {
+    "listen",
+    "key_file",
+    "rdma_device",
+    "reserve_ttl_s",
+    "peer_quarantine_max",
+    "quarantine_max",
+    "stage_workers",
+    "stage_queue",
+}
+# A memory node's peer side (the GPU nodes' remote tiers)
+DEFAULT_RESERVE_TTL_S = 2 * DEFAULT_RDMA_TIMEOUT_S
+DEFAULT_STAGE_WORKERS = 4
+DEFAULT_STAGE_QUEUE = 64
 
 
 @dataclass(frozen=True)
@@ -101,8 +114,18 @@ class TierTraits:
 
 @dataclass(frozen=True)
 class RemoteServerConfig:
-    listen: str
+    """A memory node's endpoint for GPU nodes' remote tiers."""
+
+    listen: str  # host:port
     key_file: str
+    # Quarantined bytes at which a peer node (all peers) gets no more room
+    peer_quarantine_max: int
+    quarantine_max: int | None = None  # None: 1/8 of the registered L1 bytes
+    rdma_device: str = ""  # UCX device of the NIC; empty for UCX's choice
+    # A credited page whose WRITE_DONE has not come by then is quarantined
+    reserve_ttl_s: float = DEFAULT_RESERVE_TTL_S
+    stage_workers: int = DEFAULT_STAGE_WORKERS
+    stage_queue: int = DEFAULT_STAGE_QUEUE
 
 
 @dataclass(frozen=True)
@@ -352,6 +375,58 @@ def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> B
     )
 
 
+def _parse_remote_server(raw: Any, budgets: Budgets) -> RemoteServerConfig:
+    what = "config.remote_server"
+    rs = _require_keys(raw, _REMOTE_SERVER_KEYS, what)
+    listen = _str(rs, "listen", what)
+    host, sep, port = listen.removeprefix("tcp://").rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise NodeConfigError(f"{what}.listen: expected host:port, got {listen!r}")
+    device = rs.get("rdma_device", "")
+    if not isinstance(device, str):
+        raise NodeConfigError(f"{what}.rdma_device: expected a string, got {device!r}")
+    ttl = _number(rs, "reserve_ttl_s", what, DEFAULT_RESERVE_TTL_S)
+    if ttl <= 0:
+        raise NodeConfigError(f"{what}.reserve_ttl_s: must be positive, got {ttl}")
+
+    def cap(key: str, default: int | None) -> int | None:
+        if key not in rs:
+            return default
+        value = parse_size(rs[key], f"{what}.{key}")
+        if value == 0:
+            raise NodeConfigError(f"{what}.{key}: must be positive")
+        return value
+
+    peer_max = cap("peer_quarantine_max", 2 * budgets.credit_max_bytes)
+    assert peer_max is not None
+    counts = {}
+    for key, default in (
+        ("stage_workers", DEFAULT_STAGE_WORKERS),
+        ("stage_queue", DEFAULT_STAGE_QUEUE),
+    ):
+        value = rs.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise NodeConfigError(
+                f"{what}.{key}: expected an integer >= 1, got {value!r}"
+            )
+        counts[key] = value
+    if counts["stage_queue"] < counts["stage_workers"]:
+        raise NodeConfigError(
+            f"{what}: stage_queue ({counts['stage_queue']}) is smaller than "
+            f"stage_workers ({counts['stage_workers']})"
+        )
+    return RemoteServerConfig(
+        listen=f"{host}:{port}",
+        key_file=os.path.expanduser(_str(rs, "key_file", what)),
+        rdma_device=device,
+        reserve_ttl_s=float(ttl),
+        peer_quarantine_max=peer_max,
+        quarantine_max=cap("quarantine_max", None),
+        stage_workers=counts["stage_workers"],
+        stage_queue=counts["stage_queue"],
+    )
+
+
 def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
     """Check a decoded node config and fill its defaults."""
     raw = _require_keys(raw, _TOP_KEYS, "config")
@@ -417,21 +492,18 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         if spec.last_only and t is not tiers[-1]:
             raise NodeConfigError(f"config.tiers: {t.store} must be the last tier")
 
+    budgets = _parse_budgets(raw.get("budgets"), page_size, tiers)
     remote_server = None
     if raw.get("remote_server") is not None:
-        rs = _require_keys(
-            raw["remote_server"], _REMOTE_SERVER_KEYS, "config.remote_server"
-        )
-        remote_server = RemoteServerConfig(
-            listen=_str(rs, "listen", "config.remote_server"),
-            key_file=os.path.expanduser(_str(rs, "key_file", "config.remote_server")),
-        )
+        if role != "memory":
+            raise NodeConfigError(
+                "config.remote_server: only a memory node serves other nodes"
+            )
+        remote_server = _parse_remote_server(raw["remote_server"], budgets)
     if role == "memory" and remote_server is None:
         raise NodeConfigError(
             "config.remote_server: required on a memory node (other nodes reach it there)"
         )
-
-    budgets = _parse_budgets(raw.get("budgets"), page_size, tiers)
     return NodeConfig(
         node_id=node_id,
         role=role,

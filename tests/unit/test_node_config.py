@@ -118,7 +118,7 @@ class TestExamples:
         c = parse_node_config(MEMORY_NODE)
         assert c.role == "memory"
         assert c.socket == "/run/maru/node.sock"
-        assert c.remote_server.listen == "tcp://0.0.0.0:5600"
+        assert c.remote_server.listen == "0.0.0.0:5600"
 
     def test_budget_defaults(self):
         b = parse_node_config(GPU_NODE).budgets
@@ -529,7 +529,8 @@ class TestRegistry:
         ):
             with pytest.raises(NotServableError, match=match):
                 check_servable(dataclasses.replace(config, tiers=tiers))
-        with pytest.raises(NotServableError, match="memory node"):
+        # A memory node serves the same tier combinations
+        with pytest.raises(NotServableError, match="serving the tiers"):
             check_servable(
                 dataclasses.replace(config, role="memory", tiers=(cxl, dram))
             )

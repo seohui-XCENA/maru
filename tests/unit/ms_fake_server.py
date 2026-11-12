@@ -42,8 +42,11 @@ from maru_common.protocol import (
 from maru_common.serializer import MessageDecodeError, Serializer, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
+    MEMORY_CAPABILITY,
     MS_PROTOCOL,
     POOL_KINDS,
+    REMOTE_CAPABILITY,
+    STAGE_CAPABILITY,
     AccessInfo,
     BlockRequest,
     CloseMode,
@@ -97,6 +100,10 @@ def loc_id(location: Location) -> tuple[str, str, int]:
     return (location.pool_id, location.allocation_id, location.generation)
 
 
+# The node capabilities MaruServer knows
+NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY, STAGE_CAPABILITY})
+
+
 @dataclass
 class NodeRec:
     node_id: str
@@ -108,6 +115,7 @@ class NodeRec:
     online: bool = True
     usage: list = field(default_factory=list)
     heartbeats: int = 0
+    capabilities: list[str] = field(default_factory=list)  # accepted
 
 
 @dataclass
@@ -171,7 +179,10 @@ class FakeMaruServer:
         op_window: int = 65536,
         op_bytes_max: int = 64 << 20,
         recover_page: int = 2,
+        capabilities: frozenset[str] = NODE_CAPABILITIES,
     ):
+        """``capabilities``: the node capabilities NODE_OPEN accepts."""
+        self.capabilities = capabilities
         self.heartbeat_s = heartbeat_s
         self.session_ttl_s = session_ttl_s
         self.op_window = op_window
@@ -570,6 +581,7 @@ class FakeMaruServer:
             epoch_seq=seq,
             pools=pools,
             last_seen=now,
+            capabilities=[c for c in req.capabilities if c in self.capabilities],
         )
         self.node_sessions[token] = req.node_id
         self.adopted_by[req.node_id] = [info for info, _ in adopted]
@@ -589,6 +601,7 @@ class FakeMaruServer:
             heartbeat_s=self.heartbeat_s,
             session_ttl_s=self.session_ttl_s,
             adopted=adopted,
+            capabilities=list(node.capabilities),
         )
 
     def _node_heartbeat(self, node: NodeRec, req):

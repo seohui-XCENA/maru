@@ -14,6 +14,13 @@ its file, and it keeps the file's lock until all of its I/O has ended. A
 worker that agreed fetch_v1 FETCHes SSD pages into the top tier
 (FetchManager).
 
+A memory node (role memory, the same tiers) has no workers: its RemoteServer
+binds where a GPU node claims its socket, its L1 pools are registered whole
+with the NIC before NODE_OPEN, which announces only those (a top-tier pool
+that cannot be registered fails the start), and it serves last. Its teardown
+stops the RemoteServer first and ends the NIXL agent last; a registration
+that cannot end fails the teardown, so the process exits.
+
 A run ends on its own when MaruServer restarted or ended it, when a result
 stays unknown (both close with restart), or when the RM lease is lost (leave);
 Node then starts a new run in the same process. When the RM says another run
@@ -32,9 +39,11 @@ from collections.abc import Callable, Sequence
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
+    MEMORY_CAPABILITY,
     POOL_KINDS,
     CloseMode,
     PoolDescriptor,
+    PoolInfo,
     run_holder,
 )
 
@@ -51,7 +60,9 @@ from .drivers.registry import TIERS
 from .fetch_manager import FetchManager
 from .local_pin import LocalPins
 from .local_server import LocalServer
+from .memory_node import RemoteParts, RunOps, make_remote_parts
 from .op_ledger import OP_WINDOW
+from .peer_ops import PeerOps
 from .peer_watcher import PeerWatcher
 from .placement import DEFAULT_KEPT_BACKOFF_S, PlacementPolicy
 from .pool_manager import PageState, PoolManager
@@ -100,10 +111,12 @@ def _served_tiers() -> tuple[list[str], ...]:
 SERVED_TIERS = _served_tiers()
 
 
+class CapabilityRefusedError(RuntimeError):
+    """MaruServer did not accept what the node needs to serve its role."""
+
+
 def check_servable(config: NodeConfig) -> None:
     """Refuse configs that cannot be served in full yet."""
-    if config.role != "gpu":
-        raise NotServableError("serving a memory node is not implemented yet")
     stores = [t.store for t in config.tiers]
     if stores not in SERVED_TIERS:
         served = ", ".join(f"[{', '.join(s)}]" for s in SERVED_TIERS)
@@ -167,10 +180,12 @@ class StorageService:
         unmap_timeout_s: float = DEFAULT_UNMAP_TIMEOUT_S,
         transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
+        remote_parts: Callable[["StorageService"], RemoteParts] = make_remote_parts,
     ):
         """``transfer_bytes_per_s``: the demotion copy budget.
         ``map_region``: maps a CXL region for those copies (NODE_HOLD and the
-        device by default)."""
+        device by default). ``remote_parts``: a memory node run's exporter
+        and RemoteServer."""
         check_servable(config)
         self.config = config
         self.node_epoch = node_epoch or uuid.uuid4().hex
@@ -206,6 +221,14 @@ class StorageService:
         self.server: ServerClient | None = None
         self.manager: StorageManager | None = None
         self.local: LocalServer | None = None
+        self.memory = config.role == "memory"
+        self.make_remote_parts = remote_parts
+        self.remote: RemoteParts | None = None
+        # The ops the RemoteServer serves: the run's PeerOps, once made
+        self.remote_ops = RunOps()
+        self.peer_ops: PeerOps | None = None
+        # Pools of the run's tiers left out of it (never announced)
+        self._unlisted: set[str] = set()
         # Pools taken over from the run before: adopted or claimed from the RM
         self.adopted: list[str] = []
         self._credit_tiers: set[str] = set()
@@ -214,6 +237,10 @@ class StorageService:
     def tier(self, store: str) -> Tier | None:
         """The run's tier ``store``, once made."""
         return self._tiers.get(store)
+
+    def capabilities(self) -> list[str]:
+        """What the node asks MaruServer to accept for its run."""
+        return [MEMORY_CAPABILITY] if self.memory else []
 
     def _leases(self) -> list[Leased]:
         """The run's leased tiers; a tier's thread may ask during the start."""
@@ -275,6 +302,9 @@ class StorageService:
                 new_run=True,
             )
             raise ServerStopped(str(e)) from e
+        except CapabilityRefusedError:
+            self.stop(CloseMode.LEAVE)  # it never serves: gone, not back soon
+            raise
         except BaseException:
             self.stop(CloseMode.RESTART)
             raise
@@ -284,15 +314,10 @@ class StorageService:
         if self._stopped.is_set():
             raise ServerStopped()
 
-    def _start(self) -> None:
+    def _claim_socket(self) -> None:
+        """The workers' socket, claimed first: a second start must fail
+        before NODE_OPEN."""
         config = self.config
-        top = config.top
-        size, high, low = top.size, top.high_watermark, top.low_watermark
-        if size is None or high is None or low is None:  # parsing sets them
-            raise NodeConfigError(f"the {top.store} tier needs size and watermarks")
-        if self._interrupted.is_set():
-            raise ServerStopped()
-        # Claim the socket first: a second start must fail before NODE_OPEN
         self.local = LocalServer(
             config.socket,
             None,
@@ -311,6 +336,21 @@ class StorageService:
             ),
         )
         self.local.claim()
+
+    def _start(self) -> None:
+        config = self.config
+        top = config.top
+        size, high, low = top.size, top.high_watermark, top.low_watermark
+        if size is None or high is None or low is None:  # parsing sets them
+            raise NodeConfigError(f"the {top.store} tier needs size and watermarks")
+        if self._interrupted.is_set():
+            raise ServerStopped()
+        if self.memory:
+            # Bind first: a second start must fail before NODE_OPEN
+            self.remote = self.make_remote_parts(self)
+            self.remote.server.start()
+        else:
+            self._claim_socket()
         # Before NODE_OPEN, in config order. An SSD file's lock is free only
         # once every earlier run's I/O on it has ended: an earlier run of
         # this process drained and closed it, an earlier process exited
@@ -331,16 +371,18 @@ class StorageService:
         # In the order they started: the order pools are announced and logged
         tiers = self._tiers
         traits = config.traits()
-        if any(t.demotes_to is not None for t in traits.values()):
+        if self.memory or any(t.demotes_to is not None for t in traits.values()):
             self.transfers = TransferEngine(self.transfer_bytes_per_s)
             self._map_for_transfers(self.transfers)
+            if self.memory:
+                self._export(self.transfers)
         self.pools = PoolManager(config.budgets, config.page_size)
         self._credit_tiers = {
             name for name, t in traits.items() if t.credit or t.credit_fallback
         }
         # A pool that ends with its run (DRAM) is never adopted
         for t in config.tiers:
-            for info in tiers[t.store].pool_infos():
+            for info in self._listed(tiers[t.store]):
                 if POOL_KINDS[info.kind].run_scoped:
                     self.pools.add_pool(
                         info, creditable=t.store in self._credit_tiers, tier=t.store
@@ -376,7 +418,7 @@ class StorageService:
             ),
         )
         l2 = [t for t in tiers.values() if isinstance(t, L2Tier)]
-        if l2:
+        if l2 and not self.memory:
             # Workers fetch L2 pages into the top tier
             self.manager.fetches = FetchManager(
                 self.manager,
@@ -389,13 +431,21 @@ class StorageService:
             )
         leases = [t for t in tiers.values() if isinstance(t, Leased)]
         # The tier of each pool this run opens: adopted ones are among them
-        announced = [(n, i) for n, t in tiers.items() for i in t.pool_infos()]
+        announced = [(n, i) for n, t in tiers.items() for i in self._listed(t)]
         pool_tiers = {info.pool_id: name for name, info in announced}
         rm_domains = [d for t in leases for d in t.rm_domains()]
         opened = self.server.open(
-            [info for _, info in announced], rm_domains=rm_domains
+            [info for _, info in announced],
+            rm_domains=rm_domains,
+            capabilities=self.capabilities(),
         )
         self._check_stopped()
+        refused = set(self.capabilities()) - set(opened.capabilities)
+        if refused:
+            raise CapabilityRefusedError(
+                f"MaruServer {config.server} does not accept {sorted(refused)}: "
+                f"it cannot serve a {config.role} node"
+            )
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
@@ -423,7 +473,7 @@ class StorageService:
         # reused from scratch
         for t in config.tiers:
             tier = tiers[t.store]
-            for info in tier.pool_infos():
+            for info in self._listed(tier):
                 if info.pool_id in adopted_ids or POOL_KINDS[info.kind].run_scoped:
                     continue
                 if isinstance(tier, Leased) and tier.taken_over(info.pool_id):
@@ -458,10 +508,29 @@ class StorageService:
         for lease in leases:
             lease.watch_holds(self._end_quarantine)
         self.manager.start_heartbeat()
+        if self.memory:
+            self._serve_peers(opened.server_epoch, [i for _, i in announced])
+        else:
+            self._serve_workers(l2)
+        logger.info(
+            "StorageService %s serving %s node %s, pages of %d KiB",
+            self.node_epoch,
+            config.role,
+            config.node_id,
+            config.page_size >> 10,
+        )
+        for name, tier in tiers.items():
+            if tier.pool_infos():
+                logger.info("%s tier: %s", name, tier.describe(adopted_ids))
+
+    def _serve_workers(self, l2: list[L2Tier]) -> None:
+        """Workers attach from now: they map the L1 pools."""
+        assert self.local is not None and self.manager is not None
+        config = self.config
         self.local.manager = self.manager
-        # Workers map the L1 pools; memfd indexes the fds sent with ATTACH
+        # memfd indexes the fds sent with ATTACH
         attach: list[tuple[PoolDescriptor, int | None]] = []
-        for tier in tiers.values():
+        for tier in self._tiers.values():
             if isinstance(tier, L1Tier):
                 for pool in tier.pools:
                     fd = pool.worker_fd()
@@ -474,6 +543,7 @@ class StorageService:
             # The window fits the pools fetches can use at ATTACH (the RM may
             # give less, a mapping may fail, a pool may be quarantined)
             pools, fetches = self.pools, self.manager.fetches
+            assert pools is not None and fetches is not None
 
             def top_bytes() -> int:
                 infos = [pools.pool_info(i) for i in fetches.destinations()]
@@ -485,15 +555,58 @@ class StorageService:
                 config, top_bytes(), bounce, workers
             )
         self.local.start()
-        logger.info(
-            "StorageService %s serving node %s, pages of %d KiB",
-            self.node_epoch,
-            config.node_id,
-            config.page_size >> 10,
+
+    def _serve_peers(self, server_epoch: str, infos: list[PoolInfo]) -> None:
+        """GPU nodes' remote tiers are served from now: they reach the
+        registered pools of ``infos``."""
+        assert self.remote is not None and self.manager is not None
+        rs = self.config.remote_server
+        assert rs is not None  # parsing requires it on a memory node
+        pools = self.remote.remote_pools(infos)
+        registered = sum(p.capacity for p in pools)
+        self.peer_ops = PeerOps(
+            self.manager,
+            reserve_ttl_s=rs.reserve_ttl_s,
+            peer_quarantine_max=rs.peer_quarantine_max,
+            quarantine_max=(
+                rs.quarantine_max if rs.quarantine_max is not None else registered // 8
+            ),
         )
-        for name, tier in tiers.items():
-            if tier.pool_infos():
-                logger.info("%s tier: %s", name, tier.describe(adopted_ids))
+        self.peer_ops.start()
+        self.remote_ops.target = self.peer_ops
+        self.remote.server.ready(server_epoch, pools)
+
+    def _listed(self, tier: Tier) -> list[PoolInfo]:
+        """The tier's pools in this run: those it could not register with the
+        NIC (a memory node) are left out."""
+        return [i for i in tier.pool_infos() if i.pool_id not in self._unlisted]
+
+    def _export(self, engine: TransferEngine) -> None:
+        """Register each L1 pool whole with the NIC, in the order the tiers
+        started. One that cannot be is left out of the run (never announced);
+        one of the top tier fails the start."""
+        assert self.remote is not None
+        top = self.config.top.store
+        for name, tier in self._tiers.items():
+            if not isinstance(tier, L1Tier):
+                continue
+            for pool in tier.pools:
+                try:
+                    engine.export(pool.pool_id, self.remote.exporter)
+                except Exception as e:
+                    if name == top:
+                        raise RuntimeError(
+                            f"cannot register the {name} pool {pool.pool_id} "
+                            f"with the NIC: {e}"
+                        ) from e
+                    logger.error(
+                        "%s pool %s is left out of this run: cannot register "
+                        "it with the NIC: %s",
+                        name,
+                        pool.pool_id,
+                        e,
+                    )
+                    self._unlisted.add(pool.pool_id)
 
     def _open(self, tier: Tier) -> None:
         """Open ``tier``. A DRAM pool that ran short of memory may fit once
@@ -545,6 +658,8 @@ class StorageService:
             if self._stopped.is_set():
                 return
             tier = self.pools.tier_of(pool_id)
+            if tier is None:  # left out of the run
+                return
             creditable = tier in self._credit_tiers and not self.manager.is_invalid(
                 pool_id
             )
@@ -604,6 +719,10 @@ class StorageService:
     def _teardown(self, mode: CloseMode) -> None:
         tiers = self._closing_order()
         leases = self._leases()
+        if self.remote is not None:
+            self.remote.server.stop()  # no new op; peers' connections close
+        if self.peer_ops is not None:
+            self.peer_ops.stop()
         if self.transfers is not None:
             self.transfers.stop()  # the copy under way ends; no new one starts
         for tier in tiers:
@@ -661,6 +780,14 @@ class StorageService:
         # may open it
         for tier in tiers:
             tier.close()
+        if self.remote is not None:
+            if kept:
+                # Peers' RDMA may still reach them: no new run in this process
+                raise RuntimeError(
+                    f"pools {sorted(kept)} stay registered with the NIC: the "
+                    "process must exit"
+                )
+            self.remote.close()  # the NIXL agent ends with its connections
 
     def _unmap_leased(
         self, tiers: Sequence[Leased], pools: Sequence[L1Pool]

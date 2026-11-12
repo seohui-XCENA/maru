@@ -94,8 +94,9 @@ IO_PAUSE_S = 10.0
 
 @dataclass(eq=False)
 class _WriteDone:
-    origin: str
-    entry: LedgerEntry
+    """Written pages committing: ``finish`` gets every item's outcome."""
+
+    finish: Callable[[list[ItemOutcome]], None]
     outcomes: list[ItemOutcome | None]
     remaining: int
 
@@ -506,13 +507,18 @@ class StorageManager:
                 )
             return
         self.ledger.attach(entry, reply, key)
-        wd = _WriteDone(
-            origin=rec.incarnation,
-            entry=entry,
-            outcomes=[None] * len(req.items),
-            remaining=len(req.items),
-        )
-        tickets = []
+        origin = rec.incarnation
+
+        def finish(items: list[ItemOutcome]) -> None:
+            response = WriteDoneResponse(status=Status.OK, items=items)
+            for answer in self.ledger.finish(origin, entry, response):
+                try:
+                    answer(response)
+                except Exception:
+                    logger.debug("could not answer a WRITE_DONE", exc_info=True)
+
+        outcomes: list[ItemOutcome | None] = [None] * len(req.items)
+        pages: dict[int, tuple[PageRef, CommitItem]] = {}
         for i, item in enumerate(req.items):
             try:
                 ref, location, why = self.pools.write_done(
@@ -523,21 +529,30 @@ class StorageManager:
                 ref, location, why = None, None, str(e)
             if ref is None or location is None:
                 logger.debug("WRITE_DONE item %d refused: %s", i, why)
-                wd.outcomes[i] = ItemOutcome(ItemResult.REJECTED)
-                wd.remaining -= 1
+                outcomes[i] = ItemOutcome(ItemResult.REJECTED)
                 continue
-            tickets.append(
-                _Ticket(
-                    ref=ref,
-                    item=CommitItem(
-                        key=item.key,
-                        location=location,
-                        logical_bytes=item.logical_bytes,
-                    ),
-                    write_done=wd,
-                    index=i,
-                )
+            pages[i] = (
+                ref,
+                CommitItem(
+                    key=item.key, location=location, logical_bytes=item.logical_bytes
+                ),
             )
+        self.commit_written(outcomes, pages, finish)
+
+    def commit_written(
+        self,
+        outcomes: list[ItemOutcome | None],
+        pages: dict[int, tuple[PageRef, CommitItem]],
+        finish: Callable[[list[ItemOutcome]], None],
+    ) -> None:
+        """COMMIT written PENDING pages, by item index, in the next batches;
+        ``finish`` gets every item's outcome once all are known (``outcomes``
+        holds those of the other items)."""
+        wd = _WriteDone(finish=finish, outcomes=list(outcomes), remaining=len(pages))
+        tickets = [
+            _Ticket(ref=ref, item=item, write_done=wd, index=i)
+            for i, (ref, item) in pages.items()
+        ]
         if not tickets:
             self._finish_write_done(wd)
             return
@@ -548,12 +563,10 @@ class StorageManager:
     def _finish_write_done(self, wd: _WriteDone) -> None:
         items = [o for o in wd.outcomes if o is not None]
         assert len(items) == len(wd.outcomes)  # every item has its outcome
-        response = WriteDoneResponse(status=Status.OK, items=items)
-        for reply in self.ledger.finish(wd.origin, wd.entry, response):
-            try:
-                reply(response)
-            except Exception:
-                logger.debug("could not answer a WRITE_DONE", exc_info=True)
+        try:
+            wd.finish(items)
+        except Exception:
+            logger.exception("finishing a WRITE_DONE failed")
 
     def unmap_ack(self, rec: WorkerRecord, req: UnmapAckRequest) -> UnmapAckResponse:
         with self._cv:
@@ -1294,14 +1307,17 @@ class StorageManager:
             if refs:
                 self.retire(refs, items)
 
-    def retire(self, refs: list[PageRef], items: list[KeyLocation]) -> None:
-        """Block local pins, RETIRE, act on each result. A result left unknown
-        holds the pages (never reused) and ends the run."""
+    def retire(
+        self, refs: list[PageRef], items: list[KeyLocation]
+    ) -> list[ItemOutcome] | None:
+        """Block local pins, RETIRE, act on each result; returns the results,
+        None if there are none. A result left unknown holds the pages (never
+        reused) and ends the run."""
         with self._lock:
             paused = self._paused()
         if paused or self.metadata.epoch_lost:
             self._retire_failed(refs)  # not sent
-            return
+            return None
         self.local_pins.block(refs)
         try:
             response = self.metadata.retire(items)
@@ -1311,19 +1327,19 @@ class StorageManager:
         except EpochChanged as e:
             self._hold(refs)
             self.end_run(f"MaruServer no longer knows the session ({e})")
-            return
+            return None
         except Exception as e:
             if not isinstance(e, ReplyError):
                 logger.exception("RETIRE failed")
             self._hold(refs)
             self.end_run(f"RETIRE of {len(refs)} pages: result unknown ({e})")
-            return
+            return None
         if response.status != Status.OK:
             logger.error(
                 "RETIRE refused as a whole: %s %s", response.status, response.error
             )
             self._retire_failed(refs)
-            return
+            return None
         for ref, outcome in zip(refs, response.items, strict=True):
             try:
                 self._apply_retire(ref, outcome)
@@ -1331,6 +1347,7 @@ class StorageManager:
                 logger.exception("applying the RETIRE result of %s failed", ref)
                 self._hold([ref])
         self._reclaim_retiring()
+        return list(response.items)
 
     def _apply_retire(
         self,

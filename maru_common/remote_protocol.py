@@ -207,7 +207,8 @@ class RemoteWriteDoneRequest:
 
 @dataclass
 class RemoteWriteDoneResponse:
-    """Items: ADDED, DUPLICATE (location: the committed one) or REJECTED."""
+    """Items: ADDED, DUPLICATE (location: the committed one) or REJECTED;
+    an UNKNOWN item OK once quarantined."""
 
     status: Status
     error: str | None = None

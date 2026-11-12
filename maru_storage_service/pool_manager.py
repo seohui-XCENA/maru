@@ -244,21 +244,8 @@ class PoolManager:
             if self._write_pending() >= self.budgets.commit_pending_max_bytes:
                 self._short("pending", want)
                 return []
-            rooms = self._credit_tiers(tiers)
-            space = sum(room for _, room in rooms)
-            now = time.monotonic()
-            self._waiting = {
-                h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
-            }
-            # Room owed to other waiting holders is not given away
-            owed = sum(w[0] for h, w in self._waiting.items() if h != holder)
+            rooms, space, worker_room, node_room = self._rooms(holder, tiers)
             held = self._held[holder]
-            worker_room = (self.budgets.credit_max_bytes - held) // ps
-            node_room = (
-                self.budgets.credit_total_max_bytes
-                - self._bytes(PageState.CREDITED)
-                - owed
-            ) // ps
             uncapped = min(want, worker_room, space)
             granted = max(min(uncapped, node_room), 0)
             self._note_waiting(
@@ -300,6 +287,35 @@ class PoolManager:
                 if len(out) >= granted:
                     break
             return out
+
+    def credit_room(self, holder: str, tiers: str | Sequence[str] | None = None) -> int:
+        """The bytes credit() would give ``holder`` now, at most."""
+        with self._lock:
+            if self._credit_stopped is not None or self._epoch_seq is None:
+                return 0
+            if self._write_pending() >= self.budgets.commit_pending_max_bytes:
+                return 0
+            _, space, worker_room, node_room = self._rooms(holder, tiers)
+            return max(0, min(space, worker_room, node_room)) * self.page_size
+
+    def _rooms(
+        self, holder: str, tiers: str | Sequence[str] | None
+    ) -> tuple[list[tuple[list[PageTable], int]], int, int, int]:
+        """Caller holds the lock. The credit tiers' rooms, and the pages
+        ``holder`` may get by space, by its own cap and by the node cap."""
+        ps = self.page_size
+        rooms = self._credit_tiers(tiers)
+        now = time.monotonic()
+        self._waiting = {
+            h: w for h, w in self._waiting.items() if now - w[1] < CREDIT_WAIT_S
+        }
+        # Room owed to other waiting holders is not given away
+        owed = sum(w[0] for h, w in self._waiting.items() if h != holder)
+        worker_room = (self.budgets.credit_max_bytes - self._held[holder]) // ps
+        node_room = (
+            self.budgets.credit_total_max_bytes - self._bytes(PageState.CREDITED) - owed
+        ) // ps
+        return rooms, sum(room for _, room in rooms), worker_room, node_room
 
     def _credit_tiers(
         self, tiers: str | Sequence[str] | None
@@ -547,14 +563,16 @@ class PoolManager:
             page.location = location
             return table.ref(page)
 
-    def quarantine_holder(self, holder: str) -> list[PageRef]:
-        """CREDITED -> QUARANTINED for an ended holder."""
+    def quarantine_holder(self, holder: str, tag: str | None = None) -> list[PageRef]:
+        """CREDITED -> QUARANTINED for an ended holder, under ``tag``
+        (holder_tag by default)."""
+        tag = holder_tag(holder) if tag is None else tag
         with self._lock:
             out = []
             for table in self._tables.values():
                 for page in table.pages:
                     if page.state == PageState.CREDITED and page.holder == holder:
-                        table.quarantine(page, PageState.CREDITED, holder_tag(holder))
+                        table.quarantine(page, PageState.CREDITED, tag)
                         self._held[holder] -= table.page_size
                         out.append(table.ref(page))
             if self._held[holder] == 0:
@@ -562,6 +580,53 @@ class PoolManager:
             self._waiting.pop(holder, None)
             self._asked.pop(holder, None)
             return out
+
+    def quarantine_credit(
+        self, holder: str, credit: Location, tag: str
+    ) -> PageRef | None:
+        """CREDITED -> QUARANTINED under ``tag`` for the one page ``holder``
+        holds at ``credit``; None if it holds none there."""
+        with self._lock:
+            page, _ = self.check_credit(holder, credit, returning=True)
+            if page is None:
+                return None
+            table = self._tables[credit.pool_id]
+            table.quarantine(page, PageState.CREDITED, tag)
+            self._held[holder] -= table.page_size
+            return table.ref(page)
+
+    def resolve_quarantined(
+        self,
+        location: Location,
+        tag: str,
+        key: Key | None = None,
+        logical_bytes: int = 0,
+    ) -> tuple[PageRef | None, Location | None, str]:
+        """Release evidence for the page quarantined under ``tag`` at exactly
+        ``location`` (a whole page): a transfer to it that ended DONE
+        (``key``) makes it PENDING and gives the location to commit (length
+        ``logical_bytes``); one never posted (no key) frees it. Else the
+        reason it is not such a page."""
+        with self._lock:
+            table = self._tables.get(location.pool_id)
+            ref = table.find(location) if table is not None else None
+            if table is None or ref is None:
+                return None, None, f"no page at {location}"
+            page = table.pages[ref.index]
+            if page.state != PageState.QUARANTINED or page.tag != tag:
+                return None, None, f"the page is {page.state}, not quarantined by {tag}"
+            if location.kind != table.info.kind or location.length != table.page_size:
+                return None, None, "the location is not the whole page"
+            if key is None:
+                self._to_free(table, page, PageState.QUARANTINED)
+                return ref, None, ""
+            if not 0 < logical_bytes <= table.page_size:
+                return None, None, f"logical_bytes {logical_bytes} out of range"
+            table.move(page, PageState.QUARANTINED, PageState.PENDING)
+            page.tag = None
+            page.key = key
+            page.location = replace(location, length=logical_bytes)
+            return ref, page.location, ""
 
     def release_quarantine(self, tag: str, pool_id: str | None = None) -> int:
         """QUARANTINED -> FREE for pages waiting on ``tag``; returns the count."""
