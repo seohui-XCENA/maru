@@ -24,6 +24,8 @@ from maru_common.node_protocol import (
     NOTIFY_SEQUENCE,
     AttachRequest,
     AttachResponse,
+    FetchCancelRequest,
+    FetchRequest,
     NodeMessageType,
     Notify,
     recv_frame,
@@ -31,7 +33,7 @@ from maru_common.node_protocol import (
 )
 from maru_common.protocol import HEADER_SIZE, MessageHeader
 from maru_common.serializer import RESPONSE_BIT, MessageDecodeError, Serializer
-from maru_common.storage_types import Status, StorageUnavailableError
+from maru_common.storage_types import OpRef, Status, StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +200,14 @@ class StorageConn:
     ) -> Any:
         """Send and wait for the response."""
         return self.submit(code, request).result(timeout)
+
+    def fetch(self, request: FetchRequest) -> Future:
+        """Send FETCH; its late reply remains matched to this future."""
+        return self.submit(NodeMessageType.FETCH, request)
+
+    def fetch_cancel(self, target: OpRef) -> Future:
+        """Cancel interest in a fetch; this does not release worker pins."""
+        return self.submit(NodeMessageType.FETCH_CANCEL, FetchCancelRequest(target))
 
     # -------------------------------------------------------------- receiving
 

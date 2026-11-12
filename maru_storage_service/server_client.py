@@ -21,6 +21,9 @@ from maru_common.protocol import (
     CommitItem,
     CommitRequest,
     CommitResponse,
+    FetchCompleteItem,
+    FetchCompleteRequest,
+    FetchCompleteResponse,
     FinalizeMoveRequest,
     FinalizeMoveResponse,
     HandshakeRequest,
@@ -36,6 +39,10 @@ from maru_common.protocol import (
     RecoverItem,
     RetireRequest,
     RetireResponse,
+    SourcePinRequest,
+    SourcePinResponse,
+    UnpinRequest,
+    UnpinResponse,
     WorkerExitRequest,
     WorkerExitResponse,
 )
@@ -403,6 +410,36 @@ class ServerClient:
         )
         return response
 
+    def source_pin(self, items: list[KeyLocation]) -> SourcePinResponse:
+        """Pin exact sources until the result is known."""
+        session, epoch = self._ids()
+        return self._call_op(
+            MessageType.SOURCE_PIN,
+            SourcePinRequest(session, epoch, PLACEHOLDER_OP, items),
+            len(items),
+        )
+
+    def fetch_complete(
+        self, worker_session: str, items: list[FetchCompleteItem]
+    ) -> FetchCompleteResponse:
+        """Publish copies and take worker and optional node pins atomically."""
+        session, epoch = self._ids()
+        return self._call_op(
+            MessageType.FETCH_COMPLETE,
+            FetchCompleteRequest(session, epoch, PLACEHOLDER_OP, worker_session, items),
+            len(items),
+        )
+
+    def unpin(self, pin_ids: list[str]) -> UnpinResponse:
+        """Release pins until answered; pin ids make resends idempotent."""
+        session, epoch = self._ids()
+        return self._call_op(
+            MessageType.UNPIN,
+            UnpinRequest(session, epoch, pin_ids),
+            len(pin_ids),
+            tracked=False,
+        )
+
     def recover_list(self, pool_id: str) -> list[RecoverItem]:
         """All committed locations of an adopted pool (NODE_RECOVER_LIST)."""
         items: list[RecoverItem] = []
@@ -445,16 +482,20 @@ class ServerClient:
                 return items
             cursor = response.next_cursor
 
-    def _call_op(self, msg_type: MessageType, request, count: int):
+    def _call_op(
+        self, msg_type: MessageType, request, count: int, *, tracked: bool = True
+    ):
         """Stamp a new op and send it until a result (OK, REJECTED, DISABLED);
         unknown results and BUSY are resent with the same op while the
-        session lasts (it never moves to another MaruServer run)."""
+        session lasts (it never moves to another MaruServer run).
+        UNPIN resends pin ids without an op."""
         if not 1 <= count <= MAX_BATCH:
             raise ValueError(f"{count} items; a request carries 1..{MAX_BATCH}")
         if self.epoch_lost:
             raise EpochChanged("the node session is gone")
-        request = self._origin.stamp(request)
-        seq = request.op.seq
+        if tracked:
+            request = self._origin.stamp(request)
+        seq = request.op.seq if tracked else None
         pause = RESEND_PAUSE_S
         attempt = 0
         while True:
@@ -465,18 +506,20 @@ class ServerClient:
                 with self._renew_lock:
                     session = self.session
                 if self.epoch_lost:
-                    self._origin.resolved(seq)
+                    if tracked:
+                        self._origin.resolved(seq)
                     raise EpochChanged(f"{msg_type.name} op {seq}: session lost")
                 if session != request.session:  # renewed meanwhile
                     request = dataclasses.replace(request, session=session)
                 self.resends += 1
-                request = self._origin.refresh(request)
+                if tracked:
+                    request = self._origin.refresh(request)
             attempt += 1
             try:
                 response = self._rpc.call(msg_type, request)
             except RpcUnknownError as e:
                 logger.warning(
-                    "%s op %d: result unknown (%s); sending the same op again",
+                    "%s op %s: result unknown (%s); sending the same request again",
                     msg_type.name,
                     seq,
                     e,
@@ -491,7 +534,8 @@ class ServerClient:
             if response.status == Status.EPOCH:
                 renewed = self._renew(request.session)
                 if renewed is False:
-                    self._origin.resolved(seq)  # a new server keeps no record
+                    if tracked:
+                        self._origin.resolved(seq)  # a new server keeps no record
                     self._lose_epoch(response.error)
                     raise EpochChanged(response.error)
                 if renewed is None:
@@ -499,10 +543,11 @@ class ServerClient:
                     pause = min(pause * 2, RESEND_PAUSE_MAX_S)
                 # The same op under a renewed session (the digest leaves it out)
                 continue
-            self._origin.resolved(seq)
+            if tracked:
+                self._origin.resolved(seq)
             if response.status == Status.OK and len(response.items) != count:
                 logger.error(
-                    "%s op %d: %d results for %d items",
+                    "%s op %s: %d results for %d items",
                     msg_type.name,
                     seq,
                     len(response.items),

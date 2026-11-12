@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from maru_common.config import MaruConfig
 from maru_common.ms_rpc import PLACEHOLDER_OP
@@ -36,6 +36,9 @@ from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
     DetachRequest,
+    FetchItem,
+    FetchRequest,
+    FetchResponse,
     GroupLayout,
     NodeMessageType,
     Notify,
@@ -45,6 +48,7 @@ from maru_common.node_protocol import (
     process_start_time,
 )
 from maru_common.storage_types import (
+    FETCH_CAPABILITY,
     MAX_BATCH,
     MS_PROTOCOL,
     ItemOutcome,
@@ -95,6 +99,7 @@ CONNECT_RETRY_MAX_S = 1.0
 CLOSE_TIMEOUT_S = 5.0
 BUSY_RESEND_S = 0.2
 ATTACH_WARN_S = 30.0
+MAX_UNRESOLVED_FETCHES = 32
 
 
 def _release_view(view: memoryview) -> None:
@@ -129,6 +134,18 @@ class PinnedRead(CpuReadLease):
     key: str = ""
     pin_id: str = ""
     server_epoch: str = ""
+
+
+@dataclass(eq=False)
+class _FetchScope:
+    """A parked request's interest; no foreground caller uses this yet."""
+
+    request_id: str
+    deadline: float
+    node_epoch: str | None
+    cancelled: bool = False
+    reason: MissReason | None = None
+    pending: dict[int, tuple[FetchRequest, Future]] = field(default_factory=dict)
 
 
 class _Throttle:
@@ -209,6 +226,7 @@ class MaruClient:
         self._attaching_epoch: str | None = None
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
+        self._fetch_scopes: set[_FetchScope] = set()
         self._returns: list[Location] = []
         self._connected = False
         self._closing = threading.Event()
@@ -570,6 +588,7 @@ class MaruClient:
             closed = self._closing.is_set()
             if not closed:
                 if not same_run:
+                    self._end_fetch_scopes()
                     if self.node_epoch is not None:
                         logger.warning(
                             "the StorageService restarted (node epoch %s -> %s); "
@@ -612,6 +631,7 @@ class MaruClient:
             if self._closing.is_set():
                 return
             self._closing.set()
+            self._end_fetch_scopes()
             handles = [h for h in self._handles if h.state == "writing"]
             reads = list(self._reads)
             connecting = self._connecting
@@ -690,6 +710,7 @@ class MaruClient:
             self._connected = False
             # A later connect() starts as a new run: its pools get mapped
             self.node_epoch = None
+            self._end_fetch_scopes()
             self._ops = None
             self.attach_info = None
             for handle in self._handles:
@@ -1103,7 +1124,11 @@ class MaruClient:
         if storage is None or storage.closed:
             reply.set_exception(StorageUnavailableError("not connected"))
             return reply
-        reply = storage.submit(code, request)
+        reply = (
+            storage.fetch(request)
+            if code == NodeMessageType.FETCH
+            else storage.submit(code, request)
+        )
         seq = request.op.seq
 
         def done(f: Future) -> None:
@@ -1140,6 +1165,10 @@ class MaruClient:
             return
         for code, request, on_result in ops.unresolved():
             self._send_op(code, ops.origin.refresh(request), on_result, ops, True)
+        with self._lock:
+            scopes = [s for s in self._fetch_scopes if s.cancelled]
+        for scope in scopes:
+            self._send_fetch_cancels(scope)
         with self._lock:
             returns, self._returns = self._returns, []
         if returns:
@@ -1329,6 +1358,157 @@ class MaruClient:
 
             reply.add_done_callback(done)
 
+    # ---------------------------------------------------------- parked fetch
+
+    def _new_fetch_scope(
+        self, request_id: str, *, deadline_ms: int = 250
+    ) -> _FetchScope:
+        """Prepare a scope; capability negotiation stays off until the loader exists."""
+        if deadline_ms <= 0:
+            raise ValueError("fetch deadline must be positive")
+        with self._lock:
+            return _FetchScope(
+                request_id, time.monotonic() + deadline_ms / 1000, self.node_epoch
+            )
+
+    def _fetch(
+        self, scope: _FetchScope, items: list[FetchItem], max_bytes: int
+    ) -> Future:
+        """Inactive loader hook; a late HIT is only received for UNPIN."""
+        if not 1 <= len(items) <= MAX_BATCH or max_bytes <= 0:
+            raise ValueError("invalid fetch items or byte budget")
+        items = list(items)
+        result: Future = Future()
+        with self._lock:
+            server, ops, info = self._server, self._ops, self.attach_info
+            remaining_ms = int((scope.deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0 and not scope.cancelled:
+                self._cancel_fetch_scope(scope, MissReason.TIMEOUT)
+            if scope.cancelled:
+                result.set_result(self._fetch_miss(items, scope.reason))
+                return result
+            if (
+                self._closing.is_set()
+                or self.off is not None
+                or self.role != SessionRole.WORKER
+                or ops is None
+                or server is None
+                or not server.session
+                or info is None
+                or FETCH_CAPABILITY not in info.capabilities
+                or scope.node_epoch != ops.node_epoch
+                or server.session_node_epoch != ops.node_epoch
+            ):
+                result.set_result(FetchResponse(Status.DISABLED))
+                return result
+            if (
+                sum(len(s.pending) for s in self._fetch_scopes)
+                >= MAX_UNRESOLVED_FETCHES
+            ):
+                result.set_result(FetchResponse(Status.BUSY))
+                return result
+            epoch = server.server_epoch
+            request = ops.origin.stamp(
+                FetchRequest(
+                    PLACEHOLDER_OP, server.session, list(items), max_bytes, remaining_ms
+                )
+            )
+            scope.pending[request.op.seq] = (request, result)
+            self._fetch_scopes.add(scope)
+
+        timer = threading.Timer(
+            max(0.0, scope.deadline - time.monotonic()),
+            lambda: self._cancel_fetch_scope(scope, MissReason.TIMEOUT),
+        )
+        timer.daemon = True
+        result.add_done_callback(lambda _f: timer.cancel())
+
+        def on_result(response: FetchResponse) -> None:
+            with self._lock:
+                if time.monotonic() >= scope.deadline and not scope.cancelled:
+                    self._cancel_fetch_scope(scope, MissReason.TIMEOUT)
+                scope.pending.pop(request.op.seq, None)
+                if not scope.pending:
+                    self._fetch_scopes.discard(scope)
+                late = (
+                    result.done()
+                    or scope.cancelled
+                    or self._closing.is_set()
+                    or self.off is not None
+                    or time.monotonic() >= scope.deadline
+                    or ops is not self._ops
+                    or epoch in self._ended_epochs
+                )
+                malformed = response.status == Status.OK and len(response.items) != len(
+                    items
+                )
+                if late or malformed:
+                    if server.server_epoch == epoch and epoch not in self._ended_epochs:
+                        pins = [
+                            o.pin_id for o in response.items if o.pin_id is not None
+                        ]
+                        server.unpin(pins)
+                        self._count("fetch_late_hit", len(pins))
+                    if not result.done():
+                        if malformed:
+                            result.set_exception(
+                                StorageUnavailableError("bad FETCH reply")
+                            )
+                        else:
+                            result.set_result(self._fetch_miss(items, scope.reason))
+                    return
+                result.set_result(response)
+
+        timer.start()
+        with self._lock:
+            if request.op.seq in scope.pending and ops is self._ops:
+                ops.track(NodeMessageType.FETCH, request, on_result)
+        self._post(
+            lambda: self._send_op(NodeMessageType.FETCH, request, on_result, ops, True)
+        )
+        return result
+
+    @staticmethod
+    def _fetch_miss(items: list[FetchItem], reason: MissReason | None) -> FetchResponse:
+        return FetchResponse(
+            Status.OK,
+            items=[ItemOutcome(ItemResult.MISS, reason=reason) for _ in items],
+        )
+
+    def _cancel_fetch_scope(
+        self, scope: _FetchScope, reason: MissReason | None = None
+    ) -> None:
+        with self._lock:
+            if scope.cancelled:
+                return
+            scope.cancelled, scope.reason = True, reason
+            self._count(
+                "fetch_timeout" if reason == MissReason.TIMEOUT else "fetch_cancelled"
+            )
+            for request, result in list(scope.pending.values()):
+                if not result.done():
+                    result.set_result(self._fetch_miss(request.items, reason))
+        self._post(lambda: self._send_fetch_cancels(scope))
+
+    def _send_fetch_cancels(self, scope: _FetchScope) -> None:
+        with self._lock:
+            storage = self._storage
+            if storage is None or storage.closed or scope.node_epoch != self.node_epoch:
+                return
+            targets = [request.op for request, _ in scope.pending.values()]
+        for target in targets:
+            storage.fetch_cancel(target)
+
+    def _end_fetch_scopes(self) -> None:
+        """Caller holds _lock; ended runs cannot recover old fetch results."""
+        for scope in list(self._fetch_scopes):
+            self._cancel_fetch_scope(scope)
+            for seq in scope.pending:
+                if self._ops is not None:
+                    self._ops.resolved(seq)
+            scope.pending.clear()
+        self._fetch_scopes.clear()
+
     # ------------------------------------------------------------------ reads
 
     def batch_retrieve(
@@ -1514,15 +1694,19 @@ class MaruClient:
         return out
 
     def _count_miss(self, prefix: str, outcome: ItemOutcome) -> None:
-        """Count a key that cannot be read now. Unavailable (a node down: MISS
-        offline) is not a sign the KV is gone, so it is counted apart from
-        not_found (MISS absent); FETCH (no fetch path yet) apart from both."""
+        """Count fetch failures separately from absent and offline keys."""
         result = outcome.result
         if result == ItemResult.FETCH:
             self._count(f"{prefix}_fetch")
-        elif result == ItemResult.MISS and outcome.reason != MissReason.OFFLINE:
+        elif result == ItemResult.MISS and outcome.reason in (
+            MissReason.BUSY,
+            MissReason.TIMEOUT,
+            MissReason.IO_ERROR,
+        ):
+            self._count(f"{prefix}_{outcome.reason.value}")
+        elif result == ItemResult.MISS and outcome.reason == MissReason.ABSENT:
             self._count(f"{prefix}_not_found")
-        elif result == ItemResult.MISS:
+        elif result == ItemResult.MISS and outcome.reason == MissReason.OFFLINE:
             self._count(f"{prefix}_unavailable")
             self._count(f"{prefix}_unavailable_offline")
         else:
@@ -1531,6 +1715,7 @@ class MaruClient:
     def _server_epoch_changed(self, old: str, new: str) -> None:
         with self._lock:
             self._ended_epochs.add(old)
+            self._end_fetch_scopes()
         dead = self.pins.drop_epoch(old)
         if dead:
             logger.warning(
@@ -1591,6 +1776,7 @@ class MaruClient:
                 return
             self.off = error
             self.refused = error
+            self._end_fetch_scopes()
         self.credits.close()
         self._refill_wake.set()
         logger.error(

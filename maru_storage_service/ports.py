@@ -11,10 +11,14 @@ from maru_common.node_protocol import Notify
 from maru_common.protocol import (
     CommitItem,
     CommitResponse,
+    FetchCompleteItem,
+    FetchCompleteResponse,
     FinalizeMoveResponse,
     MoveItem,
     NodeHeartbeatResponse,
     RetireResponse,
+    SourcePinResponse,
+    UnpinResponse,
     WorkerExitResponse,
 )
 from maru_common.storage_types import ExitCause, KeyLocation, PoolUsage, WorkerRef
@@ -65,6 +69,14 @@ class MetadataPort(Protocol):
     def retire(self, items: list[KeyLocation]) -> RetireResponse: ...
 
     def finalize_move(self, items: list[MoveItem]) -> FinalizeMoveResponse: ...
+
+    def source_pin(self, items: list[KeyLocation]) -> SourcePinResponse: ...
+
+    def fetch_complete(
+        self, worker_session: str, items: list[FetchCompleteItem]
+    ) -> FetchCompleteResponse: ...
+
+    def unpin(self, pin_ids: list[str]) -> UnpinResponse: ...
 
     def worker_exit(
         self, workers: list[WorkerRef], cause: ExitCause
