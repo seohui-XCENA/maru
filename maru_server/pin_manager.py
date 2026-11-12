@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum, unique
 
-from maru_common.storage_types import Key, Location, PoolKind
+from maru_common.storage_types import POOL_KINDS, Key, Location
 
 
 @unique
@@ -142,7 +142,7 @@ class PinManager:
         return count
 
     def _index(self, pin: Pin) -> dict[str, set[str]]:
-        if pin.location.kind == PoolKind.CXL:
+        if POOL_KINDS[pin.location.kind].rm_region:
             return self._cxl_by_holder
         return self._by_holder
 

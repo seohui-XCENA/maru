@@ -30,6 +30,7 @@ from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     MAX_BATCH,
     MS_PROTOCOL,
+    POOL_KINDS,
     AccessInfo,
     BlockRequest,
     CloseMode,
@@ -48,7 +49,7 @@ from maru_common.storage_types import (
     WorkerRef,
 )
 
-from .catalog import MAPPABLE_KINDS, Catalog, Entry, PoolRecord, PoolState, Requester
+from .catalog import Catalog, Entry, PoolRecord, PoolState, Requester
 from .op_ledger import OpLedger, OriginKey
 from .pin_manager import PinManager
 
@@ -269,11 +270,11 @@ class NodeRegistry:
         to and that run's CXL regions; a probe answers for its node."""
         if pool.node_id != worker.node_id:
             return self._maps_shared_cxl(worker, pool)
-        if pool.kind not in MAPPABLE_KINDS:
+        if not POOL_KINDS[pool.kind].mappable:
             return False
         if worker.role == SessionRole.PROBE:
             return True
-        if pool.kind == PoolKind.DRAM:
+        if POOL_KINDS[pool.kind].run_scoped:
             return pool.since_epoch_seq == worker.node_epoch_seq
         return pool.since_epoch_seq <= worker.node_epoch_seq
 
@@ -482,11 +483,11 @@ class NodeRegistry:
         opens: a run on another MaruServer in between may have rewritten its
         extents). A changed one starts empty; DRAM never stays."""
         info, was = listed.get(pool.pool_id), pool.info
-        if info is None or pool.kind == PoolKind.DRAM:
+        if info is None or POOL_KINDS[pool.kind].run_scoped:
             return False
         if old is None or old.host_boot_id != req.host_boot_id:
             return False
-        if pool.kind == PoolKind.CXL:
+        if POOL_KINDS[pool.kind].rm_region:
             return (
                 info.rm_domain == was.rm_domain
                 and info.region_id == was.region_id
@@ -597,7 +598,7 @@ class NodeRegistry:
             session.closed_at = now
             self._node_sessions.pop(session.token, None)
             for pool in self.catalog.pools_of(session.node_id):
-                if pool.kind == PoolKind.DRAM:
+                if POOL_KINDS[pool.kind].run_scoped:
                     self.catalog.hide_pool(pool)
             logger.info("node %s closed for a restart", session.node_id)
             return

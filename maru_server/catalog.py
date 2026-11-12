@@ -12,6 +12,7 @@ from enum import StrEnum, unique
 
 from maru_common.protocol import CommitItem, FetchCompleteItem, MoveItem
 from maru_common.storage_types import (
+    POOL_KINDS,
     FetchPlan,
     ItemOutcome,
     ItemResult,
@@ -29,8 +30,6 @@ from .pin_manager import HolderKind, PinManager
 logger = logging.getLogger(__name__)
 
 _GENERATION_MAX = (1 << 64) - 1
-# kinds a worker maps itself; others are read through a StorageService
-MAPPABLE_KINDS = (PoolKind.DRAM, PoolKind.CXL)
 
 
 @unique
@@ -103,12 +102,8 @@ class Selection:
 def location_cost(requester_node: str, pool: PoolRecord) -> int:
     """Cost order: node DRAM < node CXL < memory node DRAM/CXL < node SSD <
     memory node SSD; any other node counts as a memory node."""
-    same = pool.node_id == requester_node
-    if pool.kind == PoolKind.DRAM:
-        return 0 if same else 2
-    if pool.kind == PoolKind.CXL:
-        return 1 if same else 2
-    return 3 if same else 4
+    traits = POOL_KINDS[pool.kind]
+    return traits.local_rank if pool.node_id == requester_node else traits.remote_rank
 
 
 def _overlap(a: Location, b: Location) -> bool:
@@ -171,7 +166,9 @@ class Catalog:
         """Hide now; ``sweep`` removes the locations. CXL is forced only with
         ``force_cxl`` (its node given up, its pins released): otherwise a
         region goes back only once nothing pins it."""
-        pool.force = pool.force or (force and (pool.kind != PoolKind.CXL or force_cxl))
+        pool.force = pool.force or (
+            force and (not POOL_KINDS[pool.kind].rm_region or force_cxl)
+        )
         pool.state = PoolState.REMOVING
         self._removing.add(pool)
         self._sweeps[pool] = None
@@ -495,7 +492,7 @@ class Catalog:
     def check_copy(
         self, node_id: str, epoch_seq: int, item: FetchCompleteItem
     ) -> str | None:
-        if item.copy.kind not in MAPPABLE_KINDS:
+        if not POOL_KINDS[item.copy.kind].mappable:
             return f"a copy must be in a worker-mapped pool, not {item.copy.kind}"
         return self.check_new_location(
             node_id, epoch_seq, item.copy, item.logical_bytes
@@ -552,7 +549,7 @@ class Catalog:
                 entry, worker_holder, copy_holder, creator, cached
             )
 
-        if item.copy.kind not in MAPPABLE_KINDS:
+        if not POOL_KINDS[item.copy.kind].mappable:
             return ItemOutcome(ItemResult.REJECTED)  # never pinned for a worker
         exact = self.entry_exact(item.key, item.copy)
         if exact is not None and self.own_pool(node_id, item.copy.pool_id):
@@ -622,7 +619,8 @@ class Catalog:
             entry = self._current(key, pool_id)
             if entry is None:
                 continue
-            if entry.pool.kind == PoolKind.DRAM:
+            if POOL_KINDS[entry.pool.kind].local_rank == 0:
+                # Prefer the DRAM copy.
                 return entry
             if pool_id == copy_pool:
                 same_pool = entry
@@ -678,7 +676,7 @@ class Catalog:
                 if best_hit is None or cost < hit_cost:
                     best_hit, hit_cost = entry, cost
                 continue
-            if pool.node_id == requester.node_id and pool.kind in MAPPABLE_KINDS:
+            if pool.node_id == requester.node_id and POOL_KINDS[pool.kind].mappable:
                 continue  # own memory the worker has not mapped: no fetch
             if requester_online is None:
                 requester_online = requester.online(requester.node_id)

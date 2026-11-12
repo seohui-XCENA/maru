@@ -88,6 +88,24 @@ class PoolKind(StrEnum):
         return cls(value)
 
 
+@dataclass(frozen=True)
+class KindTraits:
+    """Server policy for a pool medium."""
+
+    mappable: bool
+    local_rank: int
+    remote_rank: int
+    run_scoped: bool
+    rm_region: bool
+
+
+POOL_KINDS = {
+    PoolKind.DRAM: KindTraits(True, 0, 2, True, False),
+    PoolKind.CXL: KindTraits(True, 1, 2, False, True),
+    PoolKind.SSD: KindTraits(False, 3, 4, False, False),
+}
+
+
 @unique
 class Visibility(StrEnum):
     """How writes on a CXL region become visible to other hosts."""

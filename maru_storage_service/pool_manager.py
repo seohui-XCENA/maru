@@ -19,6 +19,7 @@ from dataclasses import replace
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     GENERATION_COUNTER_MAX,
+    POOL_KINDS,
     Key,
     Location,
     PoolInfo,
@@ -107,7 +108,7 @@ class PoolManager:
         never gives credit: workers do not map it."""
         if state not in (PageState.FREE, PageState.QUARANTINED):
             raise ValueError(f"a pool starts FREE or QUARANTINED, not {state}")
-        if creditable and info.kind == PoolKind.SSD:
+        if creditable and not POOL_KINDS[info.kind].mappable:
             raise ValueError(f"pool {info.pool_id}: an SSD pool gives no credit")
         if info.page_size != self.page_size:
             raise ValueError(
@@ -143,7 +144,7 @@ class PoolManager:
         """Credit from a pool from now on (never an SSD pool)."""
         with self._lock:
             table = self._tables.get(pool_id)
-            if table is not None and table.info.kind != PoolKind.SSD:
+            if table is not None and POOL_KINDS[table.info.kind].mappable:
                 self._creditable.add(pool_id)
 
     def quarantine_pool(self, pool_id: str) -> None:
