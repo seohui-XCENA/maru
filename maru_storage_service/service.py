@@ -19,6 +19,7 @@ Node then starts a new run in the same process. When the RM says another run
 claimed the node, the run leaves and no new run starts.
 """
 
+import dataclasses
 import logging
 import mmap
 import threading
@@ -26,6 +27,7 @@ import time
 import uuid
 from collections.abc import Callable
 
+from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
     CloseMode,
@@ -114,6 +116,29 @@ def check_servable(config: NodeConfig) -> None:
         raise NotServableError(
             "write-through demotion is not implemented yet: use demotion back"
         )
+
+
+def worker_budgets(config: NodeConfig) -> Budgets:
+    """The budgets each worker gets at ATTACH. With an SSD tier its
+    fetch_request_max_bytes is its fetch window: the pages it may hold
+    fetched at once, within the per-op cap, the node's in-flight cap less a
+    bounce, and the top tier less its credit and transfer reserve (one page
+    at least)."""
+    budgets = config.budgets
+    if config.tier("ssd") is None:
+        return budgets
+    top, ps = config.top, config.page_size
+    room = (
+        (top.size or 0)
+        - budgets.credit_total_max_bytes
+        - budgets.transfer_reserve_bytes.get(top.store, 0)
+    )
+    window = min(
+        budgets.fetch_request_max_bytes, budgets.fetch_max_inflight_bytes - ps, room
+    )
+    return dataclasses.replace(
+        budgets, fetch_request_max_bytes=max(ps, window // ps * ps)
+    )
 
 
 class StorageService:
@@ -218,7 +243,7 @@ class StorageService:
             node_epoch=self.node_epoch,
             server_address=config.server,
             page_size=config.page_size,
-            budgets=config.budgets,
+            budgets=worker_budgets(config),
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,

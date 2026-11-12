@@ -212,7 +212,8 @@ def test_the_window_bounds_the_fetched_reads(real_server, nodes, workers, monkey
     )
     finished(reader)
     assert_external_on_cuda(reader, dst, kv)
-    assert sizes == [(1, 0), (1, 0)]  # the first read went back before the next
+    # Each FETCH holds only its own slot: the first read went back before
+    assert sizes == [(1, 1), (1, 1)]
 
 
 def test_an_inline_load_never_fetches(real_server, nodes, workers):

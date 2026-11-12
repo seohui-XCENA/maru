@@ -151,6 +151,8 @@ class _FetchScope:
     cancelled: bool = False
     reason: MissReason | None = None
     pending: dict[int, tuple[FetchRequest, Future]] = field(default_factory=dict)
+    # Its caller's reservation counts its slots
+    reserved: bool = False
 
 
 class _Throttle:
@@ -234,6 +236,10 @@ class MaruClient:
         self._fetch_scopes: set[_FetchScope] = set()
         # The request a loader thread retrieves for (fetch_scope)
         self._fetch_local = threading.local()
+        # Window slots of FETCHes a loader waits for, and fetched pins whose
+        # UNPIN is not confirmed yet: both hold their slots
+        self._fetch_reserved = 0
+        self._fetch_unpinning: set[str] = set()
         self._returns: list[Location] = []
         self._connected = False
         self._closing = threading.Event()
@@ -1379,8 +1385,9 @@ class MaruClient:
             self._fetch_local.request_id = None
 
     def _fetch_window(self) -> int | None:
-        """Pages this worker's fetches may hold at once (the node's per-op
-        cap), or None when this thread fetches nothing."""
+        """Pages this worker's fetches may hold at once (the node gives it at
+        ATTACH, within what it can fetch into), or None when this thread
+        fetches nothing."""
         info = self.attach_info
         if (
             getattr(self._fetch_local, "request_id", None) is None
@@ -1394,14 +1401,26 @@ class MaruClient:
         return max(1, info.budgets.fetch_request_max_bytes // info.page_size)
 
     def _fetch_used(self) -> int:
-        """Caller holds _lock: pages of FETCHes not answered yet, and fetched
-        reads not released (a read kept for an unconfirmed copy never is)."""
+        """Caller holds _lock: slots of FETCHes a loader waits for or left
+        unanswered, of fetched reads not released (a read kept for an
+        unconfirmed copy never is), and of fetched pins whose UNPIN is not
+        confirmed (one no longer queued was answered, or went with its
+        epoch)."""
+        if self._fetch_unpinning:
+            server = self._server
+            self._fetch_unpinning = (
+                server.unpin_pending(self._fetch_unpinning)
+                if server is not None
+                else set()
+            )
         pending = sum(
             len(request.items)
             for scope in self._fetch_scopes
+            if not scope.reserved
             for request, _ in scope.pending.values()
         )
-        return pending + sum(1 for read in self._reads if read.fetched)
+        fetched = sum(1 for read in self._reads if read.fetched)
+        return self._fetch_reserved + pending + fetched + len(self._fetch_unpinning)
 
     def retrieve_capacity(self) -> int | None:
         """Keys the next batch_retrieve may ask for on a loader thread that
@@ -1434,38 +1453,55 @@ class MaruClient:
             return
         window = self._fetch_window()
         with self._lock:
-            free = 0 if window is None else window - self._fetch_used()
-        if len(wanted) > free:
+            # Checked and taken at once; kept until the reads hold the slots
+            fits = window is not None and len(wanted) <= window - self._fetch_used()
+            if fits:
+                self._fetch_reserved += len(wanted)
+                scope = self._new_fetch_scope(self._fetch_local.request_id)
+                scope.reserved = True
+        if not fits:
             self._count("fetch_over_window", len(wanted))
             return
-        scope = self._new_fetch_scope(self._fetch_local.request_id)
-        items = [
-            FetchItem(Key(self.identity.namespace, keys[i]), outcomes[i].plan)
-            for i in wanted
-        ]
-        reply = self._fetch(scope, items, len(items) * info.page_size)
+        reads: list[PinnedRead] = []
+        dropped: list[str] = []  # HITs not taken: unpinned, or gone
         try:
-            # The scope's deadline answers it; this only bounds a lost answer
-            response = reply.result(
-                max(0.0, scope.deadline - time.monotonic()) + FETCH_WAIT_SLACK_S
-            )
-        except Exception as e:
-            logger.debug("FETCH of %d keys failed: %s", len(items), e)
-            self._count("fetch_failed", len(items))
-            return
-        if response.status != Status.OK:
-            self._count(f"fetch_{response.status.value.lower()}", len(items))
-            return
-        for i, outcome in zip(wanted, response.items, strict=True):
-            if outcome.result != ItemResult.HIT:
-                self._count_miss("fetch", outcome)
-                continue
-            read = self._take_outcome(server, keys[i], outcome, epoch, node_epoch)
-            if read is not None:
-                with self._lock:
+            items = [
+                FetchItem(Key(self.identity.namespace, keys[i]), outcomes[i].plan)
+                for i in wanted
+            ]
+            reply = self._fetch(scope, items, len(items) * info.page_size)
+            try:
+                # The scope's deadline answers it; this only bounds a lost answer
+                response = reply.result(
+                    max(0.0, scope.deadline - time.monotonic()) + FETCH_WAIT_SLACK_S
+                )
+            except Exception as e:
+                logger.debug("FETCH of %d keys failed: %s", len(items), e)
+                self._count("fetch_failed", len(items))
+                return
+            if response.status != Status.OK:
+                self._count(f"fetch_{response.status.value.lower()}", len(items))
+                return
+            for i, outcome in zip(wanted, response.items, strict=True):
+                if outcome.result != ItemResult.HIT:
+                    self._count_miss("fetch", outcome)
+                    continue
+                read = self._take_outcome(server, keys[i], outcome, epoch, node_epoch)
+                if read is not None:
+                    reads.append(read)
+                    self._count("fetch_hit")
+                elif outcome.pin_id is not None:
+                    dropped.append(outcome.pin_id)
+                out[i] = read
+        finally:
+            with self._lock:
+                # The slots pass to the reads, to the pins being unpinned
+                # and to what is still unanswered
+                self._fetch_reserved -= len(wanted)
+                scope.reserved = False
+                for read in reads:
                     read.fetched = True
-                self._count("fetch_hit")
-            out[i] = read
+                self._fetch_unpinning.update(dropped)
 
     def _new_fetch_scope(
         self, request_id: str, *, deadline_ms: int = 250
@@ -1555,6 +1591,8 @@ class MaruClient:
                             o.pin_id for o in response.items if o.pin_id is not None
                         ]
                         server.unpin(pins)
+                        # Their slots stay until the UNPIN is confirmed
+                        self._fetch_unpinning.update(pins)
                         self._count("fetch_late_hit", len(pins))
                     if not result.done():
                         if malformed:
@@ -1766,14 +1804,19 @@ class MaruClient:
         if not reads:
             return
         with self._lock:
-            for read in reads:
-                self._reads.discard(read)
             server = self._server
-            self._cv.notify_all()
         epoch = server.server_epoch if server is not None else None
         unpins = self.pins.release([r.pin_id for r in reads], epoch)
         if unpins and server is not None:
             server.unpin(unpins)
+        queued = set(unpins) if server is not None else set()
+        with self._lock:
+            for read in reads:
+                self._reads.discard(read)
+                # A fetched read's slot stays until its UNPIN is confirmed
+                if read.fetched and read.pin_id in queued:
+                    self._fetch_unpinning.add(read.pin_id)
+            self._cv.notify_all()
         self._unmap_unused_old_pools()
         if self.off is not None:
             self._end_session_when_off()

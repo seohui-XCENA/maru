@@ -886,3 +886,140 @@ def test_a_late_plan_uses_the_copy_published_before(env, monkeypatch):
     node.pools.check()
     a.close()
     b.close()
+
+
+# =============================================================================
+# A worker's fetch window (the node client in a parked load's fetch scope)
+# =============================================================================
+
+
+def loader_client(node) -> MaruHandler:
+    handler = MaruHandler(
+        MaruConfig(
+            maru_node=node.config.socket,
+            engine_id="loader",
+            cache_namespace=NS,
+            chunk_size_bytes=PAGE,
+            pool_size=PAGE,
+            pin_pools=False,
+            timeout_ms=300,
+            auto_connect=False,
+            load_only=True,
+            fetch_loads=True,
+        )
+    )
+    handler.connect()
+    return handler
+
+
+def test_the_window_fits_the_top_tier_and_a_load_goes_through_it(env):
+    server, make = env
+    node, _ = make(keys=40)
+    names = on_ssd(server, [f"k{i}" for i in range(40)])
+    # 16 DRAM pages, less 2 of credit and 1 of transfer reserve
+    window = 13
+    assert len(names) > window
+    h = loader_client(node)
+    try:
+        assert h._cpu.attach_info.budgets.fetch_request_max_bytes == window * PAGE
+        assert h.retrieve_capacity() is None  # outside a fetch scope
+        with h.fetch_scope("r1"):
+            assert h.retrieve_capacity() == window
+            done = 0
+            while done < len(names):  # as the connector's leased batches
+                wait_until(lambda: h.retrieve_capacity() == window, "slots back")
+                batch = names[done : done + window]
+                reads = h.batch_retrieve(batch)
+                assert all(r is not None for r in reads), h._cpu.stats
+                for name, read in zip(batch, reads, strict=True):
+                    assert bytes(read.view) == value_of(name)
+                assert h.retrieve_capacity() == window - len(batch)
+                h.release_retrieved(reads)
+                done += len(batch)
+        assert h._cpu.stats["fetch_hit"] == len(names)
+    finally:
+        h.close()
+
+
+def test_a_slot_stays_until_its_unpin_is_confirmed(env, monkeypatch):
+    server, make = env
+    node, keys = make(fetch_request_max_bytes=PAGE, fetch_max_inflight_bytes=2 * PAGE)
+    h = loader_client(node)
+    conn = h._cpu._server
+    flush = conn._flush_unpins
+    entered, gate = threading.Event(), threading.Event()
+
+    def held():
+        if conn.pending_unpins():
+            entered.set()
+            assert gate.wait(10)
+        return flush()
+
+    try:
+        with h.fetch_scope("r1"):
+            assert h.retrieve_capacity() == 1
+            (read,) = h.batch_retrieve([keys[0]])
+            assert read is not None and h.retrieve_capacity() == 0
+            monkeypatch.setattr(conn, "_flush_unpins", held)
+            h.release_retrieved([read])
+            assert entered.wait(5)
+            # Released here, still pinned at MaruServer: nothing more fits
+            assert conn.pending_unpins() == 1 and h.retrieve_capacity() == 0
+            assert h.batch_retrieve([keys[1]]) == [None]
+            assert h._cpu.stats["fetch_over_window"] == 1
+            gate.set()
+            wait_until(lambda: conn.pending_unpins() == 0, "the UNPIN confirmed")
+            assert h.retrieve_capacity() == 1
+    finally:
+        gate.set()
+        h.close()
+
+
+def test_two_loaders_never_take_the_same_slot(env, monkeypatch):
+    server, make = env
+    node, keys = make(
+        fetch_request_max_bytes=2 * PAGE, fetch_max_inflight_bytes=4 * PAGE
+    )
+    h = loader_client(node)
+    client = h._cpu
+    fetch = type(client)._fetch
+    entered, gate = threading.Event(), threading.Event()
+    sent = []
+
+    def held(self, *args):
+        sent.append(args)
+        if len(sent) == 1:  # r1: its slot is taken, its FETCH not sent yet
+            entered.set()
+            assert gate.wait(10)
+        return fetch(self, *args)
+
+    monkeypatch.setattr(type(client), "_fetch", held)
+    got = {}
+
+    def load(name: str, wanted: list[str]) -> None:
+        with h.fetch_scope(name):
+            got[name] = h.batch_retrieve(wanted)
+
+    first = threading.Thread(target=load, args=("r1", keys[:1]))
+    try:
+        first.start()
+        assert entered.wait(5)
+        load("r2", keys[1:3])  # two more do not fit beside r1's slot
+        assert got["r2"] == [None, None] and len(sent) == 1
+        assert client.stats["fetch_over_window"] == 2
+        load("r2", keys[1:2])  # one does
+        (second,) = got["r2"]
+        assert second is not None and bytes(second.view) == value_of(keys[1])
+        with h.fetch_scope("r2"):
+            assert h.retrieve_capacity() == 0
+        gate.set()
+        first.join(10)
+        (read,) = got["r1"]
+        assert read is not None and bytes(read.view) == value_of(keys[0])
+        with h.fetch_scope("r2"):
+            assert h.retrieve_capacity() == 0  # each slot counted once
+        h.release_retrieved([read, second])
+    finally:
+        gate.set()
+        first.join(10)
+        h.close()

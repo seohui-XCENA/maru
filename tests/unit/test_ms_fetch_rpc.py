@@ -283,6 +283,7 @@ def client():
         server_epoch="server",
         session_node_epoch="run",
         unpin=lambda ids: unpins.extend(ids),
+        unpin_pending=lambda ids: ids & set(unpins),
     )
     c.node_epoch = "run"
     c._ops = OpTracker(c.identity.incarnation, "run")
@@ -331,6 +332,10 @@ def test_fetch_deadline_keeps_unknown_op_until_late_pin_cleanup(client):
     c._storage.replies[0].set_result(HIT)
     assert unpins == ["worker-pin"] and not c._ops.unresolved()
     assert c.stats["fetch_timeout"] == c.stats["fetch_late_hit"] == 1
+    with c._lock:
+        assert c._fetch_used() == 1  # the slot stays while the UNPIN is queued
+        unpins.clear()  # confirmed
+        assert c._fetch_used() == 0
 
 
 def test_fetch_cancel_is_scoped_and_late_reply_never_maps_bytes(client, monkeypatch):

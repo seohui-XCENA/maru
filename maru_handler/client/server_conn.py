@@ -647,3 +647,8 @@ class ServerConn:
     def pending_unpins(self) -> int:
         with self._lock:
             return len(self._unpins)
+
+    def unpin_pending(self, pin_ids: set[str]) -> set[str]:
+        """Those of ``pin_ids`` still queued for UNPIN (not answered yet)."""
+        with self._lock:
+            return pin_ids.intersection(self._unpins)
