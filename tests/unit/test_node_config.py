@@ -389,7 +389,7 @@ class TestFileAndCli:
 
     def test_does_not_pretend_to_serve(self, tmp_path, capsys):
         raw = copy.deepcopy(GPU_NODE)
-        raw["tiers"][2] = {"store": "remote", "url": "tcp://mem-1:5600"}
+        raw["tiers"][0]["demotion"] = "through"
         path = tmp_path / "node.json"
         path.write_text(json.dumps(raw))
         assert main(["--config", str(path)]) == EXIT_NOT_SERVING
@@ -504,7 +504,7 @@ class TestRegistry:
             ("remote", Level.L2, False, None),
         ]
 
-    def test_served_tiers_are_the_six_combinations_in_order(self):
+    def test_served_tiers_are_the_nine_combinations_in_order(self):
         assert SERVED_TIERS == (
             ["dram"],
             ["cxl"],
@@ -512,6 +512,9 @@ class TestRegistry:
             ["dram", "ssd"],
             ["cxl", "ssd"],
             ["dram", "cxl", "ssd"],
+            ["dram", "remote"],
+            ["cxl", "remote"],
+            ["dram", "cxl", "remote"],
         )
 
     def test_servable_checks_keep_their_order(self):
@@ -590,12 +593,17 @@ class TestAStoreFromTheRegistry:
         raw["tiers"].append({"store": "fake", "size": "1T"})
         rejects(raw, r"two local tiers have pools of one kind: \['ssd'\]")
 
-    def test_a_tier_that_is_not_local_shares_a_kind(self, monkeypatch):
+    def test_a_tier_that_is_not_local_takes_demotions_and_never_evicts(
+        self, monkeypatch
+    ):
         monkeypatch.setitem(TIERS, "fake", _fake_spec(local=False))
         raw = copy.deepcopy(GPU_NODE)
         raw["tiers"][2]["demotion"] = "back"
         raw["tiers"].append({"store": "fake", "size": "1T"})
-        assert "fake" not in parse_node_config(raw).traits()
+        traits = parse_node_config(raw).traits()
+        fake = traits["fake"]
+        assert fake.kind is None and not fake.credit and not fake.evicts
+        assert traits["ssd"].demotes_to == "fake"
 
 
 class TestTierConfigCopies:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""FetchManager: FETCH from workers' loaders, for plans whose source is this
-node's SSD.
+"""FetchManager: FETCH from workers' loaders, from this node's SSD or a
+memory node's mapped pages.
 
 One flight per key at a time: one destination page in the top tier and one
 read, shared by every FETCH of the key. A flight takes its quota and its page,
@@ -38,6 +38,7 @@ from maru_common.protocol import FetchCompleteItem
 from maru_common.serializer import DecodedRequest
 from maru_common.storage_types import (
     MAX_BATCH,
+    POOL_KINDS,
     ItemOutcome,
     ItemResult,
     Key,
@@ -107,7 +108,8 @@ class _Flight:
 
     key: Key
     source: Location
-    source_ref: PageRef
+    source_ref: PageRef | None
+    source_node: str
     bounce: int
     leader: _Waiter
     waiters: list[_Waiter] = field(default_factory=list)
@@ -125,6 +127,8 @@ class _Flight:
     # The op whose session pinned the source; its read's callback has run
     pinned_by: _Op | None = None
     read_over: bool = False
+    quarantined: Location | None = None
+    read_settled: bool = False
 
 
 class FetchManager:
@@ -301,6 +305,7 @@ class FetchManager:
                         key=item.key,
                         source=item.plan.source,
                         source_ref=ref,
+                        source_node=item.plan.source_node,
                         bounce=bounce,
                         leader=_Waiter(op, i),
                         charged=cost,
@@ -402,10 +407,23 @@ class FetchManager:
         return None
 
     def _source(self, rec: WorkerRecord, key: Key, plan) -> ItemOutcome | tuple:
-        """(the source page, its bounce bytes), or the item's outcome. Only a
-        READY page of this node's L2 pools holding exactly the plan's location."""
+        """(the local source ref or None, bounce bytes), or the outcome."""
         source = plan.source
+        if key.namespace != rec.ident.namespace:
+            return ItemOutcome(ItemResult.REJECTED)
         tier = self.sources.get(source.pool_id)
+        if tier is None:
+            remote = self.transfers.owner_tier(source.pool_id)
+            if remote is not None or plan.source_node != self.node_id:
+                if (
+                    remote is None
+                    or remote.owner(source.pool_id) != plan.source_node
+                    or not remote.ready(plan.source_node)
+                    or not POOL_KINDS[source.kind].mappable  # SSD: needs STAGE
+                    or source.length != plan.bytes
+                ):
+                    return _miss(MissReason.OFFLINE)
+                return None, remote.io_size(plan.bytes)
         info = self.pools.pool_info(source.pool_id)
         if (
             key.namespace != rec.ident.namespace
@@ -767,8 +785,14 @@ class FetchManager:
             self._drop_page(flight)
             self._fail(flight, _miss())
             return False
-        refs = [flight.source_ref, flight.dest]
-        if not self.pools.io_acquire(flight.source_ref, flight.dest):
+        remote = flight.source_ref is None
+        if flight.source_ref is None:
+            refs = [flight.dest]
+            acquired = self.pools.io_acquire_transfer(flight.dest)
+        else:
+            refs = [flight.source_ref, flight.dest]
+            acquired = self.pools.io_acquire(flight.source_ref, flight.dest)
+        if not acquired:
             self._release_source(flight)
             self._drop_page(flight)
             self._fail(flight, _miss(MissReason.ABSENT))
@@ -779,7 +803,9 @@ class FetchManager:
                 Copy(flight.source, dest, flight.source.length),
                 flight.source_ref,
                 flight.dest,
-                callback=lambda _t, f=flight: self._read_ended(f, refs, wake),
+                callback=lambda t: self._read_ended(flight, refs, wake, t),
+                deadline=self._deadline(flight) if remote else None,
+                settled=(lambda _t: self._read_settled(flight)) if remote else None,
             )
         except Exception as e:  # a full queue, or the engine stopped
             logger.debug("cannot read %s: %s", flight.key, e)
@@ -791,16 +817,42 @@ class FetchManager:
         return True
 
     def _read_ended(
-        self, flight: _Flight, refs: list[PageRef], wake: threading.Event
+        self,
+        flight: _Flight,
+        refs: list[PageRef],
+        wake: threading.Event,
+        ticket: IOResult,
     ) -> None:
-        """The read's syscalls ended: its pages and bounce are free of it."""
-        self.pools.io_release(refs)
-        with self._lock:
-            if flight.charged:
-                flight.charged -= flight.bounce
-                self._inflight -= flight.bounce
+        """Release I/O refs; a kept READ destination stays quarantined. The
+        flight wakes whatever happens here."""
+        try:
+            with self._lock:
+                self.pools.io_release(refs)
+                if ticket.kept or flight.read_settled:
+                    assert flight.dest is not None
+                    flight.quarantined = self.pools.transfer_location(flight.dest)
+                    tag = f"rdma:{flight.source_node}"
+                    self.pools.quarantine_transfer(flight.dest, tag)
+                    flight.dest = None
+                    if flight.read_settled:
+                        self.pools.resolve_quarantined(flight.quarantined, tag)
+                if flight.charged:
+                    flight.charged -= flight.bounce
+                    self._inflight -= flight.bounce
+        finally:
             flight.read_over = True
-        wake.set()
+            wake.set()
+
+    def _read_settled(self, flight: _Flight) -> None:
+        """A late DONE is evidence that the quarantined page is reusable."""
+        with self._lock:
+            if flight.read_settled:
+                return
+            flight.read_settled = True
+            if flight.quarantined is not None:
+                self.pools.resolve_quarantined(
+                    flight.quarantined, f"rdma:{flight.source_node}"
+                )
 
     def _read_result(self, flight: _Flight) -> bool:
         """Whether the read moved every byte; else the flight ends."""
@@ -809,8 +861,11 @@ class FetchManager:
         if ticket.ok:
             self.results["reads"] += 1
             return True
-        self._release_source(flight)
-        self._drop_page(flight)
+        if flight.quarantined is not None:
+            self._reject_copy(flight)
+        else:
+            self._release_source(flight)
+            self._drop_page(flight)
         if ticket.cancelled:
             reason = None
         elif isinstance(ticket.error, TimeoutError):
@@ -820,6 +875,29 @@ class FetchManager:
             logger.warning("fetch read of %s failed: %s", flight.key, ticket.error)
         self._fail(flight, _miss(reason))
         return False
+
+    def _reject_copy(self, flight: _Flight) -> None:
+        """Release the source pin with a copy that fails catalog validation."""
+        assert flight.quarantined is not None
+        try:
+            response = self.metadata.fetch_complete(
+                "",
+                [
+                    FetchCompleteItem(
+                        key=flight.key,
+                        source_pin_id=flight.source_pin or "",
+                        copy=flight.quarantined,
+                        logical_bytes=0,
+                    )
+                ],
+            )
+        except Exception as e:
+            self._unknown("FETCH_COMPLETE", e)
+            return
+        if response.status == Status.OK:
+            flight.source_pin = None
+        else:
+            self._release_source(flight)
 
     def _publish(self, flights: list[_Flight]) -> list[_Flight]:
         """FETCH_COMPLETE the copies, one request per worker: each is
@@ -902,8 +980,14 @@ class FetchManager:
             if location == copy:
                 self.pools.commit_added(flight.dest)
                 self.manager.placement.on_ready(flight.dest)
-                # Evicted later by dropping it onto the SSD page, not a write
-                self.manager._note_copy(flight.dest, flight.key, flight.source)
+                # Evicted later by dropping it onto its source (the SSD page,
+                # or the memory node's page), not by a write
+                if flight.source_ref is None:
+                    self.manager.note_remote_copy(
+                        flight.dest, flight.key, flight.source
+                    )
+                else:
+                    self.manager._note_copy(flight.dest, flight.key, flight.source)
             else:
                 self.pools.commit_freed(flight.dest)  # the node had a copy
             flight.copy, flight.node_pin = location, outcome.node_pin_id

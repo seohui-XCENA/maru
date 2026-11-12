@@ -151,22 +151,24 @@ class NodeConfig:
         return next((t for t in self.tiers if t.store == store), None)
 
     def traits(self) -> dict[str, TierTraits]:
-        """Traits of each local tier (memory and SSD), by store name in config
-        order. The top tier gives credit, and a tier with credit_fallback the
-        credit the tiers above lack. A tier with demotion "back" over a local
-        tier evicts by moving its pages there; a tier that gets new pages
-        (credit or demotion) and demotes nowhere evicts by dropping."""
+        """Traits of each tier, by store name in config order. The top tier
+        gives credit, and a tier with credit_fallback the credit the tiers
+        above lack. A tier with demotion "back" evicts by moving its pages to
+        the tier below; a tier that gets new pages (credit or demotion) and
+        demotes nowhere evicts by dropping. Another node's tier (remote)
+        takes the pages demoted to it and never evicts: its owner does."""
         out: dict[str, TierTraits] = {}
         receives = True  # the top tier gets the writes
         for i, t in enumerate(self.tiers):
             spec = TIERS[t.store]
             if not spec.local:
+                out[t.store] = TierTraits(
+                    name=t.store, level=spec.level, kind=None, credit=False, evicts=False
+                )
                 receives = False
                 continue
             below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
-            demotes = (
-                t.demotion == "back" and below is not None and TIERS[below.store].local
-            )
+            demotes = t.demotion == "back" and below is not None
             fallback = i > 0 and t.credit_fallback
             out[t.store] = TierTraits(
                 name=t.store,

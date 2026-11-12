@@ -5,7 +5,8 @@
 Copies run on the engine's own thread, outside every metadata lock, paced to
 a bandwidth budget. A batch is answered once every copy in it has ended, one
 result per copy; after stop() what has not started fails. Pages of an L2
-tier (SSD) move by that tier's own I/O, to and from the mapped pools.
+tier move by that tier's own I/O, to and from the mapped pools: its own
+pools (SSD), or those another node owns (remote).
 """
 
 import collections
@@ -24,7 +25,7 @@ from .drivers.io_executor import WRITE_AFTER_READS as WRITE_AFTER_READS
 from .drivers.io_executor import WRITE_MAX_WAIT_S as WRITE_MAX_WAIT_S
 from .drivers.io_executor import IOQueueFullError as IOQueueFullError
 from .page_table import PageRef
-from .tiers import Exporter, IOResult, L2Tier, Span
+from .tiers import Exporter, IOResult, L2Tier, RemoteTier, Span
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ class TransferEngine:
         self._maps: dict[str, mmap.mmap] = {}
         # L2 pools: only their tier moves their pages
         self._l2: dict[str, L2Tier] = {}
+        # Every L2 tier, in the order added, pools or not
+        self._l2_tiers: list[L2Tier] = []
         # Mappings a tier could not detach: never closed
         self._kept: dict[str, mmap.mmap] = {}
         # NIC registrations of mapped pools: ended before they are unmapped
@@ -76,8 +79,10 @@ class TransferEngine:
                 tier.attach(pool_id, mapping)
 
     def add_l2(self, tier: L2Tier) -> None:
-        """An L2 tier's pools; stop() drains it, its owner closes it after."""
+        """An L2 tier (and its pools): it gets every mapping; stop() drains
+        it, its owner closes it after."""
         with self._lock:
+            self._l2_tiers.append(tier)
             for info in tier.pool_infos():
                 self._l2[info.pool_id] = tier
             for pool_id, mapping in self._maps.items():
@@ -107,7 +112,31 @@ class TransferEngine:
 
     def _tiers(self) -> list[L2Tier]:
         """Caller holds the lock: each L2 tier once, in the order added."""
-        return list({id(t): t for t in self._l2.values()}.values())
+        return list(self._l2_tiers)
+
+    def owner_tier(self, pool_id: str) -> RemoteTier | None:
+        """The remote tier that reaches another node's pool, if one does."""
+        with self._lock:
+            tiers = [t for t in self._l2_tiers if isinstance(t, RemoteTier)]
+        for tier in tiers:
+            if tier.owner(pool_id) is not None:
+                return tier
+        return None
+
+    def _io_tier(self, copy: Copy) -> tuple[L2Tier | None, bool]:
+        """The tier that moves ``copy`` and whether it writes to the tier.
+        Caller holds the lock."""
+        if copy.dst.pool_id in self._l2:
+            return self._l2[copy.dst.pool_id], True
+        if copy.src.pool_id in self._l2:
+            return self._l2[copy.src.pool_id], False
+        for tier in self._l2_tiers:
+            if isinstance(tier, RemoteTier):
+                if tier.owner(copy.dst.pool_id) is not None:
+                    return tier, True
+                if tier.owner(copy.src.pool_id) is not None:
+                    return tier, False
+        return None, False
 
     def submit_io(
         self,
@@ -117,18 +146,19 @@ class TransferEngine:
         *,
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
+        settled: Callable[[IOResult], None] | None = None,
     ) -> IOResult:
-        """Move ``copy`` between a mapped page and an L2 pool page through
-        its tier: a store when ``copy.dst`` is in the L2 pool, else a load.
-        ``src`` and ``dst`` are the pages; the caller holds their I/O
-        references until ``callback``. ``deadline`` (monotonic) bounds the
-        I/O. ``ok`` only once all bytes moved (``late`` if past the
+        """Move ``copy`` between a mapped page and an L2 page through its
+        tier: a store when ``copy.dst`` is the tier's, else a load. ``src``
+        and ``dst`` are the pages (None for another node's); the caller
+        holds their I/O references until ``callback``, or until
+        ``settled`` when the tier kept them. ``deadline`` (monotonic) bounds
+        the I/O. ``ok`` only once all bytes moved (``late`` if past the
         deadline). Raises if not accepted (e.g. IOQueueFullError, or
         RuntimeError once drained)."""
         n = copy.nbytes
         with self._lock:
-            write = copy.dst.pool_id in self._l2
-            tier = self._l2.get(copy.dst.pool_id if write else copy.src.pool_id)
+            tier, write = self._io_tier(copy)
             mapping = self._maps.get(copy.src.pool_id if write else copy.dst.pool_id)
         offset = (copy.src if write else copy.dst).offset
         if (
@@ -140,14 +170,16 @@ class TransferEngine:
         ):
             raise ValueError(f"no file I/O for {copy}")
         refs = (src, dst)
+        # A tier that never keeps pages need not take ``settled``
+        extra = {} if settled is None else {"settled": settled}
         if write:
             span = Span(copy.src.pool_id, offset, n)
             return tier.submit_store(
-                span, copy.dst, refs=refs, callback=callback, deadline=deadline
+                span, copy.dst, refs=refs, callback=callback, deadline=deadline, **extra
             )
         span = Span(copy.dst.pool_id, offset, n)
         return tier.submit_load(
-            copy.src, span, refs=refs, callback=callback, deadline=deadline
+            copy.src, span, refs=refs, callback=callback, deadline=deadline, **extra
         )
 
     def start(self) -> None:
@@ -188,7 +220,7 @@ class TransferEngine:
         self.stop()
         with self._lock:
             maps, self._maps = self._maps, {}
-            tiers, self._l2 = self._tiers(), {}
+            tiers, self._l2, self._l2_tiers = self._tiers(), {}, []
             exports, self._exports = self._exports, {}
         for pool_id, mapping in maps.items():
             try:

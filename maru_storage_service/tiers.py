@@ -27,6 +27,8 @@ from maru_common.storage_types import (
 from .page_table import PageRef
 
 if TYPE_CHECKING:
+    from maru_remote.transport import NixlTransport
+
     from .drivers.cxl import CxlRegionPool, RegionSource
 
 
@@ -95,10 +97,12 @@ class TierEnv:
     later_run: bool  # an earlier run of this process may still map its memory
     on_lost: Callable[[str], None]  # a leased tier must let go (its thread)
     renew_s: float
-    # Test injection: the RM (else a client at the tier's rm) and the
-    # node's own mapping of a region
+    # Test injection: the RM (else a client at the tier's rm), the
+    # node's own mapping of a region, and the NIXL transport of a run
+    # (agent name, UCX device)
     region_source: "RegionSource | None" = None
     map_region: "Callable[[CxlRegionPool], mmap.mmap] | None" = None
+    make_transport: "Callable[[str, str], NixlTransport] | None" = None
 
 
 class Tier(ABC):
@@ -222,7 +226,9 @@ class L2Tier(Tier):
     thread, or on the caller's in drain or a queued cancel, never under the
     tier's own locks, and only once the medium no longer touches the memory
     or the tier took the pages over (``kept``). The caller holds the pages'
-    I/O references until it runs; ``refs`` has None for another node's page."""
+    I/O references until it runs; ``refs`` has None for another node's page.
+    ``settled`` runs if a kept transfer ends DONE after all (then the local
+    pages are free to go); never for a tier that does not keep pages."""
 
     level = Level.L2
 
@@ -247,6 +253,7 @@ class L2Tier(Tier):
         refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
+        settled: Callable[[IOResult], None] | None = None,
     ) -> IOResult:
         """Write ``src`` to the start of the tier page ``dst``."""
 
@@ -259,6 +266,7 @@ class L2Tier(Tier):
         refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
+        settled: Callable[[IOResult], None] | None = None,
     ) -> IOResult:
         """Read the start of the tier page ``src`` into ``dst``."""
 
@@ -284,12 +292,22 @@ class RemoteTier(L2Tier):
     frees its own pages; this node only moves bytes."""
 
     name = "remote"
+    # Writes a demotion keeps in flight at a time
+    io_depth = 8
 
     def pool_infos(self) -> list[PoolInfo]:
         return []  # no pool of this node
 
     def io_size(self, nbytes: int) -> int:
         return 0  # page to page, no bounce
+
+    @abstractmethod
+    def capabilities(self) -> list[str]:
+        """What it needs MaruServer to accept for the run (NODE_OPEN)."""
+
+    @abstractmethod
+    def opened(self, server_epoch: str, accepted: list[str]) -> None:
+        """The run is open with the capabilities MaruServer accepted."""
 
     @abstractmethod
     def ready(self, node_id: str) -> bool:

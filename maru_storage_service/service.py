@@ -46,6 +46,7 @@ from maru_common.storage_types import (
     PoolInfo,
     run_holder,
 )
+from maru_remote.transport import NixlTransport
 
 from .config import NodeConfig, NodeConfigError, TierConfig
 from .config_fields import NotServableError as NotServableError
@@ -73,7 +74,7 @@ from .storage_manager import (
     DEFAULT_GPU_DRAIN_GRACE_S,
     StorageManager,
 )
-from .tiers import L1Pool, L1Tier, L2Tier, Leased, Level, Tier, TierEnv
+from .tiers import L1Pool, L1Tier, L2Tier, Leased, Level, RemoteTier, Tier, TierEnv
 from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger(__name__)
@@ -181,11 +182,13 @@ class StorageService:
         transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
         remote_parts: Callable[["StorageService"], RemoteParts] = make_remote_parts,
+        make_transport: Callable[[str, str], NixlTransport] | None = None,
     ):
         """``transfer_bytes_per_s``: the demotion copy budget.
         ``map_region``: maps a CXL region for those copies (NODE_HOLD and the
         device by default). ``remote_parts``: a memory node run's exporter
-        and RemoteServer."""
+        and RemoteServer. ``make_transport``: the remote tier's NIXL
+        transport (tests)."""
         check_servable(config)
         self.config = config
         self.node_epoch = node_epoch or uuid.uuid4().hex
@@ -223,6 +226,7 @@ class StorageService:
         self.local: LocalServer | None = None
         self.memory = config.role == "memory"
         self.make_remote_parts = remote_parts
+        self.make_transport = make_transport
         self.remote: RemoteParts | None = None
         # The ops the RemoteServer serves: the run's PeerOps, once made
         self.remote_ops = RunOps()
@@ -240,7 +244,12 @@ class StorageService:
 
     def capabilities(self) -> list[str]:
         """What the node asks MaruServer to accept for its run."""
-        return [MEMORY_CAPABILITY] if self.memory else []
+        if self.memory:
+            return [MEMORY_CAPABILITY]
+        return [c for t in self._remote_tiers() for c in t.capabilities()]
+
+    def _remote_tiers(self) -> list[RemoteTier]:
+        return [t for t in self._tiers.values() if isinstance(t, RemoteTier)]
 
     def _leases(self) -> list[Leased]:
         """The run's leased tiers; a tier's thread may ask during the start."""
@@ -272,6 +281,7 @@ class StorageService:
             renew_s=self.cxl_renew_s,
             region_source=self.region_source,
             map_region=self.map_region,
+            make_transport=self.make_transport,
         )
 
     def _make(self, tier: TierConfig) -> Tier:
@@ -371,7 +381,11 @@ class StorageService:
         # In the order they started: the order pools are announced and logged
         tiers = self._tiers
         traits = config.traits()
-        if self.memory or any(t.demotes_to is not None for t in traits.values()):
+        if (
+            self.memory
+            or any(t.demotes_to is not None for t in traits.values())
+            or any(isinstance(t, L2Tier) for t in tiers.values())
+        ):
             self.transfers = TransferEngine(self.transfer_bytes_per_s)
             self._map_for_transfers(self.transfers)
             if self.memory:
@@ -416,13 +430,15 @@ class StorageService:
             on_end=lambda reason: self._end_run(
                 reason, CloseMode.RESTART, new_run=True
             ),
+            remote={t.name: t for t in self._remote_tiers()},
         )
         l2 = [t for t in tiers.values() if isinstance(t, L2Tier)]
         if l2 and not self.memory:
-            # Workers fetch L2 pages into the top tier
+            # Workers fetch local SSD and remote memory pages into the top tier
+            assert self.transfers is not None
             self.manager.fetches = FetchManager(
                 self.manager,
-                sources=self.transfers.l2_pools() if self.transfers is not None else {},
+                sources=self.transfers.l2_pools(),
                 node_id=config.node_id,
                 page_size=config.page_size,
                 tier=top.store,
@@ -441,11 +457,13 @@ class StorageService:
         )
         self._check_stopped()
         refused = set(self.capabilities()) - set(opened.capabilities)
-        if refused:
+        if refused and self.memory:
             raise CapabilityRefusedError(
                 f"MaruServer {config.server} does not accept {sorted(refused)}: "
                 f"it cannot serve a {config.role} node"
             )
+        for remote in self._remote_tiers():
+            remote.opened(opened.server_epoch, opened.capabilities)
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
@@ -780,13 +798,13 @@ class StorageService:
         # may open it
         for tier in tiers:
             tier.close()
+        if kept and (self.remote is not None or self._remote_tiers()):
+            # RDMA may still reach them: no new run in this process
+            raise RuntimeError(
+                f"pools {sorted(kept)} stay registered with the NIC: the process "
+                "must exit"
+            )
         if self.remote is not None:
-            if kept:
-                # Peers' RDMA may still reach them: no new run in this process
-                raise RuntimeError(
-                    f"pools {sorted(kept)} stay registered with the NIC: the "
-                    "process must exit"
-                )
             self.remote.close()  # the NIXL agent ends with its connections
 
     def _unmap_leased(

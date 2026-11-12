@@ -12,6 +12,7 @@ StorageService starts a new one.
 
 import collections
 import dataclasses
+import functools
 import logging
 import threading
 import time
@@ -33,6 +34,7 @@ from maru_common.node_protocol import (
     WriteDoneResponse,
 )
 from maru_common.protocol import CommitItem, MoveItem, NodeHeartbeatResponse
+from maru_common.remote_protocol import TransferEnd, Written
 from maru_common.serializer import DecodedRequest, op_digest
 from maru_common.storage_types import (
     MAX_BATCH,
@@ -65,7 +67,7 @@ from .ports import (
     ServerStopped,
     WorkerEndpoint,
 )
-from .tiers import IOResult, Level
+from .tiers import IOResult, Level, RemoteTier
 from .transfer_engine import Copy, TransferEngine
 from .worker_registry import WorkerRecord, WorkerRegistry
 
@@ -124,6 +126,19 @@ class _Move:
     existing: bool = False
 
 
+@dataclass(eq=False)
+class _RemoteMove:
+    """A READY page moving to a memory node (write-back demotion)."""
+
+    src: PageRef
+    key: Key
+    source: Location
+    credit: Location  # the credited page, whole
+    dest: Location  # what is committed there: the logical bytes
+    # The copy is READY there already: only FINALIZE_MOVE runs
+    existing: bool = False
+
+
 class StorageManager:
     def __init__(
         self,
@@ -141,8 +156,11 @@ class StorageManager:
         on_worker_settled: Callable[[str], None] = lambda incarnation: None,
         transfers: TransferEngine | None = None,
         on_end: Callable[[str], None] = lambda reason: None,
+        remote: dict[str, RemoteTier] | None = None,
     ):
-        """``on_end(reason)``: this run cannot go on (once, from any thread)."""
+        """``on_end(reason)``: this run cannot go on (once, from any thread).
+        ``remote``: the remote tiers by store name: demotions to them go to
+        memory nodes."""
         self.node_epoch = node_epoch
         # By tier name, in config order
         self.traits = traits or {
@@ -158,6 +176,7 @@ class StorageManager:
         self.placement = placement
         # Copies for demotion; without it a tier that demotes drops instead
         self.transfers = transfers
+        self.remote = dict(remote or {})
         self.local_pins = local_pins
         self.metadata = metadata
         self.evict_interval_s = evict_interval_s
@@ -210,6 +229,16 @@ class StorageManager:
         # the eviction thread to COMMIT or drop them
         self._writing = 0
         self._written: collections.deque[tuple[_Move, IOResult]] = collections.deque()
+        # The same for writes to memory nodes, and kept ones that ended DONE
+        # after all (settled)
+        self._remote_writing = 0
+        self._remote_written: collections.deque[tuple[_RemoteMove, IOResult]] = (
+            collections.deque()
+        )
+        self._remote_settled: collections.deque[_RemoteMove] = collections.deque()
+        # Source -> its READY copy on a memory node: the next demotion only
+        # finalizes onto it
+        self._remote_copies: dict[PageRef, Location] = {}
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
 
@@ -729,6 +758,7 @@ class StorageManager:
             try:
                 self._reclaim_retiring()
                 self._writes_ended()
+                self._remote_writes_ended()
                 if run:
                     self._retire_queued()
                     self._evict_once()
@@ -753,7 +783,9 @@ class StorageManager:
             traits = self.traits[name]
             with self._lock:
                 demand = self._demand.pop(name, 0)
-                prefer = set(self._copies) if demand else set()
+                prefer = (
+                    set(self._copies) | set(self._remote_copies) if demand else set()
+                )
             if not traits.evicts:
                 continue
             pools = self._evictable_pools(name)
@@ -857,6 +889,9 @@ class StorageManager:
         room wait for the tier below to evict (it ran first in this pass);
         while the tier (``pools``) is past its high watermark they are dropped
         instead: writes must not stall."""
+        if below in self.remote:
+            self._demote_remote(name, pools, self.remote[below], refs, items)
+            return
         moves: list[_Move] = []
         todo, drop = [], []
         io = self.traits[below].io_only
@@ -907,6 +942,283 @@ class StorageManager:
         finally:
             if drop:
                 self.retire([r for r, _ in drop], [i for _, i in drop])
+
+    # ------------------------------------------------- demotion to memory nodes
+
+    def _demote_remote(
+        self,
+        name: str,
+        pools: list[str],
+        tier: RemoteTier,
+        refs: list[PageRef],
+        items: list[KeyLocation],
+    ) -> None:
+        """Write-back to memory nodes: RESERVE pages there, WRITE, WRITE_DONE
+        (the memory node commits them), then FINALIZE_MOVE the sources with
+        no finalizer. A source with a copy there already is only finalized.
+        With no room there the pages wait, or past the high watermark are
+        dropped, as for a local tier."""
+        assert self.transfers is not None
+        moves: list[_RemoteMove] = []
+        todo: list[tuple[PageRef, KeyLocation]] = []
+        for ref, item in zip(refs, items, strict=True):
+            with self._lock:
+                copy = self._remote_copies.get(ref)
+            if copy is not None:
+                moves.append(
+                    _RemoteMove(ref, item.key, item.location, copy, copy, existing=True)
+                )
+            else:
+                todo.append((ref, item))
+        with self._lock:
+            slots = max(0, tier.io_depth - self._remote_writing)
+        self.placement.release([ref for ref, _ in todo[slots:]], backoff=False)
+        todo = todo[:slots]
+        credits = tier.reserve([item.key for _, item in todo]) if todo else []
+        rest, drop = [], []
+        for (ref, item), credit in zip(todo, credits, strict=True):
+            if credit is None:
+                rest.append((ref, item))
+                continue
+            dest = dataclasses.replace(credit, length=item.location.length)
+            moves.append(_RemoteMove(ref, item.key, item.location, credit, dest))
+        if rest:
+            capacity, free, _, _ = self._tier_usage(pools)
+            if self.placement.above_high(name, capacity=capacity, free_bytes=free):
+                logger.debug("no room below %s: dropping %d pages", name, len(rest))
+                with self._lock:
+                    self.move_results["DROPPED"] += len(rest)
+                drop += rest
+            else:
+                self.placement.release([ref for ref, _ in rest], backoff=False)
+        try:
+            fresh = [m for m in moves if not m.existing]
+            existing = [m for m in moves if m.existing]
+            if self._halted():  # nothing posted: the credits go back
+                tier.cancel([m.credit for m in fresh])
+                self.placement.release([m.src for m in moves], backoff=False)
+                return
+            for move in fresh:
+                self._write_remote(tier, move)
+            if existing:
+                self._finalize_remote(tier, existing)
+        finally:
+            if drop:
+                self.retire([r for r, _ in drop], [i for _, i in drop])
+
+    def _write_remote(self, tier: RemoteTier, move: _RemoteMove) -> None:
+        """Post the WRITE; the source keeps an I/O reference until it ends,
+        or, if the tier kept it, until it settles."""
+        assert self.transfers is not None
+        if not self.pools.io_acquire_one(move.src):  # the source went
+            tier.cancel([move.credit])
+            self.placement.release([move.src])
+            return
+        with self._lock:
+            self._remote_writing += 1
+        try:
+            self.transfers.submit_io(
+                Copy(move.source, move.dest, move.source.length),
+                move.src,
+                None,
+                callback=functools.partial(self._remote_write_ended, move),
+                settled=functools.partial(self._remote_write_settled, move),
+            )
+        except Exception as e:  # not posted: the credit goes back
+            with self._lock:
+                self._remote_writing -= 1
+                self.move_results["COPY_FAILED"] += 1
+            self.pools.io_release([move.src])
+            logger.debug("cannot write %s to a memory node: %s", move.src, e)
+            tier.cancel([move.credit])
+            self.placement.release([move.src])
+
+    def _remote_write_ended(self, move: _RemoteMove, result: IOResult) -> None:
+        """On the tier's thread: no RPC here."""
+        if not result.kept:
+            self.pools.io_release([move.src])
+        with self._lock:
+            self._remote_writing -= 1
+            self._remote_written.append((move, result))
+        self._evict_wake.set()
+
+    def _remote_write_settled(self, move: _RemoteMove, result: IOResult) -> None:
+        """A kept write ended DONE after all: its source is free to go."""
+        self.pools.io_release([move.src])
+        with self._lock:
+            self._remote_settled.append(move)
+        self._evict_wake.set()
+
+    def _remote_writes_ended(self) -> None:
+        """Tell the memory nodes how the writes ended; FINALIZE_MOVE the
+        sources of those they committed."""
+        with self._lock:
+            done = list(self._remote_written)
+            self._remote_written.clear()
+            settled = list(self._remote_settled)
+            self._remote_settled.clear()
+        if not (done or settled) or not self.remote:
+            return
+        tier = next(iter(self.remote.values()))
+        ok = [m for m, r in done if r.ok]
+        failed = [m for m, r in done if not r.ok]
+        for move in failed:  # the source stays; the memory node quarantines
+            with self._lock:
+                self.move_results["COPY_FAILED"] += 1
+            self.placement.release([move.src])
+        self._remote_write_done(tier, failed, TransferEnd.UNKNOWN)
+        # A late DONE commits there: the next demotion finalizes onto it
+        for move, outcome in zip(
+            settled,
+            self._remote_write_done(tier, settled, TransferEnd.DONE) or [],
+            strict=False,
+        ):
+            self._note_remote_copy(move, outcome)
+        if not ok:
+            return
+        outcomes = self._remote_write_done(tier, ok, TransferEnd.DONE)
+        if outcomes is None:  # unknown: the sources stay
+            self.placement.release([m.src for m in ok])
+            return
+        finals: list[_RemoteMove] = []
+        for move, outcome in zip(ok, outcomes, strict=True):
+            with self._lock:
+                self.move_results[f"COMMIT:{outcome.result.value}"] += 1
+            if outcome.result == ItemResult.ADDED:
+                finals.append(move)
+            elif (
+                outcome.result == ItemResult.DUPLICATE and outcome.location is not None
+            ):
+                finals.append(
+                    dataclasses.replace(move, dest=outcome.location, existing=True)
+                )
+            else:
+                self.placement.release([move.src])
+        if finals and not self._halted():
+            self._finalize_remote(tier, finals)
+        elif finals:
+            self.placement.release([m.src for m in finals])
+
+    def _remote_write_done(
+        self, tier: RemoteTier, moves: list[_RemoteMove], end: TransferEnd
+    ) -> list[ItemOutcome] | None:
+        """WRITE_DONE of ``moves`` ending ``end``; None if the answer is not
+        known (the tier sends it again)."""
+        if not moves:
+            return []
+        try:
+            return tier.write_done(
+                [Written(m.key, m.credit, m.source.length, end) for m in moves]
+            )
+        except Exception as e:
+            with self._lock:
+                self.move_results["COMMIT:UNKNOWN"] += len(moves)
+            logger.warning("WRITE_DONE of %d pages: answer unknown (%s)", len(moves), e)
+            return None
+
+    def note_remote_copy(self, ref: PageRef, key: Key, location: Location) -> None:
+        """``ref`` holds ``key`` as ``location`` on a memory node does: its
+        demotion only finalizes onto that copy."""
+        if self._is_ready(ref, key):
+            with self._lock:
+                self._remote_copies[ref] = location
+
+    def _note_remote_copy(self, move: _RemoteMove, outcome: ItemOutcome) -> None:
+        if outcome.result == ItemResult.ADDED:
+            location = move.dest
+        elif outcome.result == ItemResult.DUPLICATE and outcome.location is not None:
+            location = outcome.location
+        else:
+            return
+        if self._is_ready(move.src, move.key):
+            with self._lock:
+                self._remote_copies[move.src] = location
+
+    def _finalize_remote(self, tier: RemoteTier, moves: list[_RemoteMove]) -> None:
+        """Remove the sources onto their copies on memory nodes (no
+        finalizer: MaruServer checks the exact copy under its lock)."""
+        live = [m for m in moves if self._is_ready(m.src, m.key)]
+        if not live:
+            return
+        self.local_pins.block([m.src for m in live])
+        try:
+            response = self.metadata.finalize_move(
+                [
+                    MoveItem(key=m.key, source=m.source, dest=m.dest, finalizer_id="")
+                    for m in live
+                ]
+            )
+        except ServerStopped:
+            self.placement.release([m.src for m in live])
+            raise
+        except EpochChanged as e:
+            self._move_unknown(live, f"MaruServer no longer knows the session ({e})")
+            return
+        except Exception as e:
+            if not isinstance(e, ReplyError):
+                logger.exception("FINALIZE_MOVE to memory nodes failed")
+            self._move_unknown(live, f"FINALIZE_MOVE: result unknown ({e})")
+            return
+        if response.status != Status.OK:
+            # Not run, and no finalizer is left: the sources stay
+            logger.error(
+                "FINALIZE_MOVE to memory nodes refused as a whole: %s %s",
+                response.status,
+                response.error,
+            )
+            self._retire_failed([m.src for m in live])
+            return
+        for move, outcome in zip(live, response.items, strict=True):
+            try:
+                self._apply_remote_move(tier, move, outcome)
+            except Exception:
+                logger.exception(
+                    "applying the FINALIZE_MOVE result of %s failed", move.src
+                )
+                self._hold([move.src])
+
+    def _apply_remote_move(
+        self, tier: RemoteTier, move: _RemoteMove, outcome: ItemOutcome
+    ) -> None:
+        result, cause = outcome.result, outcome.cause
+        if result == ItemResult.REJECTED:
+            # The copy is gone (or not of this key): the source stays, and a
+            # later demotion finds the key's copy again
+            with self._lock:
+                self.move_results["REJECTED"] += 1
+                self._remote_copies.pop(move.src, None)
+            if self._is_ready(move.src, move.key):
+                self._retire_failed([move.src])
+            return
+        if result not in (ItemResult.RETIRED, ItemResult.KEPT):
+            self._move_unknown([move], f"FINALIZE_MOVE of {move.src} answered {result}")
+            return
+        if (
+            result == ItemResult.KEPT
+            and cause == KeptCause.INVALID
+            and outcome.location is not None
+            and outcome.location.pool_id == move.dest.pool_id
+        ):
+            # The memory node's pool is no longer valid: the source stays
+            with self._lock:
+                self.move_results["KEPT:INVALID"] += 1
+                self._remote_copies.pop(move.src, None)
+            self._retire_failed([move.src])
+            return
+        if not self._is_ready(move.src, move.key):
+            return  # the source went meanwhile
+        foreign = (
+            result == ItemResult.KEPT
+            and cause == KeptCause.MOVED
+            and outcome.key != move.key
+        )
+        if foreign:
+            # The source held another key: its copy there is not this key's
+            tier.drop(move.key, move.dest)
+        elif result == ItemResult.KEPT:
+            with self._lock:
+                self._remote_copies[move.src] = move.dest
+        self._apply_retire(move.src, outcome, self.move_results)
 
     def _copy_of(self, ref: PageRef, key: Key) -> tuple[PageRef, Location] | None:
         """The source's READY copy below and its location, if it has one."""
@@ -1280,7 +1592,9 @@ class StorageManager:
         self._apply_retire(move.src, outcome, self.move_results)
         return foreign
 
-    def _move_unknown(self, moves: list[_Move], reason: str) -> None:
+    def _move_unknown(
+        self, moves: list[_Move] | list[_RemoteMove], reason: str
+    ) -> None:
         """No usable FINALIZE_MOVE result: both pages stay as they are, the
         sources' local pins stay blocked, and the run ends."""
         with self._lock:
@@ -1448,6 +1762,7 @@ class StorageManager:
             self._retire_queue.pop(ref, None)
             self._central.discard(ref)
             self._copies.pop(ref, None)
+            self._remote_copies.pop(ref, None)
 
     def _reclaim_retiring(self) -> None:
         with self._lock:

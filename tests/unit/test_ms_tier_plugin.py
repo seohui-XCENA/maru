@@ -49,6 +49,7 @@ class FakeResult:
     late: bool = False
     cancelled: bool = False
     error: Exception | None = None
+    kept: bool = False
     done: threading.Event = field(default_factory=threading.Event)
 
 

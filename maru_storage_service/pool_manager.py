@@ -720,7 +720,27 @@ class PoolManager:
             table, page = self._page(ref, PageState.TRANSFER)
             self._to_free(table, page, PageState.TRANSFER)
 
+    def quarantine_transfer(self, ref: PageRef, tag: str) -> None:
+        """TRANSFER -> QUARANTINED after the tier takes over its I/O."""
+        with self._lock:
+            table, page = self._page(ref, PageState.TRANSFER)
+            if self._io.get((ref.pool_id, ref.index)):
+                raise InvalidTransitionError(f"page {page.index} has I/O running")
+            table.quarantine(page, PageState.TRANSFER, tag)
+
     # -------------------------------------------------------- I/O references
+
+    def io_acquire_transfer(self, ref: PageRef) -> bool:
+        """An I/O reference on a TRANSFER destination at its generation."""
+        with self._lock:
+            table = self._tables.get(ref.pool_id)
+            if table is None or not 0 <= ref.index < len(table.pages):
+                return False
+            page = table.pages[ref.index]
+            if page.generation != ref.generation or page.state != PageState.TRANSFER:
+                return False
+            self._io[(ref.pool_id, ref.index)] += 1
+            return True
 
     def io_acquire(self, src: PageRef, dst: PageRef) -> bool:
         """An I/O reference on both pages of a transfer, if ``src`` is READY
@@ -735,6 +755,19 @@ class PoolManager:
                     return False
             for ref in (src, dst):
                 self._io[(ref.pool_id, ref.index)] += 1
+            return True
+
+    def io_acquire_one(self, ref: PageRef) -> bool:
+        """An I/O reference on a READY page at its generation (a transfer
+        whose other end is another node's page); False if it is not."""
+        with self._lock:
+            table = self._tables.get(ref.pool_id)
+            if table is None or not 0 <= ref.index < len(table.pages):
+                return False
+            page = table.pages[ref.index]
+            if page.generation != ref.generation or page.state != PageState.READY:
+                return False
+            self._io[(ref.pool_id, ref.index)] += 1
             return True
 
     def io_release(self, refs: Sequence[PageRef]) -> None:

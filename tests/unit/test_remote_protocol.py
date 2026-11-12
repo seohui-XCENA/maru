@@ -421,13 +421,23 @@ class _Remote(RemoteTier):
     def detach(self, pool_id):
         pass
 
-    def submit_store(self, src, dst, *, refs, callback=None, deadline=None):
+    def submit_store(
+        self, src, dst, *, refs, callback=None, deadline=None, settled=None
+    ):
         raise NotImplementedError
 
-    def submit_load(self, src, dst, *, refs, callback=None, deadline=None):
+    def submit_load(
+        self, src, dst, *, refs, callback=None, deadline=None, settled=None
+    ):
         raise NotImplementedError
 
     def drain(self):
+        pass
+
+    def capabilities(self):
+        return []
+
+    def opened(self, server_epoch, accepted):
         pass
 
     def ready(self, node_id):
@@ -466,9 +476,10 @@ class TestInterfaces:
         staged = Staged("mem1", "e1", 3, _location())
         assert dataclasses.replace(staged) == staged
 
-    def test_remote_tier_is_parsed_not_served(self):
+    def test_remote_tier_is_served_last_on_gpu_nodes(self):
         assert peer.SPEC.store == RemoteTier.name
-        assert peer.SPEC.make is None and not peer.SPEC.served
+        assert peer.SPEC.served and peer.SPEC.last_only and peer.SPEC.gpu_only
+        assert not peer.SPEC.local and peer.SPEC.kind is None
 
     def test_exporter_stub(self):
         log: list[str] = []

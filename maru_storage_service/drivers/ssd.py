@@ -514,6 +514,7 @@ class SsdTier(L2Tier):
         refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
+        settled: Callable[[IOResult], None] | None = None,
     ) -> IOTicket:
         return self._submit(src, dst, True, refs, callback, deadline)
 
@@ -525,6 +526,7 @@ class SsdTier(L2Tier):
         refs: tuple[PageRef | None, PageRef | None],
         callback: Callable[[IOResult], None] | None = None,
         deadline: float | None = None,
+        settled: Callable[[IOResult], None] | None = None,
     ) -> IOTicket:
         return self._submit(dst, src, False, refs, callback, deadline)
 

@@ -369,6 +369,11 @@ class FakeNixlAgent:
         ]
 
     def check_xfer_state(self, handle) -> str:
+        """A transfer still in progress whose peer agent ended raises
+        NIXL_ERR_REMOTE_DISCONNECT from then on, as NIXL does; it never ends
+        on its own."""
+        if handle[3] == "PROC" and handle[6].closed:
+            raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
         return handle[3]
 
     def release_xfer_handle(self, handle) -> None:

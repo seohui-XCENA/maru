@@ -94,9 +94,12 @@ def make_remote_parts(service: StorageService) -> RemoteParts:
     rs = config.remote_server
     assert rs is not None  # parsing requires it on a memory node
     key = load_key(rs.key_file)
-    require_checked_transport(os.environ)
     name = agent_name(config.node_id, service.node_epoch)
-    transport = NixlTransport(name, ucx_device=rs.rdma_device)
+    if service.make_transport is not None:
+        transport = service.make_transport(name, rs.rdma_device)
+    else:
+        require_checked_transport(os.environ)
+        transport = NixlTransport(name, ucx_device=rs.rdma_device)
     progress = ConnectProgress(transport)
     server = TcpRemoteServer(
         rs.listen,

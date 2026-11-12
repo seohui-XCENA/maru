@@ -33,6 +33,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _POLL_SLEEP_S = 0.0002
+# What NIXL raises for a transfer whose peer's agent or registration ended
+REMOTE_DISCONNECT = "NIXL_ERR_REMOTE_DISCONNECT"
 
 
 def buffer_address(buf: Any) -> int:
@@ -138,8 +140,13 @@ class PendingTransfer:
             self.in_flight = False
             self.finished = self.finished or finished
 
-    def poll(self) -> bool:
+    def poll(self, release_disconnected: bool = False) -> bool:
         """Check whether the transfer has ended; release the handle if so.
+
+        Args:
+            release_disconnected: Take NIXL's remote-disconnect error as an
+                error end and release the handle (its pages stay with the
+                caller as for any error end).
 
         Returns:
             True only after a terminal state and NIXL handle release.
@@ -154,12 +161,16 @@ class PendingTransfer:
             try:
                 state = self._transport.check_state(self.handle)
             except Exception as exc:
-                logger.warning(
-                    "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
-                )
-                # Releasing an active NIXL handle can succeed while its RMA
-                # still touches memory. A failed query is no completion proof.
-                return False
+                if release_disconnected and REMOTE_DISCONNECT in str(exc):
+                    state = "ERR"
+                else:
+                    logger.warning(
+                        "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
+                    )
+                    # Releasing an active NIXL handle can succeed while its
+                    # RMA still touches memory. A failed query is no
+                    # completion proof.
+                    return False
             if state == "PROC":
                 return False
             if state == "DONE":
@@ -173,7 +184,7 @@ class PendingTransfer:
             )
             return self.finished
 
-    def poll_state(self) -> TransferState:
+    def poll_state(self, release_disconnected: bool = False) -> TransferState:
         """Poll once without blocking (see :meth:`poll`).
 
         Returns:
@@ -181,7 +192,7 @@ class PendingTransfer:
             ``ERR`` once the handle is released in any other terminal state;
             ``PENDING`` otherwise. Only ``DONE`` ends the transfer.
         """
-        if not self.poll():
+        if not self.poll(release_disconnected):
             return TransferState.PENDING
         return TransferState.DONE if self.completed else TransferState.ERR
 
