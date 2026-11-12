@@ -4,23 +4,281 @@
 
 Copies run on the engine's own thread, outside every metadata lock, paced to
 a bandwidth budget. A batch is answered once every copy in it has ended, one
-result per copy; after stop() what has not started fails. RDMA and SSD I/O
-are not implemented yet.
+result per copy; after stop() what has not started fails. Blocking I/O uses
+a separate bounded executor, with one slot kept available for reads.
 """
 
 import collections
+import ctypes
 import logging
 import mmap
+import os
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from maru_common.storage_types import Location
+
+from .page_table import PageRef
 
 logger = logging.getLogger(__name__)
 
 # Provisional: leaves most of a CXL device's bandwidth to the workers' reads
 DEFAULT_TRANSFER_BYTES_PER_S = 4 << 30
+DEFAULT_IO_QUEUE_SIZE = 64
+
+
+class IOQueueFullError(RuntimeError):
+    """The executor cannot accept another queued operation."""
+
+
+@dataclass
+class _IOState:
+    work: Callable[["IOTicket"], None] | None
+    callback: Callable[["IOTicket"], None] | None
+    resources: tuple[object, ...]
+    fd: int
+    mapping: mmap.mmap
+    buffer: memoryview
+    done: threading.Event = field(default_factory=threading.Event)
+    started: bool = False
+    finishing: bool = False
+    cancelled: bool = False
+    ok: bool = False
+    error: Exception | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class IOTicket:
+    """One run's exact pages and resources, retained through its callback.
+
+    ``buffer`` and the duplicated ``fd`` are valid until the callback returns.
+    A cancellation request does not make a running syscall complete. ``done``
+    is set only after work, callback and resource cleanup have ended.
+    """
+
+    run: str
+    src: PageRef
+    dst: PageRef
+    nbytes: int
+    write: bool
+    _owner: "IOExecutor" = field(repr=False)
+    _state: _IOState = field(repr=False)
+
+    @property
+    def fd(self) -> int:
+        return self._state.fd
+
+    @property
+    def buffer(self) -> memoryview:
+        return self._state.buffer
+
+    @property
+    def done(self) -> threading.Event:
+        return self._state.done
+
+    @property
+    def cancelled(self) -> bool:
+        return self._state.cancelled
+
+    @property
+    def ok(self) -> bool:
+        return self._state.ok
+
+    @property
+    def error(self) -> Exception | None:
+        return self._state.error
+
+
+class IOExecutor:
+    """Two I/O threads for a single run; drain permanently closes submission.
+
+    Work uses the ticket's fd and aligned bounce buffer. It must return only
+    after all syscalls end, and raise on incomplete I/O. The caller acquires
+    page I/O references before submit and releases them in the captured
+    callback, using the ticket's run and exact generations. No work or callback
+    runs under the executor lock. Callbacks must not call drain themselves.
+    """
+
+    def __init__(
+        self,
+        run: str,
+        *,
+        max_queue: int = DEFAULT_IO_QUEUE_SIZE,
+        bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
+    ):
+        if max_queue <= 0 or bytes_per_s <= 0:
+            raise ValueError("max_queue and bytes_per_s must be positive")
+        self._run = run
+        self._max_queue = max_queue
+        self._bytes_per_s = bytes_per_s
+        self._cv = threading.Condition()
+        self._reads: collections.deque[IOTicket] = collections.deque()
+        self._writes: collections.deque[IOTicket] = collections.deque()
+        self._live: set[IOTicket] = set()
+        self._threads: list[threading.Thread] = []
+        self._stopping = False
+        self._writing = False
+        self._next_write_at = 0.0
+
+    def submit(
+        self,
+        src: PageRef,
+        dst: PageRef,
+        *,
+        fd: int,
+        nbytes: int,
+        write: bool,
+        work: Callable[[IOTicket], None],
+        callback: Callable[[IOTicket], None] | None = None,
+        alignment: int = mmap.PAGESIZE,
+        resources: tuple[object, ...] = (),
+    ) -> IOTicket:
+        """Accept without waiting for queue space; reject without taking refs.
+
+        ``nbytes`` is the driver's aligned I/O length. The bounce starts zeroed.
+        ``resources`` retains driver and page-reference owners until completion.
+        Threads and bounce buffers are allocated only for accepted work.
+        """
+        if nbytes <= 0 or alignment <= 0:
+            raise ValueError("nbytes and alignment must be positive")
+        with self._cv:
+            if self._stopping:
+                raise RuntimeError("I/O executor is drained")
+            if len(self._reads) + len(self._writes) >= self._max_queue:
+                raise IOQueueFullError("I/O submit queue is full")
+            owned_fd = os.dup(fd)
+            mapping = None
+            buffer = None
+            try:
+                mapping = mmap.mmap(-1, nbytes + alignment - 1)
+                address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+                offset = -address % alignment
+                buffer = memoryview(mapping)[offset : offset + nbytes]
+                if not self._threads:
+                    try:
+                        for i in range(2):
+                            thread = threading.Thread(
+                                target=self._loop, name=f"maru-io-{i}", daemon=True
+                            )
+                            thread.start()
+                            self._threads.append(thread)
+                    except Exception:
+                        self._stopping = True
+                        self._cv.notify_all()
+                        raise
+            except Exception:
+                if buffer is not None:
+                    buffer.release()
+                if mapping is not None:
+                    mapping.close()
+                os.close(owned_fd)
+                raise
+            state = _IOState(
+                work, callback, tuple(resources), owned_fd, mapping, buffer
+            )
+            ticket = IOTicket(self._run, src, dst, nbytes, write, self, state)
+            self._live.add(ticket)
+            (self._writes if write else self._reads).append(ticket)
+            self._cv.notify_all()
+            return ticket
+
+    def cancel(self, ticket: IOTicket) -> bool:
+        """True if queued work was stopped; running work still needs draining."""
+        if ticket._owner is not self:
+            raise ValueError("ticket belongs to another executor")
+        with self._cv:
+            if ticket.done.is_set() or ticket._state.finishing:
+                return False
+            ticket._state.cancelled = True
+            if ticket._state.started:
+                return False
+            queue = self._writes if ticket.write else self._reads
+            if ticket not in queue:
+                return False
+            queue.remove(ticket)
+            self._cv.notify_all()
+        self._finish(ticket)
+        return True
+
+    def drain(self) -> None:
+        """Stop submission, cancel queued work, and join work and callbacks."""
+        if threading.current_thread() in self._threads:
+            raise RuntimeError("cannot drain from an I/O worker")
+        with self._cv:
+            self._stopping = True
+            queued = list(self._reads) + list(self._writes)
+            self._reads.clear()
+            self._writes.clear()
+            for ticket in queued:
+                ticket._state.cancelled = True
+            self._cv.notify_all()
+        for ticket in queued:
+            self._finish(ticket)
+        for thread in self._threads:
+            thread.join()
+        with self._cv:
+            self._cv.wait_for(lambda: not self._live)
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while True:
+                    if self._stopping:
+                        return
+                    delay = self._next_write_at - time.monotonic()
+                    if self._reads:
+                        ticket = self._reads.popleft()
+                        break
+                    if self._writes and not self._writing and delay <= 0:
+                        ticket = self._writes.popleft()
+                        self._writing = True
+                        self._next_write_at = (
+                            time.monotonic() + ticket.nbytes / self._bytes_per_s
+                        )
+                        break
+                    timeout = delay if self._writes and not self._writing else None
+                    self._cv.wait(timeout)
+                ticket._state.started = True
+            try:
+                assert ticket._state.work is not None
+                ticket._state.work(ticket)
+            except Exception as e:
+                ticket._state.error = e
+            self._finish(ticket)
+            with self._cv:
+                if ticket.write:
+                    self._writing = False
+                self._cv.notify_all()
+
+    def _finish(self, ticket: IOTicket) -> None:
+        state = ticket._state
+        with self._cv:
+            state.finishing = True
+            state.ok = state.started and not state.cancelled and state.error is None
+        try:
+            if state.callback is not None:
+                state.callback(ticket)
+        except Exception:
+            logger.exception("I/O completion failed for run %s: %s", ticket.run, ticket)
+        finally:
+            state.work = state.callback = None
+            try:
+                try:
+                    os.close(state.fd)
+                finally:
+                    state.fd = -1
+                    state.buffer.release()
+                    state.mapping.close()
+            except Exception:
+                logger.exception("I/O resource cleanup failed for run %s", ticket.run)
+            finally:
+                state.resources = ()
+                with self._cv:
+                    state.done.set()
+                    self._live.remove(ticket)
+                    self._cv.notify_all()
 
 
 @dataclass(frozen=True)
@@ -42,10 +300,17 @@ class _Batch:
 class TransferEngine:
     """Thread safe. The engine owns the mappings it is given and closes them."""
 
-    def __init__(self, bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S):
+    def __init__(
+        self,
+        bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
+        *,
+        run: str = "",
+        io_max_queue: int = DEFAULT_IO_QUEUE_SIZE,
+    ):
         if bytes_per_s <= 0:
             raise ValueError(f"bytes_per_s must be positive, got {bytes_per_s}")
         self.bytes_per_s = bytes_per_s
+        self.io = IOExecutor(run, max_queue=io_max_queue, bytes_per_s=bytes_per_s)
         # Held while a copy reads or writes a mapping
         self._lock = threading.Lock()
         self._maps: dict[str, mmap.mmap] = {}
@@ -91,6 +356,7 @@ class TransferEngine:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join()
+        self.io.drain()
 
     def close(self) -> None:
         """Stop, then unmap every pool."""
