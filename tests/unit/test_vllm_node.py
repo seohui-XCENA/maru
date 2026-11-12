@@ -159,6 +159,29 @@ def workers(node):
 
 
 def store(worker, kv, start: int = 0) -> None:
+    """``prefill`` once the worker has credit; fails if a store was skipped."""
+    client = worker._handler._cpu
+    if client._writes:
+        wait_credit(worker)
+    before = skipped_stores(client)
+    prefill(worker, kv, start)
+    assert skipped_stores(client) == before
+
+
+def wait_credit(worker) -> None:
+    """Credit comes from the refill thread after connect; a store without it
+    is skipped."""
+    client = worker._handler._cpu
+    low = client.attach_info.budgets.credit_refill_low
+    wait_until(lambda: client.credits.unused_bytes >= low, what="credit")
+
+
+def skipped_stores(client) -> dict[str, int]:
+    counters = client.local_stats()["counters"]
+    return {name: n for name, n in counters.items() if name.startswith("store_")}
+
+
+def prefill(worker, kv, start: int = 0) -> None:
     """One prefill step, then wait for its WRITE_DONE."""
     metadata = MaruConnectorMetadata(
         requests=[
@@ -596,6 +619,7 @@ def test_layerwise_objects_and_their_done_marker(fake, node, workers):
 def test_stores_behind_are_found_only_once_committed(fake, node, workers):
     """#143: a chunk is invisible to lookups until MaruServer commits it."""
     writer = workers()
+    wait_credit(writer)
     held = []
     store_async = writer._handler.store_async
 
@@ -655,6 +679,7 @@ def test_several_groups_on_a_node(fake, node):
     target = torch.zeros_like(_shared())
     reader = group_worker(target)
     try:
+        wait_credit(writer)
         tokens = list(range(40))
         writer.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
         drain(writer)
@@ -1035,7 +1060,7 @@ def test_no_engine_step_waits_for_an_absent_node(fake):
     try:
         for _ in range(3):
             t0 = time.monotonic()
-            store(worker, kv)
+            prefill(worker, kv)
             load_into(worker, [torch.zeros_like(layer) for layer in kv], None)
             assert time.monotonic() - t0 < 0.5
             assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
@@ -1101,7 +1126,7 @@ def test_a_refusal_stops_startup_but_only_disables_a_running_worker(fake, node, 
             wait_until(lambda: worker._ensure_handler() or worker._node_refused)
         assert "serves without the cache" in caplog.text
         kv = rank_kv(1, 2)
-        store(worker, kv)  # skipped, no exception
+        prefill(worker, kv)  # skipped, no exception
         load_into(worker, [torch.zeros_like(layer) for layer in kv], None)
         assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
         assert fake.keys() == set()
@@ -1232,6 +1257,7 @@ def test_an_unfinished_layerwise_chunk_is_dropped_at_the_step_boundary(
     fake, node, workers
 ):
     writer = workers(maru_use_layerwise=True)
+    wait_credit(writer)
     client = writer._handler._cpu
     kv = rank_kv(1, 2)
     metadata = MaruConnectorMetadata(requests=[store_meta("r1", 0)])
@@ -1301,6 +1327,7 @@ def test_a_request_joining_after_the_copy_waits_for_the_commit():
 def test_shutdown_waits_a_bounded_time_for_maruserver(fake, node, workers, monkeypatch):
     monkeypatch.setattr(connector_module, "_NODE_STORE_DRAIN_S", 0.5)
     writer = workers()
+    wait_credit(writer)
     kv = rank_kv(1, 2)
     fake.pause(hold=True)
     try:
@@ -1982,6 +2009,7 @@ def test_shutdown_waits_for_the_markers_of_chunks_in_flight(fake, nodes_small):
 
 def test_shutdown_gives_back_the_pages_of_unfinished_chunks(fake, node, workers):
     writer = workers(maru_use_layerwise=True)
+    wait_credit(writer)
     incarnation = writer._handler._cpu.identity.incarnation
     metadata = MaruConnectorMetadata(requests=[store_meta("r1", 0)])
     attn = make_flash_attn_metadata()
