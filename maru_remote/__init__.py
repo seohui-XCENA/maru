@@ -8,6 +8,10 @@ asks it to (``map``), and deregisters it when the owner gives it back
 (``release``).
 
 Modules:
+    checked: UCX limits that make a deregistered range refuse late RDMA.
+    exporter: whole-pool NIC registration of a node run's L1 mappings.
+    progress: UCX progress of a NIXL agent that only exposes memory.
     region_map: Handler side of the remote CXL agent protocol.
-    transport: NIXL agent wrapper (registration, peers, batched READ/WRITE).
+    transport: NIXL agent wrapper (registration, peers, batched READ/WRITE,
+        blocking or posted).
 """

@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""UCX progress of the remote CXL agent's NIXL agent.
+"""UCX progress of a NIXL agent that posts no transfers.
 
-The NIXL agent runs without its progress thread, which would poll UCX
+The remote CXL agent and a memory node only expose memory: peers post every
+RDMA. Their NIXL agent runs without its progress thread, which would poll UCX
 without pause for the life of the process. RDMA reads and writes through a
-connection need no CPU here; UCX here has work when a worker connects (its
+connection need no CPU here; UCX here has work when a peer connects (its
 first transfer waits for this side to answer the connection setup) and when
-a worker checks its connection with a notification.
+a peer checks its connection with a notification.
 
-So UCX is driven while a worker connects. A map request names the worker's
-NIXL agent; the worker loads the reply and then announces itself with an
-empty notification over the new connection. From the map until that
-notification arrives, or :data:`CONNECT_WINDOW_S` passes, a thread drives
-UCX every :data:`POLL_INTERVAL_S`. While no worker connects, no thread runs.
-The service also drives UCX once on every hello, map and sweep, which drops
-the notifications workers send and completes a connection setup that
+So UCX is driven while a peer connects. A request names the peer's NIXL
+agent (a map, a hello); the peer loads the reply and then announces itself
+with an empty notification over the new connection. From that request until
+the notification arrives, or :data:`CONNECT_WINDOW_S` passes, a thread drives
+UCX every :data:`POLL_INTERVAL_S`. While no peer connects, no thread runs.
+The owner also drives UCX once on its other requests (:meth:`drain`), which
+drops the notifications peers send and completes a connection setup that
 outlasted its window.
 """
 
@@ -37,7 +38,7 @@ POLL_INTERVAL_S = 0.0002
 
 
 class ConnectProgress:
-    """Drives a NIXL transport's UCX while workers connect, and only then."""
+    """Drives a NIXL transport's UCX while peers connect, and only then."""
 
     def __init__(
         self,
@@ -50,8 +51,8 @@ class ConnectProgress:
         """Create an idle driver.
 
         Args:
-            transport: ``NixlTransport`` of the remote CXL agent.
-            window_s: How long to wait for a worker's announcement.
+            transport: ``NixlTransport`` that peers connect to.
+            window_s: How long to wait for a peer's announcement.
             poll_s: Pause between two progress calls while waiting.
             clock: Monotonic clock (tests inject one).
         """
@@ -59,7 +60,7 @@ class ConnectProgress:
         self._window_s = window_s
         self._poll_s = poll_s
         self._clock = clock
-        # NIXL agent name of a connecting worker -> end of its wait
+        # NIXL agent name of a connecting peer -> end of its wait
         self._expected: dict[str, float] = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -70,7 +71,7 @@ class ConnectProgress:
         """Drive UCX until ``name`` announces itself or the window ends.
 
         Args:
-            name: NIXL agent name the worker gave in its map request.
+            name: NIXL agent name the peer gave in its request.
         """
         with self._lock:
             if self._stop.is_set():

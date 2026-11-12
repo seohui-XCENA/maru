@@ -50,7 +50,7 @@ so a Handler learns the remote key of the regions it asked for and no other.
 
 The NIXL agent here has no progress thread. A map request names the worker's
 NIXL agent, and UCX is driven from the map until that agent announces itself
-over its connection (:class:`~maru_remote_cxl_agent.progress.ConnectProgress`);
+over its connection (:class:`~maru_remote.progress.ConnectProgress`);
 every hello, map and sweep also drives it once.
 
 Requests for different regions run concurrently; requests for one region
@@ -69,6 +69,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from maru_remote.progress import ConnectProgress
 from maru_remote.region_map import (
     DEFAULT_HINT_ACTIONS,
     HINT_ACTIONS,
@@ -79,8 +80,6 @@ from maru_remote.region_map import (
 )
 from maru_shm.client import HoldRefusedError
 from maru_shm.types import MaruHandle
-
-from .progress import ConnectProgress
 
 logger = logging.getLogger(__name__)
 

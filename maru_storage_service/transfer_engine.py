@@ -24,7 +24,7 @@ from .drivers.io_executor import WRITE_AFTER_READS as WRITE_AFTER_READS
 from .drivers.io_executor import WRITE_MAX_WAIT_S as WRITE_MAX_WAIT_S
 from .drivers.io_executor import IOQueueFullError as IOQueueFullError
 from .page_table import PageRef
-from .tiers import IOResult, L2Tier, Span
+from .tiers import Exporter, IOResult, L2Tier, Span
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,8 @@ class TransferEngine:
         self._l2: dict[str, L2Tier] = {}
         # Mappings a tier could not detach: never closed
         self._kept: dict[str, mmap.mmap] = {}
+        # NIC registrations of mapped pools: ended before they are unmapped
+        self._exports: dict[str, list[Exporter]] = {}
         self._cv = threading.Condition()
         self._queue: collections.deque[_Batch] = collections.deque()
         self._stopped = threading.Event()
@@ -80,6 +82,17 @@ class TransferEngine:
                 self._l2[info.pool_id] = tier
             for pool_id, mapping in self._maps.items():
                 tier.attach(pool_id, mapping)
+
+    def export(self, pool_id: str, exporter: Exporter) -> None:
+        """Register the pool's mapping with ``exporter`` until close(), which
+        deregisters it before unmapping. Raises, registering nothing, if the
+        pool is not mapped here or the exporter refuses it."""
+        with self._lock:
+            mapping = self._maps.get(pool_id)
+            if mapping is None:
+                raise KeyError(f"{pool_id} is not mapped for transfers")
+            exporter.attach(pool_id, mapping)
+            self._exports.setdefault(pool_id, []).append(exporter)
 
     def has_pool(self, pool_id: str) -> bool:
         """Whether transfers reach the pool: mapped here, or an L2 pool."""
@@ -168,15 +181,18 @@ class TransferEngine:
             tier.drain()
 
     def close(self) -> set[str]:
-        """Stop, then unmap every pool the L2 tiers detached (L2 pools stay
-        open). Returns the pools that stay mapped: a tier could not detach
-        them, so the engine keeps them."""
+        """Stop, then unmap every pool its exporters and the L2 tiers
+        detached (L2 pools stay open). Returns the pools that stay mapped: one
+        could not be detached, so the engine keeps it."""
         self.stop()
         with self._lock:
             maps, self._maps = self._maps, {}
             tiers, self._l2 = self._tiers(), {}
+            exports, self._exports = self._exports, {}
         for pool_id, mapping in maps.items():
             try:
+                for exporter in exports.get(pool_id, ()):
+                    exporter.detach(pool_id)
                 for tier in tiers:
                     tier.detach(pool_id)
             except Exception:

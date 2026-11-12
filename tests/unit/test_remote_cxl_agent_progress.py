@@ -9,8 +9,8 @@ import types
 import pytest
 
 from maru_remote import transport as transport_mod
+from maru_remote.progress import ConnectProgress
 from maru_remote.transport import NixlTransport
-from maru_remote_cxl_agent.progress import ConnectProgress
 from maru_remote_cxl_agent.server import MAX_NIXL_AGENT_NAME, handle_request
 from maru_remote_cxl_agent.service import RegionMapService
 from tests.unit.remote_fakes import (
@@ -30,9 +30,10 @@ def _fresh_agents():
 
 @pytest.fixture
 def agent_logs(caplog, monkeypatch):
-    # The package logger has its own handler and does not propagate once
-    # configured; let its records reach caplog.
-    monkeypatch.setattr(logging.getLogger("maru_remote_cxl_agent"), "propagate", True)
+    # The package loggers have their own handler and do not propagate once
+    # configured; let their records reach caplog.
+    for package in ("maru_remote_cxl_agent", "maru_remote"):
+        monkeypatch.setattr(logging.getLogger(package), "propagate", True)
     return caplog
 
 
@@ -136,7 +137,7 @@ def test_the_wait_for_a_worker_ends_when_it_announces_itself():
 
 def test_a_worker_that_never_announces_itself_waits_only_for_the_window(agent_logs):
     progress = ConnectProgress(worker("mapper"), window_s=0.05)
-    with agent_logs.at_level(logging.INFO, logger="maru_remote_cxl_agent.progress"):
+    with agent_logs.at_level(logging.INFO, logger="maru_remote.progress"):
         progress.expect("ghost")
         wait_for(lambda: not progress.running(), timeout=2.0)
     assert progress.expecting() == set()
@@ -183,7 +184,7 @@ def test_a_failing_drain_keeps_the_wait_going_until_the_window(agent_logs):
             raise RuntimeError("NIXL failed")
 
     progress = ConnectProgress(Broken(), window_s=0.05)
-    with agent_logs.at_level(logging.WARNING, logger="maru_remote_cxl_agent.progress"):
+    with agent_logs.at_level(logging.WARNING, logger="maru_remote.progress"):
         progress.expect("w1")
         wait_for(lambda: not progress.running(), timeout=2.0)
     assert agent_logs.text.count("driving UCX for connecting workers failed") == 1
