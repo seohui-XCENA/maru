@@ -14,14 +14,13 @@ from dataclasses import FrozenInstanceError, dataclass, field
 import pytest
 
 from maru_common.storage_types import Location, PoolKind
-from maru_storage_service.page_table import PageRef
-from maru_storage_service.transfer_engine import (
-    Copy,
+from maru_storage_service.drivers.io_executor import (
     IOExecutor,
     IOQueueFullError,
     IOTicket,
-    TransferEngine,
 )
+from maru_storage_service.page_table import PageRef
+from maru_storage_service.transfer_engine import Copy, TransferEngine
 
 PAGE = mmap.PAGESIZE
 WAIT = 5

@@ -33,6 +33,7 @@ from maru_server.catalog import PoolState
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.server import MaruServer
 from maru_storage_service.config import parse_node_config
+from maru_storage_service.drivers.io_executor import IOQueueFullError
 from maru_storage_service.drivers.ssd import SsdPool, SsdPoolError, create_ssd_pool
 from maru_storage_service.drivers.ssd_alignment import aligned_buffer
 from maru_storage_service.page_table import PageRef
@@ -43,11 +44,7 @@ from maru_storage_service.service import (
     StorageService,
     check_servable,
 )
-from maru_storage_service.transfer_engine import (
-    Copy,
-    IOQueueFullError,
-    TransferEngine,
-)
+from maru_storage_service.transfer_engine import Copy, TransferEngine
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
