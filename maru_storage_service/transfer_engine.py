@@ -6,8 +6,8 @@ Copies run on the engine's own thread, outside every metadata lock, paced to
 a bandwidth budget. A batch is answered once every copy in it has ended, one
 result per copy; after stop() what has not started fails. Blocking I/O uses
 a separate bounded executor, with one slot kept available for reads: it
-moves pages between a mapped pool and a file pool (SSD) through a bounce
-buffer.
+moves pages between a mapped pool and a file pool (SSD) through a reused
+bounce buffer.
 """
 
 import collections
@@ -34,13 +34,43 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRANSFER_BYTES_PER_S = 4 << 30
 DEFAULT_IO_QUEUE_SIZE = 64
 # A file I/O without a deadline gets this long from its start, plus its
-# bytes at this rate; one that ends later counts as failed
+# bytes at this rate; one that ends later is late
 IO_TIMEOUT_S = 1.0
 IO_MIN_BYTES_PER_S = 64 << 20
+IO_THREADS = 2
+# Reads go first, but a queued write waits at most this long, or this many
+# reads, before the next free thread takes it
+WRITE_MAX_WAIT_S = 0.05
+WRITE_AFTER_READS = 8
 
 
 class IOQueueFullError(RuntimeError):
     """The executor cannot accept another queued operation."""
+
+
+@dataclass(eq=False)
+class _Bounce:
+    """A pre-faulted, aligned bounce buffer, reused across I/Os."""
+
+    mapping: mmap.mmap
+    offset: int
+    size: int
+
+    @classmethod
+    def allocate(cls, size: int, alignment: int) -> "_Bounce":
+        mapping = mmap.mmap(-1, size + alignment - 1)
+        try:
+            base = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+            offset = -base % alignment
+            ctypes.memset(base + offset, 0, size)  # fault it in once
+        except BaseException:
+            mapping.close()
+            raise
+        return cls(mapping, offset, size)
+
+    def fits(self, size: int, alignment: int) -> bool:
+        base = ctypes.addressof(ctypes.c_char.from_buffer(self.mapping))
+        return self.size >= size and (base + self.offset) % alignment == 0
 
 
 @dataclass
@@ -49,13 +79,16 @@ class _IOState:
     callback: Callable[["IOTicket"], None] | None
     resources: tuple[object, ...]
     fd: int
-    mapping: mmap.mmap
-    buffer: memoryview
+    alignment: int
+    queued_at: float
+    bounce: _Bounce | None = None
+    buffer: memoryview | None = None
     done: threading.Event = field(default_factory=threading.Event)
     started: bool = False
     finishing: bool = False
     cancelled: bool = False
     ok: bool = False
+    late: bool = False
     error: Exception | None = None
 
 
@@ -63,8 +96,9 @@ class _IOState:
 class IOTicket:
     """One run's exact pages and resources, retained through its callback.
 
-    ``buffer`` and the duplicated ``fd`` are valid until the callback returns.
-    A cancellation request does not make a running syscall complete. ``done``
+    The duplicated ``fd`` is valid until the callback returns; ``buffer``
+    (aligned, contents undefined) from the start of the work until then. A
+    cancellation request does not make a running syscall complete. ``done``
     is set only after work, callback and resource cleanup have ended.
     """
 
@@ -81,7 +115,7 @@ class IOTicket:
         return self._state.fd
 
     @property
-    def buffer(self) -> memoryview:
+    def buffer(self) -> memoryview | None:
         return self._state.buffer
 
     @property
@@ -95,6 +129,11 @@ class IOTicket:
     @property
     def ok(self) -> bool:
         return self._state.ok
+
+    @property
+    def late(self) -> bool:
+        """Every byte moved, but after the I/O's deadline."""
+        return self._state.late
 
     @property
     def error(self) -> Exception | None:
@@ -131,6 +170,10 @@ class IOExecutor:
         self._stopping = False
         self._writing = False
         self._next_write_at = 0.0
+        # Reads taken while a write waited
+        self._reads_passed = 0
+        # Free bounce buffers, at most one per thread
+        self._bounces: list[_Bounce] = []
 
     def submit(
         self,
@@ -147,9 +190,9 @@ class IOExecutor:
     ) -> IOTicket:
         """Accept without waiting for queue space; reject without taking refs.
 
-        ``nbytes`` is the driver's aligned I/O length. The bounce starts zeroed.
+        ``nbytes`` is the driver's aligned I/O length, the bounce's size.
         ``resources`` retains driver and page-reference owners until completion.
-        Threads and bounce buffers are allocated only for accepted work.
+        Threads are started only for accepted work.
         """
         if nbytes <= 0 or alignment <= 0:
             raise ValueError("nbytes and alignment must be positive")
@@ -159,16 +202,10 @@ class IOExecutor:
             if len(self._reads) + len(self._writes) >= self._max_queue:
                 raise IOQueueFullError("I/O submit queue is full")
             owned_fd = os.dup(fd)
-            mapping = None
-            buffer = None
             try:
-                mapping = mmap.mmap(-1, nbytes + alignment - 1)
-                address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
-                offset = -address % alignment
-                buffer = memoryview(mapping)[offset : offset + nbytes]
                 if not self._threads:
                     try:
-                        for i in range(2):
+                        for i in range(IO_THREADS):
                             thread = threading.Thread(
                                 target=self._loop, name=f"maru-io-{i}", daemon=True
                             )
@@ -179,14 +216,15 @@ class IOExecutor:
                         self._cv.notify_all()
                         raise
             except Exception:
-                if buffer is not None:
-                    buffer.release()
-                if mapping is not None:
-                    mapping.close()
                 os.close(owned_fd)
                 raise
             state = _IOState(
-                work, callback, tuple(resources), owned_fd, mapping, buffer
+                work,
+                callback,
+                tuple(resources),
+                owned_fd,
+                alignment,
+                time.monotonic(),
             )
             ticket = IOTicket(self._run, src, dst, nbytes, write, self, state)
             self._live.add(ticket)
@@ -230,6 +268,31 @@ class IOExecutor:
             thread.join()
         with self._cv:
             self._cv.wait_for(lambda: not self._live)
+            bounces, self._bounces = self._bounces, []
+        for bounce in bounces:
+            bounce.mapping.close()
+
+    def _next(self) -> IOTicket | None:
+        """Caller holds the lock: the ticket to run now, if any. A paced or
+        running write lets reads go; an aged write goes before them."""
+        now = time.monotonic()
+        if self._writes and not self._writing and now >= self._next_write_at:
+            write = self._writes[0]
+            aged = (
+                now - write._state.queued_at >= WRITE_MAX_WAIT_S
+                or self._reads_passed >= WRITE_AFTER_READS
+            )
+            if aged or not self._reads:
+                self._writes.popleft()
+                self._writing = True
+                self._reads_passed = 0
+                self._next_write_at = now + write.nbytes / self._bytes_per_s
+                return write
+        if self._reads:
+            if self._writes:
+                self._reads_passed += 1
+            return self._reads.popleft()
+        return None
 
     def _loop(self) -> None:
         while True:
@@ -237,22 +300,17 @@ class IOExecutor:
                 while True:
                     if self._stopping:
                         return
-                    delay = self._next_write_at - time.monotonic()
-                    if self._reads:
-                        ticket = self._reads.popleft()
+                    ticket = self._next()
+                    if ticket is not None:
                         break
-                    if self._writes and not self._writing and delay <= 0:
-                        ticket = self._writes.popleft()
-                        self._writing = True
-                        self._next_write_at = (
-                            time.monotonic() + ticket.nbytes / self._bytes_per_s
-                        )
-                        break
-                    timeout = delay if self._writes and not self._writing else None
+                    timeout = None
+                    if self._writes and not self._writing:
+                        timeout = max(0.0, self._next_write_at - time.monotonic())
                     self._cv.wait(timeout)
                 ticket._state.started = True
             try:
                 assert ticket._state.work is not None
+                self._lend(ticket)
                 ticket._state.work(ticket)
             except Exception as e:
                 ticket._state.error = e
@@ -261,6 +319,32 @@ class IOExecutor:
                 if ticket.write:
                     self._writing = False
                 self._cv.notify_all()
+
+    def _lend(self, ticket: IOTicket) -> None:
+        """A free bounce that fits, else a new one (outside the lock)."""
+        state = ticket._state
+        with self._cv:
+            bounce = next(
+                (b for b in self._bounces if b.fits(ticket.nbytes, state.alignment)),
+                None,
+            )
+            if bounce is not None:
+                self._bounces.remove(bounce)
+        if bounce is None:
+            bounce = _Bounce.allocate(ticket.nbytes, state.alignment)
+        state.bounce = bounce
+        start = bounce.offset
+        state.buffer = memoryview(bounce.mapping)[start : start + ticket.nbytes]
+
+    def _give_back(self, bounce: _Bounce) -> None:
+        """Keep the largest IO_THREADS bounces; close the rest."""
+        with self._cv:
+            self._bounces.append(bounce)
+            self._bounces.sort(key=lambda b: b.size, reverse=True)
+            extra = self._bounces[IO_THREADS:]
+            del self._bounces[IO_THREADS:]
+        for other in extra:
+            other.mapping.close()
 
     def _finish(self, ticket: IOTicket) -> None:
         state = ticket._state
@@ -279,8 +363,11 @@ class IOExecutor:
                     os.close(state.fd)
                 finally:
                     state.fd = -1
-                    state.buffer.release()
-                    state.mapping.close()
+                    if state.buffer is not None:
+                        state.buffer.release()
+                    if state.bounce is not None:
+                        self._give_back(state.bounce)
+                        state.bounce = None
             except Exception:
                 logger.exception("I/O resource cleanup failed for run %s", ticket.run)
             finally:
@@ -363,8 +450,8 @@ class TransferEngine:
         references until ``callback``. ``deadline`` (monotonic) bounds the
         syscalls; by default the I/O gets IO_TIMEOUT_S plus its bytes at
         IO_MIN_BYTES_PER_S from its start. ``ticket.ok`` only once all bytes
-        moved. Raises if not accepted (e.g. IOQueueFullError, or RuntimeError
-        once drained)."""
+        moved (``ticket.late`` if past the deadline). Raises if not accepted
+        (e.g. IOQueueFullError, or RuntimeError once drained)."""
         n = copy.nbytes
         with self._lock:
             write = copy.dst.pool_id in self._files
@@ -387,14 +474,17 @@ class TransferEngine:
             if limit is None:
                 limit = time.monotonic() + IO_TIMEOUT_S + n / IO_MIN_BYTES_PER_S
             bounce = ticket.buffer
+            assert bounce is not None
+            # The ticket's own fd: valid until its callback returns
             if write:
                 with memoryview(mapping) as view:
                     bounce[:n] = view[offset : offset + n]
-                file.write(page_offset, bounce, n, deadline=limit)
+                file.write(page_offset, bounce, n, deadline=limit, fd=ticket.fd)
             else:
-                file.read(page_offset, n, bounce, deadline=limit)
+                file.read(page_offset, n, bounce, deadline=limit, fd=ticket.fd)
                 with memoryview(mapping) as view:
                     view[offset : offset + n] = bounce[:n]
+            ticket._state.late = time.monotonic() > limit
 
         return self.io.submit(
             src,

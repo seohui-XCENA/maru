@@ -43,7 +43,11 @@ from maru_storage_service.service import (
     StorageService,
     check_servable,
 )
-from maru_storage_service.transfer_engine import Copy, TransferEngine
+from maru_storage_service.transfer_engine import (
+    Copy,
+    IOQueueFullError,
+    TransferEngine,
+)
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (
     PAGE,
@@ -405,6 +409,22 @@ def test_a_copy_is_published_only_once_its_write_returned(
     (dest,) = node.pools.pages_in(node.ssd.pool_id, PageState.TRANSFER)[:1]
     assert node.pools.io_refs(dest) == 1
     assert not ssd_commits(fake)
+    # the eviction thread goes on meanwhile: a central delete gets done
+    idle = [
+        (name, loc)
+        for name in [f"k{j}" for j in range(10)]
+        for loc in fake.locations(Key(NS, name))
+        if loc.kind == PoolKind.DRAM
+        and (ref := node.pools.find(loc)) is not None
+        and not node.pools.io_refs(ref)
+    ]
+    name, loc = idle[0]
+    fake.queue_block(
+        "gpu-test",
+        BlockRequest("blk-held", (KeyLocation(Key(NS, name), loc),), "admin"),
+    )
+    wait_until(lambda: Key(NS, name) not in fake.keys(), what="deleted meanwhile")
+    assert not ssd_commits(fake)
     gate.set()
     wait_until(lambda: node.manager.move_results["RETIRED"] >= 1, what="moved")
     assert ssd_commits(fake)
@@ -418,11 +438,11 @@ def torn_writes(node, code: int, count: float = float("inf")) -> list[int]:
     write = node.ssd.write
     torn: list[int] = []
 
-    def tear(page_offset, src, n, *, deadline):
+    def tear(page_offset, src, n, **kwargs):
         if len(torn) >= count:
-            return write(page_offset, src, n, deadline=deadline)
+            return write(page_offset, src, n, **kwargs)
         torn.append(page_offset)
-        write(page_offset, src, max(1, n // 2), deadline=deadline)
+        write(page_offset, src, max(1, n // 2), **kwargs)
         raise OSError(code, os.strerror(code))
 
     node.ssd.write = tear
@@ -486,6 +506,43 @@ def test_a_persistent_write_failure_lets_stores_go_on(
     node.pools.check()
 
 
+@pytest.mark.parametrize("how", ["queue_full", "late"])
+def test_full_queues_and_late_writes_count_toward_the_pause(
+    fake, nodes, handlers, monkeypatch, how
+):
+    """A write the executor did not take, or one that moved every byte past
+    its deadline, counts as a failure: three in a row pause the SSD. A late
+    one is still published."""
+    monkeypatch.setattr("maru_storage_service.storage_manager.IO_PAUSE_S", 60.0)
+    node = nodes()
+    if how == "queue_full":
+
+        def full(*args, **kwargs):
+            raise IOQueueFullError("injected")
+
+        monkeypatch.setattr(node.transfers, "submit_io", full)
+    else:
+        monkeypatch.setattr("maru_storage_service.transfer_engine.IO_TIMEOUT_S", 0.05)
+        write = node.ssd.write
+
+        def slow(*args, **kwargs):
+            done = write(*args, **kwargs)
+            time.sleep(0.1)
+            return done
+
+        monkeypatch.setattr(node.ssd, "write", slow)
+    h = handlers(node)
+    names = [f"k{i}" for i in range(40)]
+    for name in names:
+        assert put(h, name)
+    wait_until(
+        lambda: node.ssd.pool_id in node.manager._io_paused, what="the SSD paused"
+    )
+    assert bool(ssd_commits(fake)) == (how == "late")
+    served_right(fake, node, h, names)
+    node.pools.check()
+
+
 def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers):
     node = nodes()
     h = handlers(node)
@@ -495,7 +552,9 @@ def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers
     key = next(f"k{i}" for i in range(10) if kinds(fake, f"k{i}") == {PoolKind.SSD})
     (location,) = fake.locations(Key(NS, key))
     ref = node.pools.find(location)
-    assert node.pools.io_acquire([ref])  # as a fetch reading it would
+    # as a fetch reading it into DRAM would
+    (dest,) = node.pools.reserve_transfer(node.dram.pool_id, 1)
+    assert node.pools.io_acquire(ref, dest)
     fake.queue_block(
         "gpu-test",
         BlockRequest(
@@ -510,7 +569,8 @@ def test_a_retired_ssd_page_is_not_reused_while_an_io_runs(fake, nodes, handlers
     )
     time.sleep(0.2)  # eviction passes go on
     assert node.pools.page(ref).state == PageState.RETIRING
-    node.pools.io_release([ref])
+    node.pools.io_release([ref, dest])
+    node.pools.transfer_failed(dest)
     wait_until(
         lambda: (page := node.pools.page(ref)) is None or page.state == PageState.FREE,
         what="reclaimed",
@@ -582,6 +642,41 @@ def test_a_cxl_top_tier_moves_to_the_ssd(fake, nodes, regions, sockdir, ssd_dir)
     for item in finalized(fake):
         assert (item.source.kind, item.dest.kind) == (PoolKind.CXL, PoolKind.SSD)
         assert ssd_bytes(node.ssd, item.dest) == value_of(item.key.key)
+    worker.close()
+    node.pools.check()
+
+
+def test_a_region_the_node_cannot_map_drops_its_pages(
+    fake, nodes, regions, sockdir, ssd_dir
+):
+    """Its pages are never copied out: eviction retires them instead of
+    trying again forever."""
+    mapped = []
+
+    def map_some(pool):
+        mapped.append(pool.pool_id)
+        mapping = regions.node_map(pool)  # the region's bytes, for the worker
+        if len(mapped) == 1:
+            mapping.close()
+            raise OSError(errno.EIO, "injected")
+        return mapping
+
+    node = nodes(cxl_ssd(fake.url, sockdir, ssd_dir), map_region=map_some)
+    unmapped = mapped[0]
+    by_pool = {p.pool_id: p.region.handle.region_id for p in node.cxl.pools}
+    worker = RawWorker(node.config.socket)
+    worker.attach()
+    names = []
+    while len(names) < 12:
+        for credit in worker.credit(2 * PAGE).credits:
+            name = f"k{len(names)}"
+            fd = regions.fds[by_pool[credit.pool_id]]
+            os.pwrite(fd, value_of(name), credit.offset)
+            assert worker.write_done([credit], [name], len(value_of(name)))
+            names.append(name)
+    wait_until(lambda: node.manager.retire_results["RETIRED"] >= 1, what="dropped")
+    assert not node.manager.move_results["COPY_FAILED"]
+    assert all(i.source.pool_id != unmapped for i in finalized(fake))
     worker.close()
     node.pools.check()
 

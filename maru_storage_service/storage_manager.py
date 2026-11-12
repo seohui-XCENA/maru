@@ -79,13 +79,14 @@ COMMIT_LINGER_S = 0.002
 EXIT_RETRY_S = 0.5
 EXIT_RETRY_MAX_S = 30.0
 # Demotion into an I/O tier (SSD): at most this much a pass, so room comes in
-# steps, and this many writes queued at a time: reads keep the rest of the
-# executor's queue
+# steps, and this many writes in flight at a time: reads keep the rest of
+# the executor's queue
 IO_BATCH_BYTES = 1 << 30
 IO_DEPTH = 2
-# This many failed writes in a row to a pool below take it out of demotion
-# for IO_PAUSE_S: the tier above then drops past its high watermark, as when
-# the tier below is full. One failure only keeps the source for a retry
+# This many failed writes in a row to a pool below (an error, a full queue,
+# never started, or ended late) take it out of demotion for IO_PAUSE_S: the
+# tier above then drops past its high watermark, as when the tier below is
+# full. One failure only keeps the source for a retry
 IO_FAILURES_MAX = 3
 IO_PAUSE_S = 10.0
 
@@ -200,6 +201,10 @@ class StorageManager:
         # when the pool takes no demotion
         self._io_failures: collections.Counter[str] = collections.Counter()
         self._io_paused: dict[str, float] = {}
+        # Demotion writes submitted and not yet ended; ended ones wait for
+        # the eviction thread to COMMIT or drop them
+        self._writing = 0
+        self._written: collections.deque[tuple[_Move, IOTicket]] = collections.deque()
         # FETCH from workers: a FetchManager on a node with an SSD tier
         self.fetches = None
 
@@ -696,6 +701,7 @@ class StorageManager:
                 run = not self._paused()
             try:
                 self._reclaim_retiring()
+                self._writes_ended()
                 if run:
                     self._retire_queued()
                     self._evict_once()
@@ -827,15 +833,26 @@ class StorageManager:
         while the tier (``pools``) is past its high watermark they are dropped
         instead: writes must not stall."""
         moves: list[_Move] = []
-        todo = []
+        todo, drop = [], []
+        io = self.traits[below].io_only
+        assert self.transfers is not None
         for ref, item in zip(refs, items, strict=True):
             copy = self._copy_of(ref, item.key)
-            if copy is None:
-                todo.append((ref, item))
-            else:
+            if copy is not None:
                 moves.append(
                     _Move(ref, item.key, item.location, copy[0], copy[1], existing=True)
                 )
+            elif not self.transfers.has_pool(ref.pool_id):
+                # Never copied out (a region the engine could not map): dropped
+                drop.append((ref, item))
+            else:
+                todo.append((ref, item))
+        if io:
+            # Bounded writes in flight; the rest are offered again
+            with self._lock:
+                slots = max(0, IO_DEPTH - self._writing)
+            self.placement.release([ref for ref, _ in todo[slots:]], backoff=False)
+            todo = todo[:slots]
         dests = self._reserve_below(below, len(todo))
         for (ref, item), dest in zip(todo, dests, strict=False):
             location = self.pools.transfer_location(dest)
@@ -849,7 +866,6 @@ class StorageManager:
                 )
             )
         rest = todo[len(dests) :]
-        drop = []
         if rest:
             capacity, free, _, _ = self._tier_usage(pools)
             if self.placement.above_high(
@@ -858,13 +874,13 @@ class StorageManager:
                 logger.debug("no room below %s: dropping %d pages", kind, len(rest))
                 with self._lock:
                     self.move_results["DROPPED"] += len(rest)
-                drop = rest
+                drop += rest
             else:
                 self.placement.release([ref for ref, _ in rest], backoff=False)
         # Every reserved page and every candidate is settled, also on an error
         try:
             if moves:
-                self._run_moves(moves, io=self.traits[below].io_only)
+                self._run_moves(moves, io=io)
         finally:
             if drop:
                 self.retire([r for r, _ in drop], [i for _, i in drop])
@@ -928,34 +944,43 @@ class StorageManager:
         return out
 
     def _run_moves(self, moves: list[_Move], io: bool = False) -> None:
-        """Copy, COMMIT and FINALIZE_MOVE ``moves``; by the I/O executor when
-        ``io`` (the pages below are in a file pool)."""
+        """Copy, COMMIT and FINALIZE_MOVE ``moves``. With ``io`` (the pages
+        below are in a file pool) the writes only start here: each ends on
+        the I/O executor, and the next pass carries it on (_writes_ended)."""
         assert self.transfers is not None
         fresh = [m for m in moves if not m.existing]
-        copied = [m for m in moves if m.existing]
+        existing = [m for m in moves if m.existing]
         if self._halted():  # no copy started: all go back
             for move in fresh:
                 self.pools.transfer_failed(move.dest)
             self.placement.release([m.src for m in moves], backoff=False)
             return
-        copies = [Copy(m.source, m.dest_location, m.source.length) for m in fresh]
         if io:
-            results = self._write_io(fresh, copies)
-        else:
-            results = self.transfers.run(copies) if copies else []
-        for move, ok in zip(fresh, results, strict=True):
+            self._write_io(fresh)
+            self._moved(existing)
+            return
+        copies = [Copy(m.source, m.dest_location, m.source.length) for m in fresh]
+        results = self.transfers.run(copies) if copies else []
+        self._moved(existing + self._copied(fresh, results))
+
+    def _copied(self, moves: list[_Move], results: list[bool]) -> list[_Move]:
+        """Settle ended copies: those that moved every byte, PENDING."""
+        out = []
+        for move, ok in zip(moves, results, strict=True):
             try:
                 if ok:
                     self.pools.transfer_done(move.dest, move.key, move.source.length)
-                    copied.append(move)
+                    out.append(move)
                     continue
-                # run() answers once the copy has ended
                 self.pools.transfer_failed(move.dest)
                 with self._lock:
                     self.move_results["COPY_FAILED"] += 1
             except Exception:
                 logger.exception("ending the copy to %s failed", move.dest)
             self.placement.release([move.src])
+        return out
+
+    def _moved(self, copied: list[_Move]) -> None:
         if self._halted():
             # The run is over: the copies go with it
             self.placement.release([m.src for m in copied])
@@ -965,42 +990,58 @@ class StorageManager:
                 self._finalize_moves(finals)
         self._reclaim_retiring()
 
-    def _write_io(self, moves: list[_Move], copies: list[Copy]) -> list[bool]:
-        """Write the copies to their file pool pages, IO_DEPTH at a time;
-        answers once every write has ended, True for each that wrote all its
-        bytes. Both pages of a write keep an I/O reference until it ends."""
+    def _write_io(self, moves: list[_Move]) -> None:
+        """Start the writes to the file pool pages. Both pages of a write
+        keep an I/O reference until it ends; the destination stays TRANSFER
+        until the eviction thread takes the result."""
         assert self.transfers is not None
-        results = [False] * len(moves)
-        running: collections.deque[tuple[int, IOTicket]] = collections.deque()
-
-        def wait_one() -> None:
-            j, ticket = running.popleft()
-            ticket.done.wait()
-            results[j] = ticket.ok
-            if ticket.ok or ticket.error is not None:
-                self._io_result(ticket.dst.pool_id, ticket.error)
-
-        for i, (move, copy) in enumerate(zip(moves, copies, strict=True)):
-            while len(running) >= IO_DEPTH:
-                wait_one()
-            refs = [move.src, move.dest]
-            if not self.pools.io_acquire(refs):
+        for move in moves:
+            if not self.pools.io_acquire(move.src, move.dest):
+                self.pools.transfer_failed(move.dest)  # the source went
+                self.placement.release([move.src])
                 continue
+            with self._lock:
+                self._writing += 1
             try:
-                ticket = self.transfers.submit_io(
-                    copy,
+                self.transfers.submit_io(
+                    Copy(move.source, move.dest_location, move.source.length),
                     move.src,
                     move.dest,
-                    callback=lambda _t, refs=refs: self.pools.io_release(refs),
+                    callback=lambda ticket, m=move: self._write_ended(m, ticket),
                 )
             except Exception as e:  # a full queue, or the engine stopped
-                self.pools.io_release(refs)
+                with self._lock:
+                    self._writing -= 1
+                self.pools.io_release([move.src, move.dest])
                 logger.debug("cannot write %s below: %s", move.src, e)
-                continue
-            running.append((i, ticket))
-        while running:
-            wait_one()
-        return results
+                self._io_result(move.dest.pool_id, e)
+                self._copied([move], [False])
+
+    def _write_ended(self, move: _Move, ticket: IOTicket) -> None:
+        """On the I/O thread: no RPC here."""
+        self.pools.io_release([move.src, move.dest])
+        with self._lock:
+            self._writing -= 1
+            self._written.append((move, ticket))
+        self._evict_wake.set()
+
+    def _writes_ended(self) -> None:
+        """COMMIT the writes that moved every byte, free the others' pages.
+        One that never ran or ended late counts as a failure too."""
+        with self._lock:
+            done = list(self._written)
+            self._written.clear()
+        if not done:
+            return
+        for move, ticket in done:
+            error = ticket.error
+            if error is None and ticket.cancelled:
+                error = RuntimeError("the write never started")
+            elif error is None and ticket.late:
+                error = TimeoutError("the write ended past its deadline")
+            self._io_result(move.dest.pool_id, error)
+        moves = [m for m, _ in done]
+        self._moved(self._copied(moves, [t.ok for _, t in done]))
 
     def _io_result(self, pool_id: str, error: Exception | None) -> None:
         """Count a write to ``pool_id``; IO_FAILURES_MAX failures in a row
@@ -1386,9 +1427,8 @@ class StorageManager:
             refs = list(self._retiring)
         for ref in refs:
             # Not reused while a reader or an I/O may still touch it
-            if self.local_pins.readers(ref) or self.pools.io_refs(ref):
+            if self.local_pins.readers(ref) or not self.pools.reclaim(ref):
                 continue
-            self.pools.reclaim(ref)
             self.local_pins.forget(ref)
             with self._lock:
                 self._retiring.discard(ref)

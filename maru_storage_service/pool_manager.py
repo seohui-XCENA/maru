@@ -507,11 +507,15 @@ class PoolManager:
             table, page = self._page(ref, PageState.READY)
             table.move(page, PageState.READY, PageState.RETIRING)
 
-    def reclaim(self, ref: PageRef) -> None:
-        """RETIRING -> FREE: local accesses and transfers on it ended."""
+    def reclaim(self, ref: PageRef) -> bool:
+        """RETIRING -> FREE once local accesses ended; False while an I/O
+        still runs on it."""
         with self._lock:
             table, page = self._page(ref, PageState.RETIRING)
+            if self._io.get((table.pool_id, page.index)):
+                return False
             self._to_free(table, page, PageState.RETIRING)
+            return True
 
     def reconcile(self, ref: PageRef, key: Key, location: Location) -> PageRef:
         """READY page takes the Catalog's occupant (KEPT MOVED): its key,
@@ -645,21 +649,18 @@ class PoolManager:
 
     # -------------------------------------------------------- I/O references
 
-    def io_acquire(self, refs: Sequence[PageRef]) -> bool:
-        """An I/O reference on each page, if every one is at its generation
-        and neither FREE nor QUARANTINED; else none is taken."""
+    def io_acquire(self, src: PageRef, dst: PageRef) -> bool:
+        """An I/O reference on both pages of a transfer, if ``src`` is READY
+        and ``dst`` TRANSFER, each at its generation; else none is taken."""
         with self._lock:
-            for ref in refs:
+            for ref, state in ((src, PageState.READY), (dst, PageState.TRANSFER)):
                 table = self._tables.get(ref.pool_id)
                 if table is None or not 0 <= ref.index < len(table.pages):
                     return False
                 page = table.pages[ref.index]
-                if page.generation != ref.generation or page.state in (
-                    PageState.FREE,
-                    PageState.QUARANTINED,
-                ):
+                if page.generation != ref.generation or page.state != state:
                     return False
-            for ref in refs:
+            for ref in (src, dst):
                 self._io[(ref.pool_id, ref.index)] += 1
             return True
 

@@ -402,24 +402,33 @@ class TestServiceTransitions:
         ref, _, _ = pm.write_done("w", c, Key("ns", "a"), 10)
         pm.commit_added(ref)
         (dest,) = pm.reserve_transfer("dram:n:e", 1)
-        assert pm.io_acquire([ref, dest])
+        # a source must be READY and a destination TRANSFER
+        assert not pm.io_acquire(dest, ref) and pm.io_refs(ref) == 0
+        assert pm.io_acquire(ref, dest)
         assert (pm.io_refs(ref), pm.io_refs(dest)) == (1, 1)
         # a write that failed, a page retired meanwhile: neither is FREE yet
         with pytest.raises(InvalidTransitionError, match="I/O running"):
             pm.transfer_failed(dest)
         pm.retired(ref)
-        with pytest.raises(InvalidTransitionError, match="I/O running"):
-            pm.reclaim(ref)
+        assert not pm.reclaim(ref)
+        assert pm.page(ref).state == PageState.RETIRING
+        # a RETIRING page takes no new I/O
+        (spare,) = pm.reserve_transfer("dram:n:e", 1)
+        assert not pm.io_acquire(ref, spare) and pm.io_refs(ref) == 1
+        pm.transfer_failed(spare)
         pm.check()
         pm.io_release([ref, dest])
         pm.transfer_failed(dest)
-        pm.reclaim(ref)
+        assert pm.reclaim(ref)
         assert pm.io_refs(ref) == 0
         # FREE, at another generation or released twice: refused
-        assert not pm.io_acquire([ref])
         (other,) = pm.reserve_transfer("dram:n:e", 1)
+        assert not pm.io_acquire(ref, other) and pm.io_refs(other) == 0
+        (c2,) = pm.credit("w", PS)
+        src, _, _ = pm.write_done("w", c2, Key("ns", "b"), 10)
+        pm.commit_added(src)
         stale = dataclasses.replace(other, generation=other.generation + 1)
-        assert not pm.io_acquire([other, stale]) and pm.io_refs(other) == 0
+        assert not pm.io_acquire(src, stale) and pm.io_refs(src) == 0
         with pytest.raises(InvalidTransitionError):
             pm.io_release([other])
         pm.check()

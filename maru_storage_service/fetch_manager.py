@@ -708,7 +708,7 @@ class FetchManager:
                 self._fail(flight, _miss())
                 continue
             refs = [flight.source_ref, flight.dest]
-            if not self.pools.io_acquire(refs):
+            if not self.pools.io_acquire(flight.source_ref, flight.dest):
                 self._release_source(flight)
                 self._drop_page(flight)
                 self._fail(flight, _miss(MissReason.ABSENT))

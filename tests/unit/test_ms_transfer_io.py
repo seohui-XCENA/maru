@@ -7,6 +7,7 @@ import errno
 import mmap
 import os
 import threading
+import time
 import weakref
 from dataclasses import FrozenInstanceError, dataclass, field
 
@@ -115,28 +116,40 @@ def completed(ticket):
     assert ticket.done.wait(WAIT), "ticket did not complete"
 
 
-def test_bounce_is_aligned_zeroed_and_owned_through_callback(io):
+def address_of(view) -> int:
+    return ctypes.addressof(ctypes.c_char.from_buffer(view))
+
+
+def test_bounce_is_aligned_reused_and_owned_through_callback(io, monkeypatch):
     driver, make, submit = io
     executor = make()
     driver.data[0] = b"v" * PAGE
     got = []
+    allocate, mappings = mmap.mmap, []
+
+    def counted(*args, **kwargs):
+        mappings.append(allocate(*args, **kwargs))
+        return mappings[-1]
+
+    monkeypatch.setattr(mmap, "mmap", counted)
 
     def callback(ticket):
         os.fstat(ticket.fd)
         assert not ticket.done.is_set()
-        got.append((ticket.ok, bytes(ticket.buffer)))
+        got.append((ticket.ok, bytes(ticket.buffer), address_of(ticket.buffer)))
 
     read = submit(executor, callback=callback, alignment=2 * PAGE)
     completed(read)
-    assert got == [(True, b"v" * PAGE)]
+    assert [g[:2] for g in got] == [(True, b"v" * PAGE)]
     assert read.fd == -1
     with pytest.raises(ValueError):
         bytes(read.buffer)
 
     def write(ticket):
-        address = ctypes.addressof(ctypes.c_char.from_buffer(ticket.buffer))
-        assert address % (2 * PAGE) == 0
-        assert bytes(ticket.buffer) == bytes(PAGE)
+        address = address_of(ticket.buffer)
+        assert address % (2 * PAGE) == 0 and address == got[0][2]
+        # the read's bounce again: what it holds is undefined
+        assert bytes(ticket.buffer) == b"v" * PAGE
         ticket.buffer[:4] = b"tail"
         driver.work(ticket)
 
@@ -149,7 +162,44 @@ def test_bounce_is_aligned_zeroed_and_owned_through_callback(io):
     )
     completed(padded)
     assert padded.ok
-    assert driver.data[PAGE] == b"tail" + bytes(PAGE - 4)
+    assert driver.data[PAGE] == b"tail" + b"v" * (PAGE - 4)
+    # one bounce, faulted in once, for both
+    assert len(mappings) == 1 and not mappings[0].closed
+    executor.drain()
+    assert mappings[0].closed
+
+
+def test_a_queued_write_is_not_starved_by_reads(io):
+    """Reads always queued, as under a steady fetch load: a write still
+    starts within its wait bound."""
+    driver, make, submit = io
+    executor = make(max_queue=64)
+    stop, started = threading.Event(), threading.Event()
+
+    def read(ticket):
+        time.sleep(0.01)
+
+    def feed():
+        while not stop.is_set():
+            try:
+                submit(executor, 0, work=read)
+            except Exception:
+                pass
+            time.sleep(0.003)
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    try:
+        time.sleep(0.1)
+        began = time.monotonic()
+        write = submit(executor, 1, write=True, work=lambda t: started.set())
+        assert started.wait(2), "the write never started"
+        assert time.monotonic() - began < 0.5
+    finally:
+        stop.set()
+        feeder.join(WAIT)
+    completed(write)
+    assert write.ok
 
 
 def test_one_write_keeps_a_thread_for_reads(io):
@@ -484,7 +534,7 @@ def test_submit_failure_releases_fd_and_bounce_before_accepting(io, monkeypatch)
         submit(executor, callback=callbacks.append)
     executor.drain()
     assert driver.order == [] and callbacks == []
-    assert mappings and all(mapping.closed for mapping in mappings)
+    assert all(mapping.closed for mapping in mappings)  # bounces come at start
     assert len(fds) == 1
     with pytest.raises(OSError, match="Bad file descriptor"):
         os.fstat(fds[0])
@@ -492,13 +542,13 @@ def test_submit_failure_releases_fd_and_bounce_before_accepting(io, monkeypatch)
         submit(executor)
 
 
-def test_bounce_allocation_failure_closes_duplicate_and_leaves_executor_usable(
+def test_bounce_allocation_failure_fails_the_io_and_leaves_executor_usable(
     io, monkeypatch
 ):
-    _, make, submit = io
+    driver, make, submit = io
     executor = make()
     duplicate = os.dup
-    fds = []
+    fds, callbacks = [], []
 
     def dup(fd):
         result = duplicate(fd)
@@ -511,8 +561,10 @@ def test_bounce_allocation_failure_closes_duplicate_and_leaves_executor_usable(
     with monkeypatch.context() as patch:
         patch.setattr(os, "dup", dup)
         patch.setattr(mmap, "mmap", allocate)
-        with pytest.raises(OSError, match="allocation failure"):
-            submit(executor)
+        failed = submit(executor, callback=callbacks.append)
+        completed(failed)
+        assert not failed.ok and failed.error.errno == errno.ENOMEM
+        assert callbacks == [failed] and driver.order == []
         assert len(fds) == 1
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(fds[0])
