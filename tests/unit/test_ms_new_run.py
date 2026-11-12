@@ -608,11 +608,13 @@ def test_a_node_that_does_not_open_is_warned_about_once(fake, nodes, handlers, c
         time.sleep(2.0)  # polls go on
     finally:
         log.removeHandler(caplog.handler)
-    warnings = [
-        r
+    # pytest >= 9.1 also attaches caplog.handler to the non-propagating
+    # maru_handler logger, so one record can be listed twice
+    warnings = {
+        id(r)
         for r in caplog.records
         if r.levelname == "WARNING" and "has not opened" in r.getMessage()
-    ]
+    }
     assert len(warnings) == 1
     opens = [
         r
