@@ -758,6 +758,54 @@ class TestWorkerBinding:
         assert pin(worker.token, worker.incarnation, foreign).status == Status.REJECTED
         assert results(pin(worker.token, worker.incarnation)) == ["HIT"]
 
+    def test_a_resend_after_the_worker_left_replays(self, env):
+        from maru_common.protocol import (
+            FetchCompleteItem,
+            FetchCompleteRequest,
+            MessageType,
+            SourcePinRequest,
+        )
+        from maru_common.storage_types import KeyLocation
+
+        _, service, wire = env
+        a, b, worker, k, source = self._setup(wire)
+        bound = {
+            "worker_session": worker.token,
+            "worker_incarnation": worker.incarnation,
+        }
+        pin_request = a.build(
+            SourcePinRequest,
+            **a.envelope(),
+            items=[KeyLocation(k, source)],
+            **bound,
+        )
+        pinned = wire.call(MessageType.SOURCE_PIN, pin_request)
+        assert results(pinned) == ["HIT"]
+        copy = a.loc(a.dram(), 1)
+        done_request = a.build(
+            FetchCompleteRequest,
+            **a.envelope(),
+            items=[FetchCompleteItem(k, pinned.items[0].pin_id, copy, copy.length)],
+            **bound,
+        )
+        worker.close()
+        # the replies were lost: the same pin comes back, none is added
+        assert wire.call(MessageType.SOURCE_PIN, pin_request) == pinned
+        assert len(service.pins) == 1
+        done = wire.call(MessageType.FETCH_COMPLETE, done_request)
+        assert done.status == Status.OK and len(service.pins) == 0
+        assert wire.call(MessageType.FETCH_COMPLETE, done_request) == done
+        # a new op for the worker that went is refused, and replays so
+        late = a.build(
+            SourcePinRequest,
+            **a.envelope(),
+            items=[KeyLocation(k, source)],
+            **bound,
+        )
+        refused = wire.call(MessageType.SOURCE_PIN, late)
+        assert refused.status == Status.REJECTED and len(service.pins) == 0
+        assert wire.call(MessageType.SOURCE_PIN, late) == refused
+
     def test_fetch_complete_pins_only_the_named_workers_session(self, env):
         from maru_common.protocol import (
             FetchCompleteItem,

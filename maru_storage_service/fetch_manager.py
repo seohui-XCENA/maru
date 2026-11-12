@@ -88,6 +88,8 @@ class _Op:
     outcomes: list[ItemOutcome | None]
     flights: list["_Flight | None"]
     answered: bool = False
+    # MaruServer refused its session: no pin is asked with it again
+    refused: bool = False
     timer: threading.Timer | None = None
 
 
@@ -477,12 +479,12 @@ class FetchManager:
             cached = [f for f in flights if f.cached]
             todo = [f for f in flights if not f.cached]
             if cached:
-                held, gone = self._hold_copies(op, cached)
+                held, gone = self._hold_copies(cached)
                 for flight in held:
                     self._fan_out(flight)
                 todo += gone
             todo = self._take_pages(todo)
-            todo = self._pin_sources(op, todo)
+            todo = self._pin_sources(todo)
             todo = self._read(todo)
             for flight in self._publish(op, todo):
                 self._fan_out(flight)
@@ -545,8 +547,8 @@ class FetchManager:
             out += self.pools.reserve_transfer(pool_id, count - len(out))
         return out
 
-    def _pin_sources(self, op: _Op, flights: list[_Flight]) -> list[_Flight]:
-        """SOURCE_PIN the exact sources for ``op``'s worker, one request."""
+    def _pin_sources(self, flights: list[_Flight]) -> list[_Flight]:
+        """SOURCE_PIN the exact sources, for a waiter of each."""
         live = []
         for flight in flights:
             if self._live(flight):
@@ -554,7 +556,7 @@ class FetchManager:
             else:
                 self._drop_page(flight)
                 self._fail(flight, _miss())
-        pins = self._source_pin(op, live, [f.source for f in live])
+        pins = self._source_pin(live, [f.source for f in live])
         out = []
         for flight, pin in zip(live, pins, strict=True):
             if isinstance(pin, str):
@@ -562,63 +564,89 @@ class FetchManager:
                 out.append(flight)
             else:
                 self._drop_page(flight)
-                self._fail_for(op, flight, pin)
+                self._fail(flight, pin)
         return out
 
+    def _pinner(self, flight: _Flight) -> _Op | None:
+        """The op whose worker the flight is pinned for: an unanswered
+        waiter's (the leader first), so a leader that left holds up no one."""
+        with self._lock:
+            for waiter in (flight.leader, *flight.waiters):
+                if not (waiter.op.answered or waiter.op.refused):
+                    return waiter.op
+        return None
+
     def _source_pin(
-        self, op: _Op, flights: list[_Flight], locations: list[Location]
+        self, flights: list[_Flight], locations: list[Location]
     ) -> list[str | ItemOutcome]:
         """A node pin on each exact location, or the outcome of its flight.
-        MaruServer checks that ``op``'s session is its worker's own (the one
-        that attached here) before anything is read: REJECTED otherwise."""
-        if not flights:
-            return []
-        try:
-            response = self.metadata.source_pin(
-                [
-                    KeyLocation(key=f.key, location=loc)
-                    for f, loc in zip(flights, locations, strict=True)
-                ],
-                worker_session=op.session,
-                worker_incarnation=op.origin,
-            )
-        except Exception as e:
-            # Nothing read: the run ends unless stopping
-            self._unknown("SOURCE_PIN", e)
-            return [_miss(MissReason.BUSY)] * len(flights)
-        if response.status == Status.REJECTED:
-            logger.warning("FETCH of %s refused: %s", op.origin, response.error)
-            return [ItemOutcome(ItemResult.REJECTED)] * len(flights)
-        if response.status != Status.OK:
-            logger.error("SOURCE_PIN refused: %s %s", response.status, response.error)
-            return [_miss(MissReason.BUSY)] * len(flights)
-        return [
-            o.pin_id
-            if o.result == ItemResult.HIT and o.pin_id
-            else _miss(o.reason or MissReason.ABSENT)
-            for o in response.items
-        ]
+        MaruServer checks that the session is its worker's own (the one that
+        attached here) before anything is read; a refused worker's items are
+        REJECTED and the flight asks with its next waiter."""
+        out: list[str | ItemOutcome] = [_miss()] * len(flights)
+        todo = list(range(len(flights)))
+        while todo:
+            asks: dict[_Op, list[int]] = {}
+            for i in todo:
+                op = self._pinner(flights[i])
+                if op is not None:  # else no one waits for it: a miss
+                    asks.setdefault(op, []).append(i)
+            todo = []
+            for op, idx in asks.items():
+                try:
+                    response = self.metadata.source_pin(
+                        [KeyLocation(flights[i].key, locations[i]) for i in idx],
+                        worker_session=op.session,
+                        worker_incarnation=op.origin,
+                    )
+                except Exception as e:
+                    # Nothing read: the run ends unless stopping
+                    self._unknown("SOURCE_PIN", e)
+                    for i in idx:
+                        out[i] = _miss(MissReason.BUSY)
+                    continue
+                if response.status == Status.REJECTED:
+                    logger.warning("FETCH of %s refused: %s", op.origin, response.error)
+                    self._refuse(op, [flights[i] for i in idx])
+                    todo += idx
+                    continue
+                if response.status != Status.OK:
+                    logger.error(
+                        "SOURCE_PIN refused: %s %s", response.status, response.error
+                    )
+                    for i in idx:
+                        out[i] = _miss(MissReason.BUSY)
+                    continue
+                for i, o in zip(idx, response.items, strict=True):
+                    out[i] = (
+                        o.pin_id
+                        if o.result == ItemResult.HIT and o.pin_id
+                        else _miss(o.reason or MissReason.ABSENT)
+                    )
+        return out
 
-    def _fail_for(self, op: _Op, flight: _Flight, outcome: ItemOutcome) -> None:
-        """End the flight with ``outcome`` for ``op``; a refusal of op's
-        worker is only a miss for the other waiters."""
-        if outcome.result != ItemResult.REJECTED:
-            self._fail(flight, outcome)
-            return
+    def _refuse(self, op: _Op, flights: list[_Flight]) -> None:
+        """``op``'s items of the flights are REJECTED; the flights go on for
+        their other waiters."""
+        waiters = []
         with self._lock:
-            waiters = [flight.leader, *flight.waiters]
-            flight.waiters = []
-            self._close(flight)
+            op.refused = True
+            for flight in flights:
+                mine = [w for w in flight.waiters if w.op is op]
+                flight.waiters = [w for w in flight.waiters if w.op is not op]
+                if flight.leader.op is op:
+                    mine.append(flight.leader)
+                waiters += mine
         for waiter in waiters:
-            self._resolve(waiter, outcome if waiter.op is op else _miss())
+            self._resolve(waiter, ItemOutcome(ItemResult.REJECTED))
 
     def _hold_copies(
-        self, op: _Op, flights: list[_Flight]
+        self, flights: list[_Flight]
     ) -> tuple[list[_Flight], list[_Flight]]:
         """A node pin (SOURCE_PIN) on each copy published before, to serve
         the waiters from (leader too); those whose copy went meanwhile read
         the SSD as a new flight, if the quota has room."""
-        pins = self._source_pin(op, flights, [f.copy for f in flights])
+        pins = self._source_pin(flights, [f.copy for f in flights])
         held, gone = [], []
         for flight, pin in zip(flights, pins, strict=True):
             if isinstance(pin, str):
@@ -628,8 +656,8 @@ class FetchManager:
                 self.results["published_used"] += 1
                 held.append(flight)
                 continue
-            if pin.result == ItemResult.REJECTED or pin.reason == MissReason.BUSY:
-                self._fail_for(op, flight, pin)
+            if pin.reason in (None, MissReason.BUSY):  # no one waits; unknown
+                self._fail(flight, pin)
                 continue
             cost = self.page_size + flight.bounce
             with self._lock:
@@ -727,8 +755,8 @@ class FetchManager:
             assert page is not None and page.location is not None
             copies.append(page.location)
         with self._lock:
-            # No pin for a worker already answered
-            session = "" if op.answered else op.session
+            # No pin for a worker already answered or refused
+            session = "" if op.answered or op.refused else op.session
         items = [
             FetchCompleteItem(
                 key=f.key,

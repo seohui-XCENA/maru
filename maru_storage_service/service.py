@@ -118,23 +118,26 @@ def check_servable(config: NodeConfig) -> None:
         )
 
 
-def worker_budgets(config: NodeConfig) -> Budgets:
+def worker_budgets(config: NodeConfig, top_bytes: int, bounce: int) -> Budgets:
     """The budgets each worker gets at ATTACH. With an SSD tier its
     fetch_request_max_bytes is its fetch window: the pages it may hold
-    fetched at once, within the per-op cap, the node's in-flight cap less a
-    bounce, and the top tier less its credit and transfer reserve (one page
+    fetched at once, within the per-op cap, the flights the node's in-flight
+    cap holds (a page and its ``bounce`` each), and the ``top_bytes`` really
+    mapped for the top tier less its credit and transfer reserve (one page
     at least)."""
     budgets = config.budgets
     if config.tier("ssd") is None:
         return budgets
-    top, ps = config.top, config.page_size
+    ps = config.page_size
     room = (
-        (top.size or 0)
+        top_bytes
         - budgets.credit_total_max_bytes
-        - budgets.transfer_reserve_bytes.get(top.store, 0)
+        - budgets.transfer_reserve_bytes.get(config.top.store, 0)
     )
     window = min(
-        budgets.fetch_request_max_bytes, budgets.fetch_max_inflight_bytes - ps, room
+        budgets.fetch_request_max_bytes,
+        budgets.fetch_max_inflight_bytes // (ps + bounce) * ps,
+        room,
     )
     return dataclasses.replace(
         budgets, fetch_request_max_bytes=max(ps, window // ps * ps)
@@ -243,7 +246,7 @@ class StorageService:
             node_epoch=self.node_epoch,
             server_address=config.server,
             page_size=config.page_size,
-            budgets=worker_budgets(config),
+            budgets=config.budgets,  # the workers' are set before it serves
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
@@ -415,6 +418,15 @@ class StorageService:
         self.local.pools = dram_pools + [
             (pool.descriptor(), None) for pool in cxl_pools
         ]
+        if self.ssd is not None:
+            # The window fits the top tier's real pools (the RM may give less)
+            infos = [self.pools.pool_info(i) for i in self.pools.pool_ids()]
+            top_bytes = sum(
+                i.capacity for i in infos if i is not None and i.kind == top.store
+            )
+            self.local.budgets = worker_budgets(
+                config, top_bytes, self.ssd.io_size(config.page_size)
+            )
         self.local.start()
         logger.info(
             "StorageService %s serving node %s, pages of %d KiB",

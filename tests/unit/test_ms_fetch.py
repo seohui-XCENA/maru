@@ -199,6 +199,7 @@ class Loader:
         self.raw = RawWorker(node.config.socket)
         reply = self.raw.attach(capabilities=[FETCH_CAPABILITY], tp_rank=tp_rank)
         assert reply.capabilities == [FETCH_CAPABILITY]
+        self.budgets = reply.budgets
         self.session = FakeWorker(
             Wire(self.service),
             SimpleNamespace(node_id=node.config.node_id, epoch=node.node_epoch),
@@ -1023,3 +1024,86 @@ def test_two_loaders_never_take_the_same_slot(env, monkeypatch):
         gate.set()
         first.join(10)
         h.close()
+
+
+# =============================================================================
+# Review fixes: the window fits the quota and the real pools; a live waiter pins
+# =============================================================================
+
+
+def test_a_full_window_fits_the_inflight_cap(env):
+    server, make = env
+    node, keys = make(
+        fetch_request_max_bytes=4 * PAGE, fetch_max_inflight_bytes=4 * PAGE
+    )
+    loader = Loader(node, server)
+    # each flight holds a page and its bounce: two fit, not three
+    assert node.ssd.io_size(PAGE) == PAGE
+    assert loader.budgets.fetch_request_max_bytes == 2 * PAGE
+    answer = loader.fetch(*keys[:2])
+    assert [o.result for o in answer.items] == [ItemResult.HIT] * 2
+    assert node.manager.fetches.results["MISS:busy"] == 0
+    loader.unpin(*[o.pin_id for o in answer.items])
+    wait_until(lambda: settled(node), "quota back")
+    loader.close()
+
+
+def test_the_window_fits_the_regions_the_rm_gave(
+    real_server, sockdir, ssd_dir, regions
+):
+    server, url = real_server
+    config = cxl_ssd(url, sockdir, ssd_dir)
+    rm = FakeRm()
+    rm.capacity = 8 * PAGE  # one region of the two the tier asks for
+    node = start_node(
+        config,
+        host_boot_id="boot-1",
+        region_source=rm,
+        cxl_renew_s=0.05,
+        map_region=regions.node_map,
+    )
+    try:
+        assert sum(p.info().capacity for p in node.cxl.pools) == 8 * PAGE
+        worker = RawWorker(node.config.socket)
+        reply = worker.attach(capabilities=[FETCH_CAPABILITY])
+        budgets = config.budgets
+        room = 8 * PAGE - budgets.credit_total_max_bytes - PAGE
+        assert PAGE <= room < budgets.fetch_request_max_bytes
+        assert reply.budgets.fetch_request_max_bytes == room
+        worker.close()
+    finally:
+        node.stop()
+
+
+@pytest.mark.parametrize("how", ["timeout", "closed"])
+def test_a_waiter_pins_the_source_once_the_leader_left(env, monkeypatch, how):
+    server, make = env
+    node, keys = make()
+    name = keys[0]
+    fetches = node.manager.fetches
+    reserve, room = fetches._reserve, threading.Event()
+    monkeypatch.setattr(
+        fetches, "_reserve", lambda count: reserve(count) if room.is_set() else []
+    )
+    a, b = Loader(node, server), Loader(node, server, tp_rank=1)
+    first = a.send(
+        a.request(a.items(name), deadline_ms=150 if how == "timeout" else 5000)
+    )
+    wait_until(lambda: fetches.flights() == 1, "the flight waits for room")
+    second = b.send(b.request(b.items(name)))
+    wait_until(lambda: fetches.results["joined"] == 1, "joined")
+    if how == "timeout":
+        assert first.result(10).items[0].result == ItemResult.MISS
+    a.session.close()
+    room.set()
+    hit = second.result(10).items[0]
+    assert hit.result == ItemResult.HIT and b.read(hit.location) == value_of(name)
+    if how == "closed":  # asked with its session first: refused, b's used next
+        assert first.result(10).items[0].result == ItemResult.REJECTED
+    wait_until(lambda: pins(server, name, hit.location) == 1, "only b's pin")
+    b.unpin(hit.pin_id)
+    wait_until(lambda: node_pins(server, node) == 0, "no node pin left")
+    wait_until(lambda: settled(node), "quota back")
+    node.pools.check()
+    a.close()
+    b.close()

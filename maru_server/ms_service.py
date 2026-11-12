@@ -567,17 +567,19 @@ class MsService:
             rejected = self._too_many(req.items, SourcePinResponse, "items")
             if rejected:
                 return rejected
-            if req.worker_incarnation:
-                worker = self.registry.known_worker(req.worker_session)
-                error = self._not_bound(session, worker, req.worker_incarnation)
-                if error is None and any(
-                    i.key.namespace != worker.namespace for i in req.items
-                ):
-                    error = "a key is not in the worker's namespace"
-                if error is not None:
-                    return SourcePinResponse(status=Status.REJECTED, error=error)
 
             def run(batch: _Batch) -> SourcePinResponse:
+                # Only a new op is checked: a resend gets its first answer,
+                # with the pins it made, also once the worker went
+                if req.worker_incarnation:
+                    worker = self.registry.known_worker(req.worker_session)
+                    error = self._not_bound(session, worker, req.worker_incarnation)
+                    if error is None and any(
+                        i.key.namespace != worker.namespace for i in req.items
+                    ):
+                        error = "a key is not in the worker's namespace"
+                    if error is not None:
+                        return SourcePinResponse(status=Status.REJECTED, error=error)
                 now = self._clock()
 
                 def online(node_id: str) -> bool:
