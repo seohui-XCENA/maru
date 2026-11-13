@@ -4,6 +4,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,58 @@ def test_cpu_handler_without_rm_or_dax(cpu_server, async_rpc, monkeypatch):
         worker.close()
         scheduler.close()
         other.close()
+
+
+@pytest.mark.parametrize("async_rpc", [False, True])
+def test_concurrent_engines_on_the_server_worker_pool(cpu_server, async_rpc):
+    """maru-server handles requests on several worker threads: engines
+    storing, probing and reading at once each see exactly their own KV."""
+    engines, keys = 8, 32
+    barrier = threading.Barrier(engines)
+    errors: list[BaseException] = []
+
+    def run(i: int) -> None:
+        config = {
+            "server_url": cpu_server,
+            "storage_backend": "cpu",
+            "engine_id": f"engine-{i}",
+            "cache_namespace": "model-revision-1",
+            "pool_size": 64 * keys,
+            "chunk_size_bytes": 64,
+            "use_async_rpc": async_rpc,
+        }
+        worker = MaruHandler(MaruConfig(**config))
+        scheduler = MaruHandler(
+            MaruConfig(**{**config, "metadata_only": True, "pool_size": 0})
+        )
+        try:
+            assert worker.connect() and scheduler.connect()
+            barrier.wait(timeout=30)
+            names = [f"key-{n}" for n in range(keys)]
+            for n, name in enumerate(names):
+                handle = worker.alloc(64)
+                handle.buf[:] = bytes([i, n]) * 32
+                assert worker.store(name, handle)
+                assert scheduler.batch_exists([name, f"absent-{n}"]) == [True, False]
+            for n, name in enumerate(names):
+                with worker.retrieve(name) as info:
+                    assert bytes(info.view) == bytes([i, n]) * 32
+            assert scheduler.batch_exists(names) == [True] * keys
+        except BaseException as exc:  # reported on the main thread
+            errors.append(exc)
+            barrier.abort()
+        finally:
+            worker.close()
+            scheduler.close()
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(engines)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not any(t.is_alive() for t in threads)
+    if errors:
+        raise errors[0]
 
 
 def test_metadata_only_cxl_client_does_not_allocate(cpu_server, monkeypatch):
