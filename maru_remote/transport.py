@@ -383,9 +383,18 @@ class NixlTransport:
         with self._lock:
             if any(p.peer == name for p in self._pending.values()):
                 raise RuntimeError(f"NIXL peer {name} still has unreleased transfers")
-            self._agent.remove_remote_agent(name)
+            self._remove_remote_agent(name)
             self._peers.discard(name)
             self._tainted.discard(name)
+
+    def _remove_remote_agent(self, name: str) -> None:
+        """Caller holds the lock. A peer NIXL invalidated (its connection
+        failed) is gone already."""
+        try:
+            self._agent.remove_remote_agent(name)
+        except Exception as exc:
+            if PEER_INVALIDATED not in str(exc):
+                raise
 
     def has_peer(self, name: str) -> bool:
         """Whether a peer is loaded (added by :meth:`add_peer`, not removed)."""
@@ -490,7 +499,7 @@ class NixlTransport:
                     # destroys its rkeys and makes NIXL report ERR before the
                     # RMA has ended. Keep the peer until every transfer ends.
                     return False
-                self._agent.remove_remote_agent(name)
+                self._remove_remote_agent(name)
                 self._peers.discard(name)
                 self._tainted.discard(name)
         except Exception as exc:

@@ -181,6 +181,12 @@ class FakeNixlAgent:
         return name.encode()  # the real binding returns bytes too
 
     def remove_remote_agent(self, name: str) -> None:
+        if name in self.invalidated:  # NIXL dropped its metadata already
+            self.invalidated.discard(name)
+            self.peers.discard(name)
+            self.conns.pop(name, None)
+            self.known.pop(name, None)
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
         self.peers.discard(name)
         self.conns.pop(name, None)
         self.known.pop(name, None)

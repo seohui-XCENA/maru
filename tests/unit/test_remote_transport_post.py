@@ -453,3 +453,15 @@ def test_a_failed_state_query_is_logged_once(pair, monkeypatch):
     finally:
         logger.removeHandler(records)
     assert sum("state check failed" in m for m in records.messages) == 1
+
+
+def test_an_invalidated_peer_is_removed_and_the_transport_closes(pair):
+    pair.gpu.stall()
+    pending = pair.post("WRITE")
+    pair.gpu.agent.invalidated.add(pair.peer)
+    assert pending.poll_state(release_disconnected=True) is TransferState.ERR
+    # NIXL answers NOT_FOUND to removing a peer it invalidated: it is gone
+    assert pair.gpu.disconnect(pair.peer)
+    assert not pair.gpu.has_peer(pair.peer)
+    pair.gpu.close()
+    assert pair.gpu.agent.regs == []
