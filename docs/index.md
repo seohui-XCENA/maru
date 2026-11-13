@@ -128,6 +128,7 @@ KV Cache Management <source/design_doc/kv_cache_management>
 Consistency and Safety <source/design_doc/consistency_and_safety>
 Prefetch Hints (Read and Write) <source/design_doc/read_hints>
 CPU/CXL L1 and SSD L2 (Proposal) <source/design_doc/tiered_kv_cache>
+Node StorageService (multi-tier, memory nodes) <source/design_doc/node_storage_service>
 ```
 
 ```{toctree}
