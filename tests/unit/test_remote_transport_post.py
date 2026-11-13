@@ -5,6 +5,8 @@ Also covers FakeTransport: handle end and packet end are apart, the same
 range gets the same key, and an agent's end takes its connections.
 """
 
+import logging
+
 import pytest
 
 from maru_remote.transport import TransferState
@@ -412,3 +414,42 @@ def test_stale_metadata_never_connects_to_a_later_agent(pair):
     assert bytes(pair.pool) == bytes([9]) * N
     assert bytes(pair.local) == bytes([7]) * N
     assert not pair.gpu.announce(peer) and nxt.take_notifs() == {}
+
+
+def test_a_transfer_to_an_invalidated_peer_is_released_as_an_error(pair):
+    pair.gpu.stall()
+    kept = pair.post("WRITE")
+    released = pair.post("WRITE")
+    # The peer's process died; once its RC retries ran out, NIXL invalidated
+    # the peer agent and reports NOT_FOUND for transfers to it
+    pair.gpu.agent.invalidated.add(pair.peer)
+    assert kept.poll_state() is TransferState.PENDING  # not asked to release
+    assert released.poll_state(release_disconnected=True) is TransferState.ERR
+    assert not released.completed and len(pair.gpu.agent.released) == 1
+
+
+def test_a_failed_state_query_is_logged_once(pair, monkeypatch):
+    pair.gpu.stall()
+    pending = pair.post("WRITE")
+
+    def unavailable(_handle):
+        raise RuntimeError("state temporarily unavailable")
+
+    class Records(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    records = Records()
+    logger = logging.getLogger("maru_remote.transport")
+    monkeypatch.setattr(pair.gpu.agent, "check_xfer_state", unavailable)
+    logger.addHandler(records)
+    try:
+        for _ in range(5):
+            assert pending.poll_state() is TransferState.PENDING
+    finally:
+        logger.removeHandler(records)
+    assert sum("state check failed" in m for m in records.messages) == 1

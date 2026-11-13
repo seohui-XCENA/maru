@@ -82,6 +82,9 @@ class FakeNixlAgent:
         self.known: dict[str, set[tuple[int, int, int]] | None] = {}
         self.broken: set[str] = set()
         self.failed: set[str] = set()  # peers whose endpoint UCX closed
+        # Peers NIXL invalidated after their connection failed (the peer's
+        # process died and the RC retries ran out)
+        self.invalidated: set[str] = set()
         self.notifs: list[tuple[str, bytes]] = []  # (sender, message) received
         self.backends: list[tuple[str, dict]] = []
         self.stall = False
@@ -370,8 +373,11 @@ class FakeNixlAgent:
 
     def check_xfer_state(self, handle) -> str:
         """A transfer still in progress whose peer agent ended raises
-        NIXL_ERR_REMOTE_DISCONNECT from then on, as NIXL does; it never ends
+        NIXL_ERR_REMOTE_DISCONNECT from then on, and one whose peer NIXL
+        invalidated raises NIXL_ERR_NOT_FOUND, as NIXL does; it never ends
         on its own."""
+        if handle[3] == "PROC" and handle[4] in self.invalidated:
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
         if handle[3] == "PROC" and handle[6].closed:
             raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
         return handle[3]

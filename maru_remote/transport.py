@@ -33,8 +33,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _POLL_SLEEP_S = 0.0002
-# What NIXL raises for a transfer whose peer's agent or registration ended
+# What NIXL raises for a transfer whose peer is gone: its agent or
+# registration ended, or NIXL invalidated the peer agent once its connection
+# failed (its process died: the RC retries ran out)
 REMOTE_DISCONNECT = "NIXL_ERR_REMOTE_DISCONNECT"
+PEER_INVALIDATED = "NIXL_ERR_NOT_FOUND"
 
 
 def buffer_address(buf: Any) -> int:
@@ -129,6 +132,7 @@ class PendingTransfer:
         # Pools of one worker share the transport: two clients may poll the
         # same transfer, and its handle must be released once.
         self._poll_lock = threading.Lock()
+        self._query_warned = False  # a failed state query is logged once
 
     def hand_over(self, finished: bool = False) -> None:
         """Called by the posting thread once it stops using the handle.
@@ -144,9 +148,10 @@ class PendingTransfer:
         """Check whether the transfer has ended; release the handle if so.
 
         Args:
-            release_disconnected: Take NIXL's remote-disconnect error as an
-                error end and release the handle (its pages stay with the
-                caller as for any error end).
+            release_disconnected: Take NIXL's errors for a gone peer
+                (remote disconnect, invalidated peer agent) as an error end
+                and release the handle (its pages stay with the caller as
+                for any error end).
 
         Returns:
             True only after a terminal state and NIXL handle release.
@@ -161,12 +166,20 @@ class PendingTransfer:
             try:
                 state = self._transport.check_state(self.handle)
             except Exception as exc:
-                if release_disconnected and REMOTE_DISCONNECT in str(exc):
+                text = str(exc)
+                if release_disconnected and (
+                    REMOTE_DISCONNECT in text or PEER_INVALIDATED in text
+                ):
                     state = "ERR"
                 else:
-                    logger.warning(
-                        "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
-                    )
+                    if not self._query_warned:
+                        self._query_warned = True
+                        logger.warning(
+                            "NIXL %s to %s: state check failed: %s",
+                            self.op,
+                            self.peer,
+                            exc,
+                        )
                     # Releasing an active NIXL handle can succeed while its
                     # RMA still touches memory. A failed query is no
                     # completion proof.
